@@ -1,0 +1,16 @@
+[package]
+name = "ldgr"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+blake3 = "1.5"
+rand_chacha = "0.9"
+rand_core = "0.9"
+
+[dev-dependencies]
+proptest = "1"
