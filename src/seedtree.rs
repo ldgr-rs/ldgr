@@ -4,6 +4,7 @@ use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
 /// A deterministic random stream derived from one campaign seed.
+#[derive(Debug, Clone)]
 pub struct SeedTree {
     root: [u8; 32],
 }

@@ -1,6 +1,7 @@
 //! Explicit single-threaded deterministic simulation runtime.
 
 use std::collections::VecDeque;
+use std::fmt;
 
 use crate::config::RunConfig;
 use crate::format::{EntryKind, Payload};
@@ -65,6 +66,17 @@ pub enum RuntimeError {
     StepLimit { limit: usize },
 }
 
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Journal(error) => write!(f, "journal error: {error}"),
+            Self::StepLimit { limit } => write!(f, "simulation exceeded {limit} steps"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeError {}
+
 impl From<JournalError> for RuntimeError {
     fn from(error: JournalError) -> Self {
         Self::Journal(error)
@@ -85,6 +97,15 @@ pub struct Simulation {
 impl Simulation {
     /// Create a simulation from task programs.
     pub fn new(config: RunConfig, programs: Vec<Vec<Instruction>>) -> Self {
+        Self::with_replay(config, programs, Vec::new())
+    }
+
+    /// Create a simulation that follows recorded ready-list choices.
+    pub fn with_replay(
+        config: RunConfig,
+        programs: Vec<Vec<Instruction>>,
+        replay: Vec<usize>,
+    ) -> Self {
         let tasks = programs
             .into_iter()
             .enumerate()
@@ -97,7 +118,7 @@ impl Simulation {
             })
             .collect::<Vec<_>>();
         let ready = (0..tasks.len()).collect::<Vec<_>>();
-        let scheduler = Scheduler::new(config.policy, config.seed_tree(), Vec::new());
+        let scheduler = Scheduler::new(config.policy, config.seed_tree(), replay);
         Self {
             config,
             tasks,

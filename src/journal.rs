@@ -111,7 +111,7 @@ impl Entry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct JournalState {
     entries: HashMap<Hash, Arc<Entry>>,
     heads: HashMap<ActorId, Hash>,
@@ -119,7 +119,7 @@ struct JournalState {
 }
 
 /// An append-only in-memory journal view. Forks share immutable entries.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Journal {
     state: Arc<JournalState>,
 }
