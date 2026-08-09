@@ -197,6 +197,15 @@ impl Simulation {
                         right: payload,
                     },
                 )?;
+                if self.config.dropped_events.contains(&id) {
+                    self.journal.append(
+                        EntryKind::Fault,
+                        actor,
+                        [id],
+                        Payload::Text("drop".into()),
+                    )?;
+                    return Ok(());
+                }
                 let delivered = self.net.send(Message {
                     from: task_id,
                     to,

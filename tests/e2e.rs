@@ -1,10 +1,10 @@
 use ldgr::config::{Policy, RunConfig};
 use ldgr::explorer::Workload;
-use ldgr::explorer::replay;
-use ldgr::explorer::search;
+use ldgr::explorer::{replay, replay_with_faults, search};
+use ldgr::format::{EntryKind, Payload};
 use ldgr::ldfi::suggest_cut;
 use ldgr::minimizer::ddmin;
-use ldgr::oracle::LinearizabilityOracle;
+use ldgr::oracle::{HistoryOperation, HistoryOracle, KeyValueSpec, Oracle};
 use ldgr::runtime::Instruction;
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +33,31 @@ impl Workload for MiniKv {
             ],
         ]
     }
+
+    fn history(&self, run: &ldgr::runtime::RunResult) -> Vec<HistoryOperation> {
+        run.journal
+            .entries()
+            .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
+                (EntryKind::Send, Payload::Pair { left: 1, right: 42 })
+                    if entry.data.actor == 0 =>
+                {
+                    Some(HistoryOperation::Write {
+                        key: "k".into(),
+                        value: 42,
+                        witness: entry.id,
+                    })
+                }
+                (EntryKind::Outcome, Payload::Number(value)) if entry.data.actor == 2 => {
+                    Some(HistoryOperation::Read {
+                        key: "k".into(),
+                        value: *value,
+                        witness: entry.id,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[test]
@@ -41,13 +66,27 @@ fn mini_kv_finds_and_reproduces_stale_read() {
         seed: [0; 32],
         policy: Policy::Random,
         max_steps: 256,
+        dropped_events: Vec::new(),
     };
-    let finding = search(&MiniKv, &LinearizabilityOracle, config, 256)
+    let workload = MiniKv;
+    let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
+    let finding = search(&workload, &oracle, config, 256)
         .unwrap()
         .expect("campaign should find planted race");
     assert!(finding.verdict.violated);
     assert!(!finding.verdict.witnesses.is_empty());
-    assert!(!suggest_cut(&finding.run.journal, &finding.verdict).is_empty());
+    let cuts = suggest_cut(&finding.run.journal, &finding.verdict);
+    assert!(!cuts.is_empty());
+    assert!(cuts.iter().any(|cut| {
+        replay_with_faults(
+            &workload,
+            finding.seed,
+            finding.run.decisions.clone(),
+            vec![cut.event],
+        )
+        .map(|run| !oracle.check(&run).violated)
+        .unwrap_or(false)
+    }));
     let replayed = replay(&MiniKv, finding.seed, finding.run.decisions.clone()).unwrap();
     assert_eq!(
         finding.run.journal.root_hash(),
@@ -63,6 +102,7 @@ fn same_seed_produces_identical_journal_root() {
             priority_changes: 2,
         },
         max_steps: 256,
+        dropped_events: Vec::new(),
     };
     let left = ldgr::runtime::Simulation::new(config.clone(), MiniKv.programs())
         .run()

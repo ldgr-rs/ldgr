@@ -27,7 +27,6 @@ pub fn suggest_cut(journal: &Journal, verdict: &Verdict) -> Vec<FaultCut> {
                 continue;
             };
             let cost = match entry.data.kind {
-                EntryKind::Recv => 1,
                 EntryKind::Send => 2,
                 EntryKind::TimerFire => 3,
                 EntryKind::FsRead | EntryKind::FsWrite => 4,

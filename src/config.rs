@@ -1,5 +1,6 @@
 //! Run configuration shared by simulation and Explorer code.
 
+use crate::journal::Hash;
 use crate::seedtree::SeedTree;
 
 /// Scheduling policy for one deterministic run.
@@ -22,6 +23,8 @@ pub struct RunConfig {
     pub policy: Policy,
     /// Maximum number of executed instructions.
     pub max_steps: usize,
+    /// Journal event hashes whose effects must be dropped.
+    pub dropped_events: Vec<Hash>,
 }
 
 impl Default for RunConfig {
@@ -30,6 +33,7 @@ impl Default for RunConfig {
             seed: [0; 32],
             policy: Policy::Random,
             max_steps: 10_000,
+            dropped_events: Vec::new(),
         }
     }
 }

@@ -8,6 +8,9 @@ use crate::runtime::{Instruction, RunResult, Simulation};
 pub trait Workload {
     /// Build task programs for a run.
     fn programs(&self) -> Vec<Vec<Instruction>>;
+
+    /// Convert a completed run into abstract operations for a history oracle.
+    fn history(&self, run: &RunResult) -> Vec<crate::oracle::HistoryOperation>;
 }
 
 /// One violating campaign result.
@@ -34,7 +37,7 @@ pub fn search<W: Workload, O: Oracle>(
         let run = Simulation::new(config.clone(), workload.programs())
             .run()
             .map_err(|error| format!("simulation failed: {error:?}"))?;
-        let verdict = oracle.check(&run.journal);
+        let verdict = oracle.check(&run);
         if verdict.violated {
             return Ok(Some(Finding {
                 seed: config.seed,
@@ -61,6 +64,25 @@ pub fn replay<W: Workload>(
     Simulation::with_replay(config, workload.programs(), decisions)
         .run()
         .map_err(|error| format!("replay failed: {error}"))
+}
+
+/// Replay one workload with a journal-hash fault schedule.
+pub fn replay_with_faults<W: Workload>(
+    workload: &W,
+    seed: [u8; 32],
+    decisions: Vec<usize>,
+    dropped_events: Vec<[u8; 32]>,
+) -> Result<RunResult, String> {
+    let mut config = RunConfig {
+        seed,
+        policy: Policy::Replay,
+        dropped_events,
+        ..RunConfig::default()
+    };
+    config.max_steps = decisions.len().saturating_add(10);
+    Simulation::with_replay(config, workload.programs(), decisions)
+        .run()
+        .map_err(|error| format!("fault replay failed: {error}"))
 }
 
 /// Return the first divergence between two runs.

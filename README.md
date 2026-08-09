@@ -9,7 +9,7 @@ It currently demonstrates part of the seed implementation:
 - seeded random and PCT-style scheduling;
 - virtual time, simulated networking, and a small crashable file model;
 - journal predicates, causal slicing, and `ddmin`;
-- bounded LDFI fault candidates; and
+- executable bounded LDFI fault candidates; and
 - a mini-KV stale-read campaign.
 
 Run the demo with `cargo run --example minikv`.
