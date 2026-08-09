@@ -1,7 +1,7 @@
 //! Deterministic, independently-seeded random streams.
 
 use rand_chacha::ChaCha20Rng;
-use rand_core::{RngCore, SeedableRng};
+use rand_core::{Rng, SeedableRng};
 
 /// A deterministic random stream derived from one campaign seed.
 #[derive(Debug, Clone)]

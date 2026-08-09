@@ -17,4 +17,3 @@ pub mod scheduler;
 pub mod seedtree;
 pub mod simfs;
 pub mod time;
-pub mod workloads;
