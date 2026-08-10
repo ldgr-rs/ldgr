@@ -1,0 +1,36 @@
+[package]
+name = "ledger-journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Content-addressed causal DAG journal, vector clocks, and segment store"
+
+[features]
+default = ["std"]
+std = ["blake3/std", "dep:zstd", "ledger-format/std"]
+
+[dependencies]
+blake3 = { version = "1.8", default-features = false }
+rpds = { workspace = true }
+hashbrown = { version = "0.15", default-features = false, features = [
+	"default-hasher",
+] }
+ledger-format = { path = "../ledger-format", default-features = false }
+zstd = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+ledger-format = { path = "../ledger-format" }
+proptest.workspace = true
+
+[[bench]]
+name = "storage"
+harness = false
+
+[[bench]]
+name = "vc"
+harness = false
+
+[lints]
+workspace = true
