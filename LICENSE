@@ -1,0 +1,19 @@
+# License
+
+This repository uses a per-crate license split. The authoritative declaration
+for each crate is its `license` field in `Cargo.toml`; `cargo run -p xtask -- licenses`
+enforces the split in CI.
+
+| License | Crates | Text |
+| :--- | :--- | :--- |
+| AGPL-3.0-or-later | `ledger-sim`, `ledger-explorer` (the engine) | `LICENSE-AGPL-3.0` |
+| MIT OR Apache-2.0 | `ledger-format`, `ledger-journal`, `wasm-guest` | `LICENSE-MIT`, `LICENSE-APACHE` |
+| Apache-2.0 | `ledger-cli`, `ledger-flow`, `ledger-lint`, `xtask` | `LICENSE-APACHE` |
+
+The engine is dual-licensed: AGPL-3.0-or-later for open use, and a paid
+commercial license for teams that must link or embed it without AGPL
+obligations. See `docs/06-business.md`.
+
+Contributions are accepted under the license of the crate they land in, and
+grant the project the right to sublicense engine contributions under the
+commercial license. See `CONTRIBUTING.md`.
