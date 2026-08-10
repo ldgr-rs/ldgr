@@ -1,0 +1,5 @@
+# Crash reproductions written by cargo-fuzz during local runs.
+artifacts/
+# Coverage-increasing inputs libFuzzer discovers into the corpus dir during
+# local runs. Only the human-named seed files in corpus/ are tracked.
+corpus/*/[0-9a-f][0-9a-f]*

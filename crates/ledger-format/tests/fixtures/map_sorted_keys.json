@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "name": "map_sorted_keys",
+  "description": "Golden canonical CBOR fixture",
+  "value": {
+    "type": "map",
+    "entries": [
+      {
+        "key": {
+          "type": "text",
+          "value": "a"
+        },
+        "value": {
+          "type": "unsigned",
+          "value": 1
+        }
+      },
+      {
+        "key": {
+          "type": "text",
+          "value": "b"
+        },
+        "value": {
+          "type": "unsigned",
+          "value": 2
+        }
+      },
+      {
+        "key": {
+          "type": "text",
+          "value": "c"
+        },
+        "value": {
+          "type": "unsigned",
+          "value": 3
+        }
+      }
+    ]
+  }
+}

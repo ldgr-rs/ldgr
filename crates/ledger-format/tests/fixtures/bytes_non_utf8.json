@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "name": "bytes_non_utf8",
+  "description": "Golden canonical CBOR fixture",
+  "value": {
+    "type": "bytes",
+    "hex": "fffefd"
+  }
+}

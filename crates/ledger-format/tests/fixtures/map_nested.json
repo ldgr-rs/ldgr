@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "name": "map_nested",
+  "description": "Golden canonical CBOR fixture",
+  "value": {
+    "type": "map",
+    "entries": [
+      {
+        "key": {
+          "type": "text",
+          "value": "a"
+        },
+        "value": {
+          "type": "map",
+          "entries": [
+            {
+              "key": {
+                "type": "text",
+                "value": "b"
+              },
+              "value": {
+                "type": "unsigned",
+                "value": 1
+              }
+            }
+          ]
+        }
+      },
+      {
+        "key": {
+          "type": "text",
+          "value": "c"
+        },
+        "value": {
+          "type": "unsigned",
+          "value": 2
+        }
+      }
+    ]
+  }
+}

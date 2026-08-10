@@ -1,0 +1,29 @@
+[package]
+name = "ledger-format-fuzz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "libFuzzer targets for the ledger-format zero-trust parser boundary"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ledger-format = { path = ".." }
+
+[[bin]]
+name = "canonical_decoder"
+path = "fuzz_targets/canonical_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tolerant_reader"
+path = "fuzz_targets/tolerant_reader.rs"
+test = false
+doc = false
+bench = false

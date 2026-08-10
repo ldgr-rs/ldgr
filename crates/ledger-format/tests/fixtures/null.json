@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "name": "null",
+  "description": "Golden canonical CBOR fixture",
+  "value": {
+    "type": "null"
+  }
+}

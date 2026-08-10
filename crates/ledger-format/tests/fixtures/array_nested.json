@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "array_nested",
+  "description": "Golden canonical CBOR fixture",
+  "value": {
+    "type": "array",
+    "items": [
+      {
+        "type": "unsigned",
+        "value": 1
+      },
+      {
+        "type": "array",
+        "items": [
+          {
+            "type": "unsigned",
+            "value": 2
+          },
+          {
+            "type": "array",
+            "items": [
+              {
+                "type": "unsigned",
+                "value": 3
+              },
+              {
+                "type": "array",
+                "items": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

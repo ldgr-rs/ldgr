@@ -1,0 +1,17 @@
+[package]
+name = "ledger-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Canonical format, entry types, and CBOR encoding for the Ledger DST engine"
+
+[features]
+default = ["std"]
+std = ["blake3/std"]
+
+[dependencies]
+blake3 = { version = "1.8", default-features = false }
+
+[lints]
+workspace = true
