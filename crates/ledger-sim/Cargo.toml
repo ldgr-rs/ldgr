@@ -1,0 +1,56 @@
+[package]
+name = "ledger-sim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-or-later"
+description = "Deterministic simulation engine, effect boundaries, schedulers, SimNet, SimFs, and sentinel"
+
+[dependencies]
+blake3.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+wasmtime = { workspace = true, optional = true }
+wasmtime-wasi = { workspace = true, optional = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+getrandom.workspace = true
+libc = { workspace = true, optional = true }
+ledger-format = { path = "../ledger-format" }
+ledger-journal = { path = "../ledger-journal" }
+
+[build-dependencies]
+cc = "1"
+
+[features]
+default = ["backend-native"]
+backend-native = []
+backend-wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+sentinel = ["dep:libc"]
+sim-fs-journaling = []
+
+[dev-dependencies]
+proptest.workspace = true
+futures.workspace = true
+criterion.workspace = true
+
+[[bin]]
+name = "sentinel-probe"
+path = "src/bin/sentinel_probe.rs"
+required-features = ["sentinel"]
+
+[[bench]]
+name = "wasm_throughput"
+harness = false
+required-features = ["backend-wasm"]
+
+[[bench]]
+name = "sim_throughput"
+harness = false
+
+[[bench]]
+name = "sim_overhead"
+harness = false
+
+[lints]
+workspace = true
