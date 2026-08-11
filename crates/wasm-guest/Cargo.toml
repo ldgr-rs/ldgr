@@ -1,0 +1,15 @@
+[package]
+name = "wasm-guest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic Wasm guest for the ledger Wasm track"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[lints]
+workspace = true
