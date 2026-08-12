@@ -1,0 +1,16 @@
+[package]
+name = "ledger-flow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "Durable execution step-logging engine and crash-resilient workflow state machine"
+
+[dependencies]
+blake3.workspace = true
+ledger-format = { path = "../ledger-format" }
+ledger-journal = { path = "../ledger-journal" }
+ledger-sim = { path = "../ledger-sim" }
+
+[lints]
+workspace = true
