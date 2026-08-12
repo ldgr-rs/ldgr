@@ -1,0 +1,809 @@
+//! Composable history, assertion, invariant, and differential oracles over journal runs.
+
+use ledger_format::{EntryKind, Hash, Payload};
+use ledger_journal::Journal;
+use ledger_sim::RunResult;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+
+/// A predicate evaluation verdict with causal witness hashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verdict {
+    pub violated: bool,
+    /// Journal entry hashes witnessing the violation.
+    pub witnesses: Vec<Hash>,
+    pub reason: String,
+}
+
+impl Verdict {
+    pub fn pass() -> Self {
+        Self {
+            violated: false,
+            witnesses: Vec::new(),
+            reason: "specification satisfied".into(),
+        }
+    }
+
+    pub fn fail(witnesses: Vec<Hash>, reason: impl Into<String>) -> Self {
+        Self {
+            violated: true,
+            witnesses,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// An oracle that evaluates properties over completed simulation runs.
+pub trait Oracle {
+    fn check(&self, run: &RunResult) -> Verdict;
+}
+
+/// An abstract operation extracted from a workload execution history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryOperation {
+    Write {
+        key: String,
+        value: u64,
+        witness: Hash,
+    },
+    Read {
+        key: String,
+        value: u64,
+        witness: Hash,
+    },
+    Push {
+        value: u64,
+        witness: Hash,
+    },
+    Pop {
+        value: u64,
+        witness: Hash,
+    },
+}
+
+impl HistoryOperation {
+    /// Journal entry witnessing this operation.
+    pub fn witness(&self) -> Hash {
+        match self {
+            HistoryOperation::Write { witness, .. }
+            | HistoryOperation::Read { witness, .. }
+            | HistoryOperation::Push { witness, .. }
+            | HistoryOperation::Pop { witness, .. } => *witness,
+        }
+    }
+}
+
+/// One operation with the journal entries of its invoke and response events.
+///
+/// The real-time order between operations derives from the vector clocks of
+/// these entries: operation A precedes operation B when A's response entry
+/// happens before B's invoke entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinOperation {
+    /// Journal entry id of the operation's invocation.
+    pub invoke: Hash,
+    /// Journal entry id of the operation's response.
+    pub response: Hash,
+    /// The operation replayed against the sequential specification.
+    pub operation: HistoryOperation,
+}
+
+/// A sequential specification for history checking.
+pub trait SequentialSpec: Clone {
+    fn apply(&mut self, operation: &HistoryOperation) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyValueSpec {
+    values: BTreeMap<String, u64>,
+}
+
+impl SequentialSpec for KeyValueSpec {
+    fn apply(&mut self, operation: &HistoryOperation) -> Result<(), String> {
+        match operation {
+            HistoryOperation::Write { key, value, .. } => {
+                self.values.insert(key.clone(), *value);
+                Ok(())
+            }
+            HistoryOperation::Read { key, value, .. } => {
+                let expected = self.values.get(key).copied().unwrap_or(0);
+                if expected == *value {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "read of {key} returned {value}, expected {expected}"
+                    ))
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Sequential FIFO queue specification.
+#[derive(Debug, Clone, Default)]
+pub struct QueueSpec {
+    queue: VecDeque<u64>,
+}
+
+impl SequentialSpec for QueueSpec {
+    fn apply(&mut self, operation: &HistoryOperation) -> Result<(), String> {
+        match operation {
+            HistoryOperation::Push { value, .. } => {
+                self.queue.push_back(*value);
+                Ok(())
+            }
+            HistoryOperation::Pop { value, .. } => {
+                if let Some(front) = self.queue.pop_front() {
+                    if front == *value {
+                        Ok(())
+                    } else {
+                        Err(format!("popped {value}, expected {front}"))
+                    }
+                } else {
+                    Err(format!("popped {value} from empty queue"))
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A generic history oracle checking operations against a sequential specification.
+pub struct HistoryOracle<'a, W, S> {
+    workload: &'a W,
+    specification: S,
+}
+
+impl<'a, W, S> HistoryOracle<'a, W, S> {
+    pub const fn new(workload: &'a W, specification: S) -> Self {
+        Self {
+            workload,
+            specification,
+        }
+    }
+}
+
+impl<W, S> Oracle for HistoryOracle<'_, W, S>
+where
+    W: crate::search::Workload,
+    S: SequentialSpec,
+{
+    fn check(&self, run: &RunResult) -> Verdict {
+        let mut specification = self.specification.clone();
+        for operation in self.workload.history(run) {
+            let witness = operation.witness();
+            if let Err(reason) = specification.apply(&operation) {
+                return Verdict::fail(vec![witness], reason);
+            }
+        }
+        Verdict::pass()
+    }
+}
+
+/// Default bound on operations the linearizability checker explores.
+///
+/// The search is exponential in the operation count. Reference workloads stay
+/// far below the bound; larger histories are reported as not checked rather
+/// than explored blindly.
+const DEFAULT_LIN_BOUND: usize = 12;
+
+/// Linearizability oracle over journal-extracted histories.
+///
+/// Operations carry invoke and response journal witnesses. The checker builds
+/// the real-time partial order from the witnesses' vector clocks: operation A
+/// precedes B when A's response happens before B's invoke. It then searches
+/// for a serial order that extends the partial order and satisfies the
+/// sequential specification. A non-linearizable history is rejected with the
+/// failing operation and its already-serialized predecessors reported.
+pub struct LinearizabilityOracle<'a, W, S> {
+    workload: &'a W,
+    specification: S,
+    bound: usize,
+}
+
+impl<'a, W, S> LinearizabilityOracle<'a, W, S> {
+    pub const fn new(workload: &'a W, specification: S) -> Self {
+        Self {
+            workload,
+            specification,
+            bound: DEFAULT_LIN_BOUND,
+        }
+    }
+
+    pub const fn with_bound(mut self, bound: usize) -> Self {
+        self.bound = bound;
+        self
+    }
+}
+
+/// The operation a failed serialization search could not place.
+struct LinFailure {
+    /// Operations already serialized, in order.
+    prefix: Vec<usize>,
+    /// The operation that could not be placed after the prefix.
+    index: usize,
+    /// Why the sequential specification rejected it.
+    reason: String,
+}
+
+/// Search for a serial order extending the real-time partial order.
+///
+/// Every recursion tries each ready operation in index order, so the search
+/// is deterministic. On a dead end the first unplaceable operation and the
+/// serialized prefix are recorded.
+fn find_serialization<S: SequentialSpec>(
+    operations: &[LinOperation],
+    predecessors: &[Vec<usize>],
+    state: S,
+    pending: &mut [bool],
+    serialized: &mut Vec<usize>,
+    failure: &mut Option<LinFailure>,
+) -> bool {
+    if !pending.iter().any(|open| *open) {
+        return true;
+    }
+    for index in 0..operations.len() {
+        if !pending[index] {
+            continue;
+        }
+        if !predecessors[index].iter().all(|earlier| !pending[*earlier]) {
+            continue;
+        }
+        let mut next = state.clone();
+        if next.apply(&operations[index].operation).is_ok() {
+            pending[index] = false;
+            serialized.push(index);
+            if find_serialization(operations, predecessors, next, pending, serialized, failure) {
+                return true;
+            }
+            serialized.pop();
+            pending[index] = true;
+        }
+    }
+    if failure.is_none() {
+        for index in 0..operations.len() {
+            if !pending[index] {
+                continue;
+            }
+            if !predecessors[index].iter().all(|earlier| !pending[*earlier]) {
+                continue;
+            }
+            let mut next = state.clone();
+            if let Err(reason) = next.apply(&operations[index].operation) {
+                *failure = Some(LinFailure {
+                    prefix: serialized.clone(),
+                    index,
+                    reason,
+                });
+                break;
+            }
+        }
+    }
+    false
+}
+
+impl<'a, W, S> LinearizabilityOracle<'a, W, S>
+where
+    S: SequentialSpec,
+{
+    /// Check explicit operations against a journal's real-time order.
+    pub fn check_operations(&self, journal: &Journal, operations: &[LinOperation]) -> Verdict {
+        let count = operations.len();
+        if count > self.bound {
+            return Verdict {
+                violated: false,
+                witnesses: Vec::new(),
+                reason: format!(
+                    "linearizability check bounded at {} operations; history has {count}",
+                    self.bound
+                ),
+            };
+        }
+        let mut clocks = Vec::with_capacity(count);
+        for operation in operations {
+            let Some(invoke) = journal.get(&operation.invoke) else {
+                return Verdict::fail(
+                    vec![operation.invoke],
+                    "linearizability: missing invoke entry",
+                );
+            };
+            let Some(response) = journal.get(&operation.response) else {
+                return Verdict::fail(
+                    vec![operation.response],
+                    "linearizability: missing response entry",
+                );
+            };
+            clocks.push((invoke.vector_clock.clone(), response.vector_clock.clone()));
+        }
+        let mut predecessors = vec![Vec::new(); count];
+        for later in 0..count {
+            for earlier in 0..count {
+                if earlier != later && clocks[earlier].1.happens_before(&clocks[later].0) {
+                    predecessors[later].push(earlier);
+                }
+            }
+        }
+        let mut pending = vec![true; count];
+        let mut serialized = Vec::with_capacity(count);
+        let mut failure: Option<LinFailure> = None;
+        let found = find_serialization(
+            operations,
+            &predecessors,
+            self.specification.clone(),
+            &mut pending,
+            &mut serialized,
+            &mut failure,
+        );
+        if found {
+            return Verdict::pass();
+        }
+        let failure = failure.unwrap_or(LinFailure {
+            prefix: Vec::new(),
+            index: 0,
+            reason: "no serial order exists".into(),
+        });
+        let chain = failure
+            .prefix
+            .iter()
+            .map(|index| format!("{}:{:02x?}", index, &operations[*index].invoke[..4]))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        let operation = &operations[failure.index];
+        Verdict::fail(
+            vec![operation.invoke, operation.response],
+            format!(
+                "non-linearizable: no serial order extends the real-time order; operation {} ({:?}) rejected after [{}]: {}",
+                failure.index, operation.operation, chain, failure.reason
+            ),
+        )
+    }
+}
+
+impl<W, S> Oracle for LinearizabilityOracle<'_, W, S>
+where
+    W: crate::search::Workload,
+    S: SequentialSpec,
+{
+    fn check(&self, run: &RunResult) -> Verdict {
+        let operations = self.workload.lin_history(run);
+        self.check_operations(&run.journal, &operations)
+    }
+}
+
+/// An assertion oracle that checks all `Assert` entries in the journal.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AssertionOracle;
+
+impl Oracle for AssertionOracle {
+    fn check(&self, run: &RunResult) -> Verdict {
+        for entry in run.journal.entries() {
+            if entry.data.kind == EntryKind::Assert {
+                match &entry.data.payload {
+                    Payload::Number(0) => {
+                        return Verdict::fail(
+                            vec![entry.id],
+                            format!("assertion failed at actor {}", entry.data.actor),
+                        );
+                    }
+                    Payload::Text(msg) if msg.starts_with("fail") => {
+                        return Verdict::fail(vec![entry.id], format!("assertion failed: {msg}"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Verdict::pass()
+    }
+}
+
+/// An invariant oracle that executes a user-provided closure over the journal.
+pub struct InvariantOracle<F>
+where
+    F: Fn(&Journal) -> Result<(), (Hash, String)>,
+{
+    invariant: F,
+}
+
+impl<F> InvariantOracle<F>
+where
+    F: Fn(&Journal) -> Result<(), (Hash, String)>,
+{
+    pub fn new(invariant: F) -> Self {
+        Self { invariant }
+    }
+}
+
+impl<F> Oracle for InvariantOracle<F>
+where
+    F: Fn(&Journal) -> Result<(), (Hash, String)>,
+{
+    fn check(&self, run: &RunResult) -> Verdict {
+        match (self.invariant)(&run.journal) {
+            Ok(()) => Verdict::pass(),
+            Err((witness, reason)) => Verdict::fail(vec![witness], reason),
+        }
+    }
+}
+
+/// Differential equivalence oracle that compares two runs for equivalent behavior.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DifferentialOracle;
+
+impl DifferentialOracle {
+    pub fn compare(left: &RunResult, right: &RunResult) -> Verdict {
+        if left.registers != right.registers {
+            return Verdict::fail(
+                Vec::new(),
+                format!(
+                    "differential register mismatch: left={:?}, right={:?}",
+                    left.registers, right.registers
+                ),
+            );
+        }
+        if left.journal.root_hash() != right.journal.root_hash() {
+            return Verdict::fail(
+                Vec::new(),
+                "differential journal hash divergence between runs",
+            );
+        }
+        Verdict::pass()
+    }
+}
+
+/// Collect the entry ids of `Outcome` and `Assert` entries.
+///
+/// These structural entries carry the semantic outcome of a run, so they are
+/// the natural witnesses for a property violation.
+pub fn witnesses_from_journal(journal: &Journal) -> Vec<Hash> {
+    journal
+        .entries()
+        .filter_map(|entry| match entry.data.kind {
+            EntryKind::Outcome | EntryKind::Assert => Some(entry.id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Property predicate over the journal, used as an oracle.
+///
+/// The predicate runs over the completed run's journal. A `false` result is a
+/// violation whose witnesses are the outcome and assertion entries.
+pub struct PropertyOracle<P: Fn(&Journal) -> bool> {
+    pub property: P,
+    /// Human-readable property name for the failure reason.
+    pub name: String,
+}
+
+impl<P: Fn(&Journal) -> bool> Oracle for PropertyOracle<P> {
+    fn check(&self, run: &RunResult) -> Verdict {
+        if (self.property)(&run.journal) {
+            Verdict::pass()
+        } else {
+            Verdict::fail(
+                witnesses_from_journal(&run.journal),
+                format!("property violated: {}", self.name),
+            )
+        }
+    }
+}
+
+/// Derive a monotonic predicate version from a property name and a counter.
+///
+/// The counter distinguishes versions of the same named property; bump it when
+/// the predicate's semantics change. A version change invalidates every cached
+/// verdict for the property.
+pub fn predicate_version(name: &str, counter: u64) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(name.as_bytes());
+    hasher.update(&counter.to_le_bytes());
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..8]);
+    u64::from_le_bytes(out)
+}
+
+/// Cache layer over a journal predicate, keyed by `(predicate_version, root_hash)`.
+///
+/// The offline checking path evaluates a predicate once per distinct journal
+/// root and reuses the verdict on repeat roots. The version pins the property
+/// semantics: bump it when the predicate changes so a stale verdict never
+/// surfaces.
+pub struct CachedPropertyOracle<P>
+where
+    P: Fn(&Journal) -> bool,
+{
+    oracle: PropertyOracle<P>,
+    version: u64,
+    cache: RefCell<HashMap<(u64, Hash), Verdict>>,
+    evaluations: Cell<usize>,
+}
+
+impl<P> CachedPropertyOracle<P>
+where
+    P: Fn(&Journal) -> bool,
+{
+    pub fn new(property: P, name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            version: predicate_version(&name, 0),
+            oracle: PropertyOracle { property, name },
+            cache: RefCell::new(HashMap::new()),
+            evaluations: Cell::new(0),
+        }
+    }
+
+    /// Construct the cache with an explicit version.
+    pub fn with_version(property: P, name: impl Into<String>, version: u64) -> Self {
+        Self {
+            version,
+            oracle: PropertyOracle {
+                property,
+                name: name.into(),
+            },
+            cache: RefCell::new(HashMap::new()),
+            evaluations: Cell::new(0),
+        }
+    }
+
+    /// Number of times the underlying predicate actually evaluated.
+    pub fn evaluations(&self) -> usize {
+        self.evaluations.get()
+    }
+
+    /// Number of distinct `(version, root)` verdicts cached.
+    pub fn cache_len(&self) -> usize {
+        self.cache.borrow().len()
+    }
+
+    /// Evaluate `run`, serving repeat roots from the cache.
+    pub fn check_cached(&self, run: &RunResult) -> Verdict {
+        let root = run.journal.root_hash();
+        let key = (self.version, root);
+        if let Some(verdict) = self.cache.borrow().get(&key) {
+            return verdict.clone();
+        }
+        let verdict = self.oracle.check(run);
+        self.evaluations.set(self.evaluations.get() + 1);
+        self.cache.borrow_mut().insert(key, verdict.clone());
+        verdict
+    }
+}
+
+impl<P> Oracle for CachedPropertyOracle<P>
+where
+    P: Fn(&Journal) -> bool,
+{
+    fn check(&self, run: &RunResult) -> Verdict {
+        self.check_cached(run)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::search;
+    use crate::workloads::MiniKvWorkload;
+    use ledger_sim::{Instruction, RunConfig, Simulation};
+
+    fn single_actor_programs(sets: usize) -> Vec<Vec<Instruction>> {
+        let mut program = (0..sets)
+            .map(|value| Instruction::Set(value as u64))
+            .collect::<Vec<_>>();
+        program.push(Instruction::Outcome);
+        program.push(Instruction::Done);
+        vec![program]
+    }
+
+    fn run_programs(programs: Vec<Vec<Instruction>>) -> RunResult {
+        let config = RunConfig {
+            seed: [3; 32],
+            policy: ledger_sim::Policy::Random,
+            max_steps: 512,
+            ..RunConfig::default()
+        };
+        Simulation::new(config, programs).run().unwrap()
+    }
+
+    #[test]
+    fn property_violated_when_journal_exceeds_bound() {
+        let run = run_programs(single_actor_programs(10));
+        let oracle = PropertyOracle {
+            property: |journal| journal.len() < 5,
+            name: "few entries".into(),
+        };
+        let verdict = oracle.check(&run);
+        assert!(verdict.violated);
+        assert!(!verdict.witnesses.is_empty());
+        assert!(verdict.reason.contains("few entries"));
+    }
+
+    #[test]
+    fn property_passes_within_bound() {
+        let run = run_programs(vec![vec![Instruction::Done]]);
+        let oracle = PropertyOracle {
+            property: |journal| journal.len() < 5,
+            name: "few entries".into(),
+        };
+        let verdict = oracle.check(&run);
+        assert!(!verdict.violated);
+    }
+
+    #[test]
+    fn cached_property_oracle_evaluates_once_per_root() {
+        let run = run_programs(single_actor_programs(2));
+        let calls = Cell::new(0usize);
+        let oracle = CachedPropertyOracle::new(
+            |journal: &Journal| {
+                calls.set(calls.get() + 1);
+                !journal
+                    .entries()
+                    .any(|entry| matches!(&entry.data.payload, Payload::Number(1)))
+            },
+            "no set of value 1",
+        );
+
+        let first = oracle.check(&run);
+        let second = oracle.check(&run);
+        assert_eq!(
+            first, second,
+            "the same root must return the cached verdict"
+        );
+        assert!(first.violated);
+        assert_eq!(calls.get(), 1, "the closure must run once for one root");
+        assert_eq!(oracle.evaluations(), 1);
+
+        let other = run_programs(single_actor_programs(1));
+        let verdict = oracle.check(&other);
+        assert!(
+            !verdict.violated,
+            "a different root must recompute against the smaller journal"
+        );
+        assert_eq!(calls.get(), 2, "a different root must recompute");
+        assert_eq!(oracle.evaluations(), 2);
+        assert_eq!(oracle.cache_len(), 2);
+    }
+
+    fn linearizable_point_journal() -> (Journal, Vec<LinOperation>) {
+        let mut journal = Journal::new();
+        let write = journal
+            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .expect("append must succeed");
+        let read = journal
+            .append(EntryKind::Outcome, 2, [write], Payload::Number(1))
+            .expect("append must succeed");
+        let operations = vec![
+            LinOperation {
+                invoke: write,
+                response: write,
+                operation: HistoryOperation::Write {
+                    key: "k".into(),
+                    value: 1,
+                    witness: write,
+                },
+            },
+            LinOperation {
+                invoke: read,
+                response: read,
+                operation: HistoryOperation::Read {
+                    key: "k".into(),
+                    value: 1,
+                    witness: read,
+                },
+            },
+        ];
+        (journal, operations)
+    }
+
+    #[test]
+    fn linearizability_accepts_a_serializable_history() {
+        let (journal, operations) = linearizable_point_journal();
+        let oracle = LinearizabilityOracle::new(&MiniKvWorkload, KeyValueSpec::default());
+        let verdict = oracle.check_operations(&journal, &operations);
+        assert!(!verdict.violated, "{}", verdict.reason);
+    }
+
+    #[test]
+    fn linearizability_rejects_a_real_time_stale_read() {
+        let mut journal = Journal::new();
+        let write = journal
+            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .expect("append must succeed");
+        let read = journal
+            .append(EntryKind::Outcome, 2, [write], Payload::Number(0))
+            .expect("append must succeed");
+        let operations = vec![
+            LinOperation {
+                invoke: write,
+                response: write,
+                operation: HistoryOperation::Write {
+                    key: "k".into(),
+                    value: 1,
+                    witness: write,
+                },
+            },
+            LinOperation {
+                invoke: read,
+                response: read,
+                operation: HistoryOperation::Read {
+                    key: "k".into(),
+                    value: 0,
+                    witness: read,
+                },
+            },
+        ];
+        let oracle = LinearizabilityOracle::new(&MiniKvWorkload, KeyValueSpec::default());
+        let verdict = oracle.check_operations(&journal, &operations);
+        assert!(
+            verdict.violated,
+            "a read that started after the write completed must see the new value"
+        );
+        assert!(
+            verdict.witnesses.contains(&read),
+            "the offending read must witness the violation"
+        );
+        assert!(
+            verdict.reason.contains("non-linearizable"),
+            "the offending cycle must be reported: {}",
+            verdict.reason
+        );
+    }
+
+    #[test]
+    fn linearizability_accepts_concurrent_overlapping_operations() {
+        let mut journal = Journal::new();
+        let w_invoke = journal
+            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .expect("append must succeed");
+        let w_response = journal
+            .append(EntryKind::Recv, 1, [w_invoke], Payload::Number(0))
+            .expect("append must succeed");
+        let r_invoke = journal
+            .append(EntryKind::Outcome, 2, [], Payload::Number(0))
+            .expect("append must succeed");
+        let r_response = journal
+            .append(EntryKind::Outcome, 2, [r_invoke], Payload::Number(0))
+            .expect("append must succeed");
+        let operations = vec![
+            LinOperation {
+                invoke: w_invoke,
+                response: w_response,
+                operation: HistoryOperation::Write {
+                    key: "k".into(),
+                    value: 1,
+                    witness: w_invoke,
+                },
+            },
+            LinOperation {
+                invoke: r_invoke,
+                response: r_response,
+                operation: HistoryOperation::Read {
+                    key: "k".into(),
+                    value: 0,
+                    witness: r_invoke,
+                },
+            },
+        ];
+        let oracle = LinearizabilityOracle::new(&MiniKvWorkload, KeyValueSpec::default());
+        let verdict = oracle.check_operations(&journal, &operations);
+        assert!(
+            !verdict.violated,
+            "a stale read overlapping the write is linearizable: {}",
+            verdict.reason
+        );
+    }
+
+    #[test]
+    fn linearizability_oracle_finds_mini_kv_stale_read() {
+        let config = RunConfig {
+            seed: [0; 32],
+            policy: ledger_sim::Policy::Random,
+            max_steps: 256,
+            ..RunConfig::default()
+        };
+        let oracle = LinearizabilityOracle::new(&MiniKvWorkload, KeyValueSpec::default());
+        let finding = search(&MiniKvWorkload, &oracle, config, 256)
+            .expect("search must run")
+            .expect("the mini-kv stale read must violate linearizability");
+        assert!(finding.verdict.violated);
+    }
+}

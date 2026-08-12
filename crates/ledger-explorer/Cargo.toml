@@ -1,0 +1,22 @@
+[package]
+name = "ledger-explorer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "AGPL-3.0-or-later"
+description = "Backward search engine, LDFI solver, 4-stage minimizer, and oracles"
+
+[dependencies]
+blake3.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+ledger-format = { path = "../ledger-format" }
+ledger-journal = { path = "../ledger-journal" }
+ledger-sim = { path = "../ledger-sim" }
+
+[features]
+default = []
+solver-cadical = []
+
+[lints]
+workspace = true
