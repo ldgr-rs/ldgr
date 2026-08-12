@@ -1,0 +1,21 @@
+[package]
+name = "ledger-lint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "Forbidden ambient API scanner for deterministic simulation boundaries"
+
+[[bin]]
+name = "ledger-lint"
+path = "src/main.rs"
+
+[dependencies]
+walkdir.workspace = true
+ledger-format = { path = "../ledger-format" }
+
+[dev-dependencies]
+ledger-sim = { path = "../ledger-sim" }
+
+[lints]
+workspace = true
