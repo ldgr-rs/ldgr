@@ -1,0 +1,22 @@
+[package]
+name = "ledger-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "Apache-2.0"
+description = "Command-line interface for the Ledger deterministic simulation testing platform"
+
+[[bin]]
+name = "ledger"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+clap-verbosity-flag = { workspace = true }
+ledger-format = { path = "../ledger-format" }
+ledger-sim = { path = "../ledger-sim" }
+ledger-explorer = { path = "../ledger-explorer" }
+
+[lints]
+workspace = true
