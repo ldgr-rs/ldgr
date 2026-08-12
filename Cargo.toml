@@ -1,16 +1,50 @@
-[package]
-name = "ldgr"
+[workspace]
+resolver = "3"
+members = [
+	"crates/ledger-format",
+	"crates/ledger-format/fuzz",
+	"crates/ledger-journal",
+	"crates/ledger-sim",
+	"crates/ledger-explorer",
+	"crates/ledger-flow",
+	"crates/ledger-lint",
+	"crates/ledger-cli",
+	"crates/wasm-guest",
+	"xtask",
+]
+default-members = ["crates/ledger-cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 rust-version = "1.90"
+repository = "https://github.com/ledger/ledger"
 
-[lib]
-path = "src/lib.rs"
-
-[dependencies]
+[workspace.dependencies]
 blake3 = "1.8"
+rpds = { version = "1.2", default-features = false }
 rand_chacha = "0.10"
 rand_core = "0.10"
-
-[dev-dependencies]
 proptest = "1"
+criterion = "0.8"
+zstd = "0.13"
+walkdir = "2"
+thiserror = "2"
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+clap-verbosity-flag = "3"
+wasmtime = { version = "47", default-features = false, features = [
+	"cranelift",
+	"runtime",
+	"rr",
+] }
+wasmtime-wasi = { version = "47", default-features = false, features = ["p1"] }
+futures = "0.3"
+tokio = { version = "1", features = ["io-util", "time"] }
+getrandom = { version = "0.4", features = ["sys_rng"] }
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_abi = "warn"

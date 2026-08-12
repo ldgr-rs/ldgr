@@ -1,0 +1,8 @@
+[profile.default]
+# Fail fast so a broken crate is reported immediately in CI.
+fail-fast = true
+
+retries = 0
+
+[profile.ci]
+threads-required = 1
