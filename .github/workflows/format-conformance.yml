@@ -1,0 +1,51 @@
+name: format-conformance
+
+on:
+  push:
+    paths:
+      - "crates/ledger-format/**"
+      # Vestigial: docs/ is a symlink to an external design repo, so git never
+      # tracks changes under it and this pattern can never match a PR. Kept for
+      # documentation value.
+      - "docs/11-format-research.md"
+      - ".github/workflows/format-conformance.yml"
+  pull_request:
+    paths:
+      - "crates/ledger-format/**"
+      # Vestigial: see the push filter above.
+      - "docs/11-format-research.md"
+      - ".github/workflows/format-conformance.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Format conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p ledger-format --all-targets -- -D warnings
+      - run: cargo test -p ledger-format
+      # Deterministic parser fuzz harness: mutates valid entries and manifests
+      # with fixed seeds and asserts no reader ever panics.
+      - name: Run the deterministic parser fuzz harness
+        run: cargo test -p ledger-format --test fuzz_mutation
+      # The Go encoder runs the same fixture corpus as the Rust encoder and
+      # must produce byte-identical canonical CBOR output. Any mismatch fails this job.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - run: go test ./golden/...
+        working-directory: crates/ledger-format/tests/go

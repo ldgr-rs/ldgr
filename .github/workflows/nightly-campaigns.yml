@@ -1,0 +1,164 @@
+name: nightly-campaigns
+
+# Nightly swarm campaigns over the reference workloads plus the determinism
+# hash-drift guard.
+#
+# The self-hosted runner pool is not wired yet: both matrix legs run on
+# ubuntu-latest. The matrix is the slot where a self-hosted pool would attach.
+#
+# Campaign policy:
+# - mini-kv is the planted-bug workload. Its stale-read race fires by design,
+#   so its findings are expected repros, uploaded as artifacts, and never open
+#   issues.
+# - two-phase-commit is the clean workload. Its assertion oracle must hold
+#   under swarm faults. A finding there is a genuine violation: the leg fails
+#   and an issue opens with the repro manifest reference and seed.
+#
+# Artifacts: each leg uploads a machine-readable campaign-summary.json (a
+# summary, not a formal certificate - the repo has no certificate schema yet)
+# plus one unminimized .ldgr repro manifest per finding.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hash-drift:
+    name: Hash-drift guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-wasip1
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Build debug Wasm guest artifact
+        run: cargo build --target wasm32-wasip1 -p wasm-guest
+      - name: Run the fixed-seed determinism corpus in release
+        run: |
+          cargo test -p ledger-sim --release --test executor_parity --test self_check
+          cargo test -p ledger-explorer --release --test e2e --test bug_corpus_v1
+      - name: Fail on any journal-hash drift
+        run: |
+          echo "Any failure above indicates journal-root drift across identical seeds."
+          echo "Quarantine the change and diff the journaling path."
+
+  swarm-campaign:
+    name: Swarm campaign
+    runs-on: ubuntu-latest
+    needs: hash-drift
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workload: mini-kv
+            seed: 42
+            role: planted
+          - workload: two-phase-commit
+            seed: 7
+            role: clean
+    permissions:
+      contents: read
+      issues: write # The tripwire opens a GitHub issue on a genuine violation.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Build the swarm campaign driver in release
+        run: cargo build --release -p ledger-explorer --example nightly_swarm_campaign
+      - name: Run the bounded swarm campaign (256 attempts, fixed seed)
+        run: |
+          ./target/release/examples/nightly_swarm_campaign \
+            --workload "${{ matrix.workload }}" --runs 256 \
+            --seed "${{ matrix.seed }}" --max-steps 256 \
+            --out "campaign-artifacts/${{ matrix.workload }}"
+      - name: Upload campaign artifacts (summary + repro manifests)
+        uses: actions/upload-artifact@v4
+        with:
+          name: "swarm-campaign-${{ matrix.workload }}"
+          path: "campaign-artifacts/${{ matrix.workload }}"
+          if-no-files-found: error
+      - name: "Tripwire: fail only on a genuine violation in the clean workload"
+        if: matrix.role == 'clean'
+        id: tripwire
+        run: |
+          python3 - <<'EOF'
+          import json
+          import pathlib
+
+          summary = pathlib.Path("campaign-artifacts/two-phase-commit/campaign-summary.json")
+          report = json.loads(summary.read_text())
+          findings = report["findings"]
+          print(f"two-phase-commit: {report['runs_executed']} runs, "
+                f"{report['distinct_journal_roots']} distinct roots, {len(findings)} violations")
+          if findings:
+              pathlib.Path("campaign-artifacts/.genuine-finding").write_text(summary.read_text())
+              print(f"genuine violation: {len(findings)} finding(s) on a clean workload")
+              raise SystemExit(1)
+          print("clean workload held under swarm faults")
+          EOF
+      - name: Open a GitHub issue for the genuine violation
+        if: "${{ failure() && steps.tripwire.outcome == 'failure' && matrix.role == 'clean' }}"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = 'campaign-artifacts/.genuine-finding';
+            if (!fs.existsSync(marker)) {
+              core.info('no genuine-finding marker; skipping issue');
+              return;
+            }
+            const report = JSON.parse(fs.readFileSync(marker, 'utf8'));
+            const finding = report.findings[0];
+            const title = `[nightly swarm] violation: ${report.workload}`;
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            if (openIssues.some((issue) => issue.title === title)) {
+              core.info(`open issue already exists for ${title}; skipping`);
+              return;
+            }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              '## Nightly swarm campaign: genuine violation',
+              '',
+              'The clean two-phase-commit workload violated an oracle under swarm faults.',
+              '',
+              `- **Workload:** ${report.workload}`,
+              `- **Base seed:** ${report.base_seed}`,
+              `- **Campaign:** ${report.runs_executed} runs, ${report.distinct_journal_roots} distinct journal roots`,
+              `- **Finding attempt:** ${finding.attempt}`,
+              `- **Finding seed:** ${finding.seed}`,
+              `- **Journal root:** ${finding.journal_root}`,
+              `- **Reason:** ${finding.reason}`,
+              `- **Repro manifest:** \`${finding.repro_manifest}\` (in the \`swarm-campaign-${report.workload}\` artifact of this run)`,
+              `- **Run:** ${runUrl}`,
+              '',
+              'The repro manifest is an unminimized `.ldgr` file. Minimize it before triage.',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+            });

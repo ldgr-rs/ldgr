@@ -1,0 +1,66 @@
+name: release
+
+# Release pipeline. Runs on version-tag pushes.
+# The publish step is a dry run until the crates land on crates.io. Enabling
+# real publishing means: drop `--dry-run` and `--allow-dirty` from the publish
+# step, configure the `release` GitHub environment with a CARGO_REGISTRY_TOKEN
+# secret and required reviewers (the manual-approval gate), and keep the
+# per-crate workspace order below.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+          targets: wasm32-wasip1
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build debug Wasm guest artifact (needed by wasm tests)
+        run: cargo build --target wasm32-wasip1 -p wasm-guest
+      - name: Full test suite in release mode
+        run: cargo nextest run --workspace --all-features --profile ci --release
+      - name: Run doctests in release mode
+        run: cargo test --workspace --doc --release
+      - name: Enforce the AGPL/Apache/MIT crate licensing split
+        run: cargo run -p xtask -- licenses
+
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    needs: test
+    # Manual-approval gate: configure required reviewers on this environment.
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Dry-run publish in workspace dependency order
+        run: |
+          for crate in ledger-format ledger-journal ledger-sim ledger-explorer \
+                       ledger-flow ledger-lint ledger-cli; do
+            cargo publish --dry-run --allow-dirty -p "$crate"
+          done

@@ -1,0 +1,40 @@
+name: fuzz
+
+on:
+  schedule:
+    # Nightly coverage-guided fuzz runs for the parser boundary. The
+    # deterministic mutation harness runs on every ledger-format PR via
+    # format-conformance.yml; these libFuzzer runs are time-bounded, so they
+    # stay scheduled.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  libfuzzer:
+    name: LibFuzzer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # cargo-fuzz requires a nightly toolchain for -Z sanitizer support.
+      # The repo's rust-toolchain.toml pins 1.97.1 for regular builds;
+      # RUSTUP_TOOLCHAIN scopes nightly to these steps only.
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@cargo-fuzz
+      - name: Fuzz the canonical decoder (90s)
+        run: cargo fuzz run --fuzz-dir crates/ledger-format/fuzz canonical_decoder -- -max_total_time=90 -timeout=5
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+      - name: Fuzz the tolerant reader (90s)
+        run: cargo fuzz run --fuzz-dir crates/ledger-format/fuzz tolerant_reader -- -max_total_time=90 -timeout=5
+        env:
+          RUSTUP_TOOLCHAIN: nightly

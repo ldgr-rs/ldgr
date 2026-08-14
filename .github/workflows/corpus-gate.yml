@@ -1,0 +1,68 @@
+name: corpus-gate
+
+# Runs on changes to the journal, sim, explorer, or corpus paths.
+
+on:
+  push:
+    paths:
+      - "crates/ledger-journal/**"
+      - "crates/ledger-sim/**"
+      - "crates/ledger-explorer/**"
+      - "corpora/**"
+      - ".github/workflows/corpus-gate.yml"
+  pull_request:
+    paths:
+      - "crates/ledger-journal/**"
+      - "crates/ledger-sim/**"
+      - "crates/ledger-explorer/**"
+      - "corpora/**"
+      - ".github/workflows/corpus-gate.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  corpus:
+    name: Corpus gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-wasip1
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Build debug Wasm guest artifact
+        run: cargo build --target wasm32-wasip1 -p wasm-guest
+      - name: Planted-leak corpus must be 100% flagged
+        run: |
+          set +e
+          cargo run -p ledger-lint -- corpora/planted-leaks/
+          status=$?
+          set -e
+          test "$status" -eq 1
+      - name: Determinism self-check (10^4 runs, release)
+        run: cargo test -p ledger-sim --test self_check --release
+      - name: Minimization gate (>=90% off a 10^6-entry failure)
+        run: cargo test -p ledger-explorer --test minimize_gate --release
+      - name: PBT-in-sim corpus (planted counterexamples found via input axis)
+        run: cargo nextest run -p ledger-explorer --test search_axes --test minimize_pipeline --all-features
+      - name: LDFI fault execution + replay semantics
+        run: cargo nextest run -p ledger-explorer --test fault_execution --all-features
+      - name: Source-DPOR determinism
+        run: cargo nextest run -p ledger-sim --test dpor --all-features
+      - name: no_std builds for the journal core
+        run: |
+          cargo check -p ledger-format --no-default-features
+          cargo check -p ledger-journal --no-default-features
+      - name: Wasm differential (native/Wasm zero divergence)
+        run: cargo test -p ledger-sim --features backend-wasm --test wasm_differential
+      - name: Full sim + explorer tests
+        run: cargo nextest run -p ledger-sim -p ledger-explorer --all-features
