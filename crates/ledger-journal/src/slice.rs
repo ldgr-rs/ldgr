@@ -34,8 +34,10 @@ impl Journal {
             }
         }
         Ok(self
-            .entries()
-            .map(|entry| entry.id)
+            .order()
+            .iter()
+            .chain(self.state.overlay_order.iter())
+            .copied()
             .filter(|id| seen.contains(id))
             .collect())
     }
@@ -56,8 +58,10 @@ impl Journal {
                 affected.insert(entry.id);
             }
         }
-        self.entries()
-            .map(|entry| entry.id)
+        self.order()
+            .iter()
+            .chain(self.state.overlay_order.iter())
+            .copied()
             .filter(|id| affected.contains(id))
             .collect()
     }
@@ -83,11 +87,10 @@ impl Journal {
 
         for id in self.order().iter().chain(self.state.overlay_order.iter()) {
             if set.contains(id)
-                && let Some(entry) = self.get(id)
+                && let Some(arc_entry) = self.get_arc(id)
             {
-                let arc_entry = Arc::new(entry.clone());
-                sub_entries.insert(*id, Arc::clone(&arc_entry));
-                sub_heads.insert(entry.data.actor, *id);
+                sub_heads.insert(arc_entry.data.actor, *id);
+                sub_entries.insert(*id, arc_entry);
                 sub_order.push(*id);
             }
         }

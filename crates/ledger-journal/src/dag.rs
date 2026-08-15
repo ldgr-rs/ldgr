@@ -234,9 +234,10 @@ impl Journal {
         observed_parents: impl IntoIterator<Item = Hash>,
         payload: Payload,
     ) -> Result<Hash, JournalError> {
+        let previous_head = self.state.heads.get(&actor).copied();
         let mut parents = Vec::new();
-        if let Some(previous) = self.state.heads.get(&actor) {
-            parents.push(*previous);
+        if let Some(previous) = previous_head {
+            parents.push(previous);
         }
         let observed = observed_parents.into_iter();
         if observed.size_hint().1 != Some(0) {
@@ -246,22 +247,27 @@ impl Journal {
                 }
             }
         }
-        let sequence = self
-            .state
-            .heads
-            .get(&actor)
-            .and_then(|head| self.get(head))
-            .map_or(0, |entry| entry.data.sequence + 1);
+        let (sequence, head_entry) = match previous_head {
+            Some(head) => {
+                let entry = self.get(&head).ok_or(JournalError::MissingParent(head))?;
+                (entry.data.sequence + 1, Some(entry))
+            }
+            None => (0, None),
+        };
 
         // Merge all parents in one pass; a single parent clones its clock
         // directly as the fast path.
         let mut clock = VectorClock::default();
         if parents.len() == 1 {
-            let entry = self
-                .get(&parents[0])
-                .ok_or(JournalError::MissingParent(parents[0]))?;
-            clock = entry.vector_clock.clone();
-        } else {
+            if let Some(entry) = head_entry {
+                clock = entry.vector_clock.clone();
+            } else {
+                let entry = self
+                    .get(&parents[0])
+                    .ok_or(JournalError::MissingParent(parents[0]))?;
+                clock = entry.vector_clock.clone();
+            }
+        } else if !parents.is_empty() {
             for parent in &parents {
                 let entry = self
                     .get(parent)
@@ -301,6 +307,15 @@ impl Journal {
             .get(id)
             .or_else(|| self.state.base.get(id))
             .map(Arc::as_ref)
+    }
+
+    /// Look up an entry Arc by content address.
+    pub(crate) fn get_arc(&self, id: &Hash) -> Option<Arc<Entry>> {
+        self.state
+            .overlay
+            .get(id)
+            .cloned()
+            .or_else(|| self.state.base.get(id).cloned())
     }
 
     /// Return entries in append order.

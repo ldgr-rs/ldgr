@@ -38,7 +38,7 @@ impl VectorClock {
     /// Returns a new clock; neither input is mutated. A lockstep walk over
     /// the two ascending iterators merges in O(#actors).
     pub fn merge(&self, other: &Self) -> Self {
-        if self.0.is_empty() {
+        if self.0.is_empty() || self.0 == other.0 {
             return Self(other.0.clone());
         }
         if other.0.is_empty() {
@@ -47,26 +47,51 @@ impl VectorClock {
         let mut left = self.0.iter().peekable();
         let mut right = other.0.iter().peekable();
         let mut merged = Vec::with_capacity(self.0.size() + other.0.size());
+        let mut identical_to_left = true;
+        let mut identical_to_right = true;
         while let (Some((lactor, lval)), Some((ractor, rval))) = (left.peek(), right.peek()) {
             match lactor.cmp(ractor) {
                 Ordering::Less => {
                     merged.push((**lactor, **lval));
+                    identical_to_right = false;
                     left.next();
                 }
                 Ordering::Greater => {
                     merged.push((**ractor, **rval));
+                    identical_to_left = false;
                     right.next();
                 }
                 Ordering::Equal => {
-                    merged.push((**lactor, (**lval).max(**rval)));
+                    let lv = **lval;
+                    let rv = **rval;
+                    let max_val = lv.max(rv);
+                    if lv < rv {
+                        identical_to_left = false;
+                    }
+                    if rv < lv {
+                        identical_to_right = false;
+                    }
+                    merged.push((**lactor, max_val));
                     left.next();
                     right.next();
                 }
             }
         }
-        merged.extend(left.map(|(actor, value)| (*actor, *value)));
-        merged.extend(right.map(|(actor, value)| (*actor, *value)));
-        Self(merged.into_iter().collect())
+        if left.peek().is_some() {
+            identical_to_right = false;
+            merged.extend(left.map(|(actor, value)| (*actor, *value)));
+        }
+        if right.peek().is_some() {
+            identical_to_left = false;
+            merged.extend(right.map(|(actor, value)| (*actor, *value)));
+        }
+        if identical_to_left {
+            Self(self.0.clone())
+        } else if identical_to_right {
+            Self(other.0.clone())
+        } else {
+            Self(merged.into_iter().collect())
+        }
     }
 
     /// Increment the component for an actor.

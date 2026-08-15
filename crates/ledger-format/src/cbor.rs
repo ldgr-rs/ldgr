@@ -247,10 +247,12 @@ impl CborValue {
     }
 }
 
+#[inline]
 pub fn unsigned(out: &mut Vec<u8>, value: u64) {
     major(out, 0, value);
 }
 
+#[inline]
 pub fn signed(out: &mut Vec<u8>, value: i64) {
     if value >= 0 {
         unsigned(out, value as u64);
@@ -259,28 +261,34 @@ pub fn signed(out: &mut Vec<u8>, value: i64) {
     }
 }
 
+#[inline]
 pub fn bytes(out: &mut Vec<u8>, value: &[u8]) {
     major(out, 2, value.len() as u64);
     out.extend_from_slice(value);
 }
 
+#[inline]
 pub fn text(out: &mut Vec<u8>, value: &str) {
     major(out, 3, value.len() as u64);
     out.extend_from_slice(value.as_bytes());
 }
 
+#[inline]
 pub fn array(out: &mut Vec<u8>, length: usize) {
     major(out, 4, length as u64);
 }
 
+#[inline]
 pub fn map(out: &mut Vec<u8>, length: usize) {
     major(out, 5, length as u64);
 }
 
+#[inline]
 pub fn tag(out: &mut Vec<u8>, tag_num: u64) {
     major(out, 6, tag_num);
 }
 
+#[inline]
 pub fn boolean(out: &mut Vec<u8>, val: bool) {
     if val {
         out.push(0xf5);
@@ -289,6 +297,7 @@ pub fn boolean(out: &mut Vec<u8>, val: bool) {
     }
 }
 
+#[inline]
 pub fn null(out: &mut Vec<u8>) {
     out.push(0xf6);
 }
@@ -318,6 +327,7 @@ pub fn encode_minimal_float(out: &mut Vec<u8>, value: f64) {
 /// section 4.2.3:
 /// 1. Shorter byte length precedes longer byte length.
 /// 2. Identical byte length uses bytewise lexicographical comparison.
+#[inline]
 pub fn compare_canonical_keys(a: &[u8], b: &[u8]) -> Ordering {
     if a.len() != b.len() {
         a.len().cmp(&b.len())
@@ -326,6 +336,7 @@ pub fn compare_canonical_keys(a: &[u8], b: &[u8]) -> Ordering {
     }
 }
 
+#[inline]
 fn major(out: &mut Vec<u8>, kind: u8, value: u64) {
     let head = kind << 5;
     if value <= 23 {

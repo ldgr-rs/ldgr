@@ -155,11 +155,10 @@ impl ExecutorShared {
         entry_id: Option<Hash>,
     ) {
         let bandit_active = self.scheduler.borrow().novelty_active();
-        let signature = if bandit_active {
-            entry_id.and_then(|id| self.entry_vc_signature(id))
-        } else {
-            None
-        };
+        if !bandit_active {
+            return;
+        }
+        let signature = entry_id.and_then(|id| self.entry_vc_signature(id));
         self.scheduler
             .borrow_mut()
             .on_entry_emitted(actor, kind, task_id, signature);

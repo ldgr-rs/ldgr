@@ -45,6 +45,7 @@ pub fn ddmin<T: Clone, F: FnMut(&[T]) -> bool>(input: &[T], mut fails: F) -> Vec
     }
     let mut current = input.to_vec();
     let mut partitions = 2usize;
+    let mut candidate = Vec::new();
     while current.len() >= 2 {
         let chunk = current.len().div_ceil(partitions);
         let mut reduced = false;
@@ -55,11 +56,12 @@ pub fn ddmin<T: Clone, F: FnMut(&[T]) -> bool>(input: &[T], mut fails: F) -> Vec
                 break;
             }
             let end = (start + chunk).min(current.len());
-            let mut candidate = Vec::with_capacity(current.len() - (end - start));
+            candidate.clear();
+            candidate.reserve((current.len() - (end - start)).saturating_sub(candidate.capacity()));
             candidate.extend_from_slice(&current[..start]);
             candidate.extend_from_slice(&current[end..]);
             if fails(&candidate) {
-                current = candidate;
+                current = std::mem::take(&mut candidate);
                 partitions = partitions.saturating_sub(1).max(2);
                 reduced = true;
                 break;
