@@ -27,6 +27,7 @@ proptest.workspace = true
 [[bench]]
 name = "storage"
 harness = false
+required-features = ["std"]
 
 [[bench]]
 name = "vc"

@@ -20,7 +20,7 @@ Run from the workspace root. The test suite needs `cargo-nextest` (`cargo instal
 | Doctests | `cargo test --workspace --doc` |
 | Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Format | `cargo fmt --all -- --check` (fix: `cargo fmt --all`) |
-| Benchmarks | `cargo bench -p ledger-journal --bench storage` (nextest does not run benches) |
+| Benchmarks (local for now till having reliable method) | `cargo bench -p ledger-journal --bench storage`; `cargo bench -p ledger-sim --bench sim_throughput`; `cargo bench -p ledger-sim --bench sim_overhead`; `cargo bench -p ledger-sim --bench wasm_throughput --features backend-wasm`. Perf gates are measured locally, not in CI (shared runners are too slow and noisy). |
 | Licenses | `cargo run -p xtask -- licenses` |
 | Lint-rules gate | `cargo run -p ledger-lint -- crates/` |
 | Run CLI | `cargo run -p ledger-cli -- sim` |

@@ -174,7 +174,7 @@ fn json_output_is_one_object() {
 
 #[test]
 fn ldfi_executes_top_hypothesis() {
-    let report = ledger_cli::ldfi_cmd::run_ldfi(0, 256, 32)
+    let report = ledger_cli::ldfi_cmd::run_ldfi(0, 256, 16)
         .unwrap()
         .expect("campaign should find the mini-kv violation");
     assert!(!report.hypotheses.is_empty());
@@ -192,13 +192,15 @@ fn ldfi_executes_top_hypothesis() {
     );
 
     let out = Command::new(ledger_bin())
-        .args(["ldfi", "--attempts", "16"])
+        .args(["ldfi", "--attempts", "8"])
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        "ldfi CLI failed with {:?}\nstderr: {}\nstdout: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(

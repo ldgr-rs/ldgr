@@ -103,11 +103,10 @@ fn belt_activates_when_armed() {
     );
 }
 
-/// The public run path arms the belt by default (feature compiled in): the
-/// run entry hook installs the seccomp denylist and the RDTSC trap and the
-/// sim completes under the live filter.
+/// The public run path leaves the belt unarmed by default so host processes
+/// and test harnesses are not permanently constrained with seccomp filters.
 #[test]
-fn run_path_arms_belt_by_default() {
+fn run_path_defaults_to_not_armed() {
     let output = probe_command()
         .env("LEDGER_PROBE_MODE", "simulate")
         .output()
@@ -116,13 +115,12 @@ fn run_path_arms_belt_by_default() {
     assert!(output.status.success(), "probe failed: {stdout}");
     assert!(stdout.contains("simulate-ok"), "got: {stdout}");
     assert!(
-        stdout.contains("belt=Some(Active"),
-        "run must report Active by default, got: {stdout}"
+        stdout.contains("belt=Some(NotArmed)"),
+        "run must report NotArmed by default, got: {stdout}"
     );
 }
 
-/// A falsy `LEDGER_SENTINEL_BELT` opts the process out of the belt; the run
-/// path then reports `NotArmed` and installs nothing.
+/// A falsy `LEDGER_SENTINEL_BELT` explicitly opts the process out of the belt.
 #[test]
 fn run_path_belt_disabled_via_env_reports_not_armed() {
     let output = probe_command()

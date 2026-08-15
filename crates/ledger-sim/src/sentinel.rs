@@ -39,7 +39,7 @@ pub enum BeltStatus {
 
 /// Belt hook invoked at the sim run entry on Linux builds with `sentinel`.
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
-pub use crate::sentinel_belt::activate_process_belt;
+pub use crate::sentinel_belt::{TscTrapGuard, activate_process_belt};
 
 /// Belt hook no-op for platforms without the belt.
 ///
@@ -48,6 +48,19 @@ pub use crate::sentinel_belt::activate_process_belt;
 #[cfg(not(all(feature = "sentinel", target_os = "linux")))]
 pub fn activate_process_belt() -> BeltStatus {
     BeltStatus::Unavailable
+}
+
+/// Dummy TSC trap guard for platforms without the belt.
+#[cfg(not(all(feature = "sentinel", target_os = "linux")))]
+#[derive(Debug, Default)]
+pub struct TscTrapGuard;
+
+#[cfg(not(all(feature = "sentinel", target_os = "linux")))]
+impl TscTrapGuard {
+    /// No-op constructor for platforms without the belt.
+    pub fn arm_if_armed() -> Self {
+        Self
+    }
 }
 
 /// Runtime sentinel that tracks and flags unjournaled ambient effects.

@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! Content-addressed fork tests.
 //!
 //! A fork aliases the parent's sealed segments by hard link (same inode), keeps

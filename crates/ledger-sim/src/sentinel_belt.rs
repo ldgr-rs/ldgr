@@ -198,12 +198,49 @@ pub fn trap_rdtsc() -> Result<(), SentinelError> {
     Ok(())
 }
 
+/// Allow RDTSC reads by clearing the PR_SET_TSC trap.
+pub fn allow_rdtsc() -> Result<(), SentinelError> {
+    unsafe {
+        let ret = libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_ENABLE, 0, 0, 0);
+        if ret != 0 {
+            return Err(SentinelError::Prctl("PR_SET_TSC", errno()));
+        }
+    }
+    Ok(())
+}
+
+/// Scoped RAII guard that traps RDTSC reads during simulation and restores PR_TSC_ENABLE on drop.
+#[derive(Debug)]
+pub struct TscTrapGuard {
+    active: bool,
+}
+
+impl TscTrapGuard {
+    /// Enter a section where RDTSC reads are trapped with SIGSEGV if the belt is armed.
+    pub fn arm_if_armed() -> Self {
+        if belt_armed() {
+            let _ = trap_rdtsc();
+            Self { active: true }
+        } else {
+            Self { active: false }
+        }
+    }
+}
+
+impl Drop for TscTrapGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = allow_rdtsc();
+        }
+    }
+}
+
 /// Arm the process belt for the next sim run.
 ///
-/// The belt is armed by default whenever the `sentinel` feature is compiled
-/// in on Linux: the run entry hook installs the seccomp denylist and the
-/// RDTSC trap before the sim starts. `arm_belt` forces arming on even when
-/// the process opted out through the environment.
+/// Arm the process belt for the next sim run.
+///
+/// The run entry hook installs the seccomp denylist and the RDTSC trap
+/// before the sim starts when armed. `arm_belt` forces arming on.
 pub fn arm_belt() {
     ARMED.store(true, Ordering::Relaxed);
 }
@@ -211,22 +248,20 @@ pub fn arm_belt() {
 /// Return true when the process belt is armed.
 ///
 /// The belt is armed by `arm_belt` or by a truthy `LEDGER_SENTINEL_BELT`
-/// environment value, and by default when the `sentinel` feature is compiled
-/// in on Linux. A falsy `LEDGER_SENTINEL_BELT` (empty, `0`, `false`, `off`,
-/// `no`) disables the belt for that process. The env read is a host-side gate
-/// at run entry: it never feeds the journal, the scheduler, or any simulated
-/// effect, so it cannot perturb a deterministic run.
+/// environment value (`1`, `true`, `on`, `yes`). By default, the belt is not
+/// armed so it does not install permanent seccomp filters on the host process.
+/// The env read is a host-side gate at run entry: it never feeds the journal,
+/// the scheduler, or any simulated effect, so it cannot perturb a deterministic run.
 fn belt_armed() -> bool {
     if ARMED.load(Ordering::Relaxed) {
         return true;
     }
     match std::env::var_os("LEDGER_SENTINEL_BELT") {
-        Some(value) => !matches!(
+        Some(value) => matches!(
             value.to_string_lossy().as_ref(),
-            "" | "0" | "false" | "off" | "no"
+            "1" | "true" | "on" | "yes"
         ),
-        // With the sentinel feature compiled in, the belt is armed by default.
-        None => true,
+        None => false,
     }
 }
 

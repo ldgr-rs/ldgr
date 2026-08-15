@@ -183,6 +183,7 @@ impl Simulation {
 
     /// Run until all tasks finish or the instruction budget is reached.
     pub fn run(self) -> Result<RunResult, RuntimeError> {
+        let _tsc_guard = crate::sentinel::TscTrapGuard::arm_if_armed();
         crate::sentinel::activate_process_belt();
         self.executor.run()
     }

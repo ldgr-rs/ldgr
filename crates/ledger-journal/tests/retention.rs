@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! Retention tier tests for the `PersistentJournal` and `SegmentStore`.
 //!
 //! Retention is archive-based and non-destructive. A store retained to cold

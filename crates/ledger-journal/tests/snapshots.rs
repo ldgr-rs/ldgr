@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! On-disk snapshot persistence tests.
 //!
 //! Snapshots fire every `interval` entries per actor. They are recorded in

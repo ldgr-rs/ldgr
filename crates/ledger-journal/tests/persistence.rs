@@ -1,3 +1,4 @@
+#![cfg(feature = "std")]
 //! End-to-end persistence tests for the `PersistentJournal` facade.
 //!
 //! These tests exercise the real file path: a journal appends through the
