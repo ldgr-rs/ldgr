@@ -29,7 +29,9 @@ jobs:
       # RUSTUP_TOOLCHAIN scopes nightly to these steps only.
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
+        uses: taiki-e/cache-cargo-install-action@v2
+        with:
+          tool: cargo-fuzz
       - name: Fuzz the canonical decoder (90s)
         run: cargo fuzz run --fuzz-dir crates/ledger-format/fuzz canonical_decoder -- -max_total_time=90 -timeout=5
         env:
