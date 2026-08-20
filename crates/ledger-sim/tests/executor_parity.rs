@@ -32,12 +32,11 @@ fn mini_kv_programs() -> Vec<Vec<Instruction>> {
 }
 
 fn run(seed_byte: u8) -> ledger_sim::RunResult {
-    let config = RunConfig {
-        seed: [seed_byte; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([seed_byte; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     Simulation::new(config, mini_kv_programs()).run().unwrap()
 }
 
@@ -122,12 +121,11 @@ fn executor_matches_golden_roots_at_all_seeds() {
 
 #[test]
 fn timed_delivery_jumps_time_and_delivers() {
-    let config = RunConfig {
-        seed: [3; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([3; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     let programs = vec![
         vec![
             Instruction::SendTimed {
@@ -170,12 +168,11 @@ fn timed_delivery_jumps_time_and_delivers() {
 #[test]
 fn drop_fault_journals_against_send() {
     // Capture the Send entry id from a clean run, then drop it on replay.
-    let config = RunConfig {
-        seed: [4; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([4; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     let programs = vec![
         vec![Instruction::Send { to: 1, payload: 42 }, Instruction::Done],
         vec![Instruction::Receive, Instruction::Done],
@@ -189,8 +186,12 @@ fn drop_fault_journals_against_send() {
         .find(|entry| matches!(entry.data.kind, ledger_format::EntryKind::Send))
         .map(|entry| entry.id)
         .expect("a Send entry must exist");
-    let mut dropped = config;
-    dropped.dropped_events = vec![send_id];
+    let dropped = RunConfig::builder()
+        .seed([4; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .dropped_events(vec![send_id])
+        .build();
     let run = Simulation::new(dropped, programs).run().unwrap();
     let kinds = run
         .journal
@@ -211,12 +212,11 @@ fn drop_fault_journals_against_send() {
 
 #[test]
 fn fs_crash_journals_crash_state_fault() {
-    let config = RunConfig {
-        seed: [5; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([5; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     let programs = vec![vec![
         Instruction::FsWrite {
             path: "k".into(),

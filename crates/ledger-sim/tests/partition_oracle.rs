@@ -16,12 +16,11 @@ fn boxed(
 }
 
 fn config(seed: [u8; 32]) -> RunConfig {
-    RunConfig {
-        seed,
-        policy: Policy::Random,
-        max_steps: 512,
-        ..RunConfig::default()
-    }
+    RunConfig::builder()
+        .seed(seed)
+        .policy(Policy::Random)
+        .max_steps(512)
+        .build()
 }
 
 /// A mid-run partition fault flips the link, refuses subsequent sends, and a

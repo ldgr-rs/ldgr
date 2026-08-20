@@ -67,7 +67,7 @@ pub trait Effects {
     /// One tick is one microsecond; simulation backends convert the duration
     /// to ticks before registering the timer. The returned future carries no
     /// `Send` bound because the sim is single-threaded.
-    #[allow(async_fn_in_trait)]
+    #[allow(async_fn_in_trait)] // this trait predates edition-2024 async fn support
     async fn sleep(&self, d: core::time::Duration);
 
     fn net(&self) -> &dyn Net;

@@ -467,15 +467,14 @@ mod tests {
 
     #[test]
     fn bandit_same_seed_produces_same_decision_sequence() {
-        let config = RunConfig {
-            seed: [11; 32],
-            policy: Policy::Bandit {
+        let config = RunConfig::builder()
+            .seed([11; 32])
+            .policy(Policy::Bandit {
                 exploration_constant: 1.414,
                 pct_mix: 0.1,
-            },
-            max_steps: 256,
-            ..RunConfig::default()
-        };
+            })
+            .max_steps(256)
+            .build();
         let programs = mini_kv_programs();
         let first = Simulation::new(config.clone(), programs.clone())
             .run()

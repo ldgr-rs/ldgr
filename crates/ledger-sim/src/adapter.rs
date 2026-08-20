@@ -60,10 +60,14 @@ impl ProgramFuture {
                 Step::Parked
             }
             Instruction::Send { to, payload } => {
+                // Send returns bool; a failed append is already recorded
+                // inside Boundary::send, so nothing is lost here.
                 let _ = self.boundary.send(to, payload);
                 Step::Continue
             }
             Instruction::SendTimed { to, payload, delay } => {
+                // Same contract as Send: journal failures are recorded inside
+                // Boundary::send_timed.
                 let _ = self.boundary.send_timed(to, payload, delay);
                 Step::Continue
             }
@@ -97,16 +101,22 @@ impl ProgramFuture {
                 Step::Continue
             }
             Instruction::FsWrite { path, value } => {
-                let _ = self.boundary.fs().write(&path, value);
+                if let Err(error) = self.boundary.fs().write(&path, value) {
+                    self.boundary.record_journal_error(error);
+                }
                 Step::Continue
             }
             Instruction::FsFsync => {
-                let _ = self.boundary.fs().fsync();
+                if let Err(error) = self.boundary.fs().fsync() {
+                    self.boundary.record_journal_error(error);
+                }
                 Step::Continue
             }
             Instruction::FsRead { path } => {
-                if let Ok(Some(value)) = self.boundary.fs().read(&path) {
-                    self.boundary.set_register(value);
+                match self.boundary.fs().read(&path) {
+                    Ok(Some(value)) => self.boundary.set_register(value),
+                    Ok(None) => {}
+                    Err(error) => self.boundary.record_journal_error(error),
                 }
                 Step::Continue
             }
@@ -120,7 +130,9 @@ impl ProgramFuture {
             }
             Instruction::Outcome => {
                 let value = self.boundary.register();
-                let _ = self.boundary.outcome(value);
+                if let Err(error) = self.boundary.outcome(value) {
+                    self.boundary.record_journal_error(error);
+                }
                 Step::Continue
             }
             Instruction::Done => {
@@ -140,7 +152,13 @@ impl Future for ProgramFuture {
         match this.execute_one() {
             Ok(Step::Continue) | Ok(Step::Parked) => Poll::Pending,
             Ok(Step::Finished) => Poll::Ready(()),
-            Err(_) => Poll::Ready(()),
+            // A journal append failure aborts the program future; record it
+            // on the boundary so the run's journal_error slot surfaces it
+            // instead of dropping it silently.
+            Err(error) => {
+                this.boundary.record_journal_error(error);
+                Poll::Ready(())
+            }
         }
     }
 }

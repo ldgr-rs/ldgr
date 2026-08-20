@@ -69,20 +69,18 @@ pub fn run_dpor(
     programs: Vec<Vec<Instruction>>,
     cfg: &DporConfig,
 ) -> Result<DporReport, RuntimeError> {
-    let base_config = RunConfig {
-        seed: cfg.seed,
-        policy: Policy::Dpor,
-        max_steps: cfg.max_steps,
-        ..RunConfig::default()
-    };
+    let base_config = RunConfig::builder()
+        .seed(cfg.seed)
+        .policy(Policy::Dpor)
+        .max_steps(cfg.max_steps)
+        .build();
     // Flip runs follow the forced prefix through the Replay policy; the
     // `Random` fallback continues the schedule after the prefix is exhausted.
-    let replay_config = RunConfig {
-        seed: cfg.seed,
-        policy: Policy::Replay,
-        max_steps: cfg.max_steps,
-        ..RunConfig::default()
-    };
+    let replay_config = RunConfig::builder()
+        .seed(cfg.seed)
+        .policy(Policy::Replay)
+        .max_steps(cfg.max_steps)
+        .build();
 
     let base = Simulation::new(base_config.clone(), programs.clone()).run()?;
     let base_root = base.journal.root_hash();

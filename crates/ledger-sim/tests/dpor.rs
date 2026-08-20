@@ -1,8 +1,6 @@
 //! Bounded source-DPOR driver tests.
 
-use ledger_sim::config::{Policy, RunConfig};
-use ledger_sim::dpor::{DporConfig, run_dpor};
-use ledger_sim::runtime::{Instruction, Simulation};
+use ledger_sim::{DporConfig, Instruction, Policy, RunConfig, Simulation, run_dpor};
 use std::collections::{HashMap, HashSet};
 
 fn mini_kv_programs() -> Vec<Vec<Instruction>> {
@@ -73,12 +71,11 @@ fn dpor_explores_causally_distinct_schedules() {
 
     // Replay determinism: every reported decision sequence reproduces its root.
     for run in &report.runs {
-        let config = RunConfig {
-            seed: cfg.seed,
-            policy: Policy::Replay,
-            max_steps: cfg.max_steps,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed(cfg.seed)
+            .policy(Policy::Replay)
+            .max_steps(cfg.max_steps)
+            .build();
         let replayed = Simulation::with_replay(config, mini_kv_programs(), run.decisions.clone())
             .run()
             .unwrap();
@@ -136,12 +133,11 @@ fn dpor_sleep_set_prunes_ordered_tasks() {
     };
     let report = run_dpor(programs.clone(), &cfg).unwrap();
 
-    let base_config = RunConfig {
-        seed: cfg.seed,
-        policy: Policy::Dpor,
-        max_steps: cfg.max_steps,
-        ..RunConfig::default()
-    };
+    let base_config = RunConfig::builder()
+        .seed(cfg.seed)
+        .policy(Policy::Dpor)
+        .max_steps(cfg.max_steps)
+        .build();
     let base = Simulation::new(base_config, programs).run().unwrap();
     let eligible_pairs: usize = base
         .trace
@@ -176,12 +172,11 @@ fn dpor_explores_flip_before_tasks_become_ordered() {
     };
     let report = run_dpor(programs.clone(), &cfg).unwrap();
 
-    let base_config = RunConfig {
-        seed: cfg.seed,
-        policy: Policy::Dpor,
-        max_steps: cfg.max_steps,
-        ..RunConfig::default()
-    };
+    let base_config = RunConfig::builder()
+        .seed(cfg.seed)
+        .policy(Policy::Dpor)
+        .max_steps(cfg.max_steps)
+        .build();
     let base = Simulation::new(base_config, programs).run().unwrap();
     let step0 = &base.trace[0];
     assert!(
@@ -234,12 +229,11 @@ fn dpor_explores_each_causal_class_once() {
     };
     let report = run_dpor(programs.clone(), &cfg).unwrap();
 
-    let base_config = RunConfig {
-        seed: cfg.seed,
-        policy: Policy::Dpor,
-        max_steps: cfg.max_steps,
-        ..RunConfig::default()
-    };
+    let base_config = RunConfig::builder()
+        .seed(cfg.seed)
+        .policy(Policy::Dpor)
+        .max_steps(cfg.max_steps)
+        .build();
     let base = Simulation::new(base_config, programs).run().unwrap();
 
     let concurrent = concurrent_alt_pairs(&base);

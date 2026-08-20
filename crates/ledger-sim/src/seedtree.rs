@@ -29,7 +29,7 @@ impl SeedTree {
     /// Build the deterministic per-generator input stream for a PBT generator.
     ///
     /// The stream key is `gen/<generator>`, so every PBT generator gets its
-    /// own independent, reproducible stream.
+    /// own independent, reproducible stream. Used by the explorer PBT bridge.
     pub fn gen_stream(&self, generator: &str) -> ChaCha20Rng {
         self.rng(&format!("gen/{generator}"))
     }

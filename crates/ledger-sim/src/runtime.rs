@@ -6,7 +6,6 @@
 //! reproduces the classic one-scheduling-decision-per-instruction discipline
 //! (see [`crate::adapter`]).
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -105,6 +104,15 @@ pub struct RunResult {
     pub monitor_issues: Vec<MonitorIssue>,
     /// Event ids whose scheduled fault injections took effect.
     pub applied_faults: Vec<ledger_format::Hash>,
+    /// First journal-append failure observed on a path that cannot propagate.
+    ///
+    /// Append failures on non-`Result` surfaces (send helpers, spawn, crash)
+    /// cannot abort the run mid-flight, so the first one is recorded here and
+    /// the executor rejects the finished run with [`RuntimeError::Journal`].
+    /// A populated slot means the journal is incomplete and byte-identical
+    /// replay is broken; on the `Ok` path this field is always `None` (kept
+    /// for API stability and inspection).
+    pub journal_error: Option<JournalError>,
 }
 
 /// Runtime errors that preserve the failed run context.
@@ -183,7 +191,19 @@ impl Simulation {
 
     /// Run until all tasks finish or the instruction budget is reached.
     pub fn run(self) -> Result<RunResult, RuntimeError> {
-        let _tsc_guard = crate::sentinel::TscTrapGuard::arm_if_armed();
+        let tsc_guard = crate::sentinel::TscTrapGuard::arm_if_armed();
+        if let Some(error) = tsc_guard.activation_error() {
+            // The belt is demanded and the RDTSC trap is absent: surface the
+            // typed failure instead of claiming the trap is in place. The
+            // belt hook records its own typed status (queryable via
+            // `belt_status`); a failed belt cannot abort the run through
+            // RuntimeError, so the run completes and evidence gates assert
+            // the belt status when ground truth is required.
+            eprintln!("ledger-sim sentinel: RDTSC trap activation failed: {error}");
+        }
+        // Keep the guard alive for the whole run; it restores the TSC trap on
+        // drop, and dropping it early would un-trap the simulated section.
+        let _guard = tsc_guard;
         crate::sentinel::activate_process_belt();
         self.executor.run()
     }
@@ -219,27 +239,41 @@ impl Simulation {
     }
 }
 
-/// Legacy task shape retained for API compatibility; the executor does not use
-/// it. Kept so the public `Task` type name continues to resolve.
-#[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct Task {
-    /// Task identity.
-    pub id: usize,
-    /// Remaining instructions.
-    pub program: VecDeque<Instruction>,
-    /// Last received or assigned value.
-    pub register: u64,
-    /// Whether the task is blocked on a receive or timer.
-    pub blocked: bool,
-    /// Whether the task completed.
-    pub done: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ledger_format::EntryKind;
+
+    /// A run whose journal-error slot is populated is rejected end to end:
+    /// no [`RunResult`] (and therefore no finding, certificate, or minimized
+    /// repro) can derive from a poisoned journal. Every explorer run helper
+    /// propagates the `?` on `Simulation::run`, so the rejection reaches
+    /// search, campaign, quad, bandit, joint, minimizer, and the corpus
+    /// probe without per-helper gates.
+    #[test]
+    fn poisoned_journal_cannot_yield_a_run() {
+        use crate::executor::Boundary;
+        let error = ledger_journal::JournalError::InvalidPayload("test poison".to_string());
+        let config = RunConfig::builder()
+            .seed([23; 32])
+            .policy(Policy::Random)
+            .max_steps(64)
+            .build();
+        let run = Simulation::with_tasks(
+            config,
+            vec![Box::new(|b: Boundary| {
+                Box::pin(async move {
+                    // Poison the slot the way a failed append would.
+                    b.record_journal_error(error);
+                })
+            })],
+        )
+        .run();
+        assert!(
+            matches!(run, Err(RuntimeError::Journal(_))),
+            "a poisoned run must not yield a RunResult: {run:?}"
+        );
+    }
 
     fn mini_kv_programs() -> Vec<Vec<Instruction>> {
         vec![
@@ -266,12 +300,11 @@ mod tests {
 
     #[test]
     fn clean_mini_kv_run_produces_zero_monitor_issues() {
-        let config = RunConfig {
-            seed: [7; 32],
-            policy: Policy::Random,
-            max_steps: 256,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([7; 32])
+            .policy(Policy::Random)
+            .max_steps(256)
+            .build();
         let run = Simulation::new(config, mini_kv_programs()).run().unwrap();
         assert!(
             run.monitor_issues.is_empty(),
@@ -282,12 +315,11 @@ mod tests {
 
     #[test]
     fn runtime_journals_spawn_wake_timer_and_clock_read_entries() {
-        let config = RunConfig {
-            seed: [8; 32],
-            policy: Policy::Random,
-            max_steps: 128,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([8; 32])
+            .policy(Policy::Random)
+            .max_steps(128)
+            .build();
         let programs = vec![
             vec![
                 Instruction::ReadClock,
@@ -323,19 +355,18 @@ mod tests {
 
     #[test]
     fn replay_follows_recorded_decision_sequence() {
-        let config = RunConfig {
-            seed: [9; 32],
-            policy: Policy::Random,
-            max_steps: 256,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([9; 32])
+            .policy(Policy::Random)
+            .max_steps(256)
+            .build();
         let programs = mini_kv_programs();
         let original = Simulation::new(config.clone(), programs.clone())
             .run()
             .unwrap();
         let decisions = original.decisions.clone();
         let mut replay_config = config;
-        replay_config.policy = Policy::Replay;
+        *replay_config.policy_mut() = Policy::Replay;
         let replayed = Simulation::with_replay(replay_config, programs, decisions)
             .run()
             .unwrap();
@@ -345,12 +376,11 @@ mod tests {
 
     #[test]
     fn input_step_journals_real_generator_and_replay_keys() {
-        let config = RunConfig {
-            seed: [10; 32],
-            policy: Policy::Random,
-            max_steps: 128,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([10; 32])
+            .policy(Policy::Random)
+            .max_steps(128)
+            .build();
         let programs = vec![vec![
             Instruction::Input {
                 generator: 7,
@@ -379,12 +409,11 @@ mod tests {
 
     #[test]
     fn set_still_journals_zeroed_keys_compatibly() {
-        let config = RunConfig {
-            seed: [11; 32],
-            policy: Policy::Random,
-            max_steps: 128,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([11; 32])
+            .policy(Policy::Random)
+            .max_steps(128)
+            .build();
         let programs = vec![vec![Instruction::Set(42), Instruction::Done]];
         let run = Simulation::new(config, programs).run().unwrap();
         let inputs = run

@@ -53,11 +53,6 @@ impl Clock {
     pub const fn now(&self) -> u64 {
         self.ticks
     }
-
-    /// Return this snapshot as a virtual clock without timers.
-    pub fn to_virtual_time(&self) -> VirtualTime {
-        VirtualTime::from_ticks(self.ticks)
-    }
 }
 
 /// A deterministic virtual clock and timer priority queue.

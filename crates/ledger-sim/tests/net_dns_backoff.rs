@@ -91,12 +91,11 @@ fn dns_resolve_send_recv_sim_is_deterministic() {
     let run = |seed: u8| {
         let mut dns = DnsTable::new();
         dns.insert("peer", 1);
-        let config = RunConfig {
-            seed: [seed; 32],
-            max_steps: 512,
-            dns,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([seed; 32])
+            .max_steps(512)
+            .dns(dns)
+            .build();
         Simulation::with_tasks(
             config,
             vec![

@@ -21,6 +21,18 @@ fn lock<T>(guard: &Mutex<T>) -> MutexGuard<'_, T> {
     guard.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Record the first journal-append failure into a shared slot.
+///
+/// Later failures never overwrite the first: the same first-wins contract as
+/// the executor's `ExecutorShared::record_journal_error`, so every backend
+/// reports the failure that first broke the run.
+pub(crate) fn record_first_journal_error(slot: &Mutex<Option<JournalError>>, error: &JournalError) {
+    let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if guard.is_none() {
+        *guard = Some(error.clone());
+    }
+}
+
 /// One deterministic RNG stream handle owning its ChaCha20 stream.
 ///
 /// The handle holds the same journal and error slot as the backend, so every
@@ -47,7 +59,7 @@ impl SimStreamRng {
         ) {
             Ok(_) => {}
             Err(error) => {
-                *lock(&self.journal_error) = Some(error);
+                record_first_journal_error(&self.journal_error, &error);
             }
         }
     }
@@ -82,10 +94,13 @@ impl TryRng for SimStreamRng {
 pub struct SimBackend {
     time: Mutex<VirtualTime>,
     seed_tree: SeedTree,
-    journal: Arc<Mutex<Journal>>,
-    journal_error: Arc<Mutex<Option<JournalError>>>,
+    /// Crate-internal: the Wasm backend attaches its WASI crossings to this
+    /// journal and error slot. Keep the mutexes opaque; external inspection
+    /// goes through [`Self::journal_snapshot`] and [`Self::journal_error`].
+    pub(crate) journal: Arc<Mutex<Journal>>,
+    pub(crate) journal_error: Arc<Mutex<Option<JournalError>>>,
     net: Mutex<SimNet>,
-    fs: Mutex<SimFs>,
+    fs: Arc<Mutex<SimFs>>,
     actor: ActorId,
     rng_streams: Vec<Option<SimStreamRng>>,
     /// Optional shared tick sink published to WASI virtual clocks.
@@ -106,7 +121,7 @@ impl SimBackend {
             journal: Arc::new(Mutex::new(Journal::new())),
             journal_error: Arc::new(Mutex::new(None)),
             net: Mutex::new(SimNet::new()),
-            fs: Mutex::new(SimFs::new()),
+            fs: Arc::new(Mutex::new(SimFs::new())),
             actor,
             rng_streams: Vec::new(),
             tick_sink: None,
@@ -129,9 +144,14 @@ impl SimBackend {
         }
     }
 
-    /// Return the journaled history for inspection.
-    pub fn journal(&self) -> &Arc<Mutex<Journal>> {
-        &self.journal
+    /// Return an immutable snapshot of the journaled history.
+    ///
+    /// The snapshot is a full copy taken under the internal lock, so it cannot
+    /// alias live backend state and never changes the run. Inspection paths
+    /// (entry iteration, `root_hash`, audits) use this instead of locking the
+    /// shared journal.
+    pub fn journal_snapshot(&self) -> Journal {
+        lock(&self.journal).clone()
     }
 
     /// Return the first journaling failure recorded through the boundary, if any.
@@ -142,14 +162,6 @@ impl SimBackend {
     /// Return the actor id this backend journals entries for.
     pub fn actor(&self) -> ActorId {
         self.actor
-    }
-
-    /// Return the shared journaling error slot.
-    ///
-    /// Wasm boundary crossings journal through the same slot, so a failure
-    /// recorded by a WASI host call surfaces through [`Self::journal_error`].
-    pub fn journal_error_slot(&self) -> &Arc<Mutex<Option<JournalError>>> {
-        &self.journal_error
     }
 
     /// Append an entry through this backend's journaling path.
@@ -175,7 +187,7 @@ impl SimBackend {
         match lock(&self.journal).append(kind, self.actor, parents, payload) {
             Ok(id) => Some(id),
             Err(error) => {
-                *lock(&self.journal_error) = Some(error);
+                record_first_journal_error(&self.journal_error, &error);
                 None
             }
         }
@@ -272,19 +284,19 @@ impl Net for SimBackend {
 impl Fs for SimBackend {
     fn write(&self, path: &str, value: u64) -> Result<Hash, JournalError> {
         let mut journal = lock(&self.journal);
-        let mut fs = lock(&self.fs);
+        let mut fs = lock(&*self.fs);
         fs.write(&mut journal, self.actor, path, value)
     }
 
     fn fsync(&self) -> Result<Hash, JournalError> {
         let mut journal = lock(&self.journal);
-        let mut fs = lock(&self.fs);
+        let mut fs = lock(&*self.fs);
         fs.fsync(&mut journal, self.actor)
     }
 
     fn read(&self, path: &str) -> Result<Option<u64>, JournalError> {
         let mut journal = lock(&self.journal);
-        let fs = lock(&self.fs);
+        let fs = lock(&*self.fs);
         fs.read(&mut journal, self.actor, path)
     }
 
@@ -296,7 +308,7 @@ impl Fs for SimBackend {
             [],
             Payload::Empty,
         );
-        lock(&self.fs).crash();
+        lock(&*self.fs).crash();
     }
 }
 
@@ -327,7 +339,7 @@ mod tests {
         let _ = effects.fs().fsync().unwrap();
         futures::executor::block_on(effects.sleep(core::time::Duration::from_micros(10)));
 
-        let journal = effects.journal().lock().unwrap();
+        let journal = effects.journal_snapshot();
         let kinds = journal.entries().map(|e| e.data.kind).collect::<Vec<_>>();
         assert!(
             kinds
@@ -364,5 +376,39 @@ mod tests {
             dense, sparse,
             "stream-1 draws must be identical regardless of stream-0 consumption"
         );
+    }
+
+    #[test]
+    fn journal_snapshot_matches_live_journal_and_stays_fixed() {
+        let mut backend = SimBackend::new(SeedTree::new([11; 32]));
+        let _ = backend.rng(0).next_u64();
+        let before = backend.journal_snapshot();
+        let root_before = before.root_hash();
+        assert_eq!(
+            before.entries().count(),
+            1,
+            "one draw must journal exactly one entry"
+        );
+
+        // The snapshot is a copy: later appends must not alter it.
+        let _ = backend.rng(0).next_u64();
+        let after = backend.journal_snapshot();
+        assert_eq!(
+            before.root_hash(),
+            root_before,
+            "snapshot must be immutable"
+        );
+        assert_eq!(
+            before.entries().count(),
+            1,
+            "snapshot must not grow with the live journal"
+        );
+        assert_eq!(
+            after.root_hash(),
+            lock(&backend.journal).root_hash(),
+            "snapshot must match the live journal root"
+        );
+        assert_eq!(after.entries().count(), 2);
+        assert!(backend.journal_error().is_none());
     }
 }

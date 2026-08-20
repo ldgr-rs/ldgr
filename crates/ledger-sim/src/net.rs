@@ -1,4 +1,5 @@
 //! Deterministic simulated network with timed delivery queues and partitions.
+//! Version 0.2: DnsTable exposes sorted `iter()` for deterministic RunConfig hashing.
 
 use ledger_format::{FaultSpec, Hash};
 use rand_core::Rng;
@@ -75,6 +76,24 @@ impl DnsTable {
     /// Whether `name` is present in the table.
     pub fn contains(&self, name: &str) -> bool {
         self.names.contains_key(name)
+    }
+
+    /// Sorted iterator over hostname entries (BTreeMap order, deterministic).
+    ///
+    /// Exposed for the deterministic boundary hash (RunConfig canonical bytes);
+    /// same config produces same hash even after DNS changes.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &usize)> {
+        self.names.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Number of entries in the table.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
     }
 }
 
@@ -182,7 +201,12 @@ impl SimNet {
         let cfg = self.link_config(message.from, message.to);
         let mut total = base_delay.saturating_add(cfg.base_delay);
         if cfg.jitter > 0 {
-            total = total.saturating_add(draw(cfg.jitter + 1));
+            // `jitter + 1` overflows at u64::MAX and would wrap the modulus to
+            // zero; the saturated modulus keeps the draw defined and
+            // deterministic on the builder path. The canonical codec rejects
+            // `jitter == u64::MAX` outright (no representable modulus), so
+            // this fallback only guards direct construction.
+            total = total.saturating_add(draw(cfg.jitter.saturating_add(1)));
         }
         if cfg.loss_probability > 0.0
             && draw(1_000_000_000) < (cfg.loss_probability * 1_000_000_000.0) as u64
@@ -232,12 +256,6 @@ impl SimNet {
     /// Establish a directed network partition from `from` to `to`.
     pub fn partition(&mut self, from: usize, to: usize) {
         self.partitions.insert((from, to));
-    }
-
-    /// Establish a symmetric (bidirectional) network partition between two nodes.
-    pub fn partition_symmetric(&mut self, a: usize, b: usize) {
-        self.partitions.insert((a, b));
-        self.partitions.insert((b, a));
     }
 
     pub fn is_partitioned(&self, from: usize, to: usize) -> bool {
