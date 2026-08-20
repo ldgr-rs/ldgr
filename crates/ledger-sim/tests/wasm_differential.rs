@@ -43,7 +43,7 @@ fn native_twin() -> (Vec<u8>, Journal) {
         core::time::Duration::from_micros(SLEEP_TICKS),
     ));
     output.extend_from_slice(b"after-sleep\n");
-    let journal = backend.journal().lock().unwrap().clone();
+    let journal = backend.journal_snapshot();
     (output, journal)
 }
 
@@ -52,7 +52,7 @@ fn wasm_twin() -> (Vec<u8>, Journal) {
     let mut backend =
         WasmBackend::from_wasm(SeedTree::new(SEED), &common::guest_wasm_bytes()).unwrap();
     let output = backend.run_guest().unwrap();
-    let journal = backend.journal().lock().unwrap().clone();
+    let journal = backend.journal_snapshot();
     (output, journal)
 }
 
@@ -191,8 +191,8 @@ fn rr_recording_backend_is_deterministic() {
     let first_out = first.run_export("run_virtualized").unwrap().to_vec();
     let second_out = second.run_export("run_virtualized").unwrap().to_vec();
     assert_eq!(first_out, second_out);
-    let first_root = first.journal().lock().unwrap().root_hash();
-    let second_root = second.journal().lock().unwrap().root_hash();
+    let first_root = first.journal_snapshot().root_hash();
+    let second_root = second.journal_snapshot().root_hash();
     assert_eq!(first_root, second_root);
 }
 
@@ -204,7 +204,7 @@ fn wasi_random_and_clock_journal_entries() {
     let wasm = common::guest_wasm_bytes();
     let mut first = WasmBackend::from_wasm(SeedTree::new([4; 32]), &wasm).unwrap();
     let _ = first.run_export("run_virtualized").unwrap();
-    let journal = first.journal().lock().unwrap().clone();
+    let journal = first.journal_snapshot();
     assert!(
         !journal.is_empty(),
         "a virtualized WASI run must journal entries"
@@ -217,7 +217,7 @@ fn wasi_random_and_clock_journal_entries() {
         kinds.iter().any(|kind| matches!(
             kind,
             EntryKind::RngDraw {
-                stream: ledger_sim::backend_wasm::WASI_RANDOM_STREAM
+                stream: ledger_sim::WASI_RANDOM_STREAM
             }
         )),
         "random_get must journal one RngDraw on the WASI stream; got {kinds:?}"
@@ -232,8 +232,8 @@ fn wasi_random_and_clock_journal_entries() {
     let mut second = WasmBackend::from_wasm(SeedTree::new([4; 32]), &wasm).unwrap();
     let _ = second.run_export("run_virtualized").unwrap();
     assert_eq!(
-        first.journal().lock().unwrap().root_hash(),
-        second.journal().lock().unwrap().root_hash(),
+        first.journal_snapshot().root_hash(),
+        second.journal_snapshot().root_hash(),
         "same seed must produce identical journal roots"
     );
 }
@@ -258,7 +258,7 @@ fn native_pingpong() -> (Vec<u8>, Journal) {
     if sent && received_payload == Some(PING_PAYLOAD) {
         output.extend_from_slice(b"PINGPONG_OK\n");
     }
-    (output, backend.journal().lock().unwrap().clone())
+    (output, backend.journal_snapshot())
 }
 
 /// The guest network boundary matches the native boundary on a send/recv
@@ -274,7 +274,7 @@ fn wasm_pingpong_matches_native_twin() {
     let wasm = common::guest_wasm_bytes();
     let mut backend = WasmBackend::from_wasm(SeedTree::new(SEED), &wasm).unwrap();
     let wasm_output = backend.run_export("run_pingpong").unwrap();
-    let wasm_journal = backend.journal().lock().unwrap().clone();
+    let wasm_journal = backend.journal_snapshot();
 
     assert_eq!(
         wasm_output, native_output,

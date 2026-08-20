@@ -7,6 +7,8 @@
 // ledger-lint:allow:libc::time (probe deliberately triggers ambient time calls)
 // ledger-lint:allow:libc::clock_gettime (probe deliberately triggers ambient time calls)
 // ledger-lint:allow:libc::gettimeofday (probe deliberately triggers ambient time calls)
+// ledger-lint:allow:libc::getrandom (probe deliberately triggers ambient entropy calls)
+// ledger-lint:allow:getrandom:: (probe deliberately triggers ambient entropy calls)
 // ledger-lint:allow:env::var (probe reads its own mode from the environment)
 
 use std::process::ExitCode;
@@ -26,6 +28,10 @@ fn main() -> ExitCode {
         "simulate" => simulate(),
         #[cfg(all(feature = "sentinel", target_os = "linux"))]
         "vdsoclk" => vdsoclk(),
+        #[cfg(all(feature = "sentinel", target_os = "linux"))]
+        "virtclk" => virtclk(),
+        #[cfg(all(feature = "sentinel", target_os = "linux"))]
+        "virtrnd" => virtrnd(),
         _ => {
             println!("probe-unknown-mode");
             ExitCode::from(3)
@@ -36,9 +42,12 @@ fn main() -> ExitCode {
 /// Fire every interposed ambient API once.
 fn ambient() -> ExitCode {
     let mut buf = [0u8; 8];
+    // Deliberate ambient call; the probe verifies the belt's reaction.
     let _ = getrandom::fill(&mut buf);
+    // Deliberate ambient call; the probe verifies the belt's reaction.
     let _ = std::time::SystemTime::now();
     // Safety: a null output pointer is a valid libc::time argument.
+    // Deliberate ambient call; the probe verifies the belt's reaction.
     let _ = unsafe { libc::time(std::ptr::null_mut()) };
     println!("probe-done");
     ExitCode::SUCCESS
@@ -54,7 +63,7 @@ fn clean() -> ExitCode {
 /// Install the seccomp denylist and attempt an ambient read.
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
 fn seccomp() -> ExitCode {
-    if let Err(error) = ledger_sim::sentinel_belt::install_seccomp_denylist() {
+    if let Err(error) = ledger_sim::install_seccomp_denylist() {
         println!("seccomp-install-failed: {error}");
         return ExitCode::from(2);
     }
@@ -77,11 +86,12 @@ fn tsc() -> ExitCode {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if let Err(error) = ledger_sim::sentinel_belt::trap_rdtsc() {
+        if let Err(error) = ledger_sim::trap_rdtsc() {
             println!("tsc-install-failed: {error}");
             return ExitCode::from(2);
         }
         // Safety: _rdtsc has no side effects on memory; the trap does the work.
+        // Deliberate ambient call; the probe verifies the TSC trap.
         let _ = unsafe { std::arch::x86_64::_rdtsc() };
         println!("tsc-trapped");
     }
@@ -91,8 +101,8 @@ fn tsc() -> ExitCode {
 /// Arm the belt and install it; prints the activation status.
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
 fn belt() -> ExitCode {
-    ledger_sim::sentinel_belt::arm_belt();
-    let status = ledger_sim::sentinel::activate_process_belt();
+    ledger_sim::arm_belt();
+    let status = ledger_sim::activate_process_belt();
     println!("belt-status: {status:?}");
     ExitCode::SUCCESS
 }
@@ -103,12 +113,11 @@ fn belt() -> ExitCode {
 /// the sim then runs under the seccomp denylist and the RDTSC trap.
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
 fn simulate() -> ExitCode {
-    let config = ledger_sim::RunConfig {
-        seed: [42; 32],
-        policy: ledger_sim::Policy::Random,
-        max_steps: 128,
-        ..ledger_sim::RunConfig::default()
-    };
+    let config = ledger_sim::RunConfig::builder()
+        .seed([42; 32])
+        .policy(ledger_sim::Policy::Random)
+        .max_steps(128)
+        .build();
     let programs = vec![
         vec![
             ledger_sim::Instruction::Send { to: 1, payload: 7 },
@@ -122,7 +131,7 @@ fn simulate() -> ExitCode {
     ];
     match ledger_sim::Simulation::new(config, programs).run() {
         Ok(run) => {
-            let belt = ledger_sim::sentinel_belt::belt_status();
+            let belt = ledger_sim::belt_status();
             println!("simulate-ok steps={} belt={belt:?}", run.steps);
             ExitCode::SUCCESS
         }
@@ -140,12 +149,57 @@ fn vdsoclk() -> ExitCode {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // Deliberate ambient call; the probe verifies the vDSO clock path.
     let _ = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
     let mut tv = libc::timeval {
         tv_sec: 0,
         tv_usec: 0,
     };
+    // Deliberate ambient call; the probe verifies the vDSO clock path.
     let _ = unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) };
     println!("probe-done");
+    ExitCode::SUCCESS
+}
+
+/// Print the raw CLOCK_REALTIME result as "sec=<u64> nsec=<u64>".
+///
+/// The e2e virtualization test asserts exact values from this line, so the
+/// call must go through the PLT where the shim interposes it.
+#[cfg(all(feature = "sentinel", target_os = "linux"))]
+fn virtclk() -> ExitCode {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let ret = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    if ret != 0 {
+        println!("virtclk-error");
+        return ExitCode::from(2);
+    }
+    println!("sec={} nsec={}", ts.tv_sec as u64, ts.tv_nsec as u64);
+    ExitCode::SUCCESS
+}
+
+/// Fill a fixed buffer through the PLT getrandom symbol and print hex.
+///
+/// The direct libc call keeps the interposition path explicit: the
+/// getrandom crate may issue the raw syscall and bypass the shim.
+#[cfg(all(feature = "sentinel", target_os = "linux"))]
+fn virtrnd() -> ExitCode {
+    let mut buf = [0u8; 16];
+    let mut off = 0usize;
+    while off < buf.len() {
+        let n = unsafe { libc::getrandom(buf[off..].as_mut_ptr().cast(), buf.len() - off, 0) };
+        if n <= 0 {
+            println!("virtrnd-error");
+            return ExitCode::from(2);
+        }
+        off += n as usize;
+    }
+    print!("rnd=");
+    for byte in buf {
+        print!("{byte:02x}");
+    }
+    println!();
     ExitCode::SUCCESS
 }

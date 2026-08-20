@@ -13,7 +13,9 @@
 //!   `HostMonotonicClock` implementations reading the shared tick sink that
 //!   `SimBackend` publishes on every clock read and time advance.
 //! - Guest `fd_write` to stdout is captured deterministically into the output
-//!   buffer; the observable output is part of the journal.
+//!   buffer so host-side output stays byte-identical across backends; byte
+//!   identity is pinned by the differential oracle, not folded into journal
+//!   hashes (no `Output` entry kind exists).
 //! - Bounded execution via fuel: a runaway guest traps at the fuel budget
 //!   instead of looping forever.
 //! - NaN canonicalization and relaxed-SIMD determinism close the two CPU
@@ -22,11 +24,14 @@
 //! The wasmtime engine runs with `Config::rr(RRConfig::Recording)`, which
 //! enables engine-enforced execution-trace determinism
 //! (`validate_rr_determinism_conflicts` rejects settings that allow
-//! nondeterminism). Full WASI filesystem virtualization onto SimFs is not
-//! implemented: wasmtime-wasi 47's preview1 surface is cap-std-bound (no
-//! pluggable in-memory filesystem trait; see wasmtime issue 8963), and the
-//! WASIp2 `Host` filesystem trait requires the guest to be a component, not a
-//! preview1 core module.
+//! nondeterminism).
+//!
+//! The backend is preview1-only: all workloads (`run`, `run_boundary`,
+//! `run_virtualized`, ...) run `wasm32-wasip1` core modules. The former
+//! WASIp2 component-model scaffold was removed because no component guest
+//! consumes it; the wasmtime component-model feature is enabled only
+//! transitively (wasmtime-wasi preview1 depends on it) and no component
+//! API is used directly.
 //!
 //! Backend-portable decision-trace replay (a journal recorded on native
 //! replaying on Wasm) is deferred. Replay in the native path pins scheduler
@@ -36,16 +41,18 @@
 //! the same ground: the same workload runs natively and in the guest with one
 //! seed, and the journals must hash identically.
 
-use crate::backend_sim::SimBackend;
+use crate::backend_sim::{SimBackend, record_first_journal_error};
 use crate::effects::{Effects, Fs, Net};
 use crate::net::Message;
 use crate::seedtree::SeedTree;
 use crate::time::Clock;
+use crate::wasi_fs::{WasiFdTable, bytes_to_u64, deterministic_fd};
 use futures::executor::block_on;
 use ledger_format::{ActorId, EntryKind, Hash, Payload, StreamId};
 use ledger_journal::{Journal, JournalError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::Rng;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use wasmtime::{Caller, Config, Engine, Error, Instance, Linker, Module, Store};
@@ -63,6 +70,76 @@ const NS_PER_TICK: u64 = 1_000;
 /// payload records the number of bytes requested. The value is high enough to
 /// stay clear of application streams.
 pub const WASI_RANDOM_STREAM: StreamId = 0xF000;
+
+/// Upper bound on the iovec count of one wasm `fd_write` or `fd_read` call.
+///
+/// WASI guests that violate the cap observe `WASI_ERRNO_INVAL`. The cap only
+/// applies to the error path: valid guests never reach it, so byte-identical
+/// journaling is preserved.
+const MAX_WASI_IOVECS: u32 = 4096;
+
+/// Upper bound on the aggregate payload bytes of one wasm `fd_write` call.
+///
+/// Guards the host-side gather buffer against a guest that claims huge
+/// iovec lengths while the memory backs them. Violations return
+/// `WASI_ERRNO_INVAL`; the cap never applies to a valid run.
+const MAX_WASI_WRITE_BYTES: usize = 16 << 20;
+
+/// WASI preview1 errno for an invalid argument (`EINVAL`).
+const WASI_ERRNO_INVAL: u32 = 28;
+
+/// WASI preview1 errno for an I/O failure (`EIO`).
+const WASI_ERRNO_IO: u32 = 29;
+
+/// Validate and gather the payload of one `fd_write` call.
+///
+/// Applies the iovec-count and payload-size caps. A memory out-of-bounds
+/// keeps the wasmtime-trap convention and maps to `Err(None)`; a cap
+/// violation reports the WASI errno in `Err(Some(errno))`. The result never
+/// depends on host state, so the valid path is byte-identical.
+fn gather_write_payload(
+    memory: &[u8],
+    iovs_ptr: u32,
+    iovs_len: u32,
+) -> Result<Vec<u8>, Option<u32>> {
+    if iovs_len > MAX_WASI_IOVECS {
+        return Err(Some(WASI_ERRNO_INVAL));
+    }
+    let mut collected = Vec::new();
+    for index in 0..iovs_len {
+        let iov_off = (iovs_ptr as usize)
+            .checked_add((index as usize) * 8)
+            .ok_or(None)?;
+        let iov_end = iov_off.checked_add(8).ok_or(None)?;
+        let iov_bytes = memory.get(iov_off..iov_end).ok_or(None)?;
+        let mut buf_ptr_bytes = [0u8; 4];
+        buf_ptr_bytes.copy_from_slice(&iov_bytes[..4]);
+        let mut buf_len_bytes = [0u8; 4];
+        buf_len_bytes.copy_from_slice(&iov_bytes[4..]);
+        let buf_ptr = u32::from_le_bytes(buf_ptr_bytes) as usize;
+        let buf_len = u32::from_le_bytes(buf_len_bytes) as usize;
+        if collected.len().saturating_add(buf_len) > MAX_WASI_WRITE_BYTES {
+            return Err(Some(WASI_ERRNO_INVAL));
+        }
+        let end = buf_ptr.checked_add(buf_len).ok_or(None)?;
+        let bytes = memory.get(buf_ptr..end).ok_or(None)?;
+        collected.extend_from_slice(bytes);
+    }
+    Ok(collected)
+}
+
+/// Record a journaled-write failure and map it to the guest-visible errno.
+///
+/// The typed error lands on the backend's shared slot so `journal_error()`
+/// reports it; the guest observes `WASI_ERRNO_IO` instead of a silent
+/// success. The mapping only fires on the error path.
+fn record_write_failure(
+    journal_error_slot: &Mutex<Option<JournalError>>,
+    error: JournalError,
+) -> u32 {
+    record_first_journal_error(journal_error_slot, &error);
+    WASI_ERRNO_IO
+}
 
 /// Result alias for the Wasm backend.
 pub type WasmResult<T> = Result<T, WasmError>;
@@ -124,7 +201,7 @@ impl WasiJournal {
         match journal.append(kind, self.actor, parents, payload) {
             Ok(_) => {}
             Err(error) => {
-                *self.journal_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+                record_first_journal_error(&self.journal_error, &error);
             }
         }
     }
@@ -181,7 +258,8 @@ impl wasmtime_wasi::HostMonotonicClock for VirtualMonotonicClock {
 /// A stdout sink that appends guest `fd_write` output to a shared buffer.
 ///
 /// The shared buffer is drained into the store's output after each call, so
-/// guest-observable output is deterministic and journaled with the run.
+/// guest-observable output is deterministic across backends; its byte identity
+/// is pinned by the differential oracle, not by journal hashes.
 struct CapturedStdout {
     sink: Arc<Mutex<Vec<u8>>>,
 }
@@ -246,19 +324,29 @@ struct WasmStoreData {
     /// draws here and journals one `RngDraw` per crossing, so WASI randomness
     /// is deterministic and the crossing is journaled exactly once.
     wasi_random: ChaCha20Rng,
+    /// Virtual filesystem fd table: deterministic fd -> SimFs path key.
+    wasi_fs: Mutex<WasiFdTable>,
 }
 
-/// Wasm backend: wraps a wasmtime engine, store, and guest instance.
+/// Wasm backend: wraps a wasmtime engine, store, and guest instances.
 ///
 /// Implements the `Effects` surface by delegating to the inner `SimBackend`.
 /// The guest crosses the boundary through the `ledger` host functions, which
 /// forward to the same effects; WASI `random_get`, `clock_time_get`, and
 /// stdout are virtualized onto the seed tree, virtual clock, and output
 /// buffer respectively.
+///
+/// Mixed topology (W2): the backend can host multiple named guest instances
+/// in one `Store`. All instances share the same `SeedTree` derivation and
+/// virtual clock, so a mixed run (e.g. Go + Zig) remains deterministic:
+/// same seed produces byte-identical journal roots. Scheduling points remain
+/// host-call boundaries; interleaving across guests is host-driven via
+/// sequential `run_export_on` calls, not preemptive threads.
 pub struct WasmBackend {
     engine: Engine,
     store: Store<WasmStoreData>,
     instance: Option<Instance>,
+    instances: HashMap<String, Instance>,
     fuel_budget: u64,
 }
 
@@ -285,6 +373,7 @@ impl WasmBackend {
         let mut backend = Self::with_engine(module.engine().clone(), seed_tree)?;
         let linker = Self::build_linker(&backend.engine)?;
         let instance = linker.instantiate(&mut backend.store, module)?;
+        backend.instances.insert("main".to_string(), instance);
         backend.instance = Some(instance);
         Ok(backend)
     }
@@ -298,8 +387,8 @@ impl WasmBackend {
 
         // WASI crossings share the inner backend's journaling path.
         let wasi_journal = WasiJournal {
-            journal: Arc::clone(effects.journal()),
-            journal_error: Arc::clone(effects.journal_error_slot()),
+            journal: Arc::clone(&effects.journal),
+            journal_error: Arc::clone(&effects.journal_error),
             actor: effects.actor(),
         };
 
@@ -329,12 +418,14 @@ impl WasmBackend {
                 output: Vec::new(),
                 stdout_sink,
                 wasi_random: seed_tree.rng("wasi.random"),
+                wasi_fs: Mutex::new(WasiFdTable::new()),
             },
         );
         Ok(Self {
             engine,
             store,
             instance: None,
+            instances: HashMap::new(),
             fuel_budget: 10_000_000,
         })
     }
@@ -353,11 +444,41 @@ impl WasmBackend {
     }
 
     /// Compile and instantiate a guest module against this backend.
+    ///
+    /// The guest is registered under the default name "main" so existing
+    /// single-instance callers continue to work. Mixed-topology callers
+    /// should prefer [`Self::load_guest_multi`].
     pub fn load_guest(&mut self, wasm: &[u8]) -> WasmResult<()> {
+        self.load_guest_multi("main", wasm)
+    }
+
+    /// Compile and instantiate a named guest module for mixed topology.
+    ///
+    /// Stores the instance under `name` in a `HashMap<String, Instance>`.
+    /// The default `load_guest` / `run_export` API stays intact and is
+    /// backed by the "main" entry. All named instances share one `Store`,
+    /// one `SeedTree`, and one virtual clock, so a run that executes
+    /// `run_export_on("go", "run")` then `run_export_on("zig", "run")`
+    /// journals deterministically: the same seed produces the same journal
+    /// root. Scheduling points remain host-call boundaries; concurrency
+    /// across guests is cooperative via sequential host calls.
+    pub fn load_guest_multi(&mut self, name: &str, wasm: &[u8]) -> WasmResult<()> {
         let module = Module::new(&self.engine, wasm)?;
         let linker = Self::build_linker(&self.engine)?;
         let instance = linker.instantiate(&mut self.store, &module)?;
-        self.instance = Some(instance);
+        self.instances.insert(name.to_string(), instance);
+        // Keep the legacy single-instance field in sync when the primary
+        // guest is (re)loaded so `run_export` without an explicit name
+        // keeps working.
+        if name == "main" {
+            self.instance = Some(instance);
+        } else if self.instance.is_none() {
+            // First guest loaded under a non-main name also populates the
+            // legacy field so single-guest callers that use `run_export`
+            // after a `load_guest_multi("go", ...)` do not see NoGuest.
+            // Mixed callers should use `run_export_on` explicitly.
+            self.instance = Some(instance);
+        }
         Ok(())
     }
 
@@ -370,9 +491,29 @@ impl WasmBackend {
     ///
     /// The output buffer is cleared before the call, so the returned bytes are
     /// exactly what this invocation logged (both the `ledger.log` boundary and
-    /// WASI stdout).
+    /// WASI stdout). Delegates to [`Self::run_export_on`] with the default
+    /// instance name "main".
     pub fn run_export(&mut self, entry: &str) -> WasmResult<Vec<u8>> {
-        let instance = self.instance.as_ref().ok_or(WasmError::NoGuest)?;
+        self.run_export_on("main", entry)
+    }
+
+    /// Run an entry point on a named guest instance and return its logged output.
+    ///
+    /// Reuses the same `Store` fuel and output logic as [`Self::run_export`],
+    /// so fuel budgeting and output capture behave identically across named
+    /// instances. The journal is shared across instances, so cross-guest runs
+    /// append to one deterministic causal DAG.
+    pub fn run_export_on(&mut self, name: &str, entry: &str) -> WasmResult<Vec<u8>> {
+        // Prefer the named map; fall back to the legacy single-instance field
+        // so callers that only used `load_guest` keep working even if the map
+        // lookup would miss due to ordering.
+        let instance = if let Some(inst) = self.instances.get(name) {
+            *inst
+        } else if name == "main" {
+            *self.instance.as_ref().ok_or(WasmError::NoGuest)?
+        } else {
+            return Err(WasmError::NoGuest);
+        };
         self.store.data_mut().output.clear();
         self.store
             .data_mut()
@@ -385,8 +526,6 @@ impl WasmBackend {
         match func.call(&mut self.store, ()) {
             Ok(()) => {}
             Err(_) => {
-                // A trap may be a genuine guest fault or fuel exhaustion; a
-                // zero fuel remainder pinpoints the latter.
                 if self.store.get_fuel()? == 0 {
                     return Err(WasmError::FuelExhausted);
                 }
@@ -409,9 +548,13 @@ impl WasmBackend {
         self.store.data().output.clone()
     }
 
-    /// Return the journaled history of the inner sim backend.
-    pub fn journal(&self) -> &Mutex<Journal> {
-        self.store.data().effects.journal()
+    /// Return an immutable snapshot of the journaled history of the inner
+    /// sim backend.
+    ///
+    /// The snapshot is a full copy taken under the backend's internal lock;
+    /// it never aliases live state and never changes the run.
+    pub fn journal_snapshot(&self) -> Journal {
+        self.store.data().effects.journal_snapshot()
     }
 
     /// Return the first journaling failure recorded by the inner backend, if any.
@@ -518,6 +661,81 @@ impl WasmBackend {
             },
         )?;
 
+        linker.func_wrap(
+            "ledger",
+            "ledger_fs_write",
+            |mut caller: Caller<'_, WasmStoreData>, ptr: u32, len: u32, value: u64| -> u32 {
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                {
+                    Some(memory) => memory,
+                    None => return 1,
+                };
+                let start = ptr as usize;
+                let end = match start.checked_add(len as usize) {
+                    Some(end) => end,
+                    None => return 1,
+                };
+                let path_bytes = match memory.data(&caller).get(start..end) {
+                    Some(bytes) => bytes.to_vec(),
+                    None => return 1,
+                };
+                let path = match String::from_utf8(path_bytes) {
+                    Ok(path) => path,
+                    Err(_) => return 1,
+                };
+                let key = path.trim_start_matches('/');
+                let key = if key.is_empty() { &path } else { key };
+                match caller.data().effects.fs().write(key, value) {
+                    Ok(_) => 0,
+                    Err(_) => 1,
+                }
+            },
+        )?;
+
+        linker.func_wrap(
+            "ledger",
+            "ledger_fs_read",
+            |mut caller: Caller<'_, WasmStoreData>, ptr: u32, len: u32| -> i64 {
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                {
+                    Some(memory) => memory,
+                    None => return -2,
+                };
+                let start = ptr as usize;
+                let end = match start.checked_add(len as usize) {
+                    Some(end) => end,
+                    None => return -2,
+                };
+                let path_bytes = match memory.data(&caller).get(start..end) {
+                    Some(bytes) => bytes.to_vec(),
+                    None => return -2,
+                };
+                let path = match String::from_utf8(path_bytes) {
+                    Ok(path) => path,
+                    Err(_) => return -2,
+                };
+                let key = path.trim_start_matches('/');
+                let key = if key.is_empty() { &path } else { key };
+                match caller.data().effects.fs().read(key) {
+                    Ok(Some(value)) => value as i64,
+                    Ok(None) => -1,
+                    Err(_) => -2,
+                }
+            },
+        )?;
+
+        linker.func_wrap(
+            "ledger",
+            "ledger_fs_crash",
+            |caller: Caller<'_, WasmStoreData>| {
+                caller.data().effects.fs().crash();
+            },
+        )?;
+
         // Shadow the preview1 `random_get` import so each WASI randomness
         // crossing journals exactly one `RngDraw` entry. The built-in preview1
         // handler draws through the context RNG without journaling, which would
@@ -558,6 +776,279 @@ impl WasmBackend {
             },
         )?;
 
+        // SimFs-backed preview1 filesystem shadow. Deterministic and journaled
+        // through the same `SimBackend::fs` that native code uses.
+
+        linker.func_wrap(
+            "wasi_snapshot_preview1",
+            "path_open",
+            |mut caller: Caller<'_, WasmStoreData>,
+             _dirfd: u32,
+             _dirflags: u32,
+             path_ptr: u32,
+             path_len: u32,
+             _oflags: u32,
+             _fs_rights_base: u64,
+             _fs_rights_inh: u64,
+             _fdflags: u32,
+             opened_fd_ptr: u32|
+             -> Result<u32, Error> {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or_else(|| Error::msg("guest has no exported memory"))?;
+                let start = path_ptr as usize;
+                let end = start
+                    .checked_add(path_len as usize)
+                    .ok_or_else(|| Error::msg("path_open length overflow"))?;
+                let path_bytes = memory
+                    .data(&caller)
+                    .get(start..end)
+                    .ok_or_else(|| Error::msg("path_open read out of bounds"))?
+                    .to_vec();
+                let path = String::from_utf8(path_bytes)
+                    .map_err(|_| Error::msg("path_open path not utf8"))?;
+                let key = path.trim_start_matches('/').to_owned();
+                let key = if key.is_empty() { path.clone() } else { key };
+                caller
+                    .data()
+                    .wasi_fs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .open(&key);
+                let fd_to_write = deterministic_fd(&key);
+                let mem = memory.data_mut(&mut caller);
+                let dst = opened_fd_ptr as usize;
+                if dst.checked_add(4).is_none() || dst + 4 > mem.len() {
+                    return Err(Error::msg("path_open opened_fd out of bounds"));
+                }
+                mem[dst..dst + 4].copy_from_slice(&fd_to_write.to_le_bytes());
+                Ok(0)
+            },
+        )?;
+
+        linker.func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            |mut caller: Caller<'_, WasmStoreData>,
+             fd: u32,
+             iovs_ptr: u32,
+             iovs_len: u32,
+             nwritten_ptr: u32|
+             -> Result<u32, Error> {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or_else(|| Error::msg("guest has no exported memory"))?;
+                // Collect bytes from iovecs under hard caps; a cap violation is
+                // a WASI errno, a memory violation is a trap.
+                let collected = match gather_write_payload(memory.data(&caller), iovs_ptr, iovs_len)
+                {
+                    Ok(payload) => payload,
+                    Err(Some(errno)) => return Ok(errno),
+                    Err(None) => return Err(Error::msg("fd_write iovec out of bounds")),
+                };
+                let total = u32::try_from(collected.len())
+                    .map_err(|_| Error::msg("fd_write payload exceeds u32"))?;
+                if fd == 1 {
+                    // stdout: capture deterministically.
+                    let sink = caller.data().stdout_sink.clone();
+                    sink.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&collected);
+                    let mem = memory.data_mut(&mut caller);
+                    let dst = nwritten_ptr as usize;
+                    if dst.checked_add(4).is_none() || dst + 4 > mem.len() {
+                        return Err(Error::msg("fd_write nwritten out of bounds"));
+                    }
+                    mem[dst..dst + 4].copy_from_slice(&total.to_le_bytes());
+                    return Ok(0);
+                }
+                if fd == 2 {
+                    let mem = memory.data_mut(&mut caller);
+                    let dst = nwritten_ptr as usize;
+                    if dst.checked_add(4).is_none() || dst + 4 > mem.len() {
+                        return Err(Error::msg("fd_write nwritten out of bounds"));
+                    }
+                    mem[dst..dst + 4].copy_from_slice(&total.to_le_bytes());
+                    return Ok(0);
+                }
+                let path_opt = caller
+                    .data()
+                    .wasi_fs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(fd)
+                    .map(|s| s.to_owned());
+                let path = match path_opt {
+                    Some(path) => path,
+                    None => return Ok(8),
+                };
+                let value = bytes_to_u64(&collected);
+                if let Err(error) = caller.data().effects.fs().write(&path, value) {
+                    // A journal failure must never disappear on a replay path:
+                    // record the typed error and surface an I/O errno to the
+                    // guest instead of a silent success.
+                    return Ok(record_write_failure(
+                        &caller.data().effects.journal_error,
+                        error,
+                    ));
+                }
+                let mem = memory.data_mut(&mut caller);
+                let dst = nwritten_ptr as usize;
+                if dst.checked_add(4).is_none() || dst + 4 > mem.len() {
+                    return Err(Error::msg("fd_write nwritten out of bounds"));
+                }
+                mem[dst..dst + 4].copy_from_slice(&total.to_le_bytes());
+                Ok(0)
+            },
+        )?;
+
+        linker.func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_read",
+            |mut caller: Caller<'_, WasmStoreData>,
+             fd: u32,
+             iovs_ptr: u32,
+             iovs_len: u32,
+             nread_ptr: u32|
+             -> Result<u32, Error> {
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or_else(|| Error::msg("guest has no exported memory"))?;
+                let path_opt = caller
+                    .data()
+                    .wasi_fs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(fd)
+                    .map(|s| s.to_owned());
+                let path = match path_opt {
+                    Some(path) => path,
+                    None => return Ok(8),
+                };
+                let value_opt = caller
+                    .data()
+                    .effects
+                    .fs()
+                    .read(&path)
+                    .map_err(|error| Error::msg(format!("fs read: {error}")))?;
+                let bytes = match value_opt {
+                    Some(value) => value.to_le_bytes().to_vec(),
+                    None => Vec::new(),
+                };
+                // Cap the iovec count like fd_write: a hostile count must not
+                // drive an unbounded host-side loop.
+                if iovs_len > MAX_WASI_IOVECS {
+                    return Ok(WASI_ERRNO_INVAL);
+                }
+                let mut written: u32 = 0;
+                let mut remaining = bytes.as_slice();
+                for index in 0..iovs_len {
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    let iov_off = (iovs_ptr as usize)
+                        .checked_add((index as usize) * 8)
+                        .ok_or_else(|| Error::msg("fd_read iov overflow"))?;
+                    let iov_end = iov_off
+                        .checked_add(8)
+                        .ok_or_else(|| Error::msg("fd_read iov end overflow"))?;
+                    let iov_bytes = memory
+                        .data(&caller)
+                        .get(iov_off..iov_end)
+                        .ok_or_else(|| Error::msg("fd_read iov out of bounds"))?
+                        .to_vec();
+                    let buf_ptr = u32::from_le_bytes([
+                        iov_bytes[0],
+                        iov_bytes[1],
+                        iov_bytes[2],
+                        iov_bytes[3],
+                    ]) as usize;
+                    let buf_len = u32::from_le_bytes([
+                        iov_bytes[4],
+                        iov_bytes[5],
+                        iov_bytes[6],
+                        iov_bytes[7],
+                    ]) as usize;
+                    let to_copy = core::cmp::min(remaining.len(), buf_len);
+                    if to_copy == 0 {
+                        continue;
+                    }
+                    let end = buf_ptr
+                        .checked_add(to_copy)
+                        .ok_or_else(|| Error::msg("fd_read buf overflow"))?;
+                    let mem = memory.data_mut(&mut caller);
+                    if end > mem.len() {
+                        return Err(Error::msg("fd_read buf out of bounds"));
+                    }
+                    mem[buf_ptr..buf_ptr + to_copy].copy_from_slice(&remaining[..to_copy]);
+                    remaining = &remaining[to_copy..];
+                    // buf_len derives from wasm32 iovec u32 fields, so to_copy
+                    // always fits u32 without truncation.
+                    written = written.saturating_add(to_copy as u32);
+                }
+                let mem = memory.data_mut(&mut caller);
+                let dst = nread_ptr as usize;
+                if dst.checked_add(4).is_none() || dst + 4 > mem.len() {
+                    return Err(Error::msg("fd_read nread out of bounds"));
+                }
+                mem[dst..dst + 4].copy_from_slice(&written.to_le_bytes());
+                Ok(0)
+            },
+        )?;
+
+        linker.func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_close",
+            |caller: Caller<'_, WasmStoreData>, fd: u32| -> Result<u32, Error> {
+                let removed = caller
+                    .data()
+                    .wasi_fs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .close(fd);
+                if removed || fd == 0 || fd == 1 || fd == 2 {
+                    Ok(0)
+                } else {
+                    Ok(8)
+                }
+            },
+        )?;
+
+        linker.func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_filestat_get",
+            |mut caller: Caller<'_, WasmStoreData>, fd: u32, buf_ptr: u32| -> Result<u32, Error> {
+                let is_virtual = caller
+                    .data()
+                    .wasi_fs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(fd);
+                if !is_virtual {
+                    return Ok(8);
+                }
+                let memory = caller
+                    .get_export("memory")
+                    .and_then(|export| export.into_memory())
+                    .ok_or_else(|| Error::msg("guest has no exported memory"))?;
+                let start = buf_ptr as usize;
+                let end = start
+                    .checked_add(64)
+                    .ok_or_else(|| Error::msg("filestat overflow"))?;
+                let mem = memory.data_mut(&mut caller);
+                if end > mem.len() {
+                    return Err(Error::msg("filestat out of bounds"));
+                }
+                for byte in &mut mem[start..end] {
+                    *byte = 0;
+                }
+                Ok(0)
+            },
+        )?;
+
         Ok(linker)
     }
 }
@@ -581,5 +1072,278 @@ impl Effects for WasmBackend {
 
     fn fs(&self) -> &dyn Fs {
         self.store.data().effects.fs()
+    }
+}
+
+#[cfg(test)]
+mod fd_write_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn gather_write_payload_boundaries() {
+        let mut memory = vec![0u8; 512];
+        // iovec[0] at [32..40]: buf_ptr 100, len 4.
+        memory[32..36].copy_from_slice(&100u32.to_le_bytes());
+        memory[36..40].copy_from_slice(&4u32.to_le_bytes());
+        memory[100..104].copy_from_slice(&[0x2a, 0x2b, 0x2c, 0x2d]);
+        // iovec[1] at [40..48]: buf_ptr 200, len 2.
+        memory[40..44].copy_from_slice(&200u32.to_le_bytes());
+        memory[44..48].copy_from_slice(&2u32.to_le_bytes());
+        memory[200..202].copy_from_slice(&[0x0e, 0x0f]);
+
+        let payload = gather_write_payload(&memory, 32, 2).expect("gather");
+        assert_eq!(payload, [0x2a, 0x2b, 0x2c, 0x2d, 0x0e, 0x0f]);
+        // An empty iovec list gathers nothing.
+        assert!(
+            gather_write_payload(&memory, 32, 0)
+                .expect("empty")
+                .is_empty()
+        );
+
+        // Oversized iovec count is a WASI errno, not a trap and not a hang.
+        assert_eq!(
+            gather_write_payload(&memory, 32, MAX_WASI_IOVECS + 1),
+            Err(Some(WASI_ERRNO_INVAL))
+        );
+        // Aggregate payload over the byte cap is a WASI errno, checked before
+        // the buffer bounds are consulted.
+        memory[36..40].copy_from_slice(&((MAX_WASI_WRITE_BYTES + 1) as u32).to_le_bytes());
+        assert_eq!(
+            gather_write_payload(&memory, 32, 1),
+            Err(Some(WASI_ERRNO_INVAL))
+        );
+        // A buffer beyond guest memory stays a trap-class violation.
+        memory[36..40].copy_from_slice(&500u32.to_le_bytes());
+        assert_eq!(gather_write_payload(&memory, 32, 1), Err(None));
+        // An iovec array beyond guest memory is a trap-class violation.
+        assert_eq!(gather_write_payload(&memory, 500, 2), Err(None));
+        // An iovec pointer whose stride overflows is a trap-class violation.
+        assert_eq!(gather_write_payload(&memory, u32::MAX, 1), Err(None));
+        // The total written byte count stays within u32 by the byte cap.
+        let payload = gather_write_payload(&memory, 32, 0).expect("gather");
+        u32::try_from(payload.len()).expect("bounded payload fits u32");
+    }
+
+    /// The journal-failure path must map to `EIO` and keep the typed error
+    /// on the backend slot, never a silent success.
+    #[test]
+    fn record_write_failure_maps_to_io_errno_and_keeps_typed_error() {
+        let slot = Mutex::new(None);
+        let errno = record_write_failure(
+            &slot,
+            JournalError::InvariantViolation("injected".to_string()),
+        );
+        assert_eq!(errno, WASI_ERRNO_IO);
+        match slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(JournalError::InvariantViolation(cause)) => assert_eq!(cause, "injected"),
+            other => panic!("typed error must be recorded, got {other:?}"),
+        }
+        // A second failure never overwrites: the slot reports the first
+        // typed cause, matching the executor's first-wins contract (a second
+        // broken append does not change which failure invalidated the run).
+        let second = record_write_failure(&slot, JournalError::MissingParent([3u8; 32]));
+        assert_eq!(second, WASI_ERRNO_IO);
+        match slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(JournalError::InvariantViolation(cause)) => assert_eq!(cause, "injected"),
+            other => panic!("first failure must win, got {other:?}"),
+        }
+    }
+
+    /// A minimal core module that imports `fd_write` and `path_open`, exports
+    /// a 1-page `memory`, and forwards its own arguments to the imports. The
+    /// exports let a test drive the host functions through real guest
+    /// execution, so `Caller::get_export` resolves the instance memory.
+    fn forwarder_module(engine: &Engine) -> Module {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+        // Type section: fd_write (i32x4 -> i32), path_open (i32x5,i64x2,i32x2 -> i32).
+        bytes.extend_from_slice(&[
+            0x01, 0x16, 0x02, 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x09, 0x7f,
+            0x7f, 0x7f, 0x7f, 0x7f, 0x7e, 0x7e, 0x7f, 0x7f, 0x01, 0x7f,
+        ]);
+        // Import section: wasi fd_write (type 0), wasi path_open (type 1).
+        let module_name = b"wasi_snapshot_preview1";
+        let mut imports = vec![0x02u8];
+        for (name, type_index) in [
+            (b"fd_write".as_slice(), 0u32),
+            (b"path_open".as_slice(), 1u32),
+        ] {
+            imports.push(module_name.len() as u8);
+            imports.extend_from_slice(module_name);
+            imports.push(name.len() as u8);
+            imports.extend_from_slice(name);
+            imports.push(0x00);
+            imports.push(type_index as u8);
+        }
+        bytes.push(0x02);
+        bytes.push(imports.len() as u8);
+        bytes.extend_from_slice(&imports);
+        // Function section: write_test (type 0), open_test (type 1).
+        bytes.extend_from_slice(&[0x03, 0x03, 0x02, 0x00, 0x01]);
+        // Memory section: 1 page, exported below.
+        bytes.extend_from_slice(&[0x05, 0x03, 0x01, 0x00, 0x01]);
+        // Export section: memory, write_test, open_test.
+        let mut exports = vec![0x03u8];
+        exports.extend_from_slice(&[0x06]);
+        exports.extend_from_slice(b"memory");
+        exports.extend_from_slice(&[0x02, 0x00]);
+        exports.extend_from_slice(&[0x0a]);
+        exports.extend_from_slice(b"write_test");
+        exports.extend_from_slice(&[0x00, 0x02]);
+        exports.extend_from_slice(&[0x09]);
+        exports.extend_from_slice(b"open_test");
+        exports.extend_from_slice(&[0x00, 0x03]);
+        bytes.push(0x07);
+        bytes.push(exports.len() as u8);
+        bytes.extend_from_slice(&exports);
+        // Code section: write_test forwards 4 i32s, open_test forwards 9.
+        let mut code = vec![0x02u8];
+        let write_body = [
+            0x00, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x20, 0x03, 0x10, 0x00, 0x0b,
+        ];
+        code.push(write_body.len() as u8);
+        code.extend_from_slice(&write_body);
+        let open_body = [
+            0x00, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0x20, 0x03, 0x20, 0x04, 0x20, 0x05, 0x20,
+            0x06, 0x20, 0x07, 0x20, 0x08, 0x10, 0x01, 0x0b,
+        ];
+        code.push(open_body.len() as u8);
+        code.extend_from_slice(&open_body);
+        bytes.push(0x0a);
+        bytes.push(code.len() as u8);
+        bytes.extend_from_slice(&code);
+        Module::new(engine, &bytes).expect("forwarder module")
+    }
+
+    /// The real host plumbing: a valid stdout write, the oversized-iovec
+    /// errno, and a full path_open + fd_write file write that journals an
+    /// `FsWrite` on the valid path. The guest forwarders drive the host
+    /// functions through real execution, so the instance memory stays the
+    /// export the host functions see.
+    #[test]
+    fn fd_write_host_error_and_valid_paths() {
+        let engine = WasmBackend::new_engine().expect("engine");
+        let mut backend = WasmBackend::with_engine(engine.clone(), SeedTree::new([0x42; 32]))
+            .expect("store scaffolding");
+        let linker = WasmBackend::build_linker(&engine).expect("linker");
+        let module = forwarder_module(&engine);
+        let instance = linker
+            .instantiate(&mut backend.store, &module)
+            .expect("instantiate forwarder module");
+        backend.store.set_fuel(1 << 20).expect("fuel for the guest");
+        let memory = instance
+            .get_memory(&mut backend.store, "memory")
+            .expect("exported memory");
+
+        let write_via_guest = |store: &mut Store<WasmStoreData>,
+                               fd: u32,
+                               iovs_ptr: u32,
+                               iovs_len: u32,
+                               nwritten_ptr: u32|
+         -> u32 {
+            instance
+                .get_typed_func::<(u32, u32, u32, u32), u32>(&mut *store, "write_test")
+                .expect("write_test export")
+                .call(&mut *store, (fd, iovs_ptr, iovs_len, nwritten_ptr))
+                .expect("write_test call")
+        };
+        let open_via_guest = |store: &mut Store<WasmStoreData>,
+                              path_ptr: u32,
+                              path_len: u32,
+                              opened_fd_ptr: u32|
+         -> u32 {
+            instance
+                .get_typed_func::<(u32, u32, u32, u32, u32, u64, u64, u32, u32), u32>(
+                    &mut *store,
+                    "open_test",
+                )
+                .expect("open_test export")
+                .call(
+                    &mut *store,
+                    (3, 0, path_ptr, path_len, 0, 0, 0, 0, opened_fd_ptr),
+                )
+                .expect("open_test call")
+        };
+
+        // Valid stdout write through a real iovec array.
+        let iovs = 32usize;
+        let nwritten = 64usize;
+        {
+            let mem = memory.data_mut(&mut backend.store);
+            mem[iovs..iovs + 8]
+                .copy_from_slice(&[100u32.to_le_bytes(), 4u32.to_le_bytes()].concat());
+            mem[100..104].copy_from_slice(&[1, 2, 3, 4]);
+        }
+        let errno = write_via_guest(&mut backend.store, 1, iovs as u32, 1, nwritten as u32);
+        assert_eq!(errno, 0);
+        {
+            let mem = memory.data(&backend.store);
+            assert_eq!(&mem[nwritten..nwritten + 4], &4u32.to_le_bytes());
+        }
+        assert_eq!(
+            backend
+                .store
+                .data()
+                .stdout_sink
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &[1, 2, 3, 4]
+        );
+
+        // Oversized iovec count returns an errno without touching the buffer.
+        let errno = write_via_guest(
+            &mut backend.store,
+            1,
+            iovs as u32,
+            MAX_WASI_IOVECS + 1,
+            nwritten as u32,
+        );
+        assert_eq!(errno, WASI_ERRNO_INVAL);
+
+        // Valid file write: path_open then fd_write journals an FsWrite and
+        // reports the exact byte count on the valid path.
+        let path_ptr = 200usize;
+        let opened_fd_ptr = 208usize;
+        {
+            let mem = memory.data_mut(&mut backend.store);
+            mem[path_ptr..path_ptr + 5].copy_from_slice(b"/data");
+        }
+        let open_errno =
+            open_via_guest(&mut backend.store, path_ptr as u32, 5, opened_fd_ptr as u32);
+        assert_eq!(open_errno, 0);
+        let fd = {
+            let mem = memory.data(&backend.store);
+            u32::from_le_bytes(
+                mem[opened_fd_ptr..opened_fd_ptr + 4]
+                    .try_into()
+                    .expect("opened fd bytes"),
+            )
+        };
+        assert!(fd >= 3, "deterministic fd must avoid stdio fds");
+        {
+            let mem = memory.data_mut(&mut backend.store);
+            mem[iovs..iovs + 8]
+                .copy_from_slice(&[64u32.to_le_bytes(), 8u32.to_le_bytes()].concat());
+            mem[64..72].copy_from_slice(&[7u8; 8]);
+        }
+        let errno = write_via_guest(&mut backend.store, fd, iovs as u32, 1, nwritten as u32);
+        assert_eq!(errno, 0);
+        {
+            let mem = memory.data(&backend.store);
+            assert_eq!(&mem[nwritten..nwritten + 4], &8u32.to_le_bytes());
+        }
+        let kinds: Vec<EntryKind> = backend
+            .store
+            .data()
+            .effects
+            .journal_snapshot()
+            .entries()
+            .map(|entry| entry.data.kind)
+            .collect();
+        assert!(
+            kinds.iter().any(|kind| matches!(kind, EntryKind::FsWrite)),
+            "journal must contain FsWrite on the valid path, got {kinds:?}"
+        );
     }
 }

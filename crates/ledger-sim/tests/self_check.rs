@@ -34,12 +34,11 @@ fn mini_kv_programs() -> Vec<Vec<Instruction>> {
 #[test]
 fn ten_thousand_same_seed_runs_produce_identical_journal_root() {
     const RUNS: u32 = 10_000;
-    let config = RunConfig {
-        seed: [7; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([7; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     let programs = mini_kv_programs();
 
     let baseline = Simulation::new(config.clone(), programs.clone())
@@ -80,12 +79,11 @@ fn self_check_covers_each_scheduling_policy() {
     ];
     let programs = mini_kv_programs();
     for policy in policies {
-        let config = RunConfig {
-            seed: [9; 32],
-            policy,
-            max_steps: 256,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([9; 32])
+            .policy(policy)
+            .max_steps(256)
+            .build();
         let a = Simulation::new(config.clone(), programs.clone())
             .run()
             .unwrap();

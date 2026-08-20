@@ -31,13 +31,12 @@ fn post_crash_value(
     program.push(Instruction::FsRead { path: "k".into() });
     program.push(Instruction::Outcome);
     program.push(Instruction::Done);
-    let config = RunConfig {
-        seed,
-        policy: Policy::Random,
-        max_steps: 256,
-        fs_journaling: mode,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed(seed)
+        .policy(Policy::Random)
+        .max_steps(256)
+        .fs_journaling(mode)
+        .build();
     let run = Simulation::new(config, vec![program]).run().unwrap();
     run.journal
         .entries()
@@ -79,12 +78,13 @@ fn journaled_crash_is_fsync_bounded_and_distinct_from_black_box() {
 /// same post-crash state and journal root.
 #[test]
 fn journaled_crash_is_deterministic() {
-    let config = |mode: JournalingMode| RunConfig {
-        seed: [22; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        fs_journaling: Some(mode),
-        ..RunConfig::default()
+    let config = |mode: JournalingMode| {
+        RunConfig::builder()
+            .seed([22; 32])
+            .policy(Policy::Random)
+            .max_steps(256)
+            .fs_journaling(Some(mode))
+            .build()
     };
     let programs = || {
         vec![vec![

@@ -11,12 +11,9 @@
 // ledger-lint:allow:rdrand (the leak-class table must name the tsc-class intrinsics)
 // ledger-lint:allow:rdseed (the leak-class table must name the tsc-class intrinsics)
 
-#![allow(unsafe_code)]
-
-use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -95,34 +92,9 @@ pub struct ProcessBeltStatus {
     pub rdrand_rdseed_present: bool,
 }
 
-/// Sentinel belt errors.
-#[derive(Debug)]
-pub enum SentinelError {
-    /// The seccomp architecture is not covered by this crate.
-    UnsupportedArch,
-    /// The built interposition shim is missing on disk.
-    ShimMissing(PathBuf),
-    /// A prctl operation failed with the given errno.
-    Prctl(&'static str, i32),
-    /// An I/O error while spawning the probe or parsing its log.
-    Io(std::io::Error),
-    /// The probe exited without the expected zero status.
-    NonZeroExit(ExitStatus),
-}
-
-impl fmt::Display for SentinelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedArch => write!(f, "sentinel belt does not support this architecture"),
-            Self::ShimMissing(path) => write!(f, "sentinel shim not found: {}", path.display()),
-            Self::Prctl(operation, errno) => write!(f, "{operation} failed with errno {errno}"),
-            Self::Io(error) => write!(f, "sentinel belt I/O error: {error}"),
-            Self::NonZeroExit(status) => write!(f, "probe did not exit cleanly: {status:?}"),
-        }
-    }
-}
-
-impl std::error::Error for SentinelError {}
+/// Sentinel belt errors are defined in `crate::sentinel` so the error type
+/// exists on every platform; the belt module re-exports it unchanged.
+pub use crate::sentinel::SentinelError;
 
 /// Return the path of the built interposition shim.
 pub fn shim_path() -> PathBuf {
@@ -158,15 +130,19 @@ pub fn install_seccomp_denylist() -> Result<(), SentinelError> {
     program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_KILL_PROCESS));
     program.push(bpf_stmt(BPF_LD_W_ABS, SECCOMP_NR_OFFSET));
     for syscall in syscalls {
+        // Kernel syscall ids are small constants; u32 holds every arch's set.
         program.push(bpf_jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
         program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_KILL_PROCESS));
     }
     program.push(bpf_stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW));
 
     let mut prog = libc::sock_fprog {
+        // Program length is 4 + 2 per denied syscall (at most 4), far below
+        // the u16 cap; the BPF kernel contract requires this field.
         len: program.len() as u16,
         filter: program.as_mut_ptr(),
     };
+    #[allow(unsafe_code)] // seccomp/prctl ffi: kernel contract requires raw syscall pointers
     unsafe {
         let ret = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
         if ret != 0 {
@@ -189,6 +165,7 @@ pub fn install_seccomp_denylist() -> Result<(), SentinelError> {
 /// Any subsequent RDTSC/RDTSCP instruction faults, so a probe that issues one
 /// dies before it can leak the timestamp. Call this only inside a subprocess.
 pub fn trap_rdtsc() -> Result<(), SentinelError> {
+    #[allow(unsafe_code)] // seccomp/prctl ffi: kernel contract requires raw syscall pointers
     unsafe {
         let ret = libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_SIGSEGV, 0, 0, 0);
         if ret != 0 {
@@ -200,6 +177,7 @@ pub fn trap_rdtsc() -> Result<(), SentinelError> {
 
 /// Allow RDTSC reads by clearing the PR_SET_TSC trap.
 pub fn allow_rdtsc() -> Result<(), SentinelError> {
+    #[allow(unsafe_code)] // seccomp/prctl ffi: kernel contract requires raw syscall pointers
     unsafe {
         let ret = libc::prctl(libc::PR_SET_TSC, libc::PR_TSC_ENABLE, 0, 0, 0);
         if ret != 0 {
@@ -213,30 +191,54 @@ pub fn allow_rdtsc() -> Result<(), SentinelError> {
 #[derive(Debug)]
 pub struct TscTrapGuard {
     active: bool,
+    activation_error: Option<SentinelError>,
 }
 
 impl TscTrapGuard {
     /// Enter a section where RDTSC reads are trapped with SIGSEGV if the belt is armed.
+    ///
+    /// The guard is active only when the trap really installed. A failed
+    /// activation stays queryable via [`TscTrapGuard::activation_error`] so
+    /// the run entry can propagate the typed error instead of pretending the
+    /// trap is in place.
     pub fn arm_if_armed() -> Self {
         if belt_armed() {
-            let _ = trap_rdtsc();
-            Self { active: true }
+            match trap_rdtsc() {
+                Ok(()) => Self {
+                    active: true,
+                    activation_error: None,
+                },
+                Err(error) => Self {
+                    active: false,
+                    activation_error: Some(error),
+                },
+            }
         } else {
-            Self { active: false }
+            Self {
+                active: false,
+                activation_error: None,
+            }
         }
+    }
+
+    /// Typed activation failure, when the RDTSC trap could not be installed.
+    ///
+    /// `None` means the trap is active or was never requested.
+    pub fn activation_error(&self) -> Option<&SentinelError> {
+        self.activation_error.as_ref()
     }
 }
 
 impl Drop for TscTrapGuard {
     fn drop(&mut self) {
-        if self.active {
-            let _ = allow_rdtsc();
+        if self.active
+            && let Err(error) = allow_rdtsc()
+        {
+            eprintln!("ledger-sim sentinel: RDTSC trap restore failed: {error}");
         }
     }
 }
 
-/// Arm the process belt for the next sim run.
-///
 /// Arm the process belt for the next sim run.
 ///
 /// The run entry hook installs the seccomp denylist and the RDTSC trap
@@ -276,6 +278,7 @@ fn belt_armed() -> bool {
 /// first collection created after installation would hit the blocked syscall
 /// and the kernel would kill the process.
 fn pre_warm_ambient_entropy() {
+    // Deliberate discard: the map exists only to seed the hasher here.
     let _ = std::collections::HashMap::<u64, u64>::new();
 }
 
@@ -297,12 +300,14 @@ pub fn install_process_belt() -> Result<ProcessBeltStatus, SentinelError> {
 /// Run-entry belt hook wired into `Simulation::run`.
 ///
 /// Warms this thread's entropy caches, then installs the seccomp denylist and
-/// the RDTSC trap when the process belt is armed. With the `sentinel` feature
-/// compiled in on Linux the belt is armed by default; `LEDGER_SENTINEL_BELT=0`
-/// (or `false`, `off`, `no`) disables it for the process. Installation happens
-/// once per process: seccomp filters cannot be removed, and stacking identical
-/// filters is wasteful. The returned status is the report a caller can log or
-/// assert; on failures the hook also emits a warning line.
+/// the RDTSC trap when the process belt is armed. The belt is NOT armed by
+/// default: `LEDGER_SENTINEL_BELT` must be set to `1`, `true`, `on`, or
+/// `yes`, or [`arm_belt`] must be called. Installation happens once per
+/// process: seccomp filters cannot be removed, and stacking identical
+/// filters is wasteful; a status record accompanies the install so later
+/// calls report it instead of reinstalling. The returned status is the
+/// report a caller can log or assert; on failures the hook also emits a
+/// warning line.
 pub fn activate_process_belt() -> BeltStatus {
     // Warm this thread's entropy caches before the filter installs, so the
     // sim's own collections never hit the blocked OS-entropy syscall.
@@ -316,13 +321,31 @@ pub fn activate_process_belt() -> BeltStatus {
         if let Some(status) = belt_status() {
             return status;
         }
-        return BeltStatus::Active {
-            rdrand_rdseed_present: false,
-        };
+        // The installed mark exists but no status was recorded (the record is
+        // first-wins and no report exists yet). Never fabricate an `Active`
+        // claim with a made-up scan result: fall through to a real install,
+        // whose stacked denylist is identical and harmless.
+        return install_and_record();
     }
-    match install_process_belt() {
+    install_and_record()
+}
+
+/// Install the process belt once and record its status.
+///
+/// The status record happens BEFORE the installed mark: a concurrent
+/// observer must never see the mark without a recorded report, or it could
+/// fabricate an `Active` claim carrying no scan result.
+fn install_and_record() -> BeltStatus {
+    install_and_record_with(install_process_belt)
+}
+
+/// [`install_and_record`] with an injectable installer, so the ordering and
+/// fall-through invariants are unit-testable without real seccomp.
+fn install_and_record_with(
+    install: impl FnOnce() -> Result<ProcessBeltStatus, SentinelError>,
+) -> BeltStatus {
+    match install() {
         Ok(belt) => {
-            BELT_INSTALLED.store(true, Ordering::Relaxed);
             let status = BeltStatus::Active {
                 rdrand_rdseed_present: belt.rdrand_rdseed_present,
             };
@@ -333,11 +356,12 @@ pub fn activate_process_belt() -> BeltStatus {
                 );
             }
             record_belt_status(&status);
+            BELT_INSTALLED.store(true, Ordering::Relaxed);
             status
         }
         Err(error) => {
-            let status = BeltStatus::Failed(error.to_string());
-            eprintln!("ledger-sim sentinel: belt activation failed: {error}");
+            let status = BeltStatus::Failed(error);
+            eprintln!("ledger-sim sentinel: {status}");
             record_belt_status(&status);
             status
         }
@@ -370,7 +394,8 @@ fn record_belt_status(status: &BeltStatus) {
 /// warning that the encodings are present, not a proof that entropy was read;
 /// unrelated data can contain the same three bytes.
 pub fn scan_rdrand_rdseed() -> Result<bool, SentinelError> {
-    let maps = std::fs::read_to_string("/proc/self/maps").map_err(SentinelError::Io)?;
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .map_err(|error| SentinelError::Io(std::sync::Arc::new(error)))?;
     let mut found = false;
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
@@ -414,6 +439,8 @@ pub fn scan_rdrand_rdseed() -> Result<bool, SentinelError> {
         if len as u64 > SCAN_CAP {
             continue;
         }
+        // Best-effort scan: an unreadable or unmappable file simply contributes
+        // no evidence; the scan result stays the verdict.
         if let Ok(mut file) = std::fs::File::open(path)
             && file.seek(SeekFrom::Start(file_offset)).is_ok()
         {
@@ -459,8 +486,11 @@ pub fn run_detected(cmd: &mut Command) -> Result<DetectionReport, SentinelError>
     }
     cmd.env("LD_PRELOAD", preload);
     cmd.env("LEDGER_SENTINEL_LOG", &log_path);
-    let status = cmd.status().map_err(SentinelError::Io)?;
+    let status = cmd
+        .status()
+        .map_err(|error| SentinelError::Io(std::sync::Arc::new(error)))?;
     if !status.success() {
+        // Deliberate best-effort cleanup; the failing exit status is the error.
         let _ = std::fs::remove_file(&log_path);
         return Err(SentinelError::NonZeroExit(status));
     }
@@ -468,8 +498,9 @@ pub fn run_detected(cmd: &mut Command) -> Result<DetectionReport, SentinelError>
         Ok(content) => content,
         // A quiet probe never triggers the shim, so no log file is created.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(SentinelError::Io(error)),
+        Err(error) => return Err(SentinelError::Io(std::sync::Arc::new(error))),
     };
+    // Deliberate best-effort cleanup of the probe log after parsing.
     let _ = std::fs::remove_file(&log_path);
     Ok(parse_log(&content))
 }
@@ -568,7 +599,7 @@ fn errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::scan_for_rdrand_rdseed;
+    use super::*;
 
     #[test]
     fn detects_rdrand_encoding() {
@@ -585,5 +616,80 @@ mod tests {
         assert!(!scan_for_rdrand_rdseed(&[0x0F, 0xC7, 0x0F]));
         assert!(!scan_for_rdrand_rdseed(&[0x0F, 0xC8, 0xF0]));
         assert!(!scan_for_rdrand_rdseed(&[0x0F, 0xC7, 0xE0]));
+    }
+
+    /// The belt-mark/status-record ordering and the fall-through rule: even
+    /// when the installed mark is present without a local record (the
+    /// first-call race), the hook must resolve through the real installer and
+    /// report its actual scan result - never a fabricated `Active` claim with
+    /// a made-up scan.
+    #[test]
+    fn installed_mark_without_record_never_fabricates_active() {
+        let status = install_and_record_with(|| {
+            Ok(ProcessBeltStatus {
+                seccomp_installed: true,
+                rdtsc_trapped: true,
+                rdrand_rdseed_present: true,
+            })
+        });
+        assert_eq!(
+            status,
+            BeltStatus::Active {
+                rdrand_rdseed_present: true
+            },
+            "the real scan result must be reported, not a fabricated one"
+        );
+        // The install mark is set only after the status record: a concurrent
+        // observer that hits the mark already finds the report in place.
+        assert!(BELT_INSTALLED.load(Ordering::Relaxed));
+        assert_eq!(
+            belt_status(),
+            Some(BeltStatus::Active {
+                rdrand_rdseed_present: true
+            })
+        );
+        // A failing installer keeps the typed error inside the variant; the
+        // process-global record keeps the first report (first call wins).
+        let failed = install_and_record_with(|| Err(SentinelError::Prctl("PR_SET_TSC", 22)));
+        assert_eq!(
+            failed,
+            BeltStatus::Failed(SentinelError::Prctl("PR_SET_TSC", 22)),
+            "the typed error must round-trip through the Failed variant"
+        );
+        assert_eq!(
+            belt_status(),
+            Some(BeltStatus::Active {
+                rdrand_rdseed_present: true
+            })
+        );
+    }
+
+    /// The TSC guard must never claim an active trap it did not install, and
+    /// a failed activation must surface the typed error instead of being
+    /// swallowed. The guard's shape follows the belt state; on kernels
+    /// without `PR_SET_TSC` the armed path reports a typed `Prctl` failure.
+    #[test]
+    fn tsc_guard_state_matches_belt_state() {
+        let was_armed = belt_armed();
+        let guard = TscTrapGuard::arm_if_armed();
+        if was_armed {
+            match guard.activation_error() {
+                Some(SentinelError::Prctl(..)) => {
+                    // Trap unavailable: the guard stays inactive and the
+                    // failure is typed, never silent.
+                }
+                Some(other) => panic!("unexpected typed activation failure: {other}"),
+                None => {
+                    // Trap installed: the guard is active and the drop below
+                    // restores PR_TSC_ENABLE.
+                }
+            }
+        } else {
+            assert!(
+                guard.activation_error().is_none(),
+                "an unarmed belt must not attempt or report a trap"
+            );
+        }
+        drop(guard);
     }
 }

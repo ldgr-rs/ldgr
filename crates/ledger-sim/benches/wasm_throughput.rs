@@ -1,11 +1,21 @@
 //! Wasm throughput benchmark.
-// ledger-lint:allow (host-side benchmark reads the guest artifact from disk; it is not simulation code)
 //!
 //! Target: >= 100k journaled entries/s at ~10k guest instructions/entry. The
 //! guest `run_throughput` entry journals one `RngDraw` per ~10k-instruction
 //! compute loop. This benchmark measures how many of those journaled entries
 //! the Wasm backend sustains per second, including wasmtime execution, host
 //! boundary crossing, and journal hashing.
+//!
+//! The empty-export bench isolates pure wasmtime trampoline cost (no host
+//! calls, no journaling). Together the two benches show whether crossing cost
+//! justifies a batch descriptor export (A3) or the dominant cost is journal
+//! hashing.
+//!
+//! Methodology: release guest artifact only; engine and module compiled once
+//! outside the timed section; criterion `iter_batched` with `SmallInput` to
+//! isolate steady-state dispatch; 10 samples, 2s warmup. All rates are
+//! wall-clock host time, never an input to simulation.
+// ledger-lint:allow (host-side benchmark reads the guest artifact from disk; it is not simulation code)
 #![cfg(feature = "backend-wasm")]
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -41,7 +51,7 @@ fn bench_w1_throughput(c: &mut Criterion) {
             },
             |mut backend| {
                 let _ = backend.run_export("run_throughput").unwrap();
-                let journal = backend.journal().lock().unwrap();
+                let journal = backend.journal_snapshot();
                 let count = journal.len();
                 assert!(
                     count as u64 >= ENTRIES_PER_RUN,
@@ -53,9 +63,28 @@ fn bench_w1_throughput(c: &mut Criterion) {
     });
 }
 
+fn bench_empty_export_trampoline(c: &mut Criterion) {
+    let wasm = load_guest();
+    let engine = WasmBackend::new_engine().unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm).unwrap();
+    c.bench_function("w1_empty_export_trampoline", |b| {
+        b.iter_batched(
+            || {
+                WasmBackend::from_module(SeedTree::new([0; 32]), &module)
+                    .unwrap()
+                    .with_fuel_budget(2_000_000_000)
+            },
+            |mut backend| {
+                backend.run_export("run_empty").unwrap();
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     name = wasm_benches;
     config = Criterion::default().sample_size(10).warm_up_time(std::time::Duration::from_secs(2));
-    targets = bench_w1_throughput
+    targets = bench_w1_throughput, bench_empty_export_trampoline
 );
 criterion_main!(wasm_benches);

@@ -23,8 +23,6 @@ ledger-journal = { path = "../ledger-journal" }
 cc = "1"
 
 [features]
-default = ["backend-native"]
-backend-native = []
 backend-wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
 sentinel = ["dep:libc"]
 sim-fs-journaling = []
@@ -33,6 +31,7 @@ sim-fs-journaling = []
 proptest.workspace = true
 futures.workspace = true
 criterion.workspace = true
+serde_json = "1"
 
 [[bin]]
 name = "sentinel-probe"

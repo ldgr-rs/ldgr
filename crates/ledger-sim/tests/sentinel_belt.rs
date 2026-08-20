@@ -6,8 +6,7 @@
 
 #![cfg(all(feature = "sentinel", target_os = "linux"))]
 
-use ledger_sim::sentinel_belt::{DetectionReport, run_detected};
-use ledger_sim::{LeakClass, Sentinel};
+use ledger_sim::{DetectionReport, LeakClass, Sentinel, run_detected};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -160,8 +159,7 @@ fn run_path_completes_under_armed_belt() {
 /// error and return a bool report.
 #[test]
 fn rdrand_rdseed_scan_reports_without_error() {
-    let present =
-        ledger_sim::sentinel_belt::scan_rdrand_rdseed().expect("opcode scan must not fail");
+    let present = ledger_sim::scan_rdrand_rdseed().expect("opcode scan must not fail");
     // Any bool is a valid report; the value itself is informational.
     let _ = present;
 }

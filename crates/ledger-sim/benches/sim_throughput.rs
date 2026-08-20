@@ -40,12 +40,11 @@ fn throughput_programs(steps_per_task: u64) -> Vec<Vec<Instruction>> {
 
 fn bench_sim_throughput(c: &mut Criterion) {
     let programs = throughput_programs(500);
-    let config = RunConfig {
-        seed: [1; 32],
-        policy: Policy::Random,
-        max_steps: 200_000,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([1; 32])
+        .policy(Policy::Random)
+        .max_steps(200_000)
+        .build();
     let mut group = c.benchmark_group("sim_throughput");
     group
         .bench_function("events_per_second_4_task", |b| {

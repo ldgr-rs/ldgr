@@ -74,6 +74,27 @@ fn run_w0_guest() -> Vec<u8> {
             |_: Caller<'_, Mutex<WasiP1Ctx>>, _peer: u32| -> i64 { -1 },
         )
         .unwrap();
+    linker
+        .func_wrap(
+            "ledger",
+            "ledger_fs_write",
+            |_: Caller<'_, Mutex<WasiP1Ctx>>, _ptr: u32, _len: u32, _value: u64| -> u32 { 0 },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "ledger",
+            "ledger_fs_read",
+            |_: Caller<'_, Mutex<WasiP1Ctx>>, _ptr: u32, _len: u32| -> i64 { -1 },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "ledger",
+            "ledger_fs_crash",
+            |_: Caller<'_, Mutex<WasiP1Ctx>>| {},
+        )
+        .unwrap();
 
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let run = instance

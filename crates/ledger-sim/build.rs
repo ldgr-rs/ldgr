@@ -15,7 +15,7 @@ fn main() {
         let compiler = cc::Build::new().get_compiler();
         let mut cmd = std::process::Command::new(compiler.path());
         cmd.args(compiler.args());
-        cmd.args(["-fPIC", "-shared", "-o", &shim_path]);
+        cmd.args(["-fPIC", "-shared", "-pthread", "-o", &shim_path]);
         cmd.arg("src/sentinel_shim.c");
         let status = cmd.status().expect("C compiler must run");
         assert!(status.success(), "failed to build the sentinel shim");
