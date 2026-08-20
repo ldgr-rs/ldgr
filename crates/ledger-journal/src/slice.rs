@@ -8,11 +8,6 @@ use crate::dag::{Journal, JournalError, JournalState};
 use ledger_format::Hash;
 
 impl Journal {
-    /// Return the causal backward closure of a single entry.
-    pub fn causal_closure(&self, start: Hash) -> Result<Vec<Hash>, JournalError> {
-        self.causal_slice(&[start])
-    }
-
     /// Return the joint backward causal closure of multiple target entries.
     pub fn causal_slice(&self, targets: &[Hash]) -> Result<Vec<Hash>, JournalError> {
         for target in targets {
@@ -34,7 +29,7 @@ impl Journal {
             }
         }
         Ok(self
-            .order()
+            .base_order()
             .iter()
             .chain(self.state.overlay_order.iter())
             .copied()
@@ -58,7 +53,7 @@ impl Journal {
                 affected.insert(entry.id);
             }
         }
-        self.order()
+        self.base_order()
             .iter()
             .chain(self.state.overlay_order.iter())
             .copied()
@@ -85,7 +80,11 @@ impl Journal {
         let mut sub_heads = HashMap::new();
         let mut sub_order = Vec::new();
 
-        for id in self.order().iter().chain(self.state.overlay_order.iter()) {
+        for id in self
+            .base_order()
+            .iter()
+            .chain(self.state.overlay_order.iter())
+        {
             if set.contains(id)
                 && let Some(arc_entry) = self.get_arc(id)
             {

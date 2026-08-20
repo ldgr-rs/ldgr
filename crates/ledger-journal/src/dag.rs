@@ -115,16 +115,35 @@ impl Entry {
         vector_clock: VectorClock,
         scratch: &mut Vec<u8>,
     ) -> Result<Self, JournalError> {
+        Ok(Self::new_with_scratch_recorded(data, vector_clock, scratch)?.0)
+    }
+
+    /// [`Self::new_with_scratch`] plus the byte length of the canonical
+    /// `EntryData` prefix written into `scratch`.
+    ///
+    /// The batch storage path reuses the scratch bytes as an
+    /// already-encoded frame payload and needs the data/clock split point
+    /// without re-encoding. The hashed bytes are identical to
+    /// [`Self::new_with_scratch`].
+    pub(crate) fn new_with_scratch_recorded(
+        data: EntryData,
+        vector_clock: VectorClock,
+        scratch: &mut Vec<u8>,
+    ) -> Result<(Self, usize), JournalError> {
         scratch.clear();
         data.encode_into(scratch)
             .map_err(|err| JournalError::InvalidPayload(err.to_string()))?;
+        let data_len = scratch.len();
         vector_clock.encode_into(scratch);
         let id = *blake3::hash(&*scratch).as_bytes();
-        Ok(Self {
-            id,
-            data,
-            vector_clock,
-        })
+        Ok((
+            Self {
+                id,
+                data,
+                vector_clock,
+            },
+            data_len,
+        ))
     }
 }
 
@@ -171,6 +190,95 @@ impl JournalState {
             }
         }
     }
+}
+
+/// One pending entry of a [`Journal::append_batch`] call.
+///
+/// Fields mirror the parameters of [`Journal::append`]; see the field docs
+/// for how parents are assembled inside a batch.
+#[derive(Debug, Clone)]
+pub struct BatchEntry {
+    /// Journal event kind.
+    pub kind: EntryKind,
+    /// Appending actor.
+    pub actor: ActorId,
+    /// Observed external parents known before the batch starts.
+    ///
+    /// Order is preserved. Duplicates of already-listed parents are dropped
+    /// exactly as in [`Journal::append`].
+    pub observed_parents: Vec<Hash>,
+    /// Append the previous batch entry's id as a trailing observed parent.
+    ///
+    /// "Previous" is the immediately preceding entry of the same
+    /// [`Journal::append_batch`] call. Entries whose causal parent is an
+    /// earlier entry of the same group (`Wake` after `TimerFire`, a fault
+    /// after its `Send`) cannot list that parent up front because the id
+    /// does not exist until the earlier entry is hashed; this flag resolves
+    /// it at append time. The reference is skipped when it duplicates an
+    /// existing parent, matching [`Journal::append`], and when the entry is
+    /// first in its call.
+    pub chain_previous: bool,
+    /// Payload covered by the content hash.
+    pub payload: Payload,
+}
+
+impl BatchEntry {
+    /// A batch entry with no observed parents.
+    pub fn new(kind: EntryKind, actor: ActorId, payload: Payload) -> Self {
+        Self {
+            kind,
+            actor,
+            observed_parents: Vec::new(),
+            chain_previous: false,
+            payload,
+        }
+    }
+
+    /// Chain this entry to the immediately preceding batch entry.
+    pub fn chained(mut self) -> Self {
+        self.chain_previous = true;
+        self
+    }
+}
+
+/// Encoded result pieces of one appended entry.
+///
+/// `payload` holds the canonical `data || vector_clock` bytes whose BLAKE3
+/// digest is `id`; `data_len` marks the split between the two parts. The
+/// segment writer turns these into storage frames without a second CBOR
+/// pass over the entry.
+#[derive(Debug, Clone)]
+pub struct EntryFrame {
+    /// Content address of the encoded entry.
+    pub id: Hash,
+    /// Byte length of the canonical `EntryData` prefix of `payload`.
+    pub data_len: usize,
+    /// Canonical `data || vector_clock` bytes.
+    pub payload: Vec<u8>,
+    /// True when the entry kind belongs to the fault-relevant set.
+    ///
+    /// Carried so frame-based storage writes preserve the sealed-segment
+    /// warm-retention flag without re-decoding payloads.
+    pub fault_relevant: bool,
+}
+
+/// Return true when an entry kind belongs to the fault-relevant set.
+///
+/// The warm retention tier keeps segments carrying these kinds loose.
+pub(crate) fn kind_is_fault_relevant(kind: &EntryKind) -> bool {
+    matches!(
+        kind,
+        EntryKind::Fault { .. } | EntryKind::Outcome | EntryKind::Assert
+    )
+}
+
+/// Overlay-then-base entry lookup on an exclusively borrowed state.
+fn state_lookup<'a>(state: &'a JournalState, id: &Hash) -> Option<&'a Entry> {
+    state
+        .overlay
+        .get(id)
+        .or_else(|| state.base.get(id))
+        .map(Arc::as_ref)
 }
 
 /// An append-only in-memory journal view. Forks share immutable entries.
@@ -250,7 +358,7 @@ impl Journal {
         let (sequence, head_entry) = match previous_head {
             Some(head) => {
                 let entry = self.get(&head).ok_or(JournalError::MissingParent(head))?;
-                (entry.data.sequence + 1, Some(entry))
+                (entry.data.sequence.saturating_add(1), Some(entry))
             }
             None => (0, None),
         };
@@ -296,6 +404,162 @@ impl Journal {
             state.freeze_overlay();
         }
         Ok(id)
+    }
+
+    /// Append a group of entries in order, returning their content addresses.
+    ///
+    /// Byte-equality contract: appending `batch` produces ids, vector
+    /// clocks, per-entry parents, and the journal root hash byte-identical
+    /// to calling [`Journal::append`] once per item in the same order. Ids
+    /// stay eager and per-entry; each entry hashes its own canonical bytes,
+    /// so a following same-actor entry consumes that id as its head parent
+    /// exactly as before. Only bookkeeping is amortized: one shared-state
+    /// claim, capacity reserves, and one overlay-freeze threshold check per
+    /// batch instead of per entry.
+    ///
+    /// Entries are applied in order until the first invalid payload, which
+    /// returns [`JournalError::InvalidPayload`] and leaves the already
+    /// applied prefix in place, mirroring how an [`Journal::append`] failure
+    /// leaves earlier appends untouched.
+    ///
+    /// An empty batch changes nothing and does not claim shared state.
+    pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<Hash>, JournalError> {
+        self.append_batch_impl(batch, None)
+    }
+
+    /// [`Journal::append_batch`] plus the canonical frame payload of every
+    /// appended entry pushed onto `frames`.
+    ///
+    /// Storage reuses these bytes instead of re-encoding each entry. On an
+    /// error the frames of the successfully appended prefix stay on `frames`
+    /// in append order.
+    #[cfg(feature = "std")]
+    pub(crate) fn append_batch_with_frames(
+        &mut self,
+        batch: Vec<BatchEntry>,
+        frames: &mut Vec<EntryFrame>,
+    ) -> Result<Vec<Hash>, JournalError> {
+        frames.reserve(batch.len());
+        self.append_batch_impl(batch, Some(frames))
+    }
+
+    fn append_batch_impl(
+        &mut self,
+        batch: Vec<BatchEntry>,
+        mut frames: Option<&mut Vec<EntryFrame>>,
+    ) -> Result<Vec<Hash>, JournalError> {
+        let count = batch.len();
+        let mut ids = Vec::with_capacity(count);
+        if count == 0 {
+            return Ok(ids);
+        }
+
+        // One claim covers the whole batch; later entries mutate the
+        // unshared state directly, like repeated post-fork appends do.
+        let state = Arc::make_mut(&mut self.state);
+        state.overlay.reserve(count);
+        state.overlay_order.reserve(count);
+
+        for spec in batch {
+            let previous_head = state.heads.get(&spec.actor).copied();
+
+            // Parent assembly mirrors `append` exactly: actor head first,
+            // then observed parents in order, deduplicated against the
+            // parents already listed. The chained reference resolves after
+            // those and lands last.
+            let mut parents = Vec::with_capacity(
+                spec.observed_parents.len()
+                    + usize::from(previous_head.is_some())
+                    + usize::from(spec.chain_previous),
+            );
+            if let Some(previous) = previous_head {
+                parents.push(previous);
+            }
+            for parent in spec.observed_parents.iter() {
+                if !parents.contains(parent) {
+                    parents.push(*parent);
+                }
+            }
+            if spec.chain_previous
+                && let Some(previous_id) = ids.last().copied()
+                && !parents.contains(&previous_id)
+            {
+                parents.push(previous_id);
+            }
+
+            // Sequence probe. The head must exist exactly as in `append`;
+            // a missing head fails before any clock work.
+            let head_info: Option<(u64, VectorClock)> = match previous_head {
+                Some(head) => {
+                    let entry =
+                        state_lookup(state, &head).ok_or(JournalError::MissingParent(head))?;
+                    Some((entry.data.sequence, entry.vector_clock.clone()))
+                }
+                None => None,
+            };
+            let sequence = match &head_info {
+                Some((previous_sequence, _)) => previous_sequence.saturating_add(1),
+                None => 0,
+            };
+
+            // Clock merge mirrors `append`: a single parent clones its
+            // clock directly as the fast path, several parents merge in
+            // parent order, none starts from the empty clock.
+            let mut clock = VectorClock::default();
+            if parents.len() == 1 {
+                if previous_head.is_some() {
+                    clock = head_info.map_or_else(VectorClock::new, |(_, c)| c);
+                } else {
+                    let entry = state_lookup(state, &parents[0])
+                        .ok_or(JournalError::MissingParent(parents[0]))?;
+                    clock = entry.vector_clock.clone();
+                }
+            } else if !parents.is_empty() {
+                for parent in &parents {
+                    let entry =
+                        state_lookup(state, parent).ok_or(JournalError::MissingParent(*parent))?;
+                    clock = clock.merge(&entry.vector_clock);
+                }
+            }
+            clock = clock.incremented(spec.actor);
+
+            let data = EntryData {
+                kind: spec.kind,
+                actor: spec.actor,
+                parents,
+                vector_clock: Vec::new(),
+                sequence,
+                payload: spec.payload,
+            };
+
+            // Eager per-entry hashing: identical bytes and ids as
+            // `Entry::new_with_scratch` (same implementation).
+            let (entry, data_len) =
+                Entry::new_with_scratch_recorded(data, clock, &mut self.scratch)?;
+            let id = entry.id;
+
+            if let Some(out) = frames.as_deref_mut() {
+                out.push(EntryFrame {
+                    id,
+                    data_len,
+                    payload: self.scratch.clone(),
+                    fault_relevant: kind_is_fault_relevant(&spec.kind),
+                });
+            }
+
+            state.overlay.insert(id, Arc::new(entry));
+            state.overlay_order.push(id);
+            state.heads.insert(spec.actor, id);
+            ids.push(id);
+        }
+
+        // One threshold check per batch. Freezing at batch end leaves the
+        // same observable maps as freezing mid-batch: entries keep their
+        // lookup path (overlay before base) either way.
+        if state.overlay.len() >= OVERLAY_THRESHOLD {
+            state.freeze_overlay();
+        }
+        Ok(ids)
     }
 
     /// Look up an entry by content address.
@@ -352,8 +616,12 @@ impl Journal {
         *hasher.finalize().as_bytes()
     }
 
-    /// Return raw order vector.
-    pub fn order(&self) -> &[Hash] {
+    /// Return the frozen base order vector.
+    ///
+    /// Only the base is returned; the overlay order lives separately and is
+    /// chained by callers that need the full view. The name makes the
+    /// partial view explicit.
+    pub fn base_order(&self) -> &[Hash] {
         &self.state.order
     }
 }
@@ -464,7 +732,7 @@ mod tests {
         assert_eq!(fork.len(), extra);
         let last = fork.entries().last().unwrap();
         assert!(fork.get(&last.id).is_some());
-        assert_eq!(fork.order().len(), OVERLAY_THRESHOLD * 2);
+        assert_eq!(fork.base_order().len(), OVERLAY_THRESHOLD * 2);
         assert_eq!(
             fork.entries().count(),
             OVERLAY_THRESHOLD * 2 + 10,
@@ -483,7 +751,7 @@ mod tests {
         }
         assert_eq!(fork.len(), extra);
         assert_eq!(
-            fork.order().len(),
+            fork.base_order().len(),
             0,
             "shared base must not be rebased while the original is alive"
         );

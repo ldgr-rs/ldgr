@@ -103,7 +103,9 @@ impl Snapshot {
             ));
         }
         let actor = match &items[0] {
-            CborValue::Unsigned(actor) => *actor as ActorId,
+            CborValue::Unsigned(actor) => u32::try_from(*actor).map_err(|_| {
+                JournalError::SnapshotStoreError("snapshot actor exceeds u32".into())
+            })?,
             _ => {
                 return Err(JournalError::SnapshotStoreError(
                     "snapshot actor is not an unsigned integer".into(),
@@ -176,7 +178,9 @@ fn decode_vector_clock(bytes: &[u8]) -> Result<VectorClock, JournalError> {
     let mut entries = BTreeMap::new();
     for (key, val) in pairs {
         let actor = match key {
-            CborValue::Unsigned(actor) => actor as ActorId,
+            CborValue::Unsigned(actor) => u32::try_from(actor).map_err(|_| {
+                JournalError::SnapshotStoreError("vector clock actor exceeds u32".into())
+            })?,
             _ => {
                 return Err(JournalError::SnapshotStoreError(
                     "vector clock key is not an unsigned integer".into(),

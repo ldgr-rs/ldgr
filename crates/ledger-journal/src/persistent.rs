@@ -1,5 +1,5 @@
 //! Durable facade over an in-memory [`Journal`] and a [`SegmentStore`].
-// ledger-lint:allow (storage infrastructure uses the ambient filesystem by design, same as segment.rs)
+// ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design, same as segment.rs)
 //!
 //! The in-memory journal is the authority for reads and for the DAG; the
 //! segment store is the durable copy. Every append is written to both, so
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::string::ToString;
 use std::vec::Vec;
 
-use crate::dag::{Entry, Journal, JournalError};
+use crate::dag::{BatchEntry, Entry, Journal, JournalError};
 use crate::monitor::{JournalCorrectnessMonitor, VerificationReport};
 use crate::retention::RetentionClass;
 use crate::segment::{SealedSegment, SegmentStore};
@@ -212,6 +212,42 @@ impl PersistentJournal {
         Ok(id)
     }
 
+    /// Append a group of entries to the journal and the store, returning ids.
+    ///
+    /// Byte-identical to looping [`Self::append`]; see
+    /// [`Journal::append_batch`] for the equality contract. The store side
+    /// consumes the journal's canonical bytes through the frame path, so an
+    /// entry encodes once for hashing and storage together.
+    ///
+    /// Failure semantics match [`Self::append`]: a journal validation error
+    /// leaves the applied prefix on both sides and must be treated as
+    /// terminal.
+    pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<Hash>, JournalError> {
+        let mut frames = Vec::with_capacity(batch.len());
+        let ids = self.journal.append_batch_with_frames(batch, &mut frames)?;
+        self.store.append_frames(&frames)?;
+        for id in &ids {
+            let entry = self.journal.get(id).ok_or_else(|| {
+                JournalError::InvariantViolation("appended entry missing from journal".to_string())
+            })?;
+            if self
+                .snapshots
+                .should_snapshot(entry.data.actor, entry.data.sequence)
+            {
+                let snapshot = Snapshot::new(
+                    entry.data.actor,
+                    entry.data.sequence,
+                    *id,
+                    entry.vector_clock.clone(),
+                    Vec::new(),
+                );
+                self.snapshots.record_snapshot(snapshot.clone());
+                self.snapshot_store.append(&snapshot)?;
+            }
+        }
+        Ok(ids)
+    }
+
     /// Look up an entry by content address in the in-memory journal.
     pub fn get(&self, id: &Hash) -> Option<&Entry> {
         self.journal.get(id)
@@ -365,6 +401,152 @@ mod tests {
             matches!(result, Err(JournalError::InvariantViolation(_))),
             "replay must reject a clock the DAG cannot re-derive"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One step of the round-trip stream.
+    struct Step {
+        kind: EntryKind,
+        actor: ActorId,
+        payload: Payload,
+        /// Observe the id produced `back` steps earlier (0 = none).
+        observed_backs: Vec<usize>,
+        /// Chain to the immediately preceding step of the same group.
+        chain: bool,
+    }
+
+    /// Five-step groups shaped like the executor's quiescent groups: a
+    /// chained TimerFire/Wake pair for actor 1, then Send and Recv for
+    /// actor 2 where the Recv observes its Send.
+    fn stream(groups: usize) -> Vec<Step> {
+        let mut steps = Vec::with_capacity(groups * 5);
+        for round in 0..groups {
+            steps.push(Step {
+                kind: EntryKind::TimerSet,
+                actor: 1,
+                payload: Payload::Number(round as u64),
+                observed_backs: Vec::new(),
+                chain: false,
+            });
+            steps.push(Step {
+                kind: EntryKind::TimerFire,
+                actor: 1,
+                payload: Payload::Empty,
+                observed_backs: Vec::new(),
+                chain: true,
+            });
+            steps.push(Step {
+                kind: EntryKind::Wake,
+                actor: 1,
+                payload: Payload::Empty,
+                observed_backs: Vec::new(),
+                chain: true,
+            });
+            steps.push(Step {
+                kind: EntryKind::Send,
+                actor: 2,
+                payload: Payload::Pair {
+                    left: 1,
+                    right: round as u64,
+                },
+                observed_backs: vec![3],
+                chain: false,
+            });
+            steps.push(Step {
+                kind: EntryKind::Recv,
+                actor: 2,
+                payload: Payload::Number(round as u64),
+                observed_backs: vec![1],
+                chain: false,
+            });
+        }
+        steps
+    }
+
+    fn apply_sequential(journal: &mut Journal, steps: &[Step]) -> Vec<Hash> {
+        let mut ids = Vec::with_capacity(steps.len());
+        for step in steps {
+            let mut observed: Vec<Hash> = step
+                .observed_backs
+                .iter()
+                .filter_map(|back| back.checked_sub(1).and_then(|i| ids.get(i).copied()))
+                .collect();
+            if step.chain
+                && let Some(previous) = ids.last().copied()
+                && !observed.contains(&previous)
+            {
+                observed.push(previous);
+            }
+            ids.push(
+                journal
+                    .append(step.kind, step.actor, observed, step.payload.clone())
+                    .unwrap(),
+            );
+        }
+        ids
+    }
+
+    #[test]
+    fn append_batch_round_trips_through_disk() {
+        let dir = temp_dir("batch-round-trip");
+        let steps = stream(6);
+
+        // Sequential in-memory reference over the identical op stream.
+        let mut reference = Journal::new();
+        let sequential_ids = apply_sequential(&mut reference, &steps);
+
+        // Batched run through the durable facade, one group per batch call.
+        let mut persisted_ids = Vec::new();
+        {
+            let mut journal = PersistentJournal::create(&dir).unwrap();
+            for group in steps.chunks(5) {
+                let batch: Vec<BatchEntry> = group
+                    .iter()
+                    .enumerate()
+                    .map(|(position, step)| {
+                        let global_index = persisted_ids.len() + position;
+                        let visible = &sequential_ids[..global_index];
+                        let mut entry =
+                            BatchEntry::new(step.kind, step.actor, step.payload.clone());
+                        for index in step
+                            .observed_backs
+                            .iter()
+                            .filter_map(|back| back.checked_sub(1))
+                            .filter(|index| *index < visible.len())
+                        {
+                            entry.observed_parents.push(visible[index]);
+                        }
+                        if step.chain && position > 0 {
+                            entry.chain_previous = true;
+                        } else if step.chain && global_index > 0 {
+                            entry.observed_parents.push(visible[visible.len() - 1]);
+                        }
+                        entry
+                    })
+                    .collect();
+                persisted_ids.extend(journal.append_batch(batch).unwrap());
+                if persisted_ids.len() == 15 {
+                    journal.force_seal().unwrap();
+                }
+            }
+            journal.write_manifest().unwrap();
+        }
+
+        assert_eq!(persisted_ids, sequential_ids, "ids must be byte-identical");
+
+        let reopened = PersistentJournal::open(&dir).unwrap();
+        assert_eq!(
+            reopened.len(),
+            steps.len(),
+            "every batched entry must persist"
+        );
+        assert_eq!(reopened.root_hash(), reference.root_hash());
+        reopened.verify().unwrap();
+        for (id, expected) in reopened.entries().zip(reference.entries()) {
+            assert_eq!(id.id, expected.id);
+            assert_eq!(id.data, expected.data);
+            assert_eq!(id.vector_clock, expected.vector_clock);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

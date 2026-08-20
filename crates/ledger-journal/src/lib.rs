@@ -31,13 +31,13 @@ pub mod snapshot;
 pub mod snapshot_store;
 
 pub use clock::VectorClock;
-pub use dag::{Entry, Journal, JournalError};
+pub use dag::{BatchEntry, Entry, EntryFrame, Journal, JournalError};
 pub use monitor::{JournalCorrectnessMonitor, MonitorIssue, VerificationReport};
 #[cfg(feature = "std")]
 pub use persistent::PersistentJournal;
 pub use retention::RetentionClass;
 #[cfg(feature = "std")]
-pub use segment::{SealedSegment, SegmentHeader, SegmentStore, SegmentWriter};
+pub use segment::{SealedSegment, SegmentStore, SegmentWriter};
 pub use snapshot::{Snapshot, SnapshotManager};
 #[cfg(feature = "std")]
 pub use snapshot_store::SnapshotStore;

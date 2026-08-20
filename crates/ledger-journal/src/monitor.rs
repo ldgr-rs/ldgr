@@ -379,23 +379,7 @@ fn cmp_issue(left: &MonitorIssue, right: &MonitorIssue) -> Ordering {
 /// Compare two vector clocks by their canonical (actor, value) pair sequences
 /// in ascending actor order.
 fn cmp_clock(left: &VectorClock, right: &VectorClock) -> Ordering {
-    let mut left_iter = left.iter();
-    let mut right_iter = right.iter();
-    loop {
-        match (left_iter.next(), right_iter.next()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some((left_actor, left_value)), Some((right_actor, right_value))) => {
-                let ord = left_actor
-                    .cmp(&right_actor)
-                    .then(left_value.cmp(&right_value));
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-        }
-    }
+    left.iter().cmp(right.iter())
 }
 
 /// Map a kind to a stable display name for issue reporting.
