@@ -203,18 +203,6 @@ pub enum Payload {
 }
 
 impl Payload {
-    /// Encodes the payload into canonical CBOR bytes.
-    ///
-    /// Infallible by contract. The journal stores only primitive payload
-    /// forms, which cannot fail to encode. Use [`Self::try_encode`] when the
-    /// payload may carry a user-supplied [`CborValue`].
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        let start = out.len();
-        if self.try_encode(out).is_err() {
-            out.truncate(start);
-        }
-    }
-
     /// Encodes the payload into canonical CBOR bytes, reporting the error.
     ///
     /// On error the buffer may contain partial bytes; the caller must discard
@@ -279,22 +267,6 @@ pub struct EntryData {
 }
 
 impl EntryData {
-    /// Encodes all hash-covered fields in canonical CBOR.
-    ///
-    /// Infallible by construction. The kind encoding, actor, parents, vector
-    /// clock, and sequence are structural and cannot fail. The payload encodes
-    /// only primitive forms in journal entries produced by the engine; a
-    /// [`Payload::Value`] carrying a non-canonical float or a disallowed tag
-    /// is a caller contract violation and is omitted rather than panicked on.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        let start = out.len();
-        if self.encode_into(&mut out).is_err() {
-            out.truncate(start);
-        }
-        out
-    }
-
     /// Encodes all hash-covered fields in canonical CBOR, reporting failures.
     ///
     /// Callers that accept payloads from untrusted sources must use this path

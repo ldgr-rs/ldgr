@@ -33,7 +33,7 @@ func TestMinimalFloatWidth(t *testing.T) {
 
 func TestFloatBoundaryWidths(t *testing.T) {
 	// Every expected byte pattern below is verified against the Rust reference
-	// encoder encode_minimal_float in crates/ledger-format/src/cbor.rs, which
+	// encoder encode_minimal_float in crates/ledger-format/src/cbor, which
 	// the differential corpus also pins. The cases exercise the f32BitsToF16
 	// boundary branches: max finite normal, the mantissa-overflow carry, the
 	// exponent overflow, subnormals, round-to-zero, and infinities.

@@ -212,9 +212,7 @@ impl RunManifest {
                             ));
                         }
                     };
-                    if map.insert(actor, hash).is_some() {
-                        return Err(CborError::DuplicateMapKey);
-                    }
+                    map.insert(actor, hash);
                 }
                 map
             }

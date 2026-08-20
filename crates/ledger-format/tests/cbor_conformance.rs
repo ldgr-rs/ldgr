@@ -88,12 +88,12 @@ fn entry(kind: EntryKind, actor: u32, payload: Payload) -> EntryData {
 fn payload_empty_round_trips() {
     // Payload::Empty encodes as array(1) followed by discriminant 6: [0x81, 0x06].
     let mut out = Vec::new();
-    Payload::Empty.encode(&mut out);
+    Payload::Empty.try_encode(&mut out).unwrap();
     assert_eq!(out, vec![0x81, 0x06]);
 
     // In a full entry the payload is the final element of the 6-item array.
     let data = entry(EntryKind::Spawn, 0, Payload::Empty);
-    let bytes = data.canonical_bytes();
+    let bytes = data.try_canonical_bytes().unwrap();
     assert_eq!(bytes[0], 0x86);
     assert!(bytes.ends_with(&[0x81, 0x06]));
 }
@@ -493,7 +493,7 @@ fn tolerant_reader_enforces_depth_limit() {
 fn entry_kind_structured_encoding_stable() {
     let rng = entry(EntryKind::RngDraw { stream: 7 }, 0, Payload::Empty);
     assert_eq!(
-        rng.canonical_bytes(),
+        rng.try_canonical_bytes().unwrap(),
         vec![0x86, 0x82, 0x0b, 0x07, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06]
     );
 
@@ -506,7 +506,7 @@ fn entry_kind_structured_encoding_stable() {
         Payload::Empty,
     );
     assert_eq!(
-        step.canonical_bytes(),
+        step.try_canonical_bytes().unwrap(),
         vec![
             0x86, 0x83, 0x10, 0x02, 0x03, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
         ]
@@ -520,7 +520,7 @@ fn entry_kind_structured_encoding_stable() {
         Payload::Empty,
     );
     assert_eq!(
-        crash.canonical_bytes(),
+        crash.try_canonical_bytes().unwrap(),
         vec![
             0x86, 0x82, 0x15, 0x82, 0x05, 0x03, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
         ]
@@ -534,7 +534,7 @@ fn entry_kind_structured_encoding_stable() {
         Payload::Empty,
     );
     assert_eq!(
-        delay.canonical_bytes(),
+        delay.try_canonical_bytes().unwrap(),
         vec![
             0x86, 0x82, 0x15, 0x82, 0x01, 0x18, 0x64, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
         ]
@@ -548,7 +548,7 @@ fn entry_kind_structured_encoding_stable() {
         Payload::Empty,
     );
     assert_eq!(
-        partition.canonical_bytes(),
+        partition.try_canonical_bytes().unwrap(),
         vec![
             0x86, 0x82, 0x15, 0x83, 0x02, 0x01, 0x02, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
         ]
@@ -562,12 +562,15 @@ fn entry_kind_structured_encoding_stable() {
         Payload::Empty,
     );
     assert_eq!(
-        drop.canonical_bytes(),
+        drop.try_canonical_bytes().unwrap(),
         vec![0x86, 0x82, 0x15, 0x00, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06]
     );
 
     for data in [&rng, &step, &crash, &delay, &partition, &drop] {
-        assert_eq!(data.canonical_bytes(), data.canonical_bytes());
+        assert_eq!(
+            data.try_canonical_bytes().unwrap(),
+            data.try_canonical_bytes().unwrap()
+        );
     }
 }
 

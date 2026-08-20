@@ -11,10 +11,12 @@ extern crate std;
 
 pub mod cbor;
 pub mod entry;
+pub mod hex;
 pub mod manifest;
 
 pub use cbor::{CborError, CborValue, TolerantReader, compare_canonical_keys, parse_tolerant};
 pub use entry::{
     ActorId, EntryData, EntryKind, FaultSpec, GenId, Hash, InputKey, Payload, StreamId,
 };
+pub use hex::{HexError, hash_from_hex, hash_to_hex};
 pub use manifest::{MANIFEST_FORMAT_VERSION, ManifestVersion, RunManifest};

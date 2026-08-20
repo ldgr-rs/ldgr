@@ -2,7 +2,7 @@
 // encoder and a differential test runner against the Rust golden fixtures.
 //
 // The Go encoder must produce byte-identical output to the Rust encoder in
-// crates/ledger-format/src/cbor.rs for the shared fixture corpus.
+// crates/ledger-format/src/cbor for the shared fixture corpus.
 package main
 
 import (

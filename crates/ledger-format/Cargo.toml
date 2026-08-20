@@ -8,10 +8,9 @@ description = "Canonical format, entry types, and CBOR encoding for the Ledger D
 
 [features]
 default = ["std"]
-std = ["blake3/std"]
+std = []
 
 [dependencies]
-blake3 = { version = "1.8", default-features = false }
 
 [lints]
 workspace = true

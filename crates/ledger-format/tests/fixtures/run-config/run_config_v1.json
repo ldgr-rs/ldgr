@@ -1,0 +1,377 @@
+{
+  "encoder": "ledger-sim config_canonical (versioned canonical CBOR)",
+  "format": "run-config-canonical",
+  "format_version": 1,
+  "hash_algorithm": "blake3",
+  "schema_version": 1,
+  "shapes": [
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "tag": "random"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "07f853f933813b97e7991566c24ed371e92254ebf2a273c251512ee475bdcf97",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798100676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "default"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "tag": "random"
+        },
+        "seed": "abababababababababababababababababababababababababababababababab",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "5d6b9094a19c0c6ce37f012131162a3d8a079beef7017cfc45f0fa6c8b1904ef",
+      "hex": "8201aa63646e738064736565645820abababababababababababababababababababababababababababababababab656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798100676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "custom_seed"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "priority_changes": 7,
+          "tag": "pct"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "1a0eafcf87ef3256b85458cdb5bfeb7f49cb0bce6cd187dc8ca62a95d01ac9d3",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c696379820107676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "policy_pct"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "exploration_constant": "1.4142135623730951",
+          "pct_mix": "0.1",
+          "tag": "bandit"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "a626e7274bd3d7187676c81c178d885404a4247bee950148e7adfac981f023df",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798302fb3ff6a09e667f3bcdfb3fb999999999999a676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "policy_bandit"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "exploration_constant": "0.5",
+          "pct_mix": "0.25",
+          "tag": "bandit"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "0b220f557336bd96f85a865b241e77e985f916d017ba139d158e7ee9664fb390",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798302f93800f93400676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "policy_bandit_half"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "tag": "replay"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "1133e04fab68fb5fd057fe22a3973bfef910b060af793be5cc32e6acf1b36a91",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798103676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "policy_replay"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "tag": "dpor"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "a6ec910a7b0850366da1e311bb9731be62fb4a854c2531ebef944d286c72a6e4",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798104676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "policy_dpor"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 1,
+        "monitor": true,
+        "policy": {
+          "tag": "random"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "ff87525debe9a3d0ef6ee3a38e79ac771afa80364562b690a125f8ab52d1c06a",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798100676d6f6e69746f72f5696d61785f7374657073016d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "max_steps_edge"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": null,
+        "links": [],
+        "max_steps": 10000,
+        "monitor": false,
+        "policy": {
+          "tag": "random"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "ba68a64038b002ea9f96693389c6d71aeeffd36c189b4b97e6aef90c998289d4",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798100676d6f6e69746f72f4696d61785f73746570731927106d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "monitor_off"
+    },
+    {
+      "config": {
+        "dns": [
+          {
+            "actor": 1,
+            "name": "alpha.test"
+          },
+          {
+            "actor": 2,
+            "name": "beta.test"
+          },
+          {
+            "actor": 4,
+            "name": "z.example"
+          }
+        ],
+        "dropped_events": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "fault_schedule": [
+          {
+            "id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "tag": "drop"
+          },
+          {
+            "send": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "tag": "delay",
+            "ticks": 3
+          },
+          {
+            "dst": 1,
+            "src": 0,
+            "tag": "partition"
+          },
+          {
+            "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "tag": "crash"
+          },
+          {
+            "tag": "corrupt",
+            "write": "1111111111111111111111111111111111111111111111111111111111111111",
+            "xor_mask": 255
+          },
+          {
+            "state": 2,
+            "tag": "crash_state",
+            "write": "2222222222222222222222222222222222222222222222222222222222222222"
+          }
+        ],
+        "fs_journaling": null,
+        "links": [
+          {
+            "base_delay": 5,
+            "from": 0,
+            "jitter": 2,
+            "loss_probability": "0.5",
+            "reorder_window": 3,
+            "to": 1
+          },
+          {
+            "base_delay": 9,
+            "from": 1,
+            "jitter": 1,
+            "loss_probability": "0.1",
+            "reorder_window": 0,
+            "to": 0
+          }
+        ],
+        "max_steps": 42042,
+        "monitor": false,
+        "policy": {
+          "priority_changes": 3,
+          "tag": "pct"
+        },
+        "seed": "4242424242424242424242424242424242424242424242424242424242424242",
+        "swarm": {
+          "crash_probability": "0.05",
+          "delay_probability": "0.2",
+          "drop_probability": "0.1",
+          "fault_classes_per_run": 4,
+          "max_delay_ticks": 7
+        }
+      },
+      "hash": "ba158275e8f9ccd09c15721ac807cbdbfee72b1b2872fc60c68365833ba55bf2",
+      "hex": "8201aa63646e7383826a616c7068612e74657374018269626574612e746573740282697a2e6578616d706c6504647365656458204242424242424242424242424242424242424242424242424242424242424242656c696e6b7382830001840502f9380003830100840901fb3fb999999999999a0065737761726d85fb3fb999999999999afb3fc999999999999a07fb3fa999999999999a0466706f6c696379820103676d6f6e69746f72f4696d61785f737465707319a43a6d66735f6a6f75726e616c696e67f66e64726f707065645f6576656e7473825820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb6e6661756c745f7363686564756c658682005820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc83015820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd038302000182035820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee83045820111111111111111111111111111111111111111111111111111111111111111118ff83055820222222222222222222222222222222222222222222222222222222222222222202",
+      "name": "rich"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": "writeback",
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "tag": "random"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "6e60feab5db55c64c8a709422aaf79d2b48009908f5897a63a1b5286dabd5bdf",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798100676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67006e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "fs_journaling_writeback"
+    },
+    {
+      "config": {
+        "dns": [],
+        "dropped_events": [],
+        "fault_schedule": [],
+        "fs_journaling": "data",
+        "links": [],
+        "max_steps": 10000,
+        "monitor": true,
+        "policy": {
+          "tag": "random"
+        },
+        "seed": "0000000000000000000000000000000000000000000000000000000000000000",
+        "swarm": {
+          "crash_probability": "0",
+          "delay_probability": "0",
+          "drop_probability": "0",
+          "fault_classes_per_run": 2,
+          "max_delay_ticks": 0
+        }
+      },
+      "hash": "2f55b702132fed8e5b432bbf27747de1f3fdbcb7e52824d0ba13c531b8127e44",
+      "hex": "8201aa63646e7380647365656458200000000000000000000000000000000000000000000000000000000000000000656c696e6b738065737761726d85f90000f9000000f900000266706f6c6963798100676d6f6e69746f72f5696d61785f73746570731927106d66735f6a6f75726e616c696e67026e64726f707065645f6576656e7473806e6661756c745f7363686564756c6580",
+      "name": "fs_journaling_data"
+    }
+  ]
+}
