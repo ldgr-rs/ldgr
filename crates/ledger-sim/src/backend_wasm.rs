@@ -133,7 +133,10 @@ impl WasiJournal {
 /// WASI wall clock backed by virtual time.
 ///
 /// Reports virtual time in nanosecond ticks, so `clock_time_get(Realtime)` is
-/// deterministic across runs. Each read journals one `ClockRead` entry.
+/// deterministic across runs. Each read journals one `ClockRead` entry
+/// because WASI `clock_time_get` is an observable cross-boundary effect;
+/// `SimBackend::clock()` stays non-journaled (see its docs) to keep the
+/// native send path byte-identical.
 struct VirtualWallClock {
     ticks: Arc<Mutex<u64>>,
     journal: WasiJournal,
@@ -154,8 +157,9 @@ impl wasmtime_wasi::HostWallClock for VirtualWallClock {
 
 /// WASI monotonic clock backed by virtual time.
 ///
-/// Each read journals one `ClockRead` entry carrying the tick count, matching
-/// the executor's clock-read journaling.
+/// Each read journals one `ClockRead` entry carrying the tick count. This
+/// matches `Boundary::read_clock` journaling; `SimBackend::clock()` and
+/// `Boundary::clock()` stay non-journaled by design.
 struct VirtualMonotonicClock {
     ticks: Arc<Mutex<u64>>,
     journal: WasiJournal,

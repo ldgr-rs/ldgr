@@ -401,12 +401,13 @@ pub fn run_swarm_campaign<W: Workload, O: Oracle>(
     let mut distinct_roots: HashSet<Hash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
+    let base_seed = base.seed;
 
     for attempt in 0..attempts {
         let mut config = base.clone();
         config.seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         config.swarm = draw_swarm(
-            config.seed,
+            base_seed,
             &format!("swarm/{attempt}"),
             SWARM_CAMPAIGN_MAX_DELAY_BUDGET,
             SWARM_CRASH_CEILING,

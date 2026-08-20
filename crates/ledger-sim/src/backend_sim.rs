@@ -183,6 +183,14 @@ impl SimBackend {
 }
 
 impl Effects for SimBackend {
+    /// Returns virtual time without journaling.
+    ///
+    /// `clock()` is a non-journaled read for internal scheduling (e.g. send
+    /// `deliver_at`). Journaled reads use `Instruction::ReadClock` or
+    /// `Boundary::read_clock`, which emit `ClockRead`. This keeps sends
+    /// byte-identical to the pre-journaling path. WASI `clock_time_get` in
+    /// `WasmBackend` journals `ClockRead` because it is an observable
+    /// cross-boundary effect; the two surfaces are intentionally distinct.
     fn clock(&self) -> Clock {
         self.publish_ticks();
         Clock::new(lock(&self.time).now())

@@ -1143,6 +1143,7 @@ impl TryRng for StreamRng {
 }
 
 impl Effects for Boundary {
+    /// Non-journaled virtual-time read (see `SimBackend::clock` docs).
     fn clock(&self) -> Clock {
         Clock::new(self.shared.time.borrow().now())
     }

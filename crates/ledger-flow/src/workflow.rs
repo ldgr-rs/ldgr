@@ -63,19 +63,40 @@ impl WorkflowExecution {
     }
 
     /// Recover workflow state from a journal.
+    ///
+    /// Pairs each `StepEnd` with its `StepBegin` parent to restore the
+    /// recorded step name. Unpaired `StepBegin` entries contribute to
+    /// `step_counter` but do not appear in `completed_steps`.
     pub fn recover_from_journal(actor: ActorId, journal: &Journal) -> Self {
+        use std::collections::HashMap;
+
+        let mut begin_names: HashMap<Hash, String> = HashMap::new();
         let mut completed_steps = Vec::new();
         let mut count = 0;
 
         for entry in journal.entries() {
-            if entry.data.actor == actor {
-                if entry.data.kind == EntryKind::StepBegin {
+            if entry.data.actor != actor {
+                continue;
+            }
+            match entry.data.kind {
+                EntryKind::StepBegin => {
                     count += 1;
-                } else if entry.data.kind == EntryKind::StepEnd
-                    && let Payload::Number(val) = entry.data.payload
-                {
-                    completed_steps.push(("step".into(), val));
+                    if let Payload::Text(ref name) = entry.data.payload {
+                        begin_names.insert(entry.id, name.clone());
+                    } else {
+                        begin_names.insert(entry.id, "step".to_string());
+                    }
                 }
+                EntryKind::StepEnd => {
+                    if let Payload::Number(val) = entry.data.payload {
+                        let parent = entry.data.parents.first().copied();
+                        let name = parent
+                            .and_then(|hash| begin_names.get(&hash).cloned())
+                            .unwrap_or_else(|| "step".to_string());
+                        completed_steps.push((name, val));
+                    }
+                }
+                _ => {}
             }
         }
 
