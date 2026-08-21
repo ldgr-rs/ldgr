@@ -2,145 +2,65 @@
 //! deterministic (identical journal root across runs) AND the planted bug must
 //! fire under the oracle.
 //!
-//! The reference sims are real async protocols on the effect boundary
-//! (mini-zab, mini-hdfs, mini-cassandra, mini-2pc, mini-leader-stepdown,
-//! mini-membership-churn, mini-hdfs-lease-expiry); the mini-kv stale read is
-//! the schedule-dependent search-based entry. Together they pin the corpus-v1
-//! gate at 8 of 12 reproductions bit-exact from seed.
+//! The scenario set lives in the single registry
+//! (`ledger_explorer::reference::corpus_scenarios`): seven reference-runtime
+//! sims (mini-zab, mini-hdfs, mini-cassandra, mini-2pc, mini-leader-stepdown,
+//! mini-membership-churn, mini-hdfs-lease-expiry), the four Stage-1
+//! additions (mini-reorder-lost-update, mini-lease-timer-race,
+//! mini-restart-dup-append, mini-partition-retry-dup), and the
+//! schedule-dependent mini-kv stale read, which search finds and then
+//! reproduces bit-exactly from its seed. Twelve reproductions pin the
+//! corpus-v1 gate at 12 of 12, bit-exact from seed.
 
-use ledger_explorer::Workload;
-use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec, Oracle, PropertyOracle};
-use ledger_explorer::reference::{
-    mini_2pc, mini_cassandra, mini_hdfs, mini_hdfs_lease_expiry, mini_leader_stepdown,
-    mini_membership_churn, mini_zab,
-};
-use ledger_explorer::search::{replay, search};
-use ledger_explorer::workloads::MiniKvWorkload;
-use ledger_sim::{Policy, RunConfig, Simulation};
+use ledger_explorer::reference::{CorpusRunner, corpus_scenarios};
+use ledger_explorer::search::replay;
+use ledger_format::RunManifest;
 use std::fs;
 use std::path::Path;
 
-fn config(seed: [u8; 32]) -> RunConfig {
-    RunConfig {
-        seed,
-        policy: Policy::Random,
-        max_steps: 4096,
-        ..RunConfig::default()
+#[test]
+fn every_scenario_reproduces_bit_exact_and_violates() {
+    for scenario in corpus_scenarios() {
+        let finding = scenario
+            .reproduce()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            finding.verdict.violated,
+            "{}: the planted bug must fire under the oracle",
+            scenario.name
+        );
+
+        match scenario.runner {
+            CorpusRunner::Tasks { .. } => {
+                // Same seed twice: the journal root must be bit-identical.
+                let second = scenario
+                    .run(scenario.base_seed, Vec::new())
+                    .unwrap_or_else(|error| panic!("{}: rerun failed: {error}", scenario.name));
+                assert_eq!(
+                    finding.run.journal.root_hash(),
+                    second.journal.root_hash(),
+                    "{}: journal root must be bit-identical across runs",
+                    scenario.name
+                );
+            }
+            CorpusRunner::MiniKv => {
+                // Schedule-dependent entry: the found seed must reproduce the
+                // same root bit-exactly on a recorded-decision replay.
+                let replayed = replay(
+                    &ledger_explorer::workloads::MiniKvWorkload,
+                    finding.seed,
+                    finding.run.decisions.clone(),
+                )
+                .unwrap_or_else(|error| panic!("{}: replay failed: {error}", scenario.name));
+                assert_eq!(
+                    finding.run.journal.root_hash(),
+                    replayed.journal.root_hash(),
+                    "{}: the found seed must reproduce bit-exactly",
+                    scenario.name
+                );
+            }
+        }
     }
-}
-
-/// Run one async reference sim twice with the same seed and check (a) the
-/// planted bug fires under the oracle and (b) the journal root is bit-identical.
-fn assert_bit_exact_reproduction(
-    name: &str,
-    builders: impl Fn() -> Vec<ledger_sim::TaskBuilder>,
-    oracle: impl Fn(&ledger_journal::Journal) -> bool,
-    seed: [u8; 32],
-) {
-    let oracle = PropertyOracle {
-        property: oracle,
-        name: name.to_string(),
-    };
-    let first = Simulation::with_tasks(config(seed), builders())
-        .run()
-        .unwrap();
-    let second = Simulation::with_tasks(config(seed), builders())
-        .run()
-        .unwrap();
-    assert_eq!(
-        first.journal.root_hash(),
-        second.journal.root_hash(),
-        "{name}: journal root must be bit-identical across runs"
-    );
-    let verdict = oracle.check(&first);
-    assert!(
-        verdict.violated,
-        "{name}: the planted bug must fire under the oracle"
-    );
-}
-
-#[test]
-fn mini_zab_split_brain_reproduces_bit_exact() {
-    let (_, oracle) = mini_zab();
-    assert_bit_exact_reproduction("mini-zab split-brain", || mini_zab().0, oracle, [1; 32]);
-}
-
-#[test]
-fn mini_hdfs_double_grant_reproduces_bit_exact() {
-    let (_, oracle) = mini_hdfs();
-    assert_bit_exact_reproduction("mini-hdfs double grant", || mini_hdfs().0, oracle, [2; 32]);
-}
-
-#[test]
-fn mini_cassandra_stale_read_reproduces_bit_exact() {
-    let (_, oracle) = mini_cassandra();
-    assert_bit_exact_reproduction(
-        "mini-cassandra stale read",
-        || mini_cassandra().0,
-        oracle,
-        [3; 32],
-    );
-}
-
-#[test]
-fn mini_2pc_coordinator_crash_reproduces_bit_exact() {
-    let (_, oracle) = mini_2pc();
-    assert_bit_exact_reproduction(
-        "mini-2pc coordinator crash",
-        || mini_2pc().0,
-        oracle,
-        [4; 32],
-    );
-}
-
-#[test]
-fn mini_leader_stepdown_reproduces_bit_exact() {
-    let (_, oracle) = mini_leader_stepdown();
-    assert_bit_exact_reproduction(
-        "mini-leader stepdown stale read",
-        || mini_leader_stepdown().0,
-        oracle,
-        [5; 32],
-    );
-}
-
-#[test]
-fn mini_membership_churn_reproduces_bit_exact() {
-    let (_, oracle) = mini_membership_churn();
-    assert_bit_exact_reproduction(
-        "mini-membership churn commit stall",
-        || mini_membership_churn().0,
-        oracle,
-        [6; 32],
-    );
-}
-
-#[test]
-fn mini_hdfs_lease_expiry_reproduces_bit_exact() {
-    let (_, oracle) = mini_hdfs_lease_expiry();
-    assert_bit_exact_reproduction(
-        "mini-hdfs lease expiry overwrite",
-        || mini_hdfs_lease_expiry().0,
-        oracle,
-        [7; 32],
-    );
-}
-
-#[test]
-fn mini_kv_stale_read_reproduces_from_seed() {
-    // Schedule-dependent entry: the search finds a violating seed, then the
-    // same seed reproduces the same root bit-exactly.
-    let oracle = HistoryOracle::new(&MiniKvWorkload, KeyValueSpec::default());
-    let finding = search(&MiniKvWorkload, &oracle, config([0; 32]), 256)
-        .unwrap()
-        .expect("mini-kv stale read must be found");
-    let replayed = replay(&MiniKvWorkload, finding.seed, finding.run.decisions.clone()).unwrap();
-    assert_eq!(
-        finding.run.journal.root_hash(),
-        replayed.journal.root_hash(),
-        "mini-kv: the found seed must reproduce bit-exactly"
-    );
-    assert!(finding.verdict.violated);
 }
 
 /// Fingerprint-pin the committed corpus manifests (fuzzer-corpus pattern):
@@ -151,31 +71,6 @@ fn mini_kv_stale_read_reproduces_from_seed() {
 /// orphans a manifest fails the gate.
 #[test]
 fn corpus_manifests_are_pinned_and_reproduce() {
-    use ledger_explorer::reference::*;
-    use ledger_format::RunManifest;
-
-    /// Run one reference sim at the manifest seed and assert the oracle fires.
-    fn reference_run(
-        name: &str,
-        builders: Vec<ledger_sim::TaskBuilder>,
-        oracle: impl Fn(&ledger_journal::Journal) -> bool,
-        seed: [u8; 32],
-    ) -> ledger_sim::RunResult {
-        let run = Simulation::with_tasks(config(seed), builders)
-            .run()
-            .unwrap();
-        assert!(
-            PropertyOracle {
-                property: oracle,
-                name: name.to_string()
-            }
-            .check(&run)
-            .violated,
-            "{name}: the planted bug must fire"
-        );
-        run
-    }
-
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpora/bug-corpus-v1");
     let mut checked = 0usize;
     for entry in fs::read_dir(&corpus).expect("corpus dir must exist") {
@@ -192,53 +87,17 @@ fn corpus_manifests_are_pinned_and_reproduce() {
         });
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
 
-        let run = match name.as_str() {
-            "mini-zab-split-brain" => {
-                reference_run(&name, mini_zab().0, mini_zab().1, manifest.root_seed)
-            }
-            "mini-hdfs-double-grant" => {
-                reference_run(&name, mini_hdfs().0, mini_hdfs().1, manifest.root_seed)
-            }
-            "mini-cassandra-stale-read" => reference_run(
-                &name,
-                mini_cassandra().0,
-                mini_cassandra().1,
-                manifest.root_seed,
-            ),
-            "mini-2pc-coordinator-crash" => {
-                reference_run(&name, mini_2pc().0, mini_2pc().1, manifest.root_seed)
-            }
-            "mini-leader-stepdown" => reference_run(
-                &name,
-                mini_leader_stepdown().0,
-                mini_leader_stepdown().1,
-                manifest.root_seed,
-            ),
-            "mini-membership-churn" => reference_run(
-                &name,
-                mini_membership_churn().0,
-                mini_membership_churn().1,
-                manifest.root_seed,
-            ),
-            "mini-hdfs-lease-expiry" => reference_run(
-                &name,
-                mini_hdfs_lease_expiry().0,
-                mini_hdfs_lease_expiry().1,
-                manifest.root_seed,
-            ),
-            "mini-kv-stale-read" => {
-                let oracle = HistoryOracle::new(&MiniKvWorkload, KeyValueSpec::default());
-                let run = Simulation::new(config(manifest.root_seed), MiniKvWorkload.programs())
-                    .run()
-                    .unwrap();
-                assert!(
-                    oracle.check(&run).violated,
-                    "{name}: the planted bug must fire"
-                );
-                run
-            }
-            other => panic!("unexpected corpus manifest: {other}"),
-        };
+        let scenario = ledger_explorer::reference::corpus_scenario(&name).unwrap_or_else(|| {
+            panic!("unexpected corpus manifest '{name}': not in the scenario registry")
+        });
+        let run = scenario
+            .run(manifest.root_seed, Vec::new())
+            .unwrap_or_else(|error| panic!("{name}: pinned rerun failed: {error}"));
+        let verdict = scenario.check(&run);
+        assert!(
+            verdict.violated,
+            "{name}: the planted bug must fire at the pinned seed"
+        );
 
         assert_eq!(
             run.journal.root_hash(),
@@ -252,5 +111,37 @@ fn corpus_manifests_are_pinned_and_reproduce() {
         );
         checked += 1;
     }
-    assert_eq!(checked, 8, "all eight corpus manifests must be pinned");
+    assert_eq!(
+        checked,
+        corpus_scenarios().len(),
+        "every registry scenario must have a pinned manifest"
+    );
+}
+
+/// The manifest seeds and roots regenerate byte-identically: running the
+/// generator twice must produce the committed corpus. This pins the
+/// generation path (registry -> canonical bytes) itself.
+#[test]
+fn manifests_are_regenerable_from_the_registry() {
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpora/bug-corpus-v1");
+    for scenario in corpus_scenarios() {
+        let finding = scenario
+            .reproduce()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let path = corpus.join(format!("{}.ldgr", scenario.name));
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|error| panic!("{}: manifest must exist: {error}", path.display()));
+        let manifest = RunManifest::from_canonical_bytes(&bytes).expect("manifest must decode");
+        assert_eq!(
+            finding.seed, manifest.root_seed,
+            "{}: the registry base seed must be the pinned seed",
+            scenario.name
+        );
+        assert_eq!(
+            finding.run.journal.root_hash(),
+            manifest.journal_root,
+            "{}: a registry rerun must reproduce the pinned root",
+            scenario.name
+        );
+    }
 }

@@ -9,12 +9,11 @@ use ledger_sim::{Policy, RunConfig, RunResult};
 
 #[test]
 fn full_pipeline_minimizes_stale_read_and_preserves_violation() {
-    let config = RunConfig {
-        seed: [0; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([0; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     let workload = MiniKvWorkload;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
     let finding = search(&workload, &oracle, config, 256)
@@ -44,6 +43,7 @@ fn full_pipeline_minimizes_stale_read_and_preserves_violation() {
     );
 
     let run = RunResult {
+        journal_error: None,
         journal: repro.journal.clone(),
         decisions: Vec::new(),
         trace: Vec::new(),

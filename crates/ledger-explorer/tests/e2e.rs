@@ -1,19 +1,19 @@
-use ledger_explorer::ldfi::solve_ldfi;
+use ledger_explorer::ldfi::solve_with;
 use ledger_explorer::minimizer::{causal_slice, minimize_schedule};
 use ledger_explorer::oracle::{AssertionOracle, HistoryOracle, KeyValueSpec, Oracle};
 use ledger_explorer::search::{Workload, diff, replay, run_campaign, search};
+use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::{MiniKvWorkload, StorageCrashWorkload, TwoPhaseCommitWorkload};
-use ledger_sim::config::{Policy, RunConfig};
+use ledger_sim::{Policy, RunConfig};
 
 #[test]
 fn mini_kv_finds_and_reproduces_stale_read() {
-    let config = RunConfig {
-        seed: [0; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        dropped_events: Vec::new(),
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([0; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .dropped_events(Vec::new())
+        .build();
     let workload = MiniKvWorkload;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
     let finding = search(&workload, &oracle, config, 256)
@@ -23,7 +23,12 @@ fn mini_kv_finds_and_reproduces_stale_read() {
     assert!(finding.verdict.violated);
     assert!(!finding.verdict.witnesses.is_empty());
 
-    let hypotheses = solve_ldfi(&finding.run.journal, &finding.verdict);
+    let hypotheses = solve_with(
+        &mut HittingSetSolver::new(),
+        &finding.run.journal,
+        &finding.verdict,
+    )
+    .expect("solve");
     assert!(!hypotheses.is_empty());
 
     let replayed = replay(&MiniKvWorkload, finding.seed, finding.run.decisions.clone()).unwrap();
@@ -36,16 +41,15 @@ fn mini_kv_finds_and_reproduces_stale_read() {
 
 #[test]
 fn bandit_scheduler_discovers_diverse_journal_roots() {
-    let config = RunConfig {
-        seed: [1; 32],
-        policy: Policy::Bandit {
+    let config = RunConfig::builder()
+        .seed([1; 32])
+        .policy(Policy::Bandit {
             exploration_constant: 1.414,
             pct_mix: 0.1,
-        },
-        max_steps: 256,
-        dropped_events: Vec::new(),
-        ..RunConfig::default()
-    };
+        })
+        .max_steps(256)
+        .dropped_events(Vec::new())
+        .build();
     let workload = MiniKvWorkload;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
 
@@ -56,13 +60,12 @@ fn bandit_scheduler_discovers_diverse_journal_roots() {
 
 #[test]
 fn two_phase_commit_passes_assertion_oracle() {
-    let config = RunConfig {
-        seed: [2; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        dropped_events: Vec::new(),
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([2; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .dropped_events(Vec::new())
+        .build();
     let workload = TwoPhaseCommitWorkload;
     let oracle = AssertionOracle;
 
@@ -73,17 +76,16 @@ fn two_phase_commit_passes_assertion_oracle() {
 
 #[test]
 fn storage_crash_consistency_preserves_fsynced_state() {
-    let config = RunConfig {
-        seed: [3; 32],
-        policy: Policy::Random,
-        max_steps: 64,
-        dropped_events: Vec::new(),
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([3; 32])
+        .policy(Policy::Random)
+        .max_steps(64)
+        .dropped_events(Vec::new())
+        .build();
     let workload = StorageCrashWorkload;
     let oracle = AssertionOracle;
 
-    let run = ledger_sim::runtime::Simulation::new(config, workload.programs())
+    let run = ledger_sim::Simulation::new(config, workload.programs())
         .run()
         .unwrap();
     assert_eq!(run.registers[0], 42);
@@ -92,13 +94,12 @@ fn storage_crash_consistency_preserves_fsynced_state() {
 
 #[test]
 fn causal_slice_preserves_witness_provenance() {
-    let config = RunConfig {
-        seed: [0; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        dropped_events: Vec::new(),
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([0; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .dropped_events(Vec::new())
+        .build();
     let workload = MiniKvWorkload;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
     let finding = search(&workload, &oracle, config, 256).unwrap().unwrap();
@@ -114,13 +115,12 @@ fn causal_slice_preserves_witness_provenance() {
 
 #[test]
 fn schedule_minimizer_reduces_decision_sequence() {
-    let config = RunConfig {
-        seed: [0; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        dropped_events: Vec::new(),
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([0; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .dropped_events(Vec::new())
+        .build();
     let workload = MiniKvWorkload;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
     let finding = search(&workload, &oracle, config, 256).unwrap().unwrap();
@@ -139,17 +139,16 @@ fn schedule_minimizer_reduces_decision_sequence() {
 
 #[test]
 fn same_seed_produces_identical_journal_root() {
-    let config = RunConfig {
-        seed: [42; 32],
-        policy: Policy::Random,
-        max_steps: 100,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([42; 32])
+        .policy(Policy::Random)
+        .max_steps(100)
+        .build();
     let w = MiniKvWorkload;
-    let r1 = ledger_sim::runtime::Simulation::new(config.clone(), w.programs())
+    let r1 = ledger_sim::Simulation::new(config.clone(), w.programs())
         .run()
         .unwrap();
-    let r2 = ledger_sim::runtime::Simulation::new(config, w.programs())
+    let r2 = ledger_sim::Simulation::new(config, w.programs())
         .run()
         .unwrap();
 

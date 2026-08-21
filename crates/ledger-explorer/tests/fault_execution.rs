@@ -2,20 +2,20 @@
 //! replays fork the journal, voided faults are data, and replays are
 //! deterministic.
 
-use ledger_explorer::ldfi::{FaultHypothesis, hypothesis_to_schedule, solve_ldfi};
+use ledger_explorer::ldfi::{FaultHypothesis, hypothesis_to_schedule, solve_with};
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::{Workload, replay_with_faults, search};
+use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::{MiniKvWorkload, TwoPhaseCommitWorkload};
 use ledger_format::{EntryKind, FaultSpec, Payload};
-use ledger_sim::{FaultInjection, Policy, RunConfig, Simulation};
+use ledger_sim::{Policy, RunConfig, SimFault, Simulation};
 
 fn find_stale_read() -> ledger_explorer::search::Finding {
-    let config = RunConfig {
-        seed: [0; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([0; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     let oracle = HistoryOracle::new(&MiniKvWorkload, KeyValueSpec::default());
     search(&MiniKvWorkload, &oracle, config, 256)
         .expect("search must run")
@@ -25,7 +25,12 @@ fn find_stale_read() -> ledger_explorer::search::Finding {
 #[test]
 fn hypothesis_becomes_executable_schedule() {
     let finding = find_stale_read();
-    let hypotheses = solve_ldfi(&finding.run.journal, &finding.verdict);
+    let hypotheses = solve_with(
+        &mut HittingSetSolver::new(),
+        &finding.run.journal,
+        &finding.verdict,
+    )
+    .expect("solve");
     let hypothesis = hypotheses
         .first()
         .expect("LDFI must produce at least one hypothesis");
@@ -67,7 +72,7 @@ fn drop_injection_forks_journal_not_mutates_base() {
         &finding.run.journal,
         finding.seed,
         finding.run.decisions.clone(),
-        vec![FaultInjection::Drop(target)],
+        vec![SimFault::Drop(target)],
     )
     .expect("replay must run");
 
@@ -92,7 +97,7 @@ fn voided_fault_is_data_not_error() {
         &finding.run.journal,
         finding.seed,
         finding.run.decisions.clone(),
-        vec![FaultInjection::Drop(ghost)],
+        vec![SimFault::Drop(ghost)],
     )
     .expect("a voided fault must not fail the replay");
     assert_eq!(report.voided.len(), 1, "the ghost injection is voided");
@@ -113,7 +118,7 @@ fn replay_is_deterministic_under_faults() {
         .filter(|entry| matches!(entry.data.kind, ledger_format::EntryKind::Send))
         .map(|entry| entry.id)
         .collect::<Vec<_>>();
-    let schedule = vec![FaultInjection::Delay {
+    let schedule = vec![SimFault::Delay {
         send: send_ids[0],
         ticks: 5,
     }];
@@ -152,7 +157,7 @@ fn partition_injection_changes_schedule() {
         &finding.run.journal,
         finding.seed,
         finding.run.decisions.clone(),
-        vec![FaultInjection::Partition { src: 0, dst: 1 }],
+        vec![SimFault::Partition { src: 0, dst: 1 }],
     )
     .expect("replay must run");
     assert_ne!(
@@ -164,12 +169,11 @@ fn partition_injection_changes_schedule() {
 
 #[test]
 fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
-    let config = RunConfig {
-        seed: [4; 32],
-        policy: Policy::Random,
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed([4; 32])
+        .policy(Policy::Random)
+        .max_steps(256)
+        .build();
     let clean = Simulation::new(config.clone(), TwoPhaseCommitWorkload.programs())
         .run()
         .expect("two-phase commit must run");
@@ -178,7 +182,7 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     // the final faulted run up to participant B's write, so the entry ids the
     // probe reports are the exact targets the final schedule must hit.
     let mut probe_config = config.clone();
-    probe_config.fault_schedule = vec![FaultInjection::Partition { src: 0, dst: 1 }];
+    *probe_config.fault_schedule_mut() = vec![SimFault::Partition { src: 0, dst: 1 }];
     let probe = Simulation::new(probe_config, TwoPhaseCommitWorkload.programs())
         .run()
         .expect("probe run must execute");
@@ -208,27 +212,25 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     };
     let schedule = hypothesis_to_schedule(&hypothesis, &probe.journal);
     assert!(
-        schedule
-            .iter()
-            .any(|f| matches!(f, FaultInjection::Delay { .. })),
+        schedule.iter().any(|f| matches!(f, SimFault::Delay { .. })),
         "the Send must map to a Delay"
     );
     assert!(
         schedule
             .iter()
-            .any(|f| matches!(f, FaultInjection::Partition { .. })),
+            .any(|f| matches!(f, SimFault::Partition { .. })),
         "the Send must map to a Partition"
     );
     assert!(
         schedule
             .iter()
-            .any(|f| matches!(f, FaultInjection::Corrupt { .. })),
+            .any(|f| matches!(f, SimFault::Corrupt { .. })),
         "the FsWrite must map to a Corrupt"
     );
     assert!(
         schedule
             .iter()
-            .any(|f| matches!(f, FaultInjection::CrashState { .. })),
+            .any(|f| matches!(f, SimFault::CrashState { .. })),
         "the FsWrite must map to a CrashState"
     );
 
@@ -241,12 +243,12 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
         Payload::Pair { left, .. } => *left as u32,
         _ => u32::MAX,
     };
-    let replay_schedule: Vec<FaultInjection> = schedule
+    let replay_schedule: Vec<SimFault> = schedule
         .into_iter()
-        .filter(|f| !matches!(f, FaultInjection::Drop(_)))
+        .filter(|f| !matches!(f, SimFault::Drop(_)))
         .collect();
     let mut faulted_config = config.clone();
-    faulted_config.fault_schedule = replay_schedule;
+    *faulted_config.fault_schedule_mut() = replay_schedule;
     let faulted = Simulation::new(faulted_config, TwoPhaseCommitWorkload.programs())
         .run()
         .expect("faulted run must execute");
