@@ -4,7 +4,7 @@ use ledger_format::{EntryKind, Hash, Payload};
 use ledger_journal::Journal;
 use ledger_sim::RunResult;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 /// A predicate evaluation verdict with causal witness hashes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,140 @@ impl Verdict {
 /// An oracle that evaluates properties over completed simulation runs.
 pub trait Oracle {
     fn check(&self, run: &RunResult) -> Verdict;
+}
+
+/// Exactly-once journal oracle over observed values.
+///
+/// The oracle checks two value-dependent invariants against the journaled
+/// input stream:
+///
+/// 1. Every input value is applied at most once. A repeated value is a
+///    duplicate apply of the same command and violates exactly-once
+///    semantics. CONTRACT: the oracle's domain is exactly-once streams; a
+///    workload whose protocol legitimately re-applies a value must not use
+///    this oracle.
+/// 2. When inputs exist and an outcome exists, the outcome payload must
+///    equal the last applied input value. A different value is a torn final
+///    apply: the visible result does not match the last command.
+///
+/// STREAM SCOPE: both conditions read the JOURNAL-GLOBAL last input and the
+/// journal-global last numeric outcome, whichever actor journaled them. The
+/// oracle therefore models a single input stream feeding a single outcome
+/// stream. A journal that interleaves several independent actor streams
+/// must scope per actor or rely on the duplicate-apply condition alone;
+/// comparing streams across actors would compare unrelated values.
+///
+/// The verdict is value-dependent on the causal event set: the journal's
+/// entry values decide the outcome, not the mere presence of a marker entry.
+/// The duplicate-apply condition is monotone in the entry set: adding entries
+/// never removes a duplicate, so extending a minimal failing journal keeps it
+/// failing. A duplicate-apply violation carries the outcome and assertion
+/// entries as witnesses, matching [`PropertyOracle`]; a torn-apply violation
+/// carries only the numeric outcome entry it compares. The reason strings
+/// name the duplicated value and its entry positions.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ExactlyOnceValueOracle;
+
+impl Oracle for ExactlyOnceValueOracle {
+    fn check(&self, run: &RunResult) -> Verdict {
+        let mut input_values: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut last_input: Option<(u64, usize)> = None;
+        // The last numeric Outcome in journal order: the terminal `Done`
+        // journals an Outcome with a text payload that must not shadow it.
+        let mut last_numeric_outcome: Option<Hash> = None;
+        for (index, entry) in run.journal.entries().enumerate() {
+            if matches!(entry.data.kind, EntryKind::InputStep { .. }) {
+                if let Payload::Number(value) = &entry.data.payload {
+                    input_values.entry(*value).or_default().push(index);
+                    last_input = Some((*value, index));
+                }
+            } else if entry.data.kind == EntryKind::Outcome
+                && matches!(&entry.data.payload, Payload::Number(_))
+            {
+                last_numeric_outcome = Some(entry.id);
+            }
+        }
+        // The duplicate must be reported deterministically: pick the smallest
+        // duplicated value, never a hash-map iteration artifact.
+        let mut duplicates: Vec<(&u64, &Vec<usize>)> = input_values
+            .iter()
+            .filter(|(_, positions)| positions.len() > 1)
+            .collect();
+        duplicates.sort_by_key(|(value, _)| **value);
+        if let Some((value, positions)) = duplicates.first() {
+            return Verdict::fail(
+                witnesses_from_journal(&run.journal),
+                format!(
+                    "exactly-once violation: input value {} applied {} times (entry positions {:?})",
+                    value,
+                    positions.len(),
+                    positions
+                ),
+            );
+        }
+        if let (Some((last_value, _)), Some(id)) = (last_input, last_numeric_outcome)
+            && let Some(entry) = run.journal.get(&id)
+            && let Payload::Number(outcome_value) = &entry.data.payload
+            && *outcome_value != last_value
+        {
+            return Verdict::fail(
+                vec![id],
+                format!(
+                    "exactly-once violation: torn final apply: outcome {} does not match last applied input {}",
+                    outcome_value, last_value
+                ),
+            );
+        }
+        Verdict::pass()
+    }
+}
+
+/// Composite oracle over boxed sub-oracles.
+///
+/// A run violates when any sub-oracle violates. Witness hashes merge in
+/// sub-oracle order; reasons of violating sub-oracles join with "; ".
+struct CompositeOracle {
+    oracles: Vec<Box<dyn Oracle>>,
+}
+
+impl Oracle for CompositeOracle {
+    fn check(&self, run: &RunResult) -> Verdict {
+        let mut violated = false;
+        let mut witnesses = Vec::new();
+        let mut reasons = Vec::new();
+        for oracle in &self.oracles {
+            let verdict = oracle.check(run);
+            violated |= verdict.violated;
+            witnesses.extend(verdict.witnesses);
+            if verdict.violated {
+                reasons.push(verdict.reason);
+            }
+        }
+        if violated {
+            Verdict {
+                violated,
+                witnesses,
+                reason: reasons.join("; "),
+            }
+        } else {
+            Verdict::pass()
+        }
+    }
+}
+
+/// Combine boxed oracles into one that violates when any input violates.
+///
+/// The composite evaluates every sub-oracle on each check, merging witnesses
+/// and violation reasons, so callers can pass one composed oracle to any
+/// existing campaign function.
+pub fn compose_oracles(oracles: Vec<Box<dyn Oracle>>) -> Box<dyn Oracle> {
+    Box::new(CompositeOracle { oracles })
+}
+
+impl Oracle for Box<dyn Oracle> {
+    fn check(&self, run: &RunResult) -> Verdict {
+        self.as_ref().check(run)
+    }
 }
 
 /// An abstract operation extracted from a workload execution history.
@@ -120,35 +254,6 @@ impl SequentialSpec for KeyValueSpec {
     }
 }
 
-/// Sequential FIFO queue specification.
-#[derive(Debug, Clone, Default)]
-pub struct QueueSpec {
-    queue: VecDeque<u64>,
-}
-
-impl SequentialSpec for QueueSpec {
-    fn apply(&mut self, operation: &HistoryOperation) -> Result<(), String> {
-        match operation {
-            HistoryOperation::Push { value, .. } => {
-                self.queue.push_back(*value);
-                Ok(())
-            }
-            HistoryOperation::Pop { value, .. } => {
-                if let Some(front) = self.queue.pop_front() {
-                    if front == *value {
-                        Ok(())
-                    } else {
-                        Err(format!("popped {value}, expected {front}"))
-                    }
-                } else {
-                    Err(format!("popped {value} from empty queue"))
-                }
-            }
-            _ => Ok(()),
-        }
-    }
-}
-
 /// A generic history oracle checking operations against a sequential specification.
 pub struct HistoryOracle<'a, W, S> {
     workload: &'a W,
@@ -209,11 +314,6 @@ impl<'a, W, S> LinearizabilityOracle<'a, W, S> {
             specification,
             bound: DEFAULT_LIN_BOUND,
         }
-    }
-
-    pub const fn with_bound(mut self, bound: usize) -> Self {
-        self.bound = bound;
-        self
     }
 }
 
@@ -397,36 +497,54 @@ impl Oracle for AssertionOracle {
     }
 }
 
-/// An invariant oracle that executes a user-provided closure over the journal.
-pub struct InvariantOracle<F>
-where
-    F: Fn(&Journal) -> Result<(), (Hash, String)>,
-{
-    invariant: F,
+/// One observable output of a run: the actor plus payload of an `Outcome`
+/// entry, in journal order.
+fn observable_outputs(run: &RunResult) -> Vec<(u32, u64)> {
+    run.journal
+        .entries()
+        .filter(|entry| entry.data.kind == EntryKind::Outcome)
+        .filter_map(|entry| match &entry.data.payload {
+            Payload::Number(value) => Some((entry.data.actor, *value)),
+            _ => None,
+        })
+        .collect()
 }
 
-impl<F> InvariantOracle<F>
-where
-    F: Fn(&Journal) -> Result<(), (Hash, String)>,
-{
-    pub fn new(invariant: F) -> Self {
-        Self { invariant }
-    }
-}
-
-impl<F> Oracle for InvariantOracle<F>
-where
-    F: Fn(&Journal) -> Result<(), (Hash, String)>,
-{
-    fn check(&self, run: &RunResult) -> Verdict {
-        match (self.invariant)(&run.journal) {
-            Ok(()) => Verdict::pass(),
-            Err((witness, reason)) => Verdict::fail(vec![witness], reason),
+/// Locate the first index where two observable-output sequences disagree.
+///
+/// `None` when the sequences are equal. The reason names the actor and both
+/// payloads (or the length mismatch) so a divergence report points at the
+/// diverging step instead of only at the journal root.
+fn output_divergence_reason(left: &[(u32, u64)], right: &[(u32, u64)]) -> Option<String> {
+    let common = left.len().min(right.len());
+    for index in 0..common {
+        if left[index] != right[index] {
+            return Some(format!(
+                "differential output divergence at output {index}: left=(actor {}, value {}), right=(actor {}, value {})",
+                left[index].0, left[index].1, right[index].0, right[index].1
+            ));
         }
     }
+    if left.len() != right.len() {
+        return Some(format!(
+            "differential output divergence: left produced {} outputs, right produced {}",
+            left.len(),
+            right.len()
+        ));
+    }
+    None
 }
 
 /// Differential equivalence oracle that compares two runs for equivalent behavior.
+///
+/// Compared surfaces, in order: final registers, observable outputs (the
+/// `Outcome` entries of the journals, in order), applied fault ids, and the
+/// journal root hash. Register and root equality are unchanged; the output
+/// and fault checks run before the root check so a behavioral divergence is
+/// reported with its location, not only as a hash mismatch. Scheduler
+/// decision sequences are deliberately not compared: two equivalent runs may
+/// follow different legal schedules, and every semantic surface above already
+/// pins the behavior those decisions produced.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DifferentialOracle;
 
@@ -438,6 +556,20 @@ impl DifferentialOracle {
                 format!(
                     "differential register mismatch: left={:?}, right={:?}",
                     left.registers, right.registers
+                ),
+            );
+        }
+        let left_outputs = observable_outputs(left);
+        let right_outputs = observable_outputs(right);
+        if let Some(reason) = output_divergence_reason(&left_outputs, &right_outputs) {
+            return Verdict::fail(Vec::new(), reason);
+        }
+        if left.applied_faults != right.applied_faults {
+            return Verdict::fail(
+                Vec::new(),
+                format!(
+                    "differential applied-fault mismatch: left={:?}, right={:?}",
+                    left.applied_faults, right.applied_faults
                 ),
             );
         }
@@ -595,12 +727,11 @@ mod tests {
     }
 
     fn run_programs(programs: Vec<Vec<Instruction>>) -> RunResult {
-        let config = RunConfig {
-            seed: [3; 32],
-            policy: ledger_sim::Policy::Random,
-            max_steps: 512,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([3; 32])
+            .policy(ledger_sim::Policy::Random)
+            .max_steps(512)
+            .build();
         Simulation::new(config, programs).run().unwrap()
     }
 
@@ -794,16 +925,138 @@ mod tests {
 
     #[test]
     fn linearizability_oracle_finds_mini_kv_stale_read() {
-        let config = RunConfig {
-            seed: [0; 32],
-            policy: ledger_sim::Policy::Random,
-            max_steps: 256,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([0; 32])
+            .policy(ledger_sim::Policy::Random)
+            .max_steps(256)
+            .build();
         let oracle = LinearizabilityOracle::new(&MiniKvWorkload, KeyValueSpec::default());
         let finding = search(&MiniKvWorkload, &oracle, config, 256)
             .expect("search must run")
             .expect("the mini-kv stale read must violate linearizability");
         assert!(finding.verdict.violated);
+    }
+
+    fn value_journal(values: &[u64], outcome: Option<u64>) -> RunResult {
+        let mut journal = Journal::new();
+        for value in values {
+            journal
+                .append(
+                    EntryKind::InputStep {
+                        generator: 0,
+                        replay: 0,
+                    },
+                    1,
+                    [],
+                    Payload::Number(*value),
+                )
+                .expect("append must succeed");
+        }
+        if let Some(outcome) = outcome {
+            journal
+                .append(EntryKind::Outcome, 1, [], Payload::Number(outcome))
+                .expect("append must succeed");
+        }
+        run_for_value_oracle(journal)
+    }
+
+    fn run_for_value_oracle(journal: Journal) -> RunResult {
+        RunResult {
+            journal_error: None,
+            journal,
+            decisions: Vec::new(),
+            trace: Vec::new(),
+            registers: Vec::new(),
+            steps: 0,
+            monitor_issues: Vec::new(),
+            applied_faults: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exactly_once_oracle_rejects_a_duplicate_apply() {
+        let run = value_journal(&[1, 2, 2], Some(2));
+        let verdict = ExactlyOnceValueOracle.check(&run);
+        assert!(verdict.violated);
+        assert!(
+            verdict.reason.contains("applied 2 times"),
+            "the reason must name the duplicate: {}",
+            verdict.reason
+        );
+        // Extending the journal never cures the duplicate: the condition is
+        // monotone in the entry set.
+        let extended = value_journal(&[0, 1, 2, 2, 3, 4], Some(2));
+        assert!(ExactlyOnceValueOracle.check(&extended).violated);
+    }
+
+    #[test]
+    fn exactly_once_oracle_rejects_a_torn_final_apply() {
+        let run = value_journal(&[1, 2, 3], Some(9));
+        let verdict = ExactlyOnceValueOracle.check(&run);
+        assert!(verdict.violated, "{}", verdict.reason);
+        assert!(
+            verdict.reason.contains("torn final apply"),
+            "the reason must name the torn apply: {}",
+            verdict.reason
+        );
+        assert!(
+            !verdict.witnesses.is_empty(),
+            "the outcome entry must witness the torn apply"
+        );
+    }
+
+    #[test]
+    fn exactly_once_oracle_passes_a_clean_log() {
+        let run = value_journal(&[1, 2, 3], Some(3));
+        assert_eq!(ExactlyOnceValueOracle.check(&run), Verdict::pass());
+        // No inputs, no outcome: vacuously holds.
+        assert_eq!(
+            ExactlyOnceValueOracle.check(&value_journal(&[], None)),
+            Verdict::pass()
+        );
+        // No outcome with inputs: the forward check is vacuous.
+        assert_eq!(
+            ExactlyOnceValueOracle.check(&value_journal(&[1, 2], None)),
+            Verdict::pass()
+        );
+    }
+
+    #[test]
+    fn exactly_once_oracle_sensitivity_to_the_causal_event_set() {
+        // Removing any single entry from a minimal duplicate pair flips the
+        // verdict to pass; adding any removed entry back keeps it failing.
+        let journal = value_journal(&[1, 2, 2], Some(2)).journal;
+        let ids = journal.entries().map(|entry| entry.id).collect::<Vec<_>>();
+        let minimal = journal
+            .subgraph(&[ids[1], ids[2]])
+            .expect("subgraph must build");
+        assert!(
+            ExactlyOnceValueOracle
+                .check(&run_for_value_oracle(minimal.clone()))
+                .violated,
+            "the duplicated pair alone must violate"
+        );
+        for removed in 0..2 {
+            let subset = minimal
+                .subgraph(&[ids[1 + (1 - removed)]])
+                .expect("subset must build");
+            assert!(
+                !ExactlyOnceValueOracle
+                    .check(&run_for_value_oracle(subset))
+                    .violated,
+                "removing one retained duplicate must flip the verdict"
+            );
+        }
+        for added in [0usize, 3] {
+            let extended = journal
+                .subgraph(&[ids[1], ids[2], ids[added]])
+                .expect("extension must build");
+            assert!(
+                ExactlyOnceValueOracle
+                    .check(&run_for_value_oracle(extended))
+                    .violated,
+                "adding back a removed entry must keep the verdict failing"
+            );
+        }
     }
 }

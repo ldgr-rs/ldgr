@@ -107,12 +107,11 @@ mod tests {
     #[test]
     fn with_inputs_journals_input_steps_with_real_keys() {
         let workload = MiniKvWorkload.with_inputs(&[7, 8, 9]);
-        let config = RunConfig {
-            seed: [6; 32],
-            policy: Policy::Random,
-            max_steps: 256,
-            ..RunConfig::default()
-        };
+        let config = RunConfig::builder()
+            .seed([6; 32])
+            .policy(Policy::Random)
+            .max_steps(256)
+            .build();
         let run = Simulation::new(config, workload.programs()).run().unwrap();
         let inputs = run
             .journal

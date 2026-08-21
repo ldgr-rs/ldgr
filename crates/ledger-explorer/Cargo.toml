@@ -10,13 +10,32 @@ description = "Backward search engine, LDFI solver, 4-stage minimizer, and oracl
 blake3.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true
+thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ledger-format = { path = "../ledger-format" }
 ledger-journal = { path = "../ledger-journal" }
 ledger-sim = { path = "../ledger-sim" }
+ledger-faultspec = { path = "../ledger-faultspec" }
+cadical = { version = "0.1.16", optional = true }
 
 [features]
 default = []
-solver-cadical = []
+solver-cadical = ["dep:cadical"]
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "solver_scaling"
+harness = false
+required-features = []
+
+[[bench]]
+name = "solver_crossover"
+harness = false
+required-features = ["solver-cadical"]
 
 [lints]
 workspace = true

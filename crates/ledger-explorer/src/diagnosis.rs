@@ -1,8 +1,6 @@
 //! First-divergence localization and causal diagnosis.
 
-use ledger_format::Hash;
 use ledger_journal::{Entry, Journal};
-use ledger_sim::RunResult;
 
 /// Collect a journal's entries in vector-clock order.
 ///
@@ -43,41 +41,11 @@ pub fn first_divergence<'a>(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CausalDivergence {
-    pub first_divergent_left: Hash,
-    pub first_divergent_right: Hash,
-    pub neighborhood: Vec<Hash>,
-}
-
-/// Bisect two runs at their first divergence.
-///
-/// The neighborhood is the left divergent entry plus its parents, which
-/// frames a code-change bisect. Returns `None` when the runs are identical
-/// or when one run is a prefix of the other: a truncated replay is not a
-/// behavior-change divergence, matching [`first_divergence`].
-pub fn causal_bisect(left: &RunResult, right: &RunResult) -> Option<CausalDivergence> {
-    let (left_entry, right_entry) = first_divergence(&left.journal, &right.journal)?;
-    let left_entry = left_entry?;
-    let right_entry = right_entry?;
-    let mut neighborhood = Vec::with_capacity(left_entry.data.parents.len() + 1);
-    neighborhood.push(left_entry.id);
-    for parent in &left_entry.data.parents {
-        if !neighborhood.contains(parent) {
-            neighborhood.push(*parent);
-        }
-    }
-    Some(CausalDivergence {
-        first_divergent_left: left_entry.id,
-        first_divergent_right: right_entry.id,
-        neighborhood,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ledger_format::{EntryKind, Payload};
+    use ledger_sim::RunResult;
 
     fn journal_with(values: &[u64]) -> Journal {
         let mut journal = Journal::new();
@@ -91,6 +59,7 @@ mod tests {
 
     fn run(journal: Journal) -> RunResult {
         RunResult {
+            journal_error: None,
             journal,
             decisions: Vec::new(),
             trace: Vec::new(),
@@ -102,43 +71,14 @@ mod tests {
     }
 
     #[test]
-    fn causal_bisect_finds_divergent_pair_and_neighborhood() {
-        let left = run(journal_with(&[1, 2, 3]));
-        let right = run(journal_with(&[1, 2, 9]));
+    fn first_divergence_ignores_append_order_of_concurrent_entries() {
+        let left = run(concurrent_journal(&[(1, 10), (2, 20)]));
+        let right = run(concurrent_journal(&[(2, 20), (1, 10)]));
 
-        let divergence = causal_bisect(&left, &right).expect("diverging runs must bisect");
-        let left_ids = left.journal.entries().map(|e| e.id).collect::<Vec<_>>();
-        let right_ids = right.journal.entries().map(|e| e.id).collect::<Vec<_>>();
-
-        assert_eq!(divergence.first_divergent_left, left_ids[2]);
-        assert_eq!(divergence.first_divergent_right, right_ids[2]);
-        assert_ne!(
-            divergence.first_divergent_left,
-            divergence.first_divergent_right
-        );
         assert!(
-            !divergence.neighborhood.is_empty(),
-            "the neighborhood must contain the left entry"
+            first_divergence(&left.journal, &right.journal).is_none(),
+            "identical vector-clock semantics must not read as a divergence"
         );
-        assert_eq!(divergence.neighborhood[0], divergence.first_divergent_left);
-        assert!(
-            divergence.neighborhood.contains(&left_ids[1]),
-            "the neighborhood must contain the left entry's parent"
-        );
-    }
-
-    #[test]
-    fn causal_bisect_returns_none_for_identical_runs() {
-        let left = run(journal_with(&[1, 2, 3]));
-        let right = run(journal_with(&[1, 2, 3]));
-        assert!(causal_bisect(&left, &right).is_none());
-    }
-
-    #[test]
-    fn causal_bisect_returns_none_for_prefix_run() {
-        let left = run(journal_with(&[1, 2, 3, 4]));
-        let right = run(journal_with(&[1, 2, 3]));
-        assert!(causal_bisect(&left, &right).is_none());
     }
 
     /// Append concurrent entries for two actors in the given order.
@@ -157,18 +97,6 @@ mod tests {
     }
 
     #[test]
-    fn first_divergence_ignores_append_order_of_concurrent_entries() {
-        let left = run(concurrent_journal(&[(1, 10), (2, 20)]));
-        let right = run(concurrent_journal(&[(2, 20), (1, 10)]));
-
-        assert!(
-            first_divergence(&left.journal, &right.journal).is_none(),
-            "identical vector-clock semantics must not read as a divergence"
-        );
-        assert!(causal_bisect(&left, &right).is_none());
-    }
-
-    #[test]
     fn prefix_truncation_is_not_a_divergence_either_way() {
         let left = run(journal_with(&[1, 2, 3, 4]));
         let right = run(journal_with(&[1, 2, 3]));
@@ -177,7 +105,6 @@ mod tests {
             first_divergence(&left.journal, &right.journal).is_none(),
             "a strict prefix must not read as a divergence"
         );
-        assert!(causal_bisect(&left, &right).is_none());
 
         let swapped_left = run(journal_with(&[1, 2, 3]));
         let swapped_right = run(journal_with(&[1, 2, 3, 4]));
@@ -185,7 +112,6 @@ mod tests {
             first_divergence(&swapped_left.journal, &swapped_right.journal).is_none(),
             "prefix direction must not matter"
         );
-        assert!(causal_bisect(&swapped_left, &swapped_right).is_none());
     }
 
     #[test]

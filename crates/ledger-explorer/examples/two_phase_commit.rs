@@ -3,19 +3,18 @@
 use ledger_explorer::oracle::AssertionOracle;
 use ledger_explorer::search::run_campaign;
 use ledger_explorer::workloads::TwoPhaseCommitWorkload;
-use ledger_sim::config::{Policy, RunConfig};
+use ledger_sim::{Policy, RunConfig};
 
 fn main() {
     println!("=== Ledger Engine: Two-Phase Commit Exploration ===");
-    let config = RunConfig {
-        seed: [100; 32],
-        policy: Policy::Bandit {
+    let config = RunConfig::builder()
+        .seed([100; 32])
+        .policy(Policy::Bandit {
             exploration_constant: 1.414,
             pct_mix: 0.1,
-        },
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+        })
+        .max_steps(256)
+        .build();
     let workload = TwoPhaseCommitWorkload;
     let oracle = AssertionOracle;
 

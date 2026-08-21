@@ -1,10 +1,11 @@
 //! Lineage-Driven Fault Injection (LDFI) solver over causal provenance DAGs.
 
 use crate::oracle::Verdict;
+use crate::solver::{FaultSolver, SolverError};
 use ledger_format::{ActorId, EntryKind, Hash, Payload};
 use ledger_journal::Journal;
-use ledger_sim::FaultInjection;
-use std::collections::{BTreeSet, HashSet};
+use ledger_sim::SimFault;
+use std::collections::HashSet;
 
 /// A single faultable boundary event.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -23,92 +24,18 @@ pub struct FaultHypothesis {
     pub explanation: String,
 }
 
-/// Legacy compatibility alias.
-pub type FaultCut = FaultableEvent;
-
-/// Suggest ranked fault hypotheses using Horn derivation path analysis and minimum hitting sets.
-pub fn solve_ldfi(journal: &Journal, verdict: &Verdict) -> Vec<FaultHypothesis> {
-    if verdict.witnesses.is_empty() && journal.is_empty() {
-        return Vec::new();
-    }
-
-    let mut all_paths: Vec<Vec<FaultableEvent>> = Vec::new();
-    for witness in &verdict.witnesses {
-        let mut current_path = Vec::new();
-        collect_derivation_paths(journal, *witness, &mut current_path, &mut all_paths);
-    }
-
-    // Fall back to a heuristic cut when backward provenance has none.
-    // Without derivation paths a hitting-set solution cannot be ranked; take
-    // the highest-cost faultable event as a single non-trivial cut instead of
-    // every faultable event, which would make any single event trivially
-    // minimal.
-    if all_paths.is_empty() {
-        let mut fallback_events = Vec::new();
-        for entry in journal.entries() {
-            if is_faultable(entry.data.kind) {
-                fallback_events.push(FaultableEvent {
-                    event: entry.id,
-                    kind: entry.data.kind,
-                    cost: event_fault_cost(journal, &entry.id),
-                });
-            }
-        }
-        if let Some(highest) = fallback_events.iter().max_by_key(|event| event.cost) {
-            all_paths.push(vec![highest.clone()]);
-        }
-    }
-
-    if all_paths.is_empty() {
-        return Vec::new();
-    }
-
-    let hitting_sets = compute_minimal_hitting_sets(&all_paths);
-    let mut hypotheses: Vec<FaultHypothesis> = hitting_sets
-        .into_iter()
-        .map(|events_set| {
-            let events: Vec<Hash> = events_set.into_iter().collect();
-            let total_cost = events
-                .iter()
-                .map(|h| event_fault_cost(journal, h))
-                .sum::<u64>();
-            let explanation = format!(
-                "Minimum hitting set cut with {} fault(s) breaking {} causal derivation path(s)",
-                events.len(),
-                all_paths.len()
-            );
-            FaultHypothesis {
-                events,
-                total_cost,
-                explanation,
-            }
-        })
-        .collect();
-
-    hypotheses.sort_by_key(|h| (h.total_cost, h.events.len()));
-    hypotheses
-}
-
-/// Legacy helper for single-event cuts.
-pub fn suggest_cut(journal: &Journal, verdict: &Verdict) -> Vec<FaultableEvent> {
-    let hypotheses = solve_ldfi(journal, verdict);
-    let mut seen = HashSet::new();
-    let mut cuts = Vec::new();
-
-    for hyp in hypotheses {
-        for event in hyp.events {
-            if seen.insert(event) {
-                let cost = event_fault_cost(journal, &event);
-                let kind = journal
-                    .get(&event)
-                    .map(|e| e.data.kind)
-                    .unwrap_or(EntryKind::Send);
-                cuts.push(FaultableEvent { event, kind, cost });
-            }
-        }
-    }
-    cuts.sort_by_key(|c| c.cost);
-    cuts
+/// Solve with an explicit [`FaultSolver`] implementation.
+///
+/// This is the generic path for call sites that need to inject a solver, for
+/// example the CaDiCaL-backed [`crate::solver::MaxSatSolver`] behind the
+/// `solver-cadical` feature. Unlike swallowing the result, the solver error
+/// propagates to the caller.
+pub fn solve_with(
+    solver: &mut dyn FaultSolver,
+    journal: &Journal,
+    verdict: &Verdict,
+) -> Result<Vec<FaultHypothesis>, SolverError> {
+    solver.solve(journal, verdict)
 }
 
 /// Convert an LDFI hypothesis cut into an executable fault schedule.
@@ -118,13 +45,13 @@ pub fn suggest_cut(journal: &Journal, verdict: &Verdict) -> Vec<FaultableEvent> 
 /// observes. Every applicable injection class is emitted per event kind, so a
 /// cut exercises Drop, Delay, Partition, Corrupt, and CrashState instead of
 /// only two classes. A target id is injected at most once per schedule.
-pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<FaultInjection> {
+pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<SimFault> {
     let mut schedule = Vec::new();
     let mut seen = HashSet::new();
     let mut seen_classes = HashSet::new();
-    let push = |schedule: &mut Vec<FaultInjection>,
+    let push = |schedule: &mut Vec<SimFault>,
                 seen_classes: &mut HashSet<(u8, Hash)>,
-                injection: FaultInjection| {
+                injection: SimFault| {
         let key = injection_key(&injection);
         if seen_classes.insert(key) {
             schedule.push(injection);
@@ -139,15 +66,11 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
         };
         match entry.data.kind {
             EntryKind::Send => {
+                push(&mut schedule, &mut seen_classes, SimFault::Drop(*event));
                 push(
                     &mut schedule,
                     &mut seen_classes,
-                    FaultInjection::Drop(*event),
-                );
-                push(
-                    &mut schedule,
-                    &mut seen_classes,
-                    FaultInjection::Delay {
+                    SimFault::Delay {
                         send: *event,
                         ticks: 1,
                     },
@@ -156,7 +79,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
                     push(
                         &mut schedule,
                         &mut seen_classes,
-                        FaultInjection::Partition {
+                        SimFault::Partition {
                             src: entry.data.actor,
                             dst: *left as ActorId,
                         },
@@ -165,15 +88,11 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
             }
             EntryKind::Recv => {
                 if let Some(parent) = send_parent(entry.data.parents.as_slice(), journal) {
+                    push(&mut schedule, &mut seen_classes, SimFault::Drop(parent));
                     push(
                         &mut schedule,
                         &mut seen_classes,
-                        FaultInjection::Drop(parent),
-                    );
-                    push(
-                        &mut schedule,
-                        &mut seen_classes,
-                        FaultInjection::Delay {
+                        SimFault::Delay {
                             send: parent,
                             ticks: 1,
                         },
@@ -182,7 +101,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
                         push(
                             &mut schedule,
                             &mut seen_classes,
-                            FaultInjection::Partition {
+                            SimFault::Partition {
                                 src: send_entry.data.actor,
                                 dst: entry.data.actor,
                             },
@@ -194,7 +113,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
                 push(
                     &mut schedule,
                     &mut seen_classes,
-                    FaultInjection::Corrupt {
+                    SimFault::Corrupt {
                         write: *event,
                         xor_mask: 1,
                     },
@@ -202,7 +121,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
                 push(
                     &mut schedule,
                     &mut seen_classes,
-                    FaultInjection::CrashState {
+                    SimFault::CrashState {
                         write: *event,
                         state: 0,
                     },
@@ -213,7 +132,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
                     push(
                         &mut schedule,
                         &mut seen_classes,
-                        FaultInjection::Corrupt {
+                        SimFault::Corrupt {
                             write: parent,
                             xor_mask: 1,
                         },
@@ -221,7 +140,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
                     push(
                         &mut schedule,
                         &mut seen_classes,
-                        FaultInjection::CrashState {
+                        SimFault::CrashState {
                             write: parent,
                             state: 0,
                         },
@@ -232,7 +151,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
                 push(
                     &mut schedule,
                     &mut seen_classes,
-                    FaultInjection::Delay {
+                    SimFault::Delay {
                         send: *event,
                         ticks: 1,
                     },
@@ -249,14 +168,14 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<F
 /// Entry-targeted injections key on the entry id; a partition keys on the
 /// directed link. The class tag keeps distinct injection classes for the same
 /// target (drop, delay, partition, corrupt, crash-state) all executable.
-fn injection_key(injection: &FaultInjection) -> (u8, Hash) {
+fn injection_key(injection: &SimFault) -> (u8, Hash) {
     match injection {
-        FaultInjection::Drop(id) => (0, *id),
-        FaultInjection::Delay { send, .. } => (1, *send),
-        FaultInjection::Crash(id) => (2, *id),
-        FaultInjection::Corrupt { write, .. } => (3, *write),
-        FaultInjection::CrashState { write, .. } => (4, *write),
-        FaultInjection::Partition { src, dst } => {
+        SimFault::Drop(id) => (0, *id),
+        SimFault::Delay { send, .. } => (1, *send),
+        SimFault::Crash(id) => (2, *id),
+        SimFault::Corrupt { write, .. } => (3, *write),
+        SimFault::CrashState { write, .. } => (4, *write),
+        SimFault::Partition { src, dst } => {
             let mut hasher = blake3::Hasher::new();
             hasher.update(&src.to_le_bytes());
             hasher.update(&dst.to_le_bytes());
@@ -285,110 +204,10 @@ fn fs_write_parent(parents: &[Hash], journal: &Journal) -> Option<Hash> {
     })
 }
 
-fn event_fault_cost(journal: &Journal, hash: &Hash) -> u64 {
-    journal
-        .get(hash)
-        .map(|e| match e.data.kind {
-            EntryKind::Send | EntryKind::Recv => 2,
-            EntryKind::TimerFire | EntryKind::TimerSet => 3,
-            EntryKind::FsRead | EntryKind::FsWrite => 4,
-            _ => 5,
-        })
-        .unwrap_or(10)
-}
-
-fn is_faultable(kind: EntryKind) -> bool {
-    matches!(
-        kind,
-        EntryKind::Send
-            | EntryKind::Recv
-            | EntryKind::FsRead
-            | EntryKind::FsWrite
-            | EntryKind::TimerFire
-            | EntryKind::TimerSet
-    )
-}
-
-fn collect_derivation_paths(
-    journal: &Journal,
-    current: Hash,
-    current_path: &mut Vec<FaultableEvent>,
-    paths: &mut Vec<Vec<FaultableEvent>>,
-) {
-    let Some(entry) = journal.get(&current) else {
-        return;
-    };
-
-    let pushed = if is_faultable(entry.data.kind) {
-        current_path.push(FaultableEvent {
-            event: current,
-            kind: entry.data.kind,
-            cost: event_fault_cost(journal, &current),
-        });
-        true
-    } else {
-        false
-    };
-
-    if entry.data.parents.is_empty() {
-        if !current_path.is_empty() {
-            paths.push(current_path.clone());
-        }
-    } else {
-        for parent in &entry.data.parents {
-            collect_derivation_paths(journal, *parent, current_path, paths);
-        }
-    }
-
-    if pushed {
-        current_path.pop();
-    }
-}
-
-fn compute_minimal_hitting_sets(paths: &[Vec<FaultableEvent>]) -> Vec<BTreeSet<Hash>> {
-    let mut candidate_sets: Vec<BTreeSet<Hash>> = vec![BTreeSet::new()];
-
-    for path in paths {
-        let path_hashes: HashSet<Hash> = path.iter().map(|e| e.event).collect();
-        let mut next_candidates: Vec<BTreeSet<Hash>> = Vec::new();
-
-        for current in candidate_sets {
-            if current.iter().any(|h| path_hashes.contains(h)) {
-                next_candidates.push(current);
-            } else {
-                for &h in &path_hashes {
-                    let mut expanded = current.clone();
-                    expanded.insert(h);
-                    next_candidates.push(expanded);
-                }
-            }
-        }
-
-        candidate_sets = prune_supersets(next_candidates);
-    }
-
-    candidate_sets
-}
-
-fn prune_supersets(sets: Vec<BTreeSet<Hash>>) -> Vec<BTreeSet<Hash>> {
-    let mut minimal = Vec::new();
-    for s in sets {
-        let is_superset = minimal
-            .iter()
-            .any(|existing: &BTreeSet<Hash>| existing.is_subset(&s) && existing != &s);
-        if !is_superset {
-            minimal.retain(|existing: &BTreeSet<Hash>| !s.is_subset(existing));
-            if !minimal.contains(&s) {
-                minimal.push(s);
-            }
-        }
-    }
-    minimal
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::solver::HittingSetSolver;
     use ledger_format::Payload;
 
     #[test]
@@ -419,7 +238,8 @@ mod tests {
             .expect("append must succeed");
 
         let verdict = Verdict::fail(vec![outcome], "planted");
-        let hypotheses = solve_ldfi(&journal, &verdict);
+        let mut solver = HittingSetSolver::new();
+        let hypotheses = solve_with(&mut solver, &journal, &verdict).expect("solve must succeed");
         assert!(
             !hypotheses.is_empty(),
             "the fallback must seed at least one hypothesis"
@@ -436,5 +256,25 @@ mod tests {
                 "the cut must draw from the faultable events"
             );
         }
+    }
+
+    #[test]
+    fn solve_with_trait_object_matches_concrete_solver() {
+        let mut journal = Journal::new();
+        let send = journal
+            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .expect("append must succeed");
+        let outcome = journal
+            .append(EntryKind::Outcome, 1, [send], Payload::Number(0))
+            .expect("append must succeed");
+        let verdict = Verdict::fail(vec![outcome], "trait check");
+
+        let mut boxed: Box<dyn FaultSolver> = Box::new(HittingSetSolver::new());
+        let via_trait = solve_with(boxed.as_mut(), &journal, &verdict).expect("trait must succeed");
+        let mut concrete = HittingSetSolver::new();
+        let direct = concrete
+            .solve(&journal, &verdict)
+            .expect("concrete must succeed");
+        assert_eq!(via_trait, direct);
     }
 }

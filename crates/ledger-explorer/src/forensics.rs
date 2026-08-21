@@ -3,42 +3,7 @@
 use ledger_format::EntryKind;
 use ledger_journal::Journal;
 use ledger_sim::RunResult;
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-
-#[derive(Debug, Default)]
-pub struct MotifAnalyzer {
-    transition_counts: HashMap<(EntryKind, EntryKind), usize>,
-}
-
-impl MotifAnalyzer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record_run(&mut self, journal: &Journal) {
-        let mut prev: Option<EntryKind> = None;
-        for entry in journal.entries() {
-            if let Some(p) = prev {
-                *self
-                    .transition_counts
-                    .entry((p, entry.data.kind))
-                    .or_insert(0) += 1;
-            }
-            prev = Some(entry.data.kind);
-        }
-    }
-
-    pub fn top_motifs(&self, limit: usize) -> Vec<((EntryKind, EntryKind), usize)> {
-        let mut list: Vec<_> = self
-            .transition_counts
-            .iter()
-            .map(|(&k, &v)| (k, v))
-            .collect();
-        list.sort_by_key(|b| Reverse(b.1));
-        list.into_iter().take(limit).collect()
-    }
-}
 
 /// Failure-probability lift of one causal motif.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +110,7 @@ mod tests {
 
     fn run(journal: Journal) -> RunResult {
         RunResult {
+            journal_error: None,
             journal,
             decisions: Vec::new(),
             trace: Vec::new(),

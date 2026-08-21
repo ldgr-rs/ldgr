@@ -6,6 +6,12 @@
 //! pure artifact producer. Campaign policy (which findings are expected and
 //! which findings must open an issue) lives in
 //! `.github/workflows/nightly-campaigns.yml`, not here.
+//!
+//! When `LEDGER_CERT_OUT` requests a certificate, the builder id records the
+//! runtime profile: `LEDGER_BUILDER_ID` (default "nightly-swarm-campaign")
+//! gains a `+<hex8>` suffix from `LEDGER_PROFILE_FINGERPRINT` when that
+//! variable is set, binding the certificate to the worker runtime profile
+//! handshake (`ledger_worker::profile`).
 // ledger-lint:allow (host-side campaign driver; it writes manifests with std::fs, unlike simulation code)
 
 use std::collections::BTreeMap;
@@ -132,12 +138,11 @@ fn parse_args() -> Result<Option<Args>, String> {
 fn base_config(seed: u64, max_steps: usize) -> RunConfig {
     let mut seed_bytes = [0u8; 32];
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
-    RunConfig {
-        seed: seed_bytes,
-        policy: Policy::Random,
-        max_steps,
-        ..RunConfig::default()
-    }
+    RunConfig::builder()
+        .seed(seed_bytes)
+        .policy(Policy::Random)
+        .max_steps(max_steps)
+        .build()
 }
 
 /// Recover the campaign attempt index from a finding seed. The swarm campaign
@@ -188,9 +193,11 @@ fn json_escape(text: &str) -> String {
 
 /// Write the summary JSON and one `.ldgr` manifest per finding into `out`.
 ///
-/// The summary is a machine-readable campaign report, not a formal
-/// certificate: the repo has no certificate schema yet, so this file names
-/// itself a summary in its own `note` field.
+/// The summary is a machine-readable campaign report. A formal in-toto
+/// Statement certificate (`campaign-certificate.json`) is also emitted via
+/// `certs.rs` when `LEDGER_CERT_OUT` is set, so the summary no longer claims
+/// to be the sole artifact. The `note` field in the summary points to the
+/// companion certificate.
 fn emit(
     report: &CampaignReport,
     workload_name: &str,
@@ -225,7 +232,7 @@ fn emit(
     }
 
     let summary = format!(
-        r#"{{"campaign":"swarm","workload":"{}","oracle":"{}","base_seed":"{}","policy":"random","max_steps":{},"runs_executed":{},"distinct_journal_roots":{},"findings":[{}],"note":"Machine-readable nightly campaign summary. This is a summary, not a formal certificate. Every finding has a companion .ldgr repro manifest in this directory; repros are unminimized."}}"#,
+        r#"{{"campaign":"swarm","workload":"{}","oracle":"{}","base_seed":"{}","policy":"random","max_steps":{},"runs_executed":{},"distinct_journal_roots":{},"findings":[{}],"note":"Machine-readable nightly campaign summary. A formal in-toto Statement certificate (campaign-certificate.json) is emitted alongside this summary via certs.rs; every finding has a companion .ldgr repro manifest in this directory and repros are unminimized."}}"#,
         workload_name,
         oracle_name,
         hex(base_seed),
@@ -237,6 +244,53 @@ fn emit(
     std::fs::write(out.join("campaign-summary.json"), summary)
         .map_err(|error| format!("write summary: {error}"))?;
     Ok(())
+}
+
+/// Canonical digest of the base config, attested as
+/// `externalParameters.runConfigDigest` in the certificate.
+///
+/// The versioned canonical bytes come from the owned codec in
+/// `ledger_sim::config_canonical`; this driver no longer carries a private
+/// copy, so the worker boundary and the certificate can never disagree.
+fn run_config_digest(config: &RunConfig) -> Result<Hash, String> {
+    ledger_sim::canonical_hash(config)
+        .map_err(|error| format!("run config canonical bytes: {error}"))
+}
+
+/// Bind a builder id to the runtime profile fingerprint.
+///
+/// When a fingerprint is supplied its first eight hex chars are appended as
+/// `+<hex8>` so certificates record which runtime profile produced them
+/// (`ledger_worker::profile` handshake). Characters other than ASCII hex
+/// digits are dropped, and a fingerprint with fewer than eight surviving
+/// chars is ignored, so a malformed variable cannot alter the builder id.
+fn bind_builder_id(base: &str, fingerprint: Option<&str>) -> String {
+    let Some(fp) = fingerprint else {
+        return base.to_string();
+    };
+    let hex8: String = fp
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
+        .collect();
+    if hex8.len() == 8 {
+        format!("{base}+{}", hex8.to_ascii_lowercase())
+    } else {
+        base.to_string()
+    }
+}
+
+/// Certificate builder id from the environment.
+///
+/// Base id is `LEDGER_BUILDER_ID` (default "nightly-swarm-campaign"); when
+/// `LEDGER_PROFILE_FINGERPRINT` is set the runtime-profile short fingerprint
+/// is bound into it via [`bind_builder_id`].
+fn builder_id() -> String {
+    let base = env::var("LEDGER_BUILDER_ID").unwrap_or_else(|_| "nightly-swarm-campaign".into());
+    bind_builder_id(
+        &base,
+        env::var("LEDGER_PROFILE_FINGERPRINT").ok().as_deref(),
+    )
 }
 
 fn drive(args: &Args) -> Result<(), String> {
@@ -259,10 +313,27 @@ fn drive(args: &Args) -> Result<(), String> {
         &report,
         args.workload.name(),
         args.workload.oracle_name(),
-        &base.seed,
+        &base.seed(),
         args.max_steps,
         &args.out,
     )?;
+    if let Ok(cert_out) = env::var("LEDGER_CERT_OUT")
+        && !cert_out.trim().is_empty()
+    {
+        let cert_path = PathBuf::from(cert_out);
+        if let Some(parent) = cert_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+        }
+        let digest = run_config_digest(&base)?;
+        let builder_id = builder_id();
+        report
+            .write_certificate(&cert_path, digest, &builder_id)
+            .map_err(|error| format!("certificate emit: {error}"))?;
+        println!("certificate written to {}", cert_path.display());
+    }
     println!(
         "swarm campaign complete: workload={} runs={} distinct_roots={} findings={} out={}",
         args.workload.name(),
@@ -340,9 +411,30 @@ mod tests {
     fn attempt_of_recovers_the_campaign_attempt_index() {
         let base = base_config(0, 64);
         for attempt in 0..16usize {
-            let mut seed = base.seed;
+            let mut seed = base.seed();
             seed[..8].copy_from_slice(&(attempt as u64).to_le_bytes());
             assert_eq!(attempt_of(&seed), attempt);
         }
+    }
+
+    #[test]
+    fn builder_id_binds_eight_hex_chars_when_fingerprint_present() {
+        assert_eq!(bind_builder_id("nightly", None), "nightly");
+        let fp = "0123456789abcdef";
+        assert_eq!(
+            bind_builder_id("nightly", Some(fp)),
+            "nightly+01234567",
+            "only the first eight hex chars bind"
+        );
+        // Uppercase input normalizes to lowercase.
+        assert_eq!(bind_builder_id("b", Some("ABCDEF01")), "b+abcdef01");
+    }
+
+    #[test]
+    fn builder_id_ignores_malformed_fingerprint() {
+        // Fewer than eight surviving hex chars leaves the base id untouched.
+        assert_eq!(bind_builder_id("nightly", Some("zz9")), "nightly");
+        assert_eq!(bind_builder_id("nightly", Some("garbage")), "nightly");
+        assert_eq!(bind_builder_id("nightly", Some("")), "nightly");
     }
 }
