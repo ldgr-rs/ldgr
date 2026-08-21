@@ -1,0 +1,20 @@
+[package]
+name = "ledger-faultspec"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "Failure-spec DSL parser, compiler, and canonical scenario library for the Ledger DST engine"
+readme = "README.md"
+
+[dependencies]
+ledger-format = { path = "../ledger-format" }
+# License seam: this crate stays Apache-2.0 on ledger-format types only.
+# The deterministic mapping from this crate's string-targeted FaultInjection
+# to the engine's hash-targeted SimFault lives in ledger-explorer's
+# faultspec_bridge (AGPL boundary). Pub fields `faults` and `schedule` are read by faultspec_bridge.
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
