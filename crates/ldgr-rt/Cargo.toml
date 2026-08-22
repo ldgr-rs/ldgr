@@ -1,0 +1,31 @@
+[package]
+name = "ldgr-rt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "Drop-in deterministic runtime facade for ldgr simulation"
+readme = "README.md"
+
+[dependencies]
+ledger-format = { path = "../ledger-format" }
+ledger-sim = { path = "../ledger-sim", optional = true }
+# Source type of `RuntimeError::Journal`; compiled only with the sim-link
+# route that maps `ledger_sim::RuntimeError`.
+ledger-journal = { path = "../ledger-journal", optional = true }
+blake3 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "net"] }
+rand_core = { workspace = true }
+rand_chacha = { workspace = true }
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+sim = ["dep:serde", "dep:serde_json"]
+sim-link = ["dep:ledger-sim", "dep:serde", "dep:serde_json", "dep:ledger-journal"]
+
+[lints]
+workspace = true
