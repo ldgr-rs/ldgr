@@ -12,11 +12,14 @@ use clap_complete::Shell;
 use ledger_cli::format_check::{FormatCheckOutcome, check_file};
 use ledger_cli::ldfi_cmd::{self, LdfiReport};
 use ledger_cli::scaffold;
-use ledger_cli::{Cli, Command, DefaultMiniKv, generate_completions, is_verbose, seed_from_u64};
+use ledger_cli::scaffold_consensus;
+use ledger_cli::{
+    Cli, Command, DefaultMiniKv, MaxSatEngineArg, generate_completions, is_verbose, seed_from_u64,
+};
 use ledger_explorer::search::{Workload, replay, search};
-use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle, minimize_schedule, solve_ldfi};
+use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle, minimize_schedule};
 use ledger_format::Hash;
-use ledger_sim::{FaultInjection, Policy, RunConfig, Simulation};
+use ledger_sim::{Policy, RunConfig, SimFault, Simulation};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -71,7 +74,7 @@ fn main() -> ExitCode {
             max_steps,
         } => run_diff(&cli, verbose, *seed_a, *seed_b, *max_steps),
         Command::Doctor => run_doctor(&cli),
-        Command::Init { dir, force } => run_init(&cli, dir.as_deref(), *force),
+        Command::Init { dir, force, sut } => run_init(&cli, dir.as_deref(), *force, *sut),
         Command::Format { file, check } if *check => run_format_check(&cli, file),
         Command::Format { .. } => {
             eprintln!("ledger: `format` currently supports only `--check`");
@@ -81,8 +84,29 @@ fn main() -> ExitCode {
             seed,
             max_steps,
             attempts,
-        } => run_ldfi(&cli, verbose, *seed, *max_steps, *attempts),
+            maxsat_engine,
+        } => run_ldfi(&cli, verbose, *seed, *max_steps, *attempts, *maxsat_engine),
         Command::Completions { shell } => run_completions(*shell),
+        Command::Ingest { input, fidelity } => run_ingest(&cli, input, *fidelity),
+        Command::Cert { cmd } => match cmd {
+            ledger_cli::CertCommand::Verify { path } => run_cert_verify(&cli, path),
+        },
+        Command::Faults { cmd } => match cmd {
+            ledger_cli::FaultsCommand::Compile { file } => run_faults_compile(&cli, file),
+            ledger_cli::FaultsCommand::Apply {
+                file,
+                seed_hex,
+                workload,
+            } => run_faults_apply(&cli, file, seed_hex, workload),
+        },
+        Command::Coverage { input, format } => run_coverage(&cli, input, format),
+        Command::Scaffold {
+            template,
+            dir,
+            force,
+        } => run_scaffold(&cli, dir, template, *force),
+        #[cfg(unix)]
+        Command::RtServer { socket } => run_rt_server(socket),
     };
     match result {
         Ok(code) => code,
@@ -93,30 +117,15 @@ fn main() -> ExitCode {
     }
 }
 
-/// Escapes one string for safe embedding in a JSON string literal.
-fn json_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
 /// Renders the violation record emitted by the `--json` sim path.
 fn json_violation(reason: &str, steps: usize, root: Hash) -> String {
-    format!(
-        r#"{{"status":"violation","reason":"{}","steps":{},"journal_root":"{:02x?}"}}"#,
-        json_escape(reason),
-        steps,
-        root
-    )
+    serde_json::json!({
+        "status": "violation",
+        "reason": reason,
+        "steps": steps,
+        "journal_root": ledger_format::hash_to_hex(&root)
+    })
+    .to_string()
 }
 
 fn run_sim(
@@ -127,19 +136,19 @@ fn run_sim(
     max_steps: usize,
     runs: usize,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let config = RunConfig {
-        seed: seed_from_u64(seed),
-        policy,
-        max_steps,
-        ..RunConfig::default()
-    };
+    let _ = verbose;
+    let config = RunConfig::builder()
+        .seed(seed_from_u64(seed))
+        .policy(policy)
+        .max_steps(max_steps)
+        .build();
     let workload = DefaultMiniKv;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
 
     if cli.ndjson {
         for attempt in 0..runs {
             let mut attempt_config = config.clone();
-            attempt_config.seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            attempt_config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
             let run = Simulation::new(attempt_config, workload.programs()).run()?;
             let verdict = oracle.check(&run);
             let status = if verdict.violated {
@@ -147,12 +156,14 @@ fn run_sim(
             } else {
                 "passed"
             };
-            println!(
-                r#"{{"attempt":{attempt},"status":"{status}","steps":{},"journal_root":"{:02x?}","reason":"{}"}}"#,
-                run.steps,
-                run.journal.root_hash(),
-                json_escape(&verdict.reason)
-            );
+            let value = serde_json::json!({
+                "attempt": attempt,
+                "status": status,
+                "steps": run.steps,
+                "journal_root": ledger_format::hash_to_hex(&run.journal.root_hash()),
+                "reason": verdict.reason
+            });
+            println!("{}", value);
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -169,20 +180,11 @@ fn run_sim(
             );
         } else {
             println!("Violation detected: {}", finding.verdict.reason);
-            println!("Journal root: {:02x?}", finding.run.journal.root_hash());
+            println!(
+                "Journal root: {}",
+                ledger_format::hash_to_hex(&finding.run.journal.root_hash())
+            );
             println!("Steps executed: {}", finding.run.steps);
-            let hypotheses = solve_ldfi(&finding.run.journal, &finding.verdict);
-            println!("LDFI cuts generated: {}", hypotheses.len());
-            if verbose {
-                for (index, hypothesis) in hypotheses.iter().enumerate() {
-                    println!(
-                        "  cut[{}]: {} faultable event(s) - {}",
-                        index,
-                        hypothesis.events.len(),
-                        hypothesis.explanation
-                    );
-                }
-            }
         }
     } else if cli.json {
         println!(r#"{{"status":"passed","runs":{runs}}}"#);
@@ -201,25 +203,27 @@ fn run_repro(
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let workload = DefaultMiniKv;
     let seed_hash = seed_from_u64(seed);
-    let config = RunConfig {
-        seed: seed_hash,
-        policy,
-        max_steps,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed(seed_hash)
+        .policy(policy)
+        .max_steps(max_steps)
+        .build();
     let run = Simulation::new(config, workload.programs()).run()?;
     let replayed = replay(&workload, seed_hash, run.decisions.clone())?;
 
     let matches = run.journal.root_hash() == replayed.journal.root_hash();
     if cli.json || cli.ndjson {
-        println!(
-            r#"{{"reproducible":{},"journal_root":"{:02x?}"}}"#,
-            matches,
-            replayed.journal.root_hash()
-        );
+        let value = serde_json::json!({
+            "reproducible": matches,
+            "journal_root": ledger_format::hash_to_hex(&replayed.journal.root_hash())
+        });
+        println!("{}", value);
     } else {
         println!("Replay status: reproducible = {matches}");
-        println!("Journal root: {:02x?}", replayed.journal.root_hash());
+        println!(
+            "Journal root: {}",
+            ledger_format::hash_to_hex(&replayed.journal.root_hash())
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -234,12 +238,11 @@ fn run_minimize(
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let workload = DefaultMiniKv;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
-    let config = RunConfig {
-        seed: seed_from_u64(seed),
-        policy,
-        max_steps,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::builder()
+        .seed(seed_from_u64(seed))
+        .policy(policy)
+        .max_steps(max_steps)
+        .build();
     if let Some(finding) = search(&workload, &oracle, config, runs)? {
         let report = minimize_schedule(&finding.run.decisions, |decisions| {
             replay(&workload, finding.seed, decisions.to_vec())
@@ -273,24 +276,35 @@ fn run_diff(
     max_steps: usize,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let workload = DefaultMiniKv;
-    let c1 = RunConfig {
-        seed: seed_from_u64(seed_a),
-        max_steps,
-        ..RunConfig::default()
-    };
-    let c2 = RunConfig {
-        seed: seed_from_u64(seed_b),
-        max_steps,
-        ..RunConfig::default()
-    };
+    let c1 = RunConfig::builder()
+        .seed(seed_from_u64(seed_a))
+        .max_steps(max_steps)
+        .build();
+    let c2 = RunConfig::builder()
+        .seed(seed_from_u64(seed_b))
+        .max_steps(max_steps)
+        .build();
     let r1 = Simulation::new(c1, workload.programs()).run()?;
     let r2 = Simulation::new(c2, workload.programs()).run()?;
 
     let diff_pair = ledger_explorer::diff(&r1, &r2);
     if cli.json || cli.ndjson {
-        println!(r#"{{"divergence":"{:02x?}"}}"#, diff_pair);
+        let value = match diff_pair {
+            Some((a, b)) => {
+                serde_json::json!({"divergence": [ledger_format::hash_to_hex(&a), ledger_format::hash_to_hex(&b)]})
+            }
+            None => serde_json::json!({"divergence": null}),
+        };
+        println!("{}", value);
     } else {
-        println!("First divergence entry pair: {:02x?}", diff_pair);
+        match diff_pair {
+            Some((a, b)) => println!(
+                "First divergence entry pair: {} {}",
+                ledger_format::hash_to_hex(&a),
+                ledger_format::hash_to_hex(&b)
+            ),
+            None => println!("No divergence"),
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -300,27 +314,21 @@ fn run_doctor(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let root = ledger_cli::checks::find_repo_root(&cwd);
     let report = ledger_cli::checks::run_doctor(&root);
     if cli.json {
-        let entries: Vec<String> = report
+        let entries: Vec<serde_json::Value> = report
             .outcomes
             .iter()
             .map(|outcome| {
                 let status = if outcome.ok { "ok" } else { "fail" };
-                format!(
-                    r#"{{"check":"{}","status":"{status}","detail":"{}"}}"#,
-                    json_escape(outcome.name),
-                    json_escape(&outcome.detail)
-                )
+                serde_json::json!({"check": outcome.name, "status": status, "detail": outcome.detail})
             })
             .collect();
-        println!(r#"{{"doctor":[{}]}}"#, entries.join(","));
+        let value = serde_json::json!({"doctor": entries});
+        println!("{}", value);
     } else if cli.ndjson {
         for outcome in &report.outcomes {
             let status = if outcome.ok { "ok" } else { "fail" };
-            println!(
-                r#"{{"check":"{}","status":"{status}","detail":"{}"}}"#,
-                json_escape(outcome.name),
-                json_escape(&outcome.detail)
-            );
+            let value = serde_json::json!({"check": outcome.name, "status": status, "detail": outcome.detail});
+            println!("{}", value);
         }
     } else {
         println!("ledger-doctor: checking repository at {}", root.display());
@@ -345,23 +353,43 @@ fn run_init(
     cli: &Cli,
     dir: Option<&str>,
     force: bool,
+    sut: bool,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let base: PathBuf = match dir {
         Some(path) => PathBuf::from(path),
         None => std::env::current_dir()?,
     };
+    if sut {
+        scaffold::write_sut_scaffold(&base, force)?;
+        let files = [
+            base.join("Cargo.toml"),
+            base.join("src").join("main.rs"),
+            base.join("tests").join("surface.rs"),
+            base.join("README.md"),
+        ];
+        if cli.json || cli.ndjson {
+            let value = serde_json::json!({
+                "status": "initialized",
+                "dir": base.display().to_string(),
+                "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>()
+            });
+            println!("{}", value);
+        } else {
+            println!("Initialized ledger SUT project in {}", base.display());
+            for path in &files {
+                println!("  created: {}", path.display());
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let report = scaffold::scaffold(&base, force)?;
     if cli.json || cli.ndjson {
-        let files: Vec<String> = report
-            .created
-            .iter()
-            .map(|path| format!(r#""{}""#, json_escape(&path.display().to_string())))
-            .collect();
-        println!(
-            r#"{{"status":"initialized","dir":"{}","files":[{}]}}"#,
-            json_escape(&base.display().to_string()),
-            files.join(",")
-        );
+        let value = serde_json::json!({
+            "status": "initialized",
+            "dir": base.display().to_string(),
+            "files": report.created.iter().map(|path| path.display().to_string()).collect::<Vec<_>>()
+        });
+        println!("{}", value);
     } else {
         println!("Initialized ledger project in {}", base.display());
         for path in &report.created {
@@ -369,6 +397,30 @@ fn run_init(
         }
         for path in &report.skipped {
             println!("  skipped (exists): {}", path.display());
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_scaffold(
+    cli: &Cli,
+    dir: &Path,
+    template: &str,
+    force: bool,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let report = scaffold_consensus::scaffold_consensus(dir, template, force)?;
+    if cli.json || cli.ndjson {
+        let value = serde_json::json!({
+            "status": "scaffolded",
+            "template": template,
+            "dir": dir.display().to_string(),
+            "files": report.created.iter().map(|path| path.display().to_string()).collect::<Vec<_>>()
+        });
+        println!("{}", value);
+    } else {
+        println!("Scaffolded ledger {template} example in {}", dir.display());
+        for path in &report.created {
+            println!("  created: {}", path.display());
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -382,10 +434,9 @@ fn run_format_check(cli: &Cli, file: &Path) -> Result<ExitCode, Box<dyn std::err
         }
         Ok(FormatCheckOutcome::Canonical) => {
             if cli.json || cli.ndjson {
-                println!(
-                    r#"{{"canonical":true,"file":"{}"}}"#,
-                    json_escape(&file.display().to_string())
-                );
+                let value =
+                    serde_json::json!({"canonical": true, "file": file.display().to_string()});
+                println!("{}", value);
             } else {
                 println!("[ok] {}: canonical", file.display());
             }
@@ -393,11 +444,8 @@ fn run_format_check(cli: &Cli, file: &Path) -> Result<ExitCode, Box<dyn std::err
         }
         Ok(FormatCheckOutcome::NonCanonical { reason }) => {
             if cli.json || cli.ndjson {
-                println!(
-                    r#"{{"canonical":false,"file":"{}","reason":"{}"}}"#,
-                    json_escape(&file.display().to_string()),
-                    json_escape(&reason)
-                );
+                let value = serde_json::json!({"canonical": false, "file": file.display().to_string(), "reason": reason});
+                println!("{}", value);
             } else {
                 println!("[FAIL] {}: {reason}", file.display());
             }
@@ -412,8 +460,9 @@ fn run_ldfi(
     seed: u64,
     max_steps: usize,
     attempts: usize,
+    maxsat_engine: MaxSatEngineArg,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let Some(report) = ldfi_cmd::run_ldfi(seed, max_steps, attempts)? else {
+    let Some(report) = ldfi_cmd::run_ldfi(seed, max_steps, attempts, maxsat_engine)? else {
         if cli.json || cli.ndjson {
             println!(r#"{{"status":"passed","attempts":{attempts}}}"#);
         } else {
@@ -424,36 +473,34 @@ fn run_ldfi(
     if cli.json {
         println!("{}", ldfi_json(&report));
     } else if cli.ndjson {
-        println!(
-            r#"{{"status":"violation","reason":"{}","steps":{},"journal_root":"{:02x?}","attempts":{}}}"#,
-            json_escape(&report.reason),
-            report.steps,
-            report.journal_root,
-            report.attempts
-        );
+        let base = serde_json::json!({
+            "status": "violation",
+            "reason": report.reason,
+            "steps": report.steps,
+            "journal_root": ledger_format::hash_to_hex(&report.journal_root),
+            "attempts": report.attempts
+        });
+        println!("{}", base);
         for (index, hypothesis) in report.hypotheses.iter().enumerate() {
-            println!(
-                r#"{{"hypothesis":{index},"events":{},"cost":{},"explanation":"{}"}}"#,
-                hypothesis.events.len(),
-                hypothesis.cost,
-                json_escape(&hypothesis.explanation)
-            );
+            let h = serde_json::json!({
+                "hypothesis": index,
+                "events": hypothesis.events.len(),
+                "cost": hypothesis.cost,
+                "explanation": hypothesis.explanation
+            });
+            println!("{}", h);
         }
-        println!(
-            r#"{{"replay":{{"applied":{},"voided":{},"prefix_ok":{}}},"schedule":[{}]}}"#,
-            report.applied,
-            report.voided,
-            report.prefix_ok,
-            report
-                .schedule
-                .iter()
-                .map(|injection| format!(r#""{}""#, describe_injection(injection)))
-                .collect::<Vec<String>>()
-                .join(",")
-        );
+        let replay = serde_json::json!({
+            "replay": {"applied": report.applied, "voided": report.voided, "prefix_ok": report.prefix_ok},
+            "schedule": report.schedule.iter().map(describe_injection).collect::<Vec<_>>()
+        });
+        println!("{}", replay);
     } else {
         println!("Violation detected: {}", report.reason);
-        println!("Journal root: {:02x?}", report.journal_root);
+        println!(
+            "Journal root: {}",
+            ledger_format::hash_to_hex(&report.journal_root)
+        );
         println!("Steps executed: {}", report.steps);
         println!("LDFI hypotheses:");
         for (index, hypothesis) in report.hypotheses.iter().enumerate() {
@@ -479,46 +526,31 @@ fn run_ldfi(
 }
 
 fn ldfi_json(report: &LdfiReport) -> String {
-    let hypotheses: Vec<String> = report
-        .hypotheses
-        .iter()
-        .map(|hypothesis| {
-            format!(
-                r#"{{"events":{},"cost":{},"explanation":"{}"}}"#,
-                hypothesis.events.len(),
-                hypothesis.cost,
-                json_escape(&hypothesis.explanation)
-            )
-        })
-        .collect();
-    let schedule: Vec<String> = report
-        .schedule
-        .iter()
-        .map(|injection| format!(r#""{}""#, describe_injection(injection)))
-        .collect();
-    format!(
-        r#"{{"status":"violation","reason":"{}","steps":{},"journal_root":"{:02x?}","hypotheses":[{}],"replay":{{"applied":{},"voided":{},"prefix_ok":{}}},"schedule":[{}]}}"#,
-        json_escape(&report.reason),
-        report.steps,
-        report.journal_root,
-        hypotheses.join(","),
-        report.applied,
-        report.voided,
-        report.prefix_ok,
-        schedule.join(",")
-    )
+    serde_json::json!({
+        "status": "violation",
+        "reason": report.reason,
+        "steps": report.steps,
+        "journal_root": ledger_format::hash_to_hex(&report.journal_root),
+        "hypotheses": report.hypotheses.iter().map(|hypothesis| serde_json::json!({
+            "events": hypothesis.events.len(),
+            "cost": hypothesis.cost,
+            "explanation": hypothesis.explanation
+        })).collect::<Vec<_>>(),
+        "replay": {"applied": report.applied, "voided": report.voided, "prefix_ok": report.prefix_ok},
+        "schedule": report.schedule.iter().map(describe_injection).collect::<Vec<_>>()
+    }).to_string()
 }
 
-fn describe_injection(injection: &FaultInjection) -> String {
+fn describe_injection(injection: &SimFault) -> String {
     match injection {
-        FaultInjection::Drop(id) => format!("drop:{}", hex_prefix(id)),
-        FaultInjection::Delay { send, ticks } => format!("delay:{}:{ticks}", hex_prefix(send)),
-        FaultInjection::Partition { src, dst } => format!("partition:{src}->{dst}"),
-        FaultInjection::Crash(id) => format!("crash:{}", hex_prefix(id)),
-        FaultInjection::Corrupt { write, xor_mask } => {
+        SimFault::Drop(id) => format!("drop:{}", hex_prefix(id)),
+        SimFault::Delay { send, ticks } => format!("delay:{}:{ticks}", hex_prefix(send)),
+        SimFault::Partition { src, dst } => format!("partition:{src}->{dst}"),
+        SimFault::Crash(id) => format!("crash:{}", hex_prefix(id)),
+        SimFault::Corrupt { write, xor_mask } => {
             format!("corrupt:{}:mask={xor_mask}", hex_prefix(write))
         }
-        FaultInjection::CrashState { write, state } => {
+        SimFault::CrashState { write, state } => {
             format!("crash-state:{}:{state}", hex_prefix(write))
         }
     }
@@ -527,6 +559,106 @@ fn describe_injection(injection: &FaultInjection) -> String {
 /// Renders the first four bytes of a hash as lowercase hex.
 fn hex_prefix(hash: &Hash) -> String {
     hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Renders a 32-byte hash as 64-char lowercase hex.
+fn hex_hash(hash: &Hash) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn run_ingest(
+    cli: &Cli,
+    input: &Path,
+    fidelity: ledger_cli::FidelityArg,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let config = ledger_adapters::OtelIngestConfig::new(fidelity.to_fidelity(), true, 100_000);
+    let ingested = ledger_adapters::otel::ingest_otel_file_with_config(input, config)?;
+    let root_hex = hex_hash(&ingested.journal.root_hash());
+    let envelope_hash = hex_hash(&ingested.envelope_hash()?);
+    let fidelity_str = fidelity.as_str();
+    let certifiable = ingested.is_certifiable();
+    let entries = ingested.journal.len();
+    if cli.json || cli.ndjson {
+        println!(
+            r#"{{"journal_root":"{root_hex}","fidelity":"{fidelity_str}","envelope_hash":"{envelope_hash}","certifiable":{certifiable},"entries":{entries}}}"#
+        );
+    } else {
+        println!("Journal root: {root_hex}");
+        println!("Fidelity: {fidelity_str}");
+        println!("Envelope hash: {envelope_hash}");
+        println!("Certifiable: {certifiable}");
+        println!("Entries: {entries}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run_cert_verify(cli: &Cli, path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let effective_json = cli.json || cli.ndjson;
+    match ledger_cli::cert_cmd::run_verify(path, effective_json) {
+        Ok(output) => {
+            println!("{output}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("ledger: {error}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn run_faults_compile(cli: &Cli, file: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let effective_json = cli.json || cli.ndjson;
+    match ledger_cli::faults_cmd::compile_scenario(file, effective_json) {
+        Ok(output) => {
+            println!("{output}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("ledger: {error}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn run_faults_apply(
+    cli: &Cli,
+    file: &Path,
+    seed_hex: &str,
+    workload: &str,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let effective_json = cli.json || cli.ndjson;
+    match ledger_cli::faults_cmd::apply_scenario(file, seed_hex, workload, effective_json) {
+        Ok(output) => {
+            println!("{output}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("ledger: {error}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn run_coverage(
+    _cli: &Cli,
+    input: &Path,
+    format: &str,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match ledger_cli::coverage_cmd::run(input, format) {
+        Ok(output) => {
+            println!("{output}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(error) => {
+            eprintln!("ledger: {error}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_rt_server(socket: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    ledger_cli::rt_server::run(socket)
 }
 
 fn run_completions(shell: Shell) -> Result<ExitCode, Box<dyn std::error::Error>> {

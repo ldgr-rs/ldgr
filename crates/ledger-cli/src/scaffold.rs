@@ -23,7 +23,11 @@ pub enum ScaffoldError {
     /// `repro.ldgr` exists and `--force` was not given.
     RefuseOverwrite(PathBuf),
     /// The default manifest could not be canonically encoded.
-    Manifest(String),
+    Manifest {
+        source: ledger_format::CborError,
+    },
+    /// The requested template name has no built-in source.
+    UnknownTemplate(String),
 }
 
 impl fmt::Display for ScaffoldError {
@@ -40,12 +44,25 @@ impl fmt::Display for ScaffoldError {
                 "refusing to overwrite existing {} (use --force)",
                 path.display()
             ),
-            Self::Manifest(detail) => write!(formatter, "cannot encode default manifest: {detail}"),
+            Self::Manifest { source } => {
+                write!(formatter, "cannot encode default manifest: {source}")
+            }
+            Self::UnknownTemplate(name) => {
+                write!(formatter, "unknown template '{name}'")
+            }
         }
     }
 }
 
-impl std::error::Error for ScaffoldError {}
+impl std::error::Error for ScaffoldError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CreateDir { error, .. } | Self::Write { error, .. } => Some(error),
+            Self::Manifest { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ScaffoldReport {
@@ -144,7 +161,7 @@ fn default_manifest() -> Result<Vec<u8>, ScaffoldError> {
     };
     manifest
         .to_canonical_bytes()
-        .map_err(|error| ScaffoldError::Manifest(error.to_string()))
+        .map_err(|source| ScaffoldError::Manifest { source })
 }
 
 /// Reference simulation program written into `src/main.rs`.
@@ -155,7 +172,7 @@ const MAIN_RS_TEMPLATE: &str = r#"//! Two-task Send/Receive reference simulation
 //! Run it with: `cargo run -p <your-crate> -- <seed>`.
 
 use ledger_explorer::search::{Workload, search};
-use ledger_explorer::{HistoryOracle, KeyValueSpec, solve_ldfi};
+use ledger_explorer::{HistoryOracle, KeyValueSpec, SolverConfig, select_solver, solve_with};
 use ledger_format::{EntryKind, Payload};
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult};
 
@@ -204,25 +221,33 @@ impl Workload for TwoTask {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut seed = [0u8; 32];
     if let Some(arg) = std::env::args().nth(1) {
+        // A non-numeric seed argument falls back to the all-zero default.
         if let Ok(value) = arg.parse::<u64>() {
             seed[..8].copy_from_slice(&value.to_le_bytes());
         }
     }
-    let config = RunConfig {
-        seed,
-        policy: Policy::Bandit {
+    let config = RunConfig::builder().seed(seed).policy(Policy::Bandit {
             exploration_constant: 1.414,
             pct_mix: 0.1,
-        },
-        max_steps: 256,
-        ..RunConfig::default()
-    };
+        }).max_steps(256).build();
     let workload = TwoTask;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
     if let Some(finding) = search(&workload, &oracle, config, 100)? {
         println!("Violation detected: {}", finding.verdict.reason);
         println!("Journal root: {:02x?}", finding.run.journal.root_hash());
-        let hypotheses = solve_ldfi(&finding.run.journal, &finding.verdict);
+        let solver_config = SolverConfig {
+            max_horizon: Some(64),
+            ..SolverConfig::default()
+        };
+        let encoded = ledger_explorer::maxsat::encode_hazard(
+            &finding.run.journal,
+            &finding.verdict,
+            &solver_config,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut solver = select_solver(&solver_config, &encoded);
+        let hypotheses =
+            solve_with(solver.as_mut(), &finding.run.journal, &finding.verdict)?;
         println!("LDFI hypotheses: {}", hypotheses.len());
     } else {
         println!("Simulation passed (100 runs evaluated).");
@@ -254,7 +279,7 @@ const AGENTS_TEMPLATE: &str = r#"# AGENTS.md - Determinism rules for this simula
 When authoring simulations, follow these rules. They mirror the ledger
 workspace rules and keep every run reproducible.
 
-1. Never read the ambient wall clock. Use `VirtualTime` or `Effects::now_ticks()`.
+1. Never read the ambient wall clock. Use `VirtualTime` or `Effects::clock().now()`.
 2. Never invoke ambient random generators. Derive streams via `SeedTree::rng(label)`.
 3. Never spawn OS threads. Use cooperative tasks via `Simulation::with_tasks`
    and `Boundary::spawn_task`.
@@ -263,6 +288,316 @@ workspace rules and keep every run reproducible.
 
 Run the workspace linter (`cargo run -p ledger-lint -- crates/`) before
 merging changes.
+"#;
+
+/// Generates an ldgr-rt based SUT scaffold.
+///
+/// Creates a minimal crate that runs the same async code under tokio
+/// (`cargo run`) and under the deterministic executor
+/// (`cargo run --features sim`).
+pub fn write_sut_scaffold(dir: &Path, force: bool) -> Result<(), ScaffoldError> {
+    fs::create_dir_all(dir).map_err(|error| ScaffoldError::CreateDir {
+        path: dir.to_path_buf(),
+        error,
+    })?;
+    let src_dir = dir.join("src");
+    fs::create_dir_all(&src_dir).map_err(|error| ScaffoldError::CreateDir {
+        path: src_dir.clone(),
+        error,
+    })?;
+    let tests_dir = dir.join("tests");
+    fs::create_dir_all(&tests_dir).map_err(|error| ScaffoldError::CreateDir {
+        path: tests_dir.clone(),
+        error,
+    })?;
+
+    let package_name = sanitize_package_name(dir);
+    let ldgr_rt_path = locate_ldgr_rt_path(dir);
+
+    let cargo_toml = sut_cargo_toml(&package_name, &ldgr_rt_path);
+    let readme = sut_readme(&package_name);
+
+    let targets: Vec<(PathBuf, Vec<u8>)> = vec![
+        (dir.join("Cargo.toml"), cargo_toml.into_bytes()),
+        (
+            src_dir.join("main.rs"),
+            SUT_MAIN_RS_TEMPLATE.as_bytes().to_vec(),
+        ),
+        (
+            tests_dir.join("surface.rs"),
+            SUT_SURFACE_RS_TEMPLATE.as_bytes().to_vec(),
+        ),
+        (dir.join("README.md"), readme.into_bytes()),
+    ];
+
+    if !force {
+        for (path, _) in &targets {
+            if path.exists() {
+                return Err(ScaffoldError::RefuseOverwrite(path.clone()));
+            }
+        }
+    }
+
+    for (path, bytes) in targets {
+        fs::write(&path, &bytes).map_err(|error| ScaffoldError::Write {
+            path: path.clone(),
+            error,
+        })?;
+    }
+
+    Ok(())
+}
+
+fn sanitize_package_name(dir: &Path) -> String {
+    if let Some(name) = dir.file_name().and_then(|s| s.to_str()) {
+        let mut out = String::with_capacity(name.len());
+        for ch in name.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                out.push(ch.to_ascii_lowercase());
+            } else if ch == '.' || ch == ' ' {
+                out.push('-');
+            }
+        }
+        if !out.is_empty() {
+            // Cargo forbids leading digit or hyphen weirdness; prefix if needed.
+            if out
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit() || c == '-')
+            {
+                return format!("sut-{out}");
+            }
+            return out;
+        }
+    }
+    "sut".into()
+}
+
+fn locate_ldgr_rt_path(dir: &Path) -> String {
+    // Compile-time repo root via CARGO_MANIFEST_DIR.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = normalize_path(&manifest_dir.join("../../"));
+    let target = normalize_path(&repo_root.join("crates/ldgr-rt"));
+    let from_abs = if dir.is_absolute() {
+        normalize_path(dir)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| normalize_path(&cwd.join(dir)))
+            .unwrap_or_else(|_| normalize_path(dir))
+    };
+    if let Some(rel) = relative_path(&from_abs, &target) {
+        rel.display().to_string()
+    } else {
+        target.display().to_string()
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => out.push(comp.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from_comps: Vec<_> = from.components().collect();
+    let to_comps: Vec<_> = to.components().collect();
+    let mut common = 0usize;
+    for (a, b) in from_comps.iter().zip(to_comps.iter()) {
+        if a == b {
+            common += 1;
+        } else {
+            break;
+        }
+    }
+    // Require some common prefix (root).
+    if common == 0 {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for _ in common..from_comps.len() {
+        rel.push("..");
+    }
+    for comp in to_comps.iter().skip(common) {
+        rel.push(comp.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        Some(PathBuf::from("."))
+    } else {
+        Some(rel)
+    }
+}
+
+fn sut_cargo_toml(package_name: &str, ldgr_rt_path: &str) -> String {
+    format!(
+        r#"[package]
+name = "{package_name}"
+version = "0.1.0"
+edition = "2024"
+description = "SUT scaffolded by ledger init --sut"
+license = "Apache-2.0"
+
+[dependencies]
+# For published builds use `ldgr-rt = "0.1"`
+ldgr-rt = {{ path = "{ldgr_rt_path}" }}
+futures = "0.3"
+
+[features]
+sim = ["ldgr-rt/sim"]
+
+[workspace]
+"#
+    )
+}
+
+fn sut_readme(package_name: &str) -> String {
+    format!(
+        r#"# {package_name}
+
+Scaffolded by `ledger init --sut`.
+
+Run under tokio (ambient):
+```sh
+cargo run
+```
+
+Run under sim (deterministic journal, virtual time):
+```sh
+cargo run --features sim
+```
+
+Sentinel belt: set `LEDGER_SENTINEL_BELT=1` to arm the leak detector,
+or `LEDGER_SENTINEL_BELT=0` to disable it. See `ledger-sim/src/sentinel_belt.rs`.
+
+The same async code runs under tokio via `ldgr-rt`. Under `--features sim`
+caller programs do not cross the ldgr-rt IPC boundary: `run` reports
+`ProgramNotTransportable` and this quick start automatically falls back to
+the engine's built-in `kv` workload via `run_named`, so the deterministic
+journal demo still works.
+"#
+    )
+}
+
+/// Minimal SUT binary using the ldgr-rt Handle.
+const SUT_MAIN_RS_TEMPLATE: &str = r#"//! Minimal SUT using ldgr-rt facade.
+//! Generated by `ledger init --sut`.
+
+use core::time::Duration;
+
+use ldgr_rt::{Handle, RunConfig};
+
+async fn task_main(handle: Handle) {
+    // Clock: virtual time in sim, ambient otherwise.
+    let now = handle.clock().now();
+    println!("clock now: {:?}", now);
+
+    // Deterministic RNG: same seed yields same draws.
+    let mut rng_handle = handle.clone();
+    let value = rng_handle.rng_next_u64(0) % 1000;
+    println!("rng[0]: {}", value);
+
+    // Send to peer actor 1.
+    let sent = handle.net_send(1, value);
+    println!("net_send to 1: {}", sent);
+
+    // Spawn child task.
+    let child_id = handle.spawn(|child| {
+        Box::pin(async move {
+            println!("[child actor {}] hello", child.actor());
+            child.sleep(Duration::from_micros(1)).await;
+            println!("[child] done");
+        })
+    });
+    println!("spawned {:?}", child_id);
+
+    handle.sleep(Duration::from_micros(5)).await;
+    println!("task done actor {}", handle.actor());
+
+    // cfg note: same binary runs under tokio and under sim.
+    #[cfg(feature = "sim")]
+    println!("sim feature active (journaled)");
+
+    #[cfg(not(feature = "sim"))]
+    println!("tokio mode (ambient)");
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Deterministic seed.
+    let cfg = RunConfig::builder().seed([42u8; 32]).max_steps(10_000).build();
+    match ldgr_rt::run(cfg.clone(), task_main) {
+        Ok(res) => {
+            println!("run steps: {}", res.steps);
+            #[cfg(feature = "sim")]
+            println!("journal root: {:x?}", res.journal_root);
+            Ok(())
+        }
+        // Programs do not cross the ldgr-rt IPC boundary; fall back to the
+        // engine's built-in workload so the first deterministic run succeeds
+        // exactly as this README advertises.
+        Err(ldgr_rt::RuntimeError::ProgramNotTransportable) => {
+            println!("program transport unavailable under sim; running engine workload \"kv\"");
+            let res = ldgr_rt::run_named(cfg, "kv")?;
+            println!("kv steps: {}", res.steps);
+            match res.journal_root {
+                Some(root) => println!("journal root: {:x?}", root),
+                None => println!("no journal root reported"),
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+"#;
+
+/// Surface probe and same-seed determinism smoke.
+const SUT_SURFACE_RS_TEMPLATE: &str = r#"use ldgr_rt::RunConfig;
+
+#[test]
+fn surface_probe() {
+    ldgr_rt::probe();
+}
+
+#[test]
+fn same_seed_is_deterministic() {
+    let cfg = RunConfig::builder().seed([42u8; 32]).max_steps(2048).build();
+    // Caller programs do not cross the ldgr-rt IPC boundary yet; under the
+    // `sim` feature `run` refuses them with a typed error, and named server
+    // workloads are reached via `run_named`.
+    #[cfg(feature = "sim")]
+    {
+        let error = ldgr_rt::run(cfg.clone(), |mut h| async move {
+            let _ = h.rng_next_u64(1);
+        })
+        .expect_err("programs must be refused on the IPC transport");
+        assert!(matches!(error, ldgr_rt::RuntimeError::ProgramNotTransportable));
+        let a = ldgr_rt::run_named(cfg.clone(), "kv").expect("named kv run");
+        let b = ldgr_rt::run_named(cfg, "kv").expect("named kv rerun");
+        assert_eq!(a.journal_root, b.journal_root);
+    }
+    #[cfg(not(feature = "sim"))]
+    {
+        let a = ldgr_rt::run(cfg.clone(), |mut h| async move {
+            let _ = h.rng_next_u64(1);
+        })
+        .unwrap();
+        let b = ldgr_rt::run(cfg, |mut h| async move {
+            let _ = h.rng_next_u64(1);
+        })
+        .unwrap();
+        assert_eq!(a.steps, b.steps);
+    }
+}
 "#;
 
 #[cfg(test)]
@@ -294,6 +629,22 @@ mod tests {
         assert!(
             !AGENTS_TEMPLATE.contains("ledger lint"),
             "AGENTS.md must not reference the nonexistent `ledger lint` subcommand"
+        );
+    }
+
+    #[test]
+    fn agents_template_uses_clock_now_chain() {
+        assert!(
+            AGENTS_TEMPLATE.contains("Effects::clock().now()"),
+            "AGENTS.md must use Effects::clock().now()"
+        );
+        assert!(
+            !AGENTS_TEMPLATE.contains("Effects::now_ticks"),
+            "AGENTS.md must not reference removed Effects::now_ticks"
+        );
+        assert!(
+            !AGENTS_TEMPLATE.contains("now_ticks"),
+            "AGENTS.md must not contain now_ticks"
         );
     }
 }

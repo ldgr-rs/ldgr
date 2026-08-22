@@ -14,9 +14,18 @@ path = "src/main.rs"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 clap-verbosity-flag = { workspace = true }
+ledger-adapters = { path = "../ledger-adapters" }
+ledger-faultspec = { path = "../ledger-faultspec" }
 ledger-format = { path = "../ledger-format" }
 ledger-sim = { path = "../ledger-sim" }
 ledger-explorer = { path = "../ledger-explorer" }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json = "1"
 
 [lints]
 workspace = true

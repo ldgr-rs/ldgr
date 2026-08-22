@@ -4,10 +4,16 @@
 //! campaign driver live here so integration tests can call them in process
 //! without spawning the binary.
 
+pub mod cert_cmd;
 pub mod checks;
+pub mod coverage_cmd;
+pub mod faults_cmd;
 pub mod format_check;
 pub mod ldfi_cmd;
+#[cfg(unix)]
+pub mod rt_server;
 pub mod scaffold;
+pub mod scaffold_consensus;
 
 use std::io;
 use std::path::PathBuf;
@@ -203,6 +209,9 @@ pub enum Command {
         /// Overwrite existing files.
         #[arg(long)]
         force: bool,
+        /// Scaffold an ldgr-rt based SUT crate.
+        #[arg(long)]
+        sut: bool,
     },
     /// Inspect a .ldgr or CBOR file.
     Format {
@@ -223,12 +232,99 @@ pub enum Command {
         /// Number of campaign attempts.
         #[arg(long, default_value_t = 64)]
         attempts: usize,
+        /// Fault-solver engine for hypothesis ranking.
+        ///
+        /// `auto` routes by measured hard-clause crossover; `builtin` forces
+        /// the pure-Rust hitting-set engine; `cadical` forces the MaxSAT
+        /// engine (branch-and-bound fallback without the `solver-cadical`
+        /// build feature).
+        #[arg(long, value_enum, default_value_t = MaxSatEngineArg::Auto)]
+        maxsat_engine: MaxSatEngineArg,
     },
     /// Print shell completion scripts to stdout.
     Completions {
         /// Target shell.
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+    /// Ingest OTel NDJSON spans into a content-addressed journal.
+    Ingest {
+        /// Path to newline-delimited JSON OTel spans.
+        #[arg(long)]
+        input: PathBuf,
+        /// Fidelity mode.
+        #[arg(long, value_enum, default_value_t = FidelityArg::LineageOnly)]
+        fidelity: FidelityArg,
+    },
+    /// Campaign certificate operations.
+    Cert {
+        #[command(subcommand)]
+        cmd: CertCommand,
+    },
+    /// Failure-spec scenario operations.
+    Faults {
+        #[command(subcommand)]
+        cmd: FaultsCommand,
+    },
+    /// Export exploration coverage (distinct roots / scenario space).
+    Coverage {
+        /// Path to NDJSON of {root_hex, run_index, finding} lines.
+        #[arg(long)]
+        input: PathBuf,
+        /// Export format: lcov, sarif, or jacoco.
+        #[arg(long, default_value = "lcov")]
+        format: String,
+    },
+    /// Scaffold a consensus-family example crate (mini-Raft, Mini-KV, 2PC).
+    Scaffold {
+        /// Template: consensus|kv|2pc
+        #[arg(long, default_value = "consensus")]
+        template: String,
+        /// Target directory for the scaffolded crate.
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+        /// Overwrite existing files.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Hidden: run the ldgr-rt IPC engine server over a Unix socket.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    RtServer {
+        /// Path to Unix socket for the SUT facade transport.
+        #[arg(long)]
+        socket: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CertCommand {
+    /// Verify a campaign certificate JSON file.
+    Verify {
+        /// Path to the certificate JSON file.
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FaultsCommand {
+    /// Compile a failure-spec scenario and list its faults.
+    Compile {
+        /// Path to the scenario DSL file.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Apply a failure-spec scenario to a seeded simulation run.
+    Apply {
+        /// Path to the scenario DSL file.
+        #[arg(long)]
+        file: PathBuf,
+        /// 64-hex-character root seed for the run.
+        #[arg(long)]
+        seed_hex: String,
+        /// Workload to run under the injected faults.
+        #[arg(long, default_value = "kv")]
+        workload: String,
     },
 }
 
@@ -251,5 +347,61 @@ impl PolicyArg {
             },
             Self::Replay => Policy::Replay,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FidelityArg {
+    #[value(name = "lineage-only")]
+    LineageOnly,
+    #[value(name = "bit-exact")]
+    BitExact,
+}
+
+/// CLI selector for the LDFI fault-solver engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MaxSatEngineArg {
+    Auto,
+    Builtin,
+    Cadical,
+}
+
+impl MaxSatEngineArg {
+    pub fn to_solver_engine(self) -> ledger_explorer::SolverEngine {
+        match self {
+            Self::Auto => ledger_explorer::SolverEngine::Auto,
+            Self::Builtin => ledger_explorer::SolverEngine::Builtin,
+            Self::Cadical => ledger_explorer::SolverEngine::Cadical,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Builtin => "builtin",
+            Self::Cadical => "cadical",
+        }
+    }
+}
+
+impl FidelityArg {
+    pub fn to_fidelity(self) -> ledger_adapters::Fidelity {
+        match self {
+            Self::LineageOnly => ledger_adapters::Fidelity::LineageOnly,
+            Self::BitExact => ledger_adapters::Fidelity::BitExact,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LineageOnly => "lineage-only",
+            Self::BitExact => "bit-exact",
+        }
+    }
+}
+
+impl std::fmt::Display for FidelityArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }

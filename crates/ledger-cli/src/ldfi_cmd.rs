@@ -5,13 +5,29 @@
 //! injection to report how many faults applied or were voided.
 
 use ledger_explorer::ldfi::hypothesis_to_schedule;
+use ledger_explorer::maxsat::encode_hazard;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::{replay_with_faults, search};
-use ledger_explorer::{FaultHypothesis, solve_ldfi};
+use ledger_explorer::{FaultHypothesis, SolverConfig, SolverError, select_solver, solve_with};
 use ledger_format::Hash;
-use ledger_sim::{FaultInjection, Policy, RunConfig};
+use ledger_sim::{Policy, RunConfig, SimFault};
+use thiserror::Error;
 
-use crate::{DefaultMiniKv, seed_from_u64};
+use crate::{DefaultMiniKv, MaxSatEngineArg, seed_from_u64};
+
+/// Errors from the `ldfi` campaign driver.
+#[derive(Debug, Error)]
+pub enum LdfiCmdError {
+    /// Campaign search failed; the explorer search API reports a message.
+    #[error("ldfi search failed: {0}")]
+    Search(String),
+    /// Ranking the fault hypotheses failed.
+    #[error("ldfi solve: {0}")]
+    Solve(#[from] SolverError),
+    /// Fault replay failed; the explorer replay API reports a message.
+    #[error("ldfi replay failed: {0}")]
+    Replay(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct LdfiHypothesis {
@@ -37,7 +53,7 @@ pub struct LdfiReport {
     /// Ranked hypotheses, cheapest first.
     pub hypotheses: Vec<LdfiHypothesis>,
     /// Fault injections in the executed top schedule.
-    pub schedule: Vec<FaultInjection>,
+    pub schedule: Vec<SimFault>,
     /// Number of injections that took effect.
     pub applied: usize,
     /// Number of injections that were voided.
@@ -48,29 +64,47 @@ pub struct LdfiReport {
 
 /// Runs the LDFI campaign.
 ///
-/// Returns `Ok(None)` when the campaign finds no violation within `attempts`.
+/// `maxsat_engine` selects the fault-solver engine for hypothesis ranking;
+/// see [`MaxSatEngineArg`]. Returns `Ok(None)` when the campaign finds no
+/// violation within `attempts`.
+///
+/// # Errors
+/// Returns [`LdfiCmdError`] when search, hypothesis ranking, or replay fails.
 pub fn run_ldfi(
     seed: u64,
     max_steps: usize,
     attempts: usize,
-) -> Result<Option<LdfiReport>, String> {
+    maxsat_engine: MaxSatEngineArg,
+) -> Result<Option<LdfiReport>, LdfiCmdError> {
     let workload = DefaultMiniKv;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
-    let config = RunConfig {
-        seed: seed_from_u64(seed),
-        policy: Policy::Bandit {
+    let config = RunConfig::builder()
+        .seed(seed_from_u64(seed))
+        .policy(Policy::Bandit {
             exploration_constant: 1.414,
             pct_mix: 0.1,
-        },
-        max_steps,
-        ..RunConfig::default()
-    };
+        })
+        .max_steps(max_steps)
+        .build();
 
-    let Some(finding) = search(&workload, &oracle, config, attempts)? else {
+    let Some(finding) =
+        search(&workload, &oracle, config, attempts).map_err(LdfiCmdError::Search)?
+    else {
         return Ok(None);
     };
 
-    let hypotheses: Vec<FaultHypothesis> = solve_ldfi(&finding.run.journal, &finding.verdict);
+    // Production default horizon 64; the engine comes from --maxsat-engine.
+    let solver_config = SolverConfig {
+        max_horizon: Some(64),
+        engine: maxsat_engine.to_solver_engine(),
+        ..SolverConfig::default()
+    };
+    let encoded = encode_hazard(&finding.run.journal, &finding.verdict, &solver_config)
+        .map_err(LdfiCmdError::Solve)?;
+    let mut solver = select_solver(&solver_config, &encoded);
+    let hypotheses: Vec<FaultHypothesis> =
+        solve_with(solver.as_mut(), &finding.run.journal, &finding.verdict)
+            .map_err(LdfiCmdError::Solve)?;
     let schedule = hypotheses
         .first()
         .map(|top| hypothesis_to_schedule(top, &finding.run.journal))
@@ -81,7 +115,8 @@ pub fn run_ldfi(
         finding.seed,
         finding.run.decisions.clone(),
         schedule.clone(),
-    )?;
+    )
+    .map_err(LdfiCmdError::Replay)?;
 
     Ok(Some(LdfiReport {
         attempts,
