@@ -1,0 +1,67 @@
+[package]
+name = "ledger-worker"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+description = "Campaign task execution daemon"
+
+[dependencies]
+ledger-sim = { path = "../ledger-sim" }
+ledger-explorer = { path = "../ledger-explorer" }
+ledger-journal = { path = "../ledger-journal" }
+ledger-format = { path = "../ledger-format" }
+tokio = { workspace = true, features = [
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"net",
+	"time",
+	"io-util",
+	"signal",
+] }
+thiserror = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = { workspace = true }
+clap = { workspace = true }
+# `with-serde_json-1` maps jsonb args to serde_json::Value on insert and read.
+tokio-postgres = { version = "0.7", optional = true, features = [
+	"with-serde_json-1",
+] }
+reqwest = { version = "0.13", optional = true, default-features = false, features = [
+	"blocking",
+	"json",
+] }
+prost = { version = "0.14", optional = true }
+# `router` hosts add_service(); `transport` alone only ships channel and
+# server plumbing.
+tonic = { version = "0.14", optional = true, default-features = false, features = [
+	"transport",
+	"router",
+	"codegen",
+] }
+tonic-prost = { version = "0.14", optional = true }
+# `net` provides UnixListenerStream for the gRPC-over-UDS server.
+tokio-stream = { version = "0.1", optional = true, features = ["net"] }
+
+[[bin]]
+name = "ledger-worker"
+path = "src/main.rs"
+
+[build-dependencies]
+# tonic-build 0.14 hosts only the service-codegen traits; configure() and
+# compile_protos() moved here. prost-build arrives transitively. Resolved
+# unconditionally so an offline default build hits the local cache; the
+# script is a no-op unless the grpc feature is on.
+tonic-prost-build = "0.14"
+
+[features]
+default = []
+sim-fs-journaling = ["ledger-sim/sim-fs-journaling"]
+pg = ["dep:tokio-postgres"]
+control-plane = ["dep:reqwest"]
+grpc = ["dep:tonic", "dep:prost", "dep:tonic-prost", "dep:tokio-stream"]
+
+[lints]
+workspace = true
