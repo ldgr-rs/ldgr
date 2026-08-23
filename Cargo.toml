@@ -10,6 +10,10 @@ members = [
 	"crates/ledger-lint",
 	"crates/ledger-cli",
 	"crates/wasm-guest",
+	"crates/ledger-faultspec",
+	"crates/ldgr-rt",
+	"crates/ledger-worker",
+	"crates/ledger-adapters",
 	"xtask",
 ]
 default-members = ["crates/ledger-cli"]
@@ -34,12 +38,15 @@ thiserror = "2"
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"
 clap-verbosity-flag = "3"
-wasmtime = { version = "47", default-features = false, features = [
+wasmtime = { version = "48", default-features = false, features = [
 	"cranelift",
 	"runtime",
 	"rr",
 ] }
-wasmtime-wasi = { version = "47", default-features = false, features = ["p1"] }
+wasmtime-wasi = { version = "48", default-features = false, features = [
+	"p1",
+	"p2",
+] }
 futures = "0.3"
 tokio = { version = "1", features = ["io-util", "time"] }
 getrandom = { version = "0.4", features = ["sys_rng"] }
