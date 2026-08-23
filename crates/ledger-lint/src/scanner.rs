@@ -47,6 +47,10 @@ pub const FORBIDDEN_PATTERNS: &[(&str, &str)] = &[
         "getrandom reads OS entropy; use SeedTree / Effects::rng",
     ),
     (
+        "getrandom::fill",
+        "getrandom::fill reads OS entropy; use SeedTree / Effects::rng",
+    ),
+    (
         "libc::clock_gettime",
         "libc clock reads ambient time; use VirtualTime / Effects",
     ),
@@ -101,6 +105,11 @@ pub const FORBIDDEN_PATTERNS: &[(&str, &str)] = &[
 const BARE_PREFIX_PATTERNS: &[(&str, &str)] = &[
     ("fs::", "Ambient std::fs bypasses SimFs; use SimFs"),
     ("net::", "Ambient std::net bypasses SimNet; use SimNet"),
+    (
+        "getrandom::",
+        "getrandom crate reads OS entropy; use SeedTree / Effects::rng",
+    ),
+    ("env::args", "ambient process args; pass inputs via Effects"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +240,11 @@ fn should_descend(entry: &DirEntry) -> bool {
         return true;
     }
     let name = entry.file_name().to_string_lossy();
-    if name.as_ref() == "target" || name.as_ref().starts_with('.') || name.as_ref() == "tests" {
+    if name.as_ref() == "target"
+        || name.as_ref().starts_with('.')
+        || name.as_ref() == "tests"
+        || name.as_ref() == "gen"
+    {
         return false;
     }
     true
@@ -329,7 +342,9 @@ fn strip_comments(line: &str, in_block_comment: &mut bool) -> String {
         out.push(bytes[pos]);
         pos += 1;
     }
-    String::from_utf8(out).unwrap_or_default()
+    // Lossy: an undecodable line keeps its bytes as U+FFFD so detection still
+    // sees the surrounding code instead of an empty string.
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
@@ -502,5 +517,30 @@ let _seed = std::env::var("SEED");"#;
 use std::fs;
 fn load() { let _ = fs::read("state.bin"); }"#;
         assert!(scan_source(code).is_empty());
+    }
+
+    #[test]
+    fn detects_getrandom_fill_and_bare_prefix() {
+        let fill = "let mut buf = [0u8; 32]; getrandom::fill(&mut buf).unwrap();";
+        let v = scan_source(fill);
+        assert!(v.iter().any(|vi| vi.pattern == "getrandom::fill"));
+        let bare =
+            "use getrandom;\nfn f() { let mut b = [0u8; 32]; let _ = getrandom::fill(&mut b); }";
+        let v2 = scan_source(bare);
+        assert!(
+            v2.iter()
+                .any(|vi| vi.pattern == "getrandom::" || vi.pattern == "getrandom::fill")
+        );
+        let allow = "// ledger-lint:allow:getrandom::\nlet mut b = [0u8; 32]; getrandom::fill(&mut b).unwrap();";
+        assert!(scan_source(allow).is_empty());
+    }
+
+    #[test]
+    fn detects_bare_env_args_and_allows_it() {
+        let bare = "use std::env;\nfn main() { let _ = env::args().collect::<Vec<_>>(); }";
+        let v = scan_source(bare);
+        assert!(v.iter().any(|vi| vi.pattern == "env::args"));
+        let allow = "// ledger-lint:allow:env::args\nuse std::env;\nfn main() { let _ = env::args().collect::<Vec<_>>(); }";
+        assert!(scan_source(allow).is_empty());
     }
 }

@@ -1,3 +1,4 @@
+// ledger-lint:allow:env::args (CLI entrypoint reads process args)
 //! CLI executable for ledger-lint scanner.
 
 use ledger_lint::{LintViolation, ScanResult, scan_rs_files};

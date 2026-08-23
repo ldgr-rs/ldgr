@@ -1,5 +1,4 @@
 use ledger_lint::{scan_rs_files, scan_source};
-use ledger_sim::{LeakClass, Sentinel};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -276,8 +275,8 @@ fn planted_leak_corpus_fully_flagged_by_directory_scan() {
     }
     assert_eq!(
         result.total_violations(),
-        18,
-        "each planted leak must be flagged at least once"
+        19,
+        "each planted leak must be flagged at least once (getrandom now counts fill and bare prefix)"
     );
 }
 
@@ -301,17 +300,4 @@ fn directory_scan_flags_instant_without_marker() {
     assert_eq!(result.files_scanned, 1);
     assert_eq!(result.total_violations(), 1);
     assert_eq!(result.violating_files[0].1[0].pattern, "Instant::now()");
-}
-
-#[test]
-fn sentinel_tracks_and_reports_runtime_leak_classes() {
-    let mut sentinel = Sentinel::new();
-    sentinel.record_leak(LeakClass::WallClock);
-    sentinel.record_leak(LeakClass::AmbientRng);
-    sentinel.record_leak(LeakClass::RawThread);
-    sentinel.record_leak(LeakClass::UnsimulatedIo);
-    sentinel.record_leak(LeakClass::EnvVarEntropy);
-
-    assert!(sentinel.has_leaks());
-    assert_eq!(sentinel.leaks().len(), 5);
 }

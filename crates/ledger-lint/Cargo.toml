@@ -12,10 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 walkdir.workspace = true
-ledger-format = { path = "../ledger-format" }
-
-[dev-dependencies]
-ledger-sim = { path = "../ledger-sim" }
 
 [lints]
 workspace = true
