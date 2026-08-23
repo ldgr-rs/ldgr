@@ -1,20 +1,27 @@
 name: corpus-gate
 
-# Runs on changes to the journal, sim, explorer, or corpus paths.
+# Runs on changes to the format, journal, sim, explorer, lint scanner, or
+# corpus paths. Format and lint are included because the release-mode gates
+# below pin journal bytes produced by the CBOR codec and flagged by the
+# scanner; regressions in either must not bypass them.
 
 on:
   push:
     paths:
+      - "crates/ledger-format/**"
       - "crates/ledger-journal/**"
       - "crates/ledger-sim/**"
       - "crates/ledger-explorer/**"
+      - "crates/ledger-lint/**"
       - "corpora/**"
       - ".github/workflows/corpus-gate.yml"
   pull_request:
     paths:
+      - "crates/ledger-format/**"
       - "crates/ledger-journal/**"
       - "crates/ledger-sim/**"
       - "crates/ledger-explorer/**"
+      - "crates/ledger-lint/**"
       - "corpora/**"
       - ".github/workflows/corpus-gate.yml"
 

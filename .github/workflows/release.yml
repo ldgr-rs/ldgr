@@ -60,7 +60,11 @@ jobs:
           toolchain: 1.97.1
       - name: Dry-run publish in workspace dependency order
         run: |
-          for crate in ledger-format ledger-journal ledger-sim ledger-explorer \
-                       ledger-flow ledger-lint ledger-cli; do
+          # Order follows the verified workspace dep edges:
+          # faultspec and ldgr-rt need sim; explorer needs faultspec;
+          # worker needs explorer; cli needs adapters + explorer.
+          for crate in ledger-format ledger-journal ledger-sim ledger-faultspec \
+                       ldgr-rt ledger-explorer ledger-adapters ledger-flow \
+                       ledger-lint ledger-worker ledger-cli; do
             cargo publish --dry-run --allow-dirty -p "$crate"
           done

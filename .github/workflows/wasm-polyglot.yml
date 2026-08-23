@@ -1,0 +1,165 @@
+name: wasm-polyglot
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  polyglot:
+    name: Polyglot guests and mixed topology
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          targets: wasm32-wasip1
+      - name: Build debug Wasm guest artifact (needed by mixed test fallback)
+        run: cargo build --target wasm32-wasip1 -p wasm-guest
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install TinyGo (checksum-pinned)
+        run: |
+          set -e
+          TINYGO_VERSION=0.37.0
+          ARCH=amd64
+          # sha256 of tinygo_0.37.0_amd64.deb, computed from the official
+          # v0.37.0 release asset (153,322,160 bytes)
+          TINYGO_SHA256=8f34a4aac7f1aa2ad51dc0f4eccd40da13b6f52fbac5c13887d57327e5f0a862
+          URL="https://github.com/tinygo-org/tinygo/releases/download/v${TINYGO_VERSION}/tinygo_${TINYGO_VERSION}_${ARCH}.deb"
+          curl -fsSL -o /tmp/tinygo.deb "$URL"
+          echo "${TINYGO_SHA256}  /tmp/tinygo.deb" | sha256sum -c -
+          sudo dpkg -i /tmp/tinygo.deb || sudo apt-get install -f -y
+          tinygo version
+
+      - name: Install Emscripten (emsdk 4.0.23, tag-pinned)
+        run: |
+          set -e
+          if command -v emcc >/dev/null 2>&1; then
+            echo "emcc already installed: $(emcc --version | head -1)"
+            exit 0
+          fi
+          EMSDK_VERSION=4.0.23
+          # The tag pins the emsdk snapshot. In this snapshot the "latest"
+          # alias resolves to 4.0.23, so install stays reproducible.
+          git clone --depth 1 --branch "${EMSDK_VERSION}" https://github.com/emscripten-core/emsdk.git /tmp/emsdk
+          /tmp/emsdk/emsdk install latest
+          /tmp/emsdk/emsdk activate latest
+          echo "emsdk ${EMSDK_VERSION} installed"
+
+      - name: Install wasm validation tools (wabt)
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wabt
+          wasm2wat --version
+
+      - name: Build Zig guest
+        run: |
+          set -e
+          mkdir -p guests/prebuilt
+          zig version
+          zig build-exe -target wasm32-freestanding -O ReleaseSmall -fno-entry --export=run -femit-bin=guests/prebuilt/zig.wasm guests/zig/main.zig
+          ls -lh guests/prebuilt/zig.wasm
+          if ! wasm2wat guests/prebuilt/zig.wasm | grep -q '(export "run"'; then
+            echo "zig guest missing run export"
+            wasm2wat guests/prebuilt/zig.wasm | head -50
+            exit 1
+          fi
+          echo "zig guest exports run"
+
+      - name: Build TinyGo guest
+        run: |
+          set -e
+          mkdir -p guests/prebuilt
+          tinygo version
+          # wasi target only: the WasmBackend is preview1-only, so a wasip2
+          # component artifact could never run here even if it built.
+          tinygo build -o guests/prebuilt/go.wasm -target wasi guests/go/main.go
+          ls -lh guests/prebuilt/go.wasm
+          if ! wasm2wat guests/prebuilt/go.wasm | grep -q '(export "run"'; then
+            echo "go guest missing run export"
+            wasm2wat guests/prebuilt/go.wasm | head -100
+            exit 1
+          fi
+          echo "go guest exports run"
+
+      - name: Build C guest with clang
+        run: |
+          set -e
+          mkdir -p guests/prebuilt
+          clang --version
+          # The runner image has clang but no wasm-ld. Install lld when needed.
+          if ! command -v wasm-ld >/dev/null 2>&1; then
+            echo "wasm-ld not found; installing lld"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq lld
+            if ! command -v wasm-ld >/dev/null 2>&1; then
+              echo "wasm-ld still missing after lld install"
+              exit 1
+            fi
+          fi
+          clang --target=wasm32 -nostdlib -Wl,--no-entry -Wl,--export=run -o guests/prebuilt/c.wasm guests/c/main.c
+          ls -lh guests/prebuilt/c.wasm
+          if ! wasm2wat guests/prebuilt/c.wasm | grep -q '(export "run"'; then
+            echo "c guest missing run export"
+            wasm2wat guests/prebuilt/c.wasm | head -50
+            exit 1
+          fi
+          echo "c guest exports run"
+
+      - name: Build Emscripten guest
+        run: |
+          set -e
+          mkdir -p guests/prebuilt
+          if [ -f /tmp/emsdk/emsdk_env.sh ]; then
+            . /tmp/emsdk/emsdk_env.sh
+          fi
+          if ! command -v emcc >/dev/null 2>&1; then
+            echo "emcc not available after emsdk install; emsdk install or activate failed"
+            exit 1
+          fi
+          emcc --version
+          emcc guests/emscripten/main.c -O3 -o guests/prebuilt/emscripten.wasm -sSTANDALONE_WASM -sEXPORTED_FUNCTIONS=_run --no-entry
+          ls -lh guests/prebuilt/emscripten.wasm
+          if ! wasm2wat guests/prebuilt/emscripten.wasm | grep -q '(export "run"'; then
+            echo "emscripten guest missing run export"
+            wasm2wat guests/prebuilt/emscripten.wasm | head -50
+            exit 1
+          fi
+          echo "emscripten guest exports run"
+
+      - name: Assert required prebuilt guests exist
+        run: |
+          set -e
+          for name in go zig c emscripten; do
+            path="guests/prebuilt/${name}.wasm"
+            if [ ! -s "$path" ]; then
+              echo "missing or empty required prebuilt guest: ${path}"
+              exit 1
+            fi
+            echo "present: ${path}"
+          done
+          ls -lh guests/prebuilt/
+
+      - name: Run mixed-topology test against prebuilt guests
+        run: cargo test -p ledger-sim --features backend-wasm --test wasm_mixed_topology -- --nocapture
+
+      - name: Run existing wasm gates
+        run: |
+          cargo test -p ledger-sim --features backend-wasm --test wasm_differential -- --nocapture
+          cargo test -p ledger-sim --features backend-wasm --test wasm_corpus_bug -- --nocapture

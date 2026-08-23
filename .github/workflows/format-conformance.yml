@@ -4,16 +4,18 @@ on:
   push:
     paths:
       - "crates/ledger-format/**"
-      # Vestigial: docs/ is a symlink to an external design repo, so git never
-      # tracks changes under it and this pattern can never match a PR. Kept for
-      # documentation value.
-      - "docs/11-format-research.md"
+      # ledger-sim owns the canonical RunConfig document encoding
+      # (src/config_canonical.rs), whose Go golden fixtures live under
+      # ledger-format/tests/go/golden. Codec changes on either side must
+      # re-run the Go conformance comparison.
+      - "crates/ledger-sim/**"
       - ".github/workflows/format-conformance.yml"
   pull_request:
     paths:
       - "crates/ledger-format/**"
-      # Vestigial: see the push filter above.
-      - "docs/11-format-research.md"
+      # See the push filter: ledger-sim encodes the canonical RunConfig
+      # document, so its changes must trigger the Go conformance job.
+      - "crates/ledger-sim/**"
       - ".github/workflows/format-conformance.yml"
 
 permissions:

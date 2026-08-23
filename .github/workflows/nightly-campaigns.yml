@@ -14,8 +14,8 @@ name: nightly-campaigns
 #   under swarm faults. A finding there is a genuine violation: the leg fails
 #   and an issue opens with the repro manifest reference and seed.
 #
-# Artifacts: each leg uploads a machine-readable campaign-summary.json (a
-# summary, not a formal certificate - the repo has no certificate schema yet)
+# Artifacts: each leg uploads a machine-readable campaign-summary.json, a
+# formal in-toto Statement campaign certificate (campaign-certificate.json),
 # plus one unminimized .ldgr repro manifest per finding.
 
 on:
@@ -47,14 +47,10 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: Build debug Wasm guest artifact
         run: cargo build --target wasm32-wasip1 -p wasm-guest
-      - name: Run the fixed-seed determinism corpus in release
+      - name: Run the fixed-seed determinism corpus in release (fails on any journal-hash drift)
         run: |
           cargo test -p ledger-sim --release --test executor_parity --test self_check
           cargo test -p ledger-explorer --release --test e2e --test bug_corpus_v1
-      - name: Fail on any journal-hash drift
-        run: |
-          echo "Any failure above indicates journal-root drift across identical seeds."
-          echo "Quarantine the change and diff the journaling path."
 
   swarm-campaign:
     name: Swarm campaign
@@ -84,12 +80,14 @@ jobs:
       - name: Build the swarm campaign driver in release
         run: cargo build --release -p ledger-explorer --example nightly_swarm_campaign
       - name: Run the bounded swarm campaign (256 attempts, fixed seed)
+        env:
+          LEDGER_CERT_OUT: "campaign-artifacts/${{ matrix.workload }}/campaign-certificate.json"
         run: |
           ./target/release/examples/nightly_swarm_campaign \
             --workload "${{ matrix.workload }}" --runs 256 \
             --seed "${{ matrix.seed }}" --max-steps 256 \
             --out "campaign-artifacts/${{ matrix.workload }}"
-      - name: Upload campaign artifacts (summary + repro manifests)
+      - name: Upload campaign artifacts (summary + certificate + repro manifests)
         uses: actions/upload-artifact@v4
         with:
           name: "swarm-campaign-${{ matrix.workload }}"

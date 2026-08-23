@@ -15,10 +15,27 @@ jobs:
   rust:
     name: Rust checks
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        # pg_queue integration tests need a real Postgres to apply the
+        # River river.job schema subset against; without it the suite panics
+        # on a missing DSN. Mirrors the control-plane-ci.yml worker job.
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       # Shared sccache across GitHub-hosted runners.
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
+      # Feeds the workspace all-features suite, which compiles pg_queue in.
+      LEDGER_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,18 +47,31 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
           targets: wasm32-wasip1
+      - name: Install protoc
+        # tonic_prost_build needs protoc to regenerate the checked-in
+        # src/gen/ledger.control.v1.rs under --all-features (ledger-worker
+        # grpc), so clippy, check, and the test suite all need it. Mirrors
+        # control-plane-ci.yml.
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build debug Wasm guest artifact (needed by wasm tests)
         run: cargo build --target wasm32-wasip1 -p wasm-guest
       - name: Run tests with cargo-nextest
         run: cargo nextest run --workspace --all-features --profile ci
       - name: Run doctests
         run: cargo test --workspace --doc
-      - name: Verify benchmarks compile
-        run: cargo bench --no-run
+      - name: Verify all benchmarks compile
+        # `cargo bench --no-run` compiles only default-members (ledger-cli),
+        # which has no benches. `--workspace --benches --all-features` checks
+        # every bench target: journal storage/vc, sim overhead/throughput
+        # (incl. wasm_throughput, gated on backend-wasm), and explorer
+        # solver scaling/crossover (gated on solver-cadical).
+        run: cargo check --workspace --benches --all-features
       - run: cargo run -p ledger-lint -- crates/
       - name: Enforce the AGPL/Apache/MIT crate licensing split
         run: cargo run -p xtask -- licenses
@@ -53,27 +83,82 @@ jobs:
           set -e
           test "$status" -eq 1
 
-  feature-matrix:
-    name: Feature matrix
+  solver-gate:
+    name: Solver scaling gate (release)
+    # Required gate: runs on every push/PR, not path-filtered. The sub-60s
+    # solver budget over the 10^6-entry journal is a release-mode claim, so
+    # it must not live only in the path-filtered corpus-gate.yml.
     runs-on: ubuntu-latest
+    env:
+      # Shared sccache across GitHub-hosted runners, same as the rust job.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Start sccache
+        uses: mozilla/sccache-action@v0.0.11
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Run release-mode solver scaling gate (10^6 entries, <60 s)
+        run: cargo test -p ledger-explorer --test solver_scaling_gate --release
+
+  feature-matrix:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    env:
+      # Shared sccache across GitHub-hosted runners, same as the rust job.
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Start sccache
+        uses: mozilla/sccache-action@v0.0.11
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
           targets: wasm32-wasip1
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@cargo-hack
+      - name: Install protoc
+        # The worker powerset below compiles grpc, whose build script
+        # regenerates src/gen/ledger.control.v1.rs via tonic_prost_build.
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+      - name: Install cargo-hack (pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack@0.6.45
       - name: no_std builds for ledger-format and ledger-journal
         run: |
           cargo check -p ledger-format --no-default-features
           cargo check -p ledger-journal --no-default-features
-      - name: Feature-combination matrix
+      - name: Feature-combination matrix (each feature)
         run: |
           cargo hack check -p ledger-format -p ledger-journal --each-feature --all-targets
           cargo hack check -p ledger-sim --each-feature
+      - name: Semantic feature pairs (bounded powersets)
+        # --include-features bounds each powerset to one semantic pair, so
+        # the matrix stays at 4 combos per crate instead of the full 2^n.
+        # The pair is what each-feature (singles) and the all-features suite
+        # both miss: features that must hold when enabled together.
+        run: |
+          cargo hack check -p ledger-sim --feature-powerset --include-features backend-wasm,sim-fs-journaling
+          cargo hack check -p ldgr-rt --feature-powerset --include-features sim,sim-link
+          cargo hack check -p ledger-worker --feature-powerset --include-features pg,grpc
+      - name: ldgr-rt surface probe (all cfgs)
+        run: |
+          cargo check -p ldgr-rt
+          cargo check -p ldgr-rt --features sim
+          cargo check -p ldgr-rt --features sim-link
+          cargo check -p ldgr-rt --features sim,sim-link
+          cargo check -p ldgr-rt --all-targets
+          cargo check -p ldgr-rt --all-targets --features sim
+          cargo check -p ldgr-rt --all-targets --features sim-link
+          cargo check -p ldgr-rt --all-targets --features sim,sim-link
 
   supply-chain:
     name: Supply-chain audit
@@ -110,3 +195,11 @@ jobs:
         run: cargo test -p ledger-sim --features backend-wasm --test wasm_differential
       - name: Run corpus-bug-through-guest gate
         run: cargo test -p ledger-sim --features backend-wasm --test wasm_corpus_bug
+      - name: Build release Wasm guest artifact (throughput gate)
+        run: cargo build --release --target wasm32-wasip1 -p wasm-guest
+      - name: Run Wasm throughput gate
+        # Release profile: the >=100k entries/s W1 budget is a steady-state
+        # release measurement (~1.2M/s measured locally). A debug-profile run
+        # leaves only ~2x headroom on a fast host, which flakes on shared
+        # runners without catching a real regression the release run misses.
+        run: cargo test --release -p ledger-sim --features backend-wasm --test wasm_throughput_gate

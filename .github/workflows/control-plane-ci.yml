@@ -1,0 +1,100 @@
+name: control-plane-ci
+
+on:
+  push:
+    paths:
+      - "crates/ledger-worker/**"
+      - "crates/ledger-format/proto/**"
+      - ".github/workflows/control-plane-ci.yml"
+  pull_request:
+    paths:
+      - "crates/ledger-worker/**"
+      - "crates/ledger-format/proto/**"
+      - ".github/workflows/control-plane-ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  worker:
+    name: Worker build plus cross-boundary determinism
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # pg_queue integration tests need a real Postgres to apply the
+        # River river.job schema subset against.
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Also feeds the all-features test step, which compiles pg_queue in.
+      LEDGER_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install protoc
+        # tonic_prost_build needs protoc to regenerate the checked-in
+        # src/gen/ledger.control.v1.rs under --all-features.
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+      - name: Check ledger-worker
+        run: cargo check -p ledger-worker --all-features --all-targets
+      - name: Clippy ledger-worker
+        run: cargo clippy -p ledger-worker --all-features --all-targets -- -D warnings
+      - name: Test ledger-worker (all features)
+        run: cargo nextest run -p ledger-worker --all-features --profile ci
+      - name: Postgres/River queue integration (real Postgres service)
+        run: cargo nextest run -p ledger-worker --features pg --test pg_queue --profile ci
+      - name: Cross-boundary determinism (explicit)
+        run: cargo nextest run -p ledger-worker --test cross_boundary --all-features --profile ci
+      - name: Cross-boundary determinism (gRPC transport)
+        run: cargo nextest run -p ledger-worker --features grpc --test cross_boundary --profile ci
+      - name: Set up buf CLI
+        uses: bufbuild/buf-action@v1
+        with:
+          # Setup only: lint runs in the step below against our own buf.yaml
+          # so the proto path and working directory stay explicit.
+          setup_only: "true"
+      - name: buf lint (proto API surface)
+        working-directory: crates/ledger-format
+        run: buf lint
+
+  hash-drift:
+    name: hash-drift
+    runs-on: ubuntu-latest
+    needs: worker
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run cross-boundary determinism twice (hash-drift guard)
+        run: |
+          # Hash-drift guard: the cross_boundary test runs the golden campaign twice and asserts
+          # journal-root equality across the in-process dispatcher and the UDS
+          # real worker, plus equality with a direct Simulation computation.
+          # Any drift fails the test.
+          cargo nextest run -p ledger-worker --test cross_boundary --all-features --profile ci
+          echo "hash-drift guard: no journal-root drift detected"
