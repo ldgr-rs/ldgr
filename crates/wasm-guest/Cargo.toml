@@ -9,6 +9,10 @@ description = "Deterministic Wasm guest for the ledger Wasm track"
 [lib]
 crate-type = ["cdylib"]
 
+# The guest targets `wasm32-wasip1` (preview1 core module); the backend is
+# preview1-only. The former WASIp2 component scaffold and its `wit/world.wit`
+# were removed with it.
+
 [dependencies]
 
 [lints]
