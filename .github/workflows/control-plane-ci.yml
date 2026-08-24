@@ -91,6 +91,12 @@ jobs:
           toolchain: 1.97.1
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Install protoc
+        # --all-features compiles the grpc feature, whose build script runs
+        # tonic_prost_build and therefore needs protoc on PATH.
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
       - name: Run cross-boundary determinism twice (hash-drift guard)
         run: |
           # Hash-drift guard: the cross_boundary test runs the golden campaign twice and asserts
