@@ -1,4 +1,9 @@
 [workspace]
+
+# CI runners hit linker SIGBUS/OOM linking wasmtime-laden debug test
+# binaries; line tables keep backtraces useful at a fraction of the size.
+[profile.dev]
+debug = "line-tables-only"
 resolver = "3"
 members = [
 	"crates/ledger-format",
