@@ -3,8 +3,16 @@ modules:
   - path: proto
 lint:
   use:
-    - DEFAULT
-  except: []
+    - STANDARD
+  # The control.v1 wire contract is frozen: service and message names are
+  # part of gRPC paths and descriptor bytes, so renames are a versioned API
+  # change, not style fixes. These four STANDARD naming rules stay off until
+  # a contract version review approves a v2 surface.
+  except:
+    - SERVICE_SUFFIX
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
 breaking:
   use:
     - FILE
