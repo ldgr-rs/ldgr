@@ -1,9 +1,4 @@
 [workspace]
-
-# CI runners hit linker SIGBUS/OOM linking wasmtime-laden debug test
-# binaries; line tables keep backtraces useful at a fraction of the size.
-[profile.dev]
-debug = "line-tables-only"
 resolver = "3"
 members = [
 	"crates/ledger-format",
@@ -60,3 +55,9 @@ libc = "0.2"
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_abi = "warn"
+
+# CI runners hit linker SIGBUS/OOM linking wasmtime-laden debug test
+# binaries; line tables keep backtraces useful at a fraction of the size.
+# Placed after all table sections so it is read as a profile, not keys.
+[profile.dev]
+debug = "line-tables-only"
