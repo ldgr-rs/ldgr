@@ -6,6 +6,7 @@ name: corpus-gate
 # scanner; regressions in either must not bypass them.
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "crates/ledger-format/**"

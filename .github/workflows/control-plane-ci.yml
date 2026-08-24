@@ -1,6 +1,7 @@
 name: control-plane-ci
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - "crates/ledger-worker/**"
