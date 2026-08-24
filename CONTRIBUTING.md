@@ -66,7 +66,6 @@ cargo build --target wasm32-wasip1 -p wasm-guest
 | `docs/` | The design and verification documents (source of truth). |
 | `corpora/` | Planted-leak and bug-corpus fixtures. |
 
-
 ## A note on determinism
 
 `ldgr` is a deterministic simulation engine. Code that runs inside a simulation must never read the ambient wall clock, ambient randomness, OS threads, the real filesystem, or the real network. Every one of those sources breaks reproducibility, which is the entire point of the project. The determinism rules are listed in `AGENTS.md`; `ledger-lint` enforces them automatically.
@@ -135,7 +134,10 @@ MIT OR Apache-2.0, and the remaining tooling is Apache-2.0. See
 [LICENSE](LICENSE), [LICENSE-AGPL-3.0](LICENSE-AGPL-3.0),
 [LICENSE-MIT](LICENSE-MIT), and [LICENSE-APACHE](LICENSE-APACHE), plus the
 `license` field in each crate's `Cargo.toml`. `cargo run -p xtask -- licenses`
-enforces the split in CI.
+enforces the split in CI, and also enforces the license-boundary architecture:
+only declared composition roots may import AGPL engine code, library edges to
+the engine must be optional features, and codec crates are pinned to the
+contract layers.
 
 The engine is dual-licensed: AGPL-3.0-or-later for open use, and a paid
 commercial license for teams that must link or embed the engine without AGPL

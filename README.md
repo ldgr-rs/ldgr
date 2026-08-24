@@ -37,7 +37,7 @@ cargo test --workspace --doc                   # doctests
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 cargo bench -p ledger-journal --bench storage  # criterion benchmarks
-cargo run -p xtask -- licenses               # license split gate
+cargo run -p xtask -- licenses               # license split + boundary gates
 cargo build --target wasm32-wasip1 -p wasm-guest  # build guest before wasm tests
 ```
 
