@@ -1,100 +1,280 @@
 # AGENTS.md
 
-`ldgr` (Ledger) is an open, self-hostable deterministic simulation testing (DST) engine in Rust. It journals every simulated effect into a content-addressed causal DAG and uses that journal to drive schedule exploration, lineage-driven fault injection (LDFI), and minimization.
+## Scope and project purpose
 
-Toolchain: Rust edition 2024, MSRV 1.90, pinned channel 1.97 (`rust-toolchain.toml`).
+These instructions apply to the `ldgr` workspace. There are no narrower
+`AGENTS.md` files in the current tree. A future nested file may narrow these
+rules, but it may not weaken determinism, safety, security, format, or
+validation requirements.
 
-## Orientation
+`ldgr` is an open, self-hostable deterministic simulation testing engine in
+Rust. It journals simulated effects in a content-addressed causal DAG and uses
+that journal for schedule exploration, lineage-driven fault injection (LDFI),
+replay, and minimization.
 
-The `docs/` tree is the source of truth. Update it in the same change that updates behavior.
+The project uses Rust edition 2024. Its MSRV is 1.90. Development and CI use
+Rust 1.97.1, pinned in `rust-toolchain.toml`.
 
-## Commands
+## Source of truth and repository state
 
-Run from the workspace root. The test suite needs `cargo-nextest` (`cargo install cargo-nextest`).
+- `Cargo.toml` is the workspace and dependency source of truth.
+- `rust-toolchain.toml` is the toolchain and target source of truth.
+- `README.md` is the user-facing entry point.
+- `docs/` contains the design source of truth.
+- `crates/ledger-format/proto/ledger/control/v1/control.proto` is the source
+  of truth for the control-plane wire contract.
+- `corpora/` contains planted ambient-API leaks and deterministic bug fixtures.
 
-| Task | Command |
-| :--- | :--- |
-| Check | `cargo check --workspace --all-targets` |
-| Test | `cargo nextest run --workspace --all-features` |
-| One test | `cargo nextest run -p <crate> --test <file> --all-features` |
-| Doctests | `cargo test --workspace --doc` |
-| Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
-| Format | `cargo fmt --all -- --check` (fix: `cargo fmt --all`) |
-| Benchmarks (local for now till having reliable method) | `cargo bench -p ledger-journal --bench storage`; `cargo bench -p ledger-sim --bench sim_throughput`; `cargo bench -p ledger-sim --bench sim_overhead`; `cargo bench -p ledger-sim --bench wasm_throughput --features backend-wasm`. Perf gates are measured locally, not in CI (shared runners are too slow and noisy). |
-| Licenses | `cargo run -p xtask -- licenses` |
-| Lint-rules gate | `cargo run -p ledger-lint -- crates/` |
-| Run CLI | `cargo run -p ledger-cli -- sim` |
+Start work with:
 
-Wasm prerequisites: build the guest before any wasm test (`cargo build --target wasm32-wasip1 -p wasm-guest`), and pass `--features backend-wasm` for the wasm test binaries. Do not run `cargo fmt --all` while another agent edits a different crate concurrently; use `cargo fmt -p <crate>` instead.
+```sh
+git status --short --branch
+git diff --stat
+find . -name AGENTS.md -print
+```
 
-## Workspace
+The worktree may contain user-owned or uncommitted changes. Preserve them.
+Read affected files and diffs before editing. Never use destructive commands
+such as `git reset --hard`, `git checkout --`, `git clean`, or broad
+recursive deletion unless the user requests that exact operation. Do not
+commit, amend, push, or create a branch unless the user asks.
 
-| Crate | Role |
-| :--- | :--- |
-| `ledger-format` | Canonical RFC 8949 CBOR codec, entry kinds, BLAKE3 hashing. `no_std`, `std` feature. |
-| `ledger-journal` | Causal DAG, vector clocks, segment store, snapshots, retention tiers. `no_std`, `std` feature (storage gated). |
-| `ledger-sim` | Effects boundary, virtual time, SimNet, SimFs, scheduler, seed tree, Wasm backend. |
-| `ledger-lint` | Static scanner for forbidden ambient APIs. |
-| `ledger-explorer` | Oracles, LDFI, minimizer, campaign search, reference sims. |
-| `ledger-flow` | Durable-execution step logging over the journal. |
-| `ledger-cli` | The `ledger` command-line application. |
-| `wasm-guest` | The deterministic Wasm guest (`wasm32-wasip1`). |
-| `xtask` | License and repo checks. |
+## Workspace architecture
 
-Tests live under `crates/<crate>/tests/`. Corpora live under `corpora/` (`planted-leaks/`, `bug-corpus-v1/`).
+The dependency direction is inward toward the format and journal layers:
 
-## Determinism rules (non-negotiable)
+```text
+ledger-format -> ledger-journal -> ledger-sim -> ledger-explorer -> ledger-cli
+       |              |              |              |
+       |              |              |              +-> ledger-worker
+       |              |              +-> ledger-flow, ledger-adapters
+       +-> ledger-faultspec, ledger-lint, ldgr-rt, wasm-guest, xtask
+```
 
-Code that runs inside a simulation must not touch the ambient host:
+Use manifests and `cargo tree` to confirm this diagram when the workspace
+changes. The main crate roles are:
 
-1. Never read the ambient wall clock (`std::time::Instant::now()`, `std::time::SystemTime::now()`). Use `VirtualTime` or `Effects::clock().now()`.
-2. Never invoke ambient randomness (`rand::thread_rng()`, `getrandom`). Draw from `SeedTree` streams or `Effects::rng(stream)`.
-3. Never spawn OS threads (`std::thread::spawn`). Use cooperative tasks via `Simulation::with_tasks` or `Effects::spawn()`.
-4. Never do raw file I/O (`std::fs`). Route it through `SimFs`.
-5. Never do raw network I/O (`std::net`). Route it through `SimNet`.
+| Crate or path | Role |
+| --- | --- |
+| `ledger-format` | `no_std` canonical CBOR, entries, hashes, manifests, and protocol source |
+| `ledger-journal` | Causal DAG, vector clocks, persistence, segments, snapshots, and retention |
+| `ledger-sim` | Effects boundary, scheduler, virtual time, SimNet, SimFs, Wasm backend, and sentinel |
+| `ledger-explorer` | Oracles, search, LDFI, MaxSAT, minimization, certificates, and campaigns |
+| `ledger-faultspec` | Failure-spec DSL parser, compiler, and scenario library |
+| `ledger-flow` | Durable-execution step logging over the journal |
+| `ledger-adapters` | OTel span ingest and journal envelopes |
+| `ledger-cli` | `ledger` command-line composition root |
+| `ledger-worker` | Queue draining, task execution, UDS/gRPC transport, and artifact publication |
+| `ldgr-rt` | Apache-2.0 SUT porting facade and IPC boundary |
+| `ledger-lint` | Static scanner for forbidden ambient APIs |
+| `wasm-guest` | Deterministic `wasm32-wasip1` guest |
+| `guests/` | Polyglot Wasm guest sources and prebuilt guest notes |
+| `xtask` | License and environment checks |
 
-`ledger-lint` enforces these statically. `// ledger-lint:allow` exempts a file, or a pattern via `// ledger-lint:allow:<SUB>`. The `TokioBackend` production passthrough is the one deliberate exception and is allow-marked.
+`ledger-cli` is the only default Cargo member. Use explicit `--workspace`
+or `-p` arguments for validation. Do not infer architecture or completion
+from a bare `cargo test` or `cargo check`.
 
-A deterministic run must be byte-identical when repeated with the same seed: same journal root, same decisions, same output. Executor-parity goldens and the 10^4-run self-check gate this.
+The license split is enforced by `cargo run -p xtask -- licenses`. Do not
+infer license safety from crate names or docs. Several integration-shaped
+crates currently depend directly on engine crates. Any change to those
+dependencies, crate licenses, or process-boundary assumptions needs explicit
+license and architecture review.
 
-## Code style
+## Determinism boundary
 
-- Run `cargo fmt --all` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` before declaring work done. Zero warnings.
-- No `unwrap()` or `expect()` in production library paths. Propagate with `?`. Tests may use them.
-- Typed errors: `Result<T, E>` with explicit error enums (thiserror in the workspace). Do not swallow errors with `let _ =` unless the discard is intentional and commented.
-- Prefer borrowing over `.clone()`; `&str` over `String`, `&[T]` over `Vec<T>` in parameters.
-- Encode invariants in types. Library crates carry `#![deny(unsafe_code)]`; `unsafe` is limited to `wasm-guest`'s wasm32 extern imports.
-- `ledger-format` and `ledger-journal` stay `no_std`-compatible. Gate std-only code (storage, I/O) behind the `std` feature and verify `cargo check -p <crate> --no-default-features`.
-- Keep public APIs backward compatible. A wire-format, entry-kind, or hash change is breaking and bumps the format version.
-- No dead code, unused imports, or `TODO` without a tracked issue.
-- Design principles: correctness before safety before maintainability before performance. Make illegal states unrepresentable. Validate input at every boundary. Add an abstraction only once there are two concrete cases.
+Simulation code must not read ambient host state. It must use explicit effects
+interfaces:
 
-## Comments
+1. Use `VirtualTime` or `Effects::clock().now()`, never ambient wall-clock
+   APIs.
+2. Use `SeedTree` or `Effects::rng(stream)`, never ambient randomness,
+   `getrandom`, or thread-local RNGs.
+3. Use cooperative tasks through the simulation executor, never OS threads or
+   thread scheduling as a source of behavior.
+4. Use `SimFs`, never raw filesystem I/O.
+5. Use `SimNet`, never raw network I/O.
 
-- Explain why, not what. Delete comments that restate the code.
-- Short, active, plain English.
-- Doc comments on public items: one short purpose line, then non-obvious `# Errors`, `# Panics`, or invariants. Prose, not bullet restatements.
-- Preserve `// ledger-lint:allow` markers and code blocks inside doc comments (they are doctests).
+Host-side tooling, the worker, the CLI, the runtime facade, adapters, and
+sentinel code may use host facilities only at an explicit boundary. Keep that
+code out of the simulation path. Preserve and justify
+`// ledger-lint:allow` and `// ledger-lint:allow:<PATTERN>` markers. Do not
+add an allow marker to hide a leak. Fix the boundary or add a focused test.
 
-## Testing
+A deterministic run with the same build, seed, configuration, and inputs must
+produce the same effect order, journal entries, decisions, and output bytes.
+When a feature intentionally permits cross-build variation, document the
+affected artifact and preserve the stated invariant, such as equal minimal
+cost and certificate validity.
 
-- Every change ships with tests. New public behavior needs a unit test; cross-crate behavior needs an integration test in the owning crate's `tests/`.
-- Use property tests (proptest) for encoding, hashing, and merge/order laws.
-- Tests are deterministic by construction: no wall time, ambient entropy, or thread scheduling.
-- Run the evidence gates before finishing: `cargo test -p ledger-sim --test self_check --release` (10^4-run determinism); `cargo test -p ledger-explorer --test minimize_gate --release` (minimize >= 90%); `cargo test -p ledger-explorer --test corpus_v1_gate` (bit-exact corpus); `cargo test -p ledger-sim --features backend-wasm --test wasm_differential --test wasm_corpus_bug` (Wasm parity and corpus bug).
+## Format, protocol, and API invariants
 
-## Git workflow
+Treat these as compatibility boundaries:
 
-- Conventional Commits: `feat:`, `fix:`, `refactor:`, `chore:`, `docs:`, `test:`. Example: `feat: add LDFI fault execution and replay semantics`.
-- One logical change per commit or PR. Keep PRs small.
-- Do not commit unless the user asks. Never commit secrets or generated artifacts (`target/` is ignored).
+- Do not change canonical CBOR, entry kinds, hash inputs, journal roots,
+  manifests, or `.ldgr` framing without an approved format change and version
+  review.
+- Do not change `ledger.control.v1` fields, field numbers, RPCs, or wire
+  semantics without updating the proto source, generated bindings,
+  compatibility tests, and docs together. Keep changes additive within a
+  version unless a version bump is approved.
+- Do not change public APIs, feature names, default features, crate licenses,
+  or process boundaries without approval. Deprecate before removal when the
+  compatibility policy requires it.
+- Validate untrusted input at every boundary. Bound lengths and counts. Validate
+  hashes, hex, paths, URLs, queue records, and protobuf fields before use.
+- UDS endpoints must use a private directory and restrictive socket permissions
+  and must authenticate the peer where the platform supports peer credentials.
+  Never put secrets in logs or URLs.
 
-## Boundaries
+For journal or Wasm performance work, preserve semantics first. Batch encoding
+or storage around per-entry hashes is allowed only if every entry ID, parent,
+root, effect count, actor order, and recovery result remains byte-identical.
+Never merge independent entry hashes into one hash. Measure before and after;
+do not promote a performance lever from an estimate alone.
 
-- **Always**: run `cargo fmt --check`, clippy, and the affected tests before declaring a task complete; follow the determinism rules; update `docs/` in the same change when behavior changes; add tests for new behavior.
-- **Ask first**: adding a dependency; changing `.github/` workflows; changing a wire format, entry kind, or hash; changing a public API; touching the license split or the `Cargo.toml` feature surface.
-- **Never**: commit secrets; add ambient time, entropy, threads, fs, or net to simulation code; edit `target/`; reference plan artifacts in code comments.
+## Implementation rules
 
-## Responsibilities
+- Prefer explicit types and invariants over convention. Make invalid states
+  hard to construct.
+- Propagate typed errors with `Result<T, E>` and `?`. Add context at the
+  boundary. Do not replace useful errors with an unstructured string when the
+  source error can be preserved.
+- Do not use `unwrap()` or `expect()` in production library paths. Tests may
+  use them only for setup or assertions whose failure is meaningful.
+- Do not discard a `Result` with `let _ =` unless the discard is intentional,
+  safe, and documented at that line. Journal and persistence errors must never
+  disappear on a replay path.
+- Prefer borrowing over cloning. Avoid unbounded allocation, unchecked casts,
+  silent truncation, and hidden global state.
+- Keep `ledger-format` and `ledger-journal` `no_std` compatible. Gate
+  storage, I/O, and other `std` code behind the existing feature surface.
+- Library crates should retain `#![deny(unsafe_code)]`. Unsafe code is limited
+  to the existing Wasm or sentinel boundary and must state its safety contract.
+- Keep comments short and explain why, not what. Public documentation must
+  state purpose and non-obvious errors, panics, safety, or invariants.
+- Do not add TODO, FIXME, sprint, audit-stage, or plan-only markers to
+  production code. Record deferred work in a durable design document or issue.
+  Existing design docs may describe planned or deferred work when the status is
+  explicit and does not claim implementation.
+- Keep generated files generated. Edit their source schema or generator, then
+  regenerate and test. Do not hand-edit generated output to make a build pass.
+- Avoid unrelated cleanup in a behavior change. Keep one logical change per
+  patch and preserve public paths unless the change includes migration work.
 
-- **User Responsibility**: for any changes the user makes to the codebase, including but not limited to adding new features, fixing bugs, and refactoring code, as well as any other changes that are necessary to maintain the codebase, the user is responsible for committing those changes and ensuring that they are properly reviewed.
+## Tests and validation
+
+Every behavior change needs a test. Use unit tests for local invariants,
+property tests for encoding, hashing, ordering, and merge laws, and integration
+tests under the owning crate for cross-crate behavior. Tests must be
+deterministic and must assert behavior, not only implementation details.
+
+Run the smallest relevant checks first, then the full gates when practical:
+
+```sh
+# Fast local checks
+cargo fmt -p <crate> -- --check
+cargo check -p <crate> --all-targets
+cargo nextest run -p <crate> --all-features
+
+# Workspace gates
+cargo fmt --all -- --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo nextest run --workspace --all-features --profile ci -E 'not binary(pg_queue)'
+cargo test --workspace --doc
+cargo run -p ledger-lint -- crates/
+cargo run -p xtask -- licenses
+cargo run -p xtask -- doctor
+
+# no_std and feature surfaces
+cargo check -p ledger-format --no-default-features
+cargo check -p ledger-journal --no-default-features
+cargo check -p ldgr-rt --all-targets
+cargo check -p ldgr-rt --all-targets --features sim
+cargo check -p ldgr-rt --all-targets --features sim-link
+
+# Wasm prerequisites and parity
+cargo build --target wasm32-wasip1 -p wasm-guest
+cargo test -p ledger-sim --features backend-wasm --test wasm_differential --test wasm_corpus_bug
+
+# Evidence gates
+cargo test -p ledger-sim --test self_check --release
+cargo test -p ledger-explorer --test minimize_gate --release
+cargo test -p ledger-explorer --test corpus_v1_gate
+cargo test -p ledger-explorer --test mcs_corpus_gate
+cargo test -p ledger-sim --features backend-wasm --test wasm_differential --test wasm_corpus_bug
+cargo build --release --target wasm32-wasip1 -p wasm-guest
+cargo test --release -p ledger-sim --features backend-wasm --test wasm_throughput_gate
+```
+
+The worker has separate feature and service requirements. Run these when the
+worker, protocol, or control-plane surface changes:
+
+```sh
+cargo check -p ledger-worker --all-features --all-targets
+cargo clippy -p ledger-worker --all-features --all-targets -- -D warnings
+cargo nextest run -p ledger-worker --test cross_boundary --all-features --profile ci
+cargo nextest run -p ledger-worker --features grpc --test cross_boundary --profile ci
+cargo nextest run -p ledger-worker --features pg --test pg_queue --profile ci
+```
+
+The Postgres test needs a live Postgres service. The gRPC test needs the
+protobuf toolchain. Do not turn an unavailable required service into a passing
+skip. Report the missing prerequisite and run the other checks.
+
+CI also runs checks that need extra tools or services. Run the applicable leg
+when changing its surface: `cargo hack` for feature combinations,
+`cargo audit` for the locked dependency graph, `buf lint` for the protobuf
+module, the format-conformance tests for cross-language encoding, and the
+polyglot Wasm workflow for guest changes. Inspect the workflow files for the
+exact tool versions and service setup.
+
+Benchmarks are evidence, not correctness tests. Use Criterion benches only
+after correctness gates pass. Record the command, build profile, feature set,
+hardware, and comparison baseline for any performance claim. Benchmark output
+belongs in ignored build directories unless the user asks for a report.
+
+## Hardening and audit workflow
+
+For a broad audit, begin in read-only mode:
+
+1. Map the repository, manifests, docs, feature matrix, CI, tests, and current
+   Git state.
+2. Split independent audits by concern. Useful concerns are docs-versus-code,
+   dead or duplicate code, comment hygiene, technical debt, test quality,
+   security boundaries, performance evidence, and public API coherence.
+3. Require each auditor finding to use:
+   `severity(P0 blocking|P1 should-fix|P2 nice)|file:line|evidence|recommended action`.
+4. Deduplicate findings and triage them before implementation. Recheck every
+   plan claim against the current worktree; plans can be stale or describe a
+   different branch.
+
+For implementation work, use one implementer per disjoint write set. Do not
+let parallel agents edit the same file. Review each completed task in this
+order:
+
+1. Spec compliance review.
+2. Code quality and security review.
+3. Focused tests and the required gates for the affected boundary.
+
+If a review finds a defect, fix it and repeat that review. Do not treat an
+implementer's self-review as a substitute for independent review. Do not put
+temporary plan text or agent instructions in source comments.
+
+## Change boundaries and approval points
+
+Ask before:
+
+- adding or changing a dependency;
+- changing `.github/`, `.gitlab-ci.yml`, release automation, or supply-chain
+  policy;
+- changing a wire format, entry kind, hash, journal-root rule, or protocol;
+- changing a public API, feature surface, crate license, or process boundary;
+- changing generated protocol files or the format version;
+- changing performance acceptance thresholds or deterministic output policy.
+
+Do not declare work complete until the affected tests pass, the relevant docs
+are updated, formatting and lint checks are clean, and any skipped gate is
+named with its reason. Do not claim a plan is complete when it is only
+validated, triaged, or benchmarked.

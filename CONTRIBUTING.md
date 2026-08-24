@@ -66,7 +66,6 @@ cargo build --target wasm32-wasip1 -p wasm-guest
 | `docs/` | The design and verification documents (source of truth). |
 | `corpora/` | Planted-leak and bug-corpus fixtures. |
 
-The docs start with `docs/01-overview.md` (concepts) and `docs/03-lld.md` (the low-level design).
 
 ## A note on determinism
 

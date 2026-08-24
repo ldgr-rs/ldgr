@@ -12,7 +12,7 @@ enforces the split in CI.
 
 The engine is dual-licensed: AGPL-3.0-or-later for open use, and a paid
 commercial license for teams that must link or embed it without AGPL
-obligations. See `docs/06-business.md`.
+obligations.
 
 Contributions are accepted under the license of the crate they land in, and
 grant the project the right to sublicense engine contributions under the
