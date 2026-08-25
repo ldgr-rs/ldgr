@@ -58,6 +58,10 @@ pub struct LdfiReport {
     pub applied: usize,
     /// Number of injections that were voided.
     pub voided: usize,
+    /// Journal entry hashes witnessing the violation.
+    pub witnesses: Vec<Hash>,
+    /// Effect origins for the witness entries, when captured.
+    pub origins: Vec<(Hash, ledger_sim::OriginSource)>,
     /// True when the journal prefix before the first fault matches the base run.
     pub prefix_ok: bool,
 }
@@ -123,6 +127,8 @@ pub fn run_ldfi(
         reason: finding.verdict.reason.clone(),
         steps: finding.run.steps,
         journal_root: finding.run.journal.root_hash(),
+        witnesses: finding.verdict.witnesses.clone(),
+        origins: finding.run.origins.clone(),
         hypotheses: hypotheses
             .into_iter()
             .map(|hypothesis| LdfiHypothesis {

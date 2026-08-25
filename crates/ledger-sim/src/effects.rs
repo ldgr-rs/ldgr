@@ -1,7 +1,9 @@
 //! Effect boundary between the system under test and deterministic execution.
 
 use crate::net::Message;
+use crate::origin::OriginSource;
 use crate::time::Clock;
+use core::panic::Location;
 use ledger_format::{Hash, StreamId};
 use rand_core::Rng;
 
@@ -17,11 +19,32 @@ pub trait Net {
     /// Queue a message for delivery. Returns false if the link is partitioned.
     fn send(&self, message: Message) -> bool;
 
+    /// Queue a message for delivery, recording where the send came from.
+    ///
+    /// The origin lands in the session side channel keyed by the Send entry
+    /// hash; journal bytes are unchanged. The default drops the origin so
+    /// existing implementations stay correct without code changes.
+    fn send_loc(&self, message: Message, at: OriginSource) -> bool {
+        let _ = at;
+        self.send(message)
+    }
+
     /// Take the first deliverable message for `task` available at `now`.
     fn recv(&self, task: usize, now: u64) -> Option<Message>;
 
     fn has_ready_message(&self, task: usize, now: u64) -> bool;
 }
+
+/// Tracked aliases for the network boundary: same behavior, plus origin
+/// capture into the session side channel when the backend supports it.
+pub trait NetExt: Net {
+    #[track_caller]
+    fn send_tracked(&self, message: Message) -> bool {
+        self.send_loc(message, Location::caller().into())
+    }
+}
+
+impl<T: Net + ?Sized> NetExt for T {}
 
 /// Storage boundary exposed to systems under test.
 ///
@@ -32,15 +55,60 @@ pub trait Fs {
     /// Write a value to the page cache and return its journal entry id.
     fn write(&self, path: &str, value: u64) -> Result<Hash, ledger_journal::JournalError>;
 
+    /// Write with origin capture; see [`Net::send_loc`]. Default delegates.
+    fn write_loc(
+        &self,
+        path: &str,
+        value: u64,
+        at: OriginSource,
+    ) -> Result<Hash, ledger_journal::JournalError> {
+        let _ = at;
+        self.write(path, value)
+    }
+
     /// Flush all dirty page-cache entries to durable synced storage.
     fn fsync(&self) -> Result<Hash, ledger_journal::JournalError>;
+
+    /// Flush with origin capture; see [`Net::send_loc`]. Default delegates.
+    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, ledger_journal::JournalError> {
+        let _ = at;
+        self.fsync()
+    }
 
     /// Read a value from page cache, recording provenance of the observed write.
     fn read(&self, path: &str) -> Result<Option<u64>, ledger_journal::JournalError>;
 
     /// Crash storage into the deterministic post-crash state.
     fn crash(&self);
+
+    /// Crash with origin capture; see [`Net::send_loc`]. Default delegates.
+    fn crash_loc(&self, at: OriginSource) {
+        let _ = at;
+        self.crash()
+    }
 }
+
+/// Tracked aliases for the storage boundary. Read is deliberately absent:
+/// its provenance entries are appended inside the fs layer, so there is no
+/// entry id observable at this boundary to key an origin against.
+pub trait FsExt: Fs {
+    #[track_caller]
+    fn write_tracked(&self, path: &str, value: u64) -> Result<Hash, ledger_journal::JournalError> {
+        self.write_loc(path, value, Location::caller().into())
+    }
+
+    #[track_caller]
+    fn fsync_tracked(&self) -> Result<Hash, ledger_journal::JournalError> {
+        self.fsync_loc(Location::caller().into())
+    }
+
+    #[track_caller]
+    fn crash_tracked(&self) {
+        self.crash_loc(Location::caller().into())
+    }
+}
+
+impl<T: Fs + ?Sized> FsExt for T {}
 
 /// Effect boundary implemented by simulation and production backends.
 ///

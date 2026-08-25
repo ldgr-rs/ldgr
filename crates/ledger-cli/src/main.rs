@@ -128,6 +128,28 @@ fn json_violation(reason: &str, steps: usize, root: Hash) -> String {
     .to_string()
 }
 
+/// Print captured origins for the witness entries of a violation.
+///
+/// Origins exist only for runs that flowed through origin-capturing calls
+/// (tracked facade sends, direct backend use). Instruction-program runs have
+/// no per-effect call sites, so this prints nothing there by design.
+fn print_effect_origins(origins: &[(Hash, ledger_sim::OriginSource)], witnesses: &[Hash]) {
+    let hits: Vec<_> = origins
+        .iter()
+        .filter(|(id, _)| witnesses.contains(id))
+        .collect();
+    if hits.is_empty() {
+        return;
+    }
+    println!("Effect origins:");
+    for (id, source) in hits {
+        if let ledger_sim::OriginSource::Source(origin) = source {
+            let hex = ledger_format::hash_to_hex(id);
+            println!("  {} at {}:{}", &hex[..8], origin.file, origin.line);
+        }
+    }
+}
+
 fn run_sim(
     cli: &Cli,
     verbose: bool,
@@ -185,6 +207,7 @@ fn run_sim(
                 ledger_format::hash_to_hex(&finding.run.journal.root_hash())
             );
             println!("Steps executed: {}", finding.run.steps);
+            print_effect_origins(&finding.run.origins, &finding.verdict.witnesses);
         }
     } else if cli.json {
         println!(r#"{{"status":"passed","runs":{runs}}}"#);
@@ -502,6 +525,7 @@ fn run_ldfi(
             ledger_format::hash_to_hex(&report.journal_root)
         );
         println!("Steps executed: {}", report.steps);
+        print_effect_origins(&report.origins, &report.witnesses);
         println!("LDFI hypotheses:");
         for (index, hypothesis) in report.hypotheses.iter().enumerate() {
             println!(
@@ -537,7 +561,15 @@ fn ldfi_json(report: &LdfiReport) -> String {
             "explanation": hypothesis.explanation
         })).collect::<Vec<_>>(),
         "replay": {"applied": report.applied, "voided": report.voided, "prefix_ok": report.prefix_ok},
-        "schedule": report.schedule.iter().map(describe_injection).collect::<Vec<_>>()
+        "schedule": report.schedule.iter().map(describe_injection).collect::<Vec<_>>(),
+        "origins": report.origins.iter().map(|(id, source)| match source {
+            ledger_sim::OriginSource::Source(origin) => serde_json::json!({
+                "entry": ledger_format::hash_to_hex(id),
+                "file": origin.file,
+                "line": origin.line
+            }),
+            _ => serde_json::json!({"entry": ledger_format::hash_to_hex(id)}),
+        }).collect::<Vec<_>>()
     }).to_string()
 }
 

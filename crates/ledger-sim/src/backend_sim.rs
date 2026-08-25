@@ -2,6 +2,7 @@
 
 use crate::effects::{Effects, Fs, Net};
 use crate::net::{Message, SimNet};
+use crate::origin::{OriginLog, OriginSource};
 use crate::seedtree::SeedTree;
 use crate::simfs::SimFs;
 use crate::time::{Clock, VirtualTime};
@@ -105,6 +106,9 @@ pub struct SimBackend {
     rng_streams: Vec<Option<SimStreamRng>>,
     /// Optional shared tick sink published to WASI virtual clocks.
     tick_sink: Option<Arc<Mutex<u64>>>,
+    /// Side channel of effect origins keyed by entry hash. Never serialized
+    /// into the journal; see [`crate::origin`].
+    origins: Mutex<OriginLog>,
 }
 
 impl SimBackend {
@@ -125,6 +129,7 @@ impl SimBackend {
             actor,
             rng_streams: Vec::new(),
             tick_sink: None,
+            origins: Mutex::new(OriginLog::default()),
         }
     }
 
@@ -162,6 +167,16 @@ impl SimBackend {
     /// Return the actor id this backend journals entries for.
     pub fn actor(&self) -> ActorId {
         self.actor
+    }
+
+    /// Snapshot the captured effect origins in append order.
+    pub fn origins_snapshot(&self) -> Vec<(Hash, OriginSource)> {
+        lock(&self.origins).snapshot()
+    }
+
+    /// Look up the origin of one journaled entry.
+    pub fn origin_of(&self, id: &Hash) -> Option<OriginSource> {
+        lock(&self.origins).get(id).cloned()
     }
 
     /// Append an entry through this backend's journaling path.
@@ -250,29 +265,30 @@ impl Effects for SimBackend {
 
 impl Net for SimBackend {
     fn send(&self, message: Message) -> bool {
-        let Some(id) = self.append(
-            EntryKind::Send,
-            [],
-            Payload::Pair {
-                left: message.to as u64,
-                right: message.payload,
-            },
-        ) else {
-            return false;
-        };
-        lock(&self.net).send(Message {
-            send_id: id,
-            ..message
-        })
+        self.send_impl(message).0
+    }
+
+    fn send_loc(&self, message: Message, at: OriginSource) -> bool {
+        let (delivered, id) = self.send_impl(message);
+        if let Some(id) = id {
+            lock(&self.origins).record(id, at);
+        }
+        delivered
     }
 
     fn recv(&self, task: usize, now: u64) -> Option<Message> {
         let message = lock(&self.net).recv_at(task, now)?;
-        self.append(
+        let id = self.append(
             EntryKind::Recv,
             [message.send_id],
             Payload::Number(message.payload),
         );
+        // Clone the origin out before re-locking: the guard from `get` lives
+        // to the end of the statement, and the mutex is not reentrant.
+        let inherited = lock(&self.origins).get(&message.send_id).cloned();
+        if let (Some(id), Some(origin)) = (id, inherited) {
+            lock(&self.origins).record(id, origin);
+        }
         Some(message)
     }
 
@@ -281,17 +297,47 @@ impl Net for SimBackend {
     }
 }
 
+impl SimBackend {
+    /// Append the Send entry and hand the message to the simulated network.
+    /// Returns delivery status plus the Send entry id when journaling worked.
+    fn send_impl(&self, message: Message) -> (bool, Option<Hash>) {
+        let Some(id) = self.append(
+            EntryKind::Send,
+            [],
+            Payload::Pair {
+                left: message.to as u64,
+                right: message.payload,
+            },
+        ) else {
+            return (false, None);
+        };
+        let delivered = lock(&self.net).send(Message {
+            send_id: id,
+            ..message
+        });
+        (delivered, Some(id))
+    }
+}
+
 impl Fs for SimBackend {
     fn write(&self, path: &str, value: u64) -> Result<Hash, JournalError> {
-        let mut journal = lock(&self.journal);
-        let mut fs = lock(&*self.fs);
-        fs.write(&mut journal, self.actor, path, value)
+        self.write_impl(path, value)
+    }
+
+    fn write_loc(&self, path: &str, value: u64, at: OriginSource) -> Result<Hash, JournalError> {
+        let id = self.write_impl(path, value)?;
+        lock(&self.origins).record(id, at);
+        Ok(id)
     }
 
     fn fsync(&self) -> Result<Hash, JournalError> {
-        let mut journal = lock(&self.journal);
-        let mut fs = lock(&*self.fs);
-        fs.fsync(&mut journal, self.actor)
+        self.fsync_impl()
+    }
+
+    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, JournalError> {
+        let id = self.fsync_impl()?;
+        lock(&self.origins).record(id, at);
+        Ok(id)
     }
 
     fn read(&self, path: &str) -> Result<Option<u64>, JournalError> {
@@ -301,7 +347,33 @@ impl Fs for SimBackend {
     }
 
     fn crash(&self) {
-        self.append(
+        self.crash_impl();
+    }
+
+    fn crash_loc(&self, at: OriginSource) {
+        if let Some(id) = self.crash_impl() {
+            lock(&self.origins).record(id, at);
+        }
+    }
+}
+
+impl SimBackend {
+    fn write_impl(&self, path: &str, value: u64) -> Result<Hash, JournalError> {
+        let mut journal = lock(&self.journal);
+        let mut fs = lock(&*self.fs);
+        fs.write(&mut journal, self.actor, path, value)
+    }
+
+    fn fsync_impl(&self) -> Result<Hash, JournalError> {
+        let mut journal = lock(&self.journal);
+        let mut fs = lock(&*self.fs);
+        fs.fsync(&mut journal, self.actor)
+    }
+
+    /// Append the crash-fault entry and fold storage into the post-crash
+    /// state. Returns the entry id when journaling worked.
+    fn crash_impl(&self) -> Option<Hash> {
+        let id = self.append(
             EntryKind::Fault {
                 fault: FaultSpec::CrashState(0),
             },
@@ -309,6 +381,7 @@ impl Fs for SimBackend {
             Payload::Empty,
         );
         lock(&*self.fs).crash();
+        id
     }
 }
 

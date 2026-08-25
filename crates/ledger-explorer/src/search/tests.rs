@@ -657,6 +657,7 @@ fn campaign_report_renders_ndjson_coverage_records() {
         steps: 0,
         monitor_issues: Vec::new(),
         applied_faults: Vec::new(),
+        origins: Vec::new(),
     };
     let report = CampaignReport {
         runs_executed: 9,

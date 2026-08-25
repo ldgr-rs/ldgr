@@ -104,6 +104,9 @@ pub struct RunResult {
     pub monitor_issues: Vec<MonitorIssue>,
     /// Event ids whose scheduled fault injections took effect.
     pub applied_faults: Vec<ledger_format::Hash>,
+    /// Effect origins keyed by entry hash, in append order. Empty unless the
+    /// run flowed through origin-capturing calls (crate::origin).
+    pub origins: Vec<(ledger_format::Hash, crate::origin::OriginSource)>,
     /// First journal-append failure observed on a path that cannot propagate.
     ///
     /// Append failures on non-`Result` surfaces (send helpers, spawn, crash)

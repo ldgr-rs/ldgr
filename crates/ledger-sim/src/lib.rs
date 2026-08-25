@@ -16,6 +16,7 @@ mod dpor;
 mod effects;
 mod executor;
 mod net;
+mod origin;
 mod runtime;
 mod scheduler;
 mod seedtree;
@@ -37,9 +38,10 @@ pub use config_canonical::{
     to_canonical_bytes,
 };
 pub use dpor::{DporConfig, DporReport, DporRun, run_dpor};
-pub use effects::{Effects, Fs, Net, TaskId};
+pub use effects::{Effects, Fs, FsExt, Net, NetExt, TaskId};
 pub use executor::{Boundary, Executor};
 pub use net::{DnsTable, LinkConfig, Message, SimNet, backoff, backoff_jittered};
+pub use origin::{EffectOrigin, OriginSource};
 pub use runtime::{
     Instruction, RunResult, RuntimeError, SCHED_ACTOR, SCHED_STREAM, Simulation, TaskBuilder,
 };

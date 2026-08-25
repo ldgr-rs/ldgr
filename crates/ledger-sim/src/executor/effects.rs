@@ -5,6 +5,7 @@
 //! executor state. The `Effects`/`Net`/`Fs` trait implementations and the
 //! sleeping/receiving futures live here; the orchestration loop, the task
 //! table, and the shared state stay in the module root.
+use crate::origin::OriginSource;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -281,16 +282,37 @@ impl Boundary {
 
     /// Send a message immediately, journaling a `Send` entry.
     pub fn send(&self, to: usize, payload: u64) -> bool {
-        Net::send(
-            self,
-            Message {
-                from: self.task,
-                to,
-                payload,
-                send_id: [0; 32],
-                deliver_at: self.shared.time.borrow().now(),
-            },
-        )
+        self.send_inner(to, payload, None)
+    }
+
+    /// Send with origin capture: the caller's source location lands in the
+    /// session side channel keyed by the Send entry hash.
+    #[track_caller]
+    pub fn send_tracked(&self, to: usize, payload: u64) -> bool {
+        self.send_inner(to, payload, Some(core::panic::Location::caller().into()))
+    }
+
+    /// Snapshot the captured effect origins in append order.
+    pub fn origins_snapshot(&self) -> Vec<(ledger_format::Hash, OriginSource)> {
+        self.shared.origins.borrow().snapshot()
+    }
+
+    /// Give a Recv entry the origin of the Send that produced it, keeping
+    /// lineage continuous across the network boundary.
+    fn inherit_recv_origin(&self, recv_id: Option<Hash>, send_id: Hash) {
+        if let Some(id) = recv_id {
+            // Clone out before re-locking; the mutex is not reentrant.
+            let inherited = self.shared.origins.borrow().get(&send_id).cloned();
+            if let Some(origin) = inherited {
+                self.shared.origins.borrow_mut().record(id, origin);
+            }
+        }
+    }
+
+    fn send_inner(&self, to: usize, payload: u64, at: Option<OriginSource>) -> bool {
+        // Behavior-identical to the historical Net::send path; the origin is
+        // recorded inside send_core against the journaled Send entry.
+        self.send_core(to, payload, 0, at)
     }
 
     /// Toggle a directed partition at the current point of the run.
@@ -329,7 +351,7 @@ impl Boundary {
     /// delay is added to the current virtual time, so identical seeds yield
     /// identical delivery order.
     pub fn send_timed(&self, to: usize, payload: u64, delay: u64) -> bool {
-        self.send_core(to, payload, delay)
+        self.send_core(to, payload, delay, None)
     }
 
     /// Single send path for `send` and `send_timed`.
@@ -337,7 +359,13 @@ impl Boundary {
     /// Journals `Send`, applies the fault and swarm policies, then delivers
     /// through the configured link or the direct queue. Delay 0 keeps
     /// unfaulted journals byte-identical.
-    fn send_core(&self, to: usize, payload: u64, base_delay: u64) -> bool {
+    fn send_core(
+        &self,
+        to: usize,
+        payload: u64,
+        base_delay: u64,
+        at: Option<OriginSource>,
+    ) -> bool {
         let now = self.shared.time.borrow().now();
         let id = match self.append(
             EntryKind::Send,
@@ -353,6 +381,9 @@ impl Boundary {
                 return false;
             }
         };
+        if let Some(origin) = at {
+            self.shared.origins.borrow_mut().record(id, origin);
+        }
         if self.shared.dropped_events.contains(&id) {
             if let Err(error) = self.append(
                 EntryKind::Fault {
@@ -592,16 +623,20 @@ impl Boundary {
     pub(crate) fn recv_now(&self) -> Option<u64> {
         let now = self.shared.time.borrow().now();
         let message = self.shared.net.borrow_mut().recv_at(self.task, now)?;
-        if let Err(error) = self.append(
+        let recv_id = match self.append(
             EntryKind::Recv,
             [message.send_id],
             Payload::Number(message.payload),
         ) {
-            // The message is already consumed; surface the failed append
-            // instead of losing it on the return-None path.
-            self.shared.record_journal_error(error);
-            return None;
-        }
+            Ok(id) => Some(id),
+            Err(error) => {
+                // The message is already consumed; surface the failed append
+                // instead of losing it on the return-None path.
+                self.shared.record_journal_error(error);
+                None
+            }
+        };
+        self.inherit_recv_origin(recv_id, message.send_id);
         Some(message.payload)
     }
 
@@ -780,18 +815,23 @@ impl Effects for Boundary {
 
 impl Net for Boundary {
     fn send(&self, message: Message) -> bool {
-        self.send_core(message.to, message.payload, 0)
+        self.send_core(message.to, message.payload, 0, None)
     }
 
     fn recv(&self, task: usize, now: u64) -> Option<Message> {
         let message = self.shared.net.borrow_mut().recv_at(task, now)?;
-        if let Err(error) = self.append(
+        let recv_id = match self.append(
             EntryKind::Recv,
             [message.send_id],
             Payload::Number(message.payload),
         ) {
-            self.shared.record_journal_error(error);
-        }
+            Ok(id) => Some(id),
+            Err(error) => {
+                self.shared.record_journal_error(error);
+                None
+            }
+        };
+        self.inherit_recv_origin(recv_id, message.send_id);
         Some(message)
     }
 
@@ -801,6 +841,17 @@ impl Net for Boundary {
 }
 
 impl Fs for Boundary {
+    fn write_loc(
+        &self,
+        path: &str,
+        value: u64,
+        at: OriginSource,
+    ) -> Result<Hash, ledger_journal::JournalError> {
+        let id = Fs::write(self, path, value)?;
+        self.shared.origins.borrow_mut().record(id, at);
+        Ok(id)
+    }
+
     fn write(&self, path: &str, value: u64) -> Result<Hash, ledger_journal::JournalError> {
         let mut journal = self.shared.journal.borrow_mut();
         let mut fs = self.shared.fs.borrow_mut();
@@ -816,6 +867,12 @@ impl Fs for Boundary {
         );
         self.inject_write_fault(id, path)?;
         self.maybe_crash_on_write(path, value)?;
+        Ok(id)
+    }
+
+    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, ledger_journal::JournalError> {
+        let id = Fs::fsync(self)?;
+        self.shared.origins.borrow_mut().record(id, at);
         Ok(id)
     }
 
@@ -854,16 +911,35 @@ impl Fs for Boundary {
     }
 
     fn crash(&self) {
-        if let Err(error) = self.append(
+        self.crash_impl();
+    }
+
+    fn crash_loc(&self, at: OriginSource) {
+        if let Some(id) = self.crash_impl() {
+            self.shared.origins.borrow_mut().record(id, at);
+        }
+    }
+}
+
+impl Boundary {
+    /// Journal the crash-fault entry and fold storage into the post-crash
+    /// state. Returns the entry id when journaling worked.
+    fn crash_impl(&self) -> Option<Hash> {
+        let id = match self.append(
             EntryKind::Fault {
                 fault: FaultSpec::CrashState(0),
             },
             [],
             Payload::Empty,
         ) {
-            self.shared.record_journal_error(error);
-        }
+            Ok(id) => Some(id),
+            Err(error) => {
+                self.shared.record_journal_error(error);
+                None
+            }
+        };
         self.fs_crash();
+        id
     }
 }
 
@@ -913,6 +989,10 @@ impl Future for RecvFuture {
                         self.task,
                         Some(id),
                     );
+                    let inherited = self.shared.origins.borrow().get(&message.send_id).cloned();
+                    if let Some(origin) = inherited {
+                        self.shared.origins.borrow_mut().record(id, origin);
+                    }
                 }
                 Err(error) => self.shared.record_journal_error(error),
             }

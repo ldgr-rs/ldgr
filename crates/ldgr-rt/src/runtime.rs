@@ -443,6 +443,7 @@ impl Handle {
     /// rebuilding the handle from scratch. Returns `false` when the link is
     /// partitioned or `to` exceeds the actor id range, mirroring an
     /// undeliverable link rather than truncating the id.
+    #[track_caller]
     pub fn net_send(&self, to: usize, payload: u64) -> bool {
         let Ok(to_id) = u32::try_from(to) else {
             return false;
@@ -450,7 +451,7 @@ impl Handle {
         #[cfg(feature = "sim-link")]
         {
             if let Some(b) = &self.boundary {
-                return b.send(to_id as usize, payload);
+                return b.send_tracked(to_id as usize, payload);
             }
         }
         Conn::new(self.actor, to_id, self.shared_net.clone()).send(payload)

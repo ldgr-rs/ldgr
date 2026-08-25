@@ -656,6 +656,7 @@ mod tests {
             steps: 0,
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
+            origins: Vec::new(),
         };
         CampaignReport {
             runs_executed: 10,
@@ -960,6 +961,7 @@ mod tests {
             steps: 0,
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
+            origins: Vec::new(),
         };
         let report = CampaignReport {
             runs_executed: 1,
@@ -1150,6 +1152,7 @@ mod tests {
                     steps: 0,
                     monitor_issues: Vec::new(),
                     applied_faults: Vec::new(),
+                    origins: Vec::new(),
                 },
                 verdict: Verdict::fail(vec![[7u8; 32]], "test"),
             }],
@@ -1289,6 +1292,7 @@ mod tests {
             steps: 0,
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
+            origins: Vec::new(),
         };
         let report = CampaignReport {
             runs_executed: 1,
