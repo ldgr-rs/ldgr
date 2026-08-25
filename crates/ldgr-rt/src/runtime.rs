@@ -168,7 +168,7 @@ pub enum RunCompletion {
     Blocked,
 }
 
-#[cfg(feature = "sim")]
+#[cfg(feature = "sim-link")]
 impl From<ledger_sim::RunOutcome> for RunCompletion {
     fn from(outcome: ledger_sim::RunOutcome) -> Self {
         match outcome {
