@@ -164,6 +164,8 @@ impl TscTrapGuard {
 /// Runtime sentinel that tracks and flags unjournaled ambient effects.
 #[derive(Debug, Default)]
 pub struct Sentinel {
+    // ledger-lint:allow:HashSet (leak classes are membership-checked and
+    // counted; the set is never iterated for output order)
     detected_leaks: HashSet<LeakClass>,
 }
 

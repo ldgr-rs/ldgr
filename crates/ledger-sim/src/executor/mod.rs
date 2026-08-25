@@ -100,6 +100,9 @@ pub(crate) struct ExecutorShared {
     ///
     /// Every journal write funnels through [`Self::journal_append`], so the
     /// journal can never gain an entry the boundary did not report.
+    // ledger-lint:allow:HashMap ledger-lint:allow:HashSet (coverage is keyed
+    // lookup and collected in sorted order at the run tail; fault classes are
+    // membership and len only)
     coverage: RefCell<HashMap<ActorId, u64>>,
     /// Distinct crash-state classes applied this run (campaign budget).
     fault_classes_used: RefCell<HashSet<u64>>,
@@ -293,10 +296,13 @@ impl Executor {
         };
         if self.config.monitor() {
             let coverage = self.shared.coverage.borrow();
-            let boundary_entries = coverage
+            let mut boundary_entries = coverage
                 .iter()
                 .map(|(actor, count)| (*actor, *count))
                 .collect::<Vec<_>>();
+            // Deterministic monitor input order: the map itself is
+            // lookup-only, but this vector feeds issue enumeration.
+            boundary_entries.sort_unstable();
             drop(coverage);
             monitor_issues.extend(JournalCorrectnessMonitor::check_coverage(
                 &journal,

@@ -67,6 +67,8 @@ impl From<&'static Location<'static>> for OriginSource {
 /// same entries, so replay repopulates the same origins.
 #[derive(Default)]
 pub(crate) struct OriginLog {
+    // ledger-lint:allow:HashMap (keyed by entry hash; append order comes
+    // from the side Vec, never from map iteration)
     map: std::collections::HashMap<Hash, OriginSource>,
     order: Vec<Hash>,
 }

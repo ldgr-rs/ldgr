@@ -32,6 +32,8 @@ pub struct StepTrace {
 /// list is reordered by `swap_remove`, so a position is not a stable identity.
 #[derive(Debug, Clone, Default)]
 pub struct NoveltyModel {
+    // ledger-lint:allow:HashMap ledger-lint:allow:HashSet (membership and keyed
+    // lookup only; iteration never escapes the scheduler)
     seen_transitions: HashSet<(EntryKind, EntryKind)>,
     seen_actor_pairs: HashSet<(ActorId, ActorId)>,
     seen_vc_branches: HashSet<u64>,

@@ -6,4 +6,5 @@
 pub mod scanner;
 pub use scanner::{
     ALLOW_MARKER, FORBIDDEN_PATTERNS, LintViolation, ScanResult, scan_rs_files, scan_source,
+    scan_warnings,
 };

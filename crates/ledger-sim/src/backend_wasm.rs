@@ -346,6 +346,7 @@ pub struct WasmBackend {
     engine: Engine,
     store: Store<WasmStoreData>,
     instance: Option<Instance>,
+    // ledger-lint:allow:HashMap (name-keyed instance lookups; never iterated)
     instances: HashMap<String, Instance>,
     fuel_budget: u64,
 }

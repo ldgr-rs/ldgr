@@ -27,6 +27,8 @@ pub struct Conn {
 pub(crate) struct SharedNet {
     // Queue preserves insertion order to keep FIFO per actor pair.
     queue: VecDeque<Message>,
+    // ledger-lint:allow:HashSet (partition pairs are membership-checked;
+    // the set is never iterated)
     partitions: std::collections::HashSet<(ActorId, ActorId)>,
 }
 
