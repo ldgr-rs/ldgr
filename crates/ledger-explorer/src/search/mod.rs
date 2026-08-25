@@ -53,7 +53,7 @@ fn find_first_violation<W: Workload, O: Oracle>(
         let run = Simulation::new(config.clone(), workload.programs())
             .run()
             .map_err(|error| format!("simulation failed: {error:?}"))?;
-        let verdict = oracle.check(&run);
+        let verdict = effective_verdict(&run, oracle.check(&run));
         if verdict.violated {
             return Ok((
                 Some(Finding {
@@ -66,6 +66,34 @@ fn find_first_violation<W: Workload, O: Oracle>(
         }
     }
     Ok((None, budget))
+}
+
+/// Promote an incomplete run to a liveness violation.
+///
+/// A run that never completed is a finding regardless of what the oracle
+/// saw on the partial journal: an exhausted step budget or pending tasks
+/// at quiescence both mean the system under test failed to make progress.
+pub fn effective_verdict(run: &ledger_sim::RunResult, verdict: crate::Verdict) -> crate::Verdict {
+    if run.outcome == ledger_sim::RunOutcome::Completed {
+        return verdict;
+    }
+    let reason = match run.outcome {
+        ledger_sim::RunOutcome::BudgetExhausted => format!(
+            "liveness violation: step budget exhausted after {} steps with tasks pending",
+            run.steps
+        ),
+        _ => "liveness violation: run quiesced with pending tasks".to_string(),
+    };
+    // Structural witnesses first; a stalled run may have none, so fall
+    // back to the journal tail: the last entries show where progress
+    // stopped.
+    let mut witnesses = crate::oracle::witnesses_from_journal(&run.journal);
+    if witnesses.is_empty() {
+        let ids: Vec<ledger_format::Hash> = run.journal.entries().map(|entry| entry.id).collect();
+        let start = ids.len().saturating_sub(8);
+        witnesses = ids[start..].to_vec();
+    }
+    crate::oracle::Verdict::fail(witnesses, reason)
 }
 
 /// Shared fault-class budget for the swarm axis across every campaign type.

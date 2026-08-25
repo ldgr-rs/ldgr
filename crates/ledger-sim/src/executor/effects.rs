@@ -182,6 +182,8 @@ impl Boundary {
         let operator = match choice % 4 {
             0 => crate::simfs::CrashOperator::DropAllUnsynced,
             1 => {
+                // ledger-lint:allow:HashSet (single-element set; the crash
+                // operator sorts before iterating)
                 let mut dropped = HashSet::new();
                 dropped.insert(path.to_owned());
                 crate::simfs::CrashOperator::DropSubset(dropped)

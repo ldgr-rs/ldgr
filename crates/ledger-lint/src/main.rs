@@ -8,13 +8,19 @@ use std::process;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: ledger-lint <path-to-source-file-or-dir>...");
+    let deny_warnings = args.iter().any(|arg| arg == "--deny-warnings");
+    let targets: Vec<&String> = args
+        .iter()
+        .skip(1)
+        .filter(|arg| *arg != "--deny-warnings")
+        .collect();
+    if targets.is_empty() {
+        eprintln!("Usage: ledger-lint [--deny-warnings] <path-to-source-file-or-dir>...");
         process::exit(1);
     }
 
     let mut aggregate = ScanResult::default();
-    for target in &args[1..] {
+    for target in targets {
         let path = Path::new(target);
         if !path.exists() {
             aggregate
@@ -26,6 +32,7 @@ fn main() {
         aggregate.files_scanned += result.files_scanned;
         aggregate.errors.extend(result.errors);
         aggregate.violating_files.extend(result.violating_files);
+        aggregate.warning_files.extend(result.warning_files);
     }
 
     for (file, violations) in &aggregate.violating_files {
@@ -33,16 +40,22 @@ fn main() {
     }
 
     let total = aggregate.total_violations();
+    let total_warnings = aggregate.total_warnings();
     println!(
-        "ledger-lint: scanned {} source file(s); {} violation(s) in {} file(s).",
+        "ledger-lint: scanned {} source file(s); {} violation(s) in {} file(s); {} warn-level finding(s) in {} file(s).",
         aggregate.files_scanned,
         total,
-        aggregate.violating_files.len()
+        aggregate.violating_files.len(),
+        total_warnings,
+        aggregate.warning_files.len()
     );
+    for (file, warnings) in &aggregate.warning_files {
+        print_warn_report(file, warnings);
+    }
     for err in &aggregate.errors {
         eprintln!("ledger-lint: {err}");
     }
-    if total > 0 || !aggregate.errors.is_empty() {
+    if total > 0 || !aggregate.errors.is_empty() || (deny_warnings && total_warnings > 0) {
         process::exit(1);
     }
 }
@@ -59,5 +72,17 @@ fn print_report(file: &Path, violations: &[LintViolation]) {
             violation.line_number, violation.line_content
         );
         println!("    Advice: {}", violation.advice);
+    }
+}
+
+fn print_warn_report(file: &Path, warnings: &[LintViolation]) {
+    println!(
+        "{}: {} warn-level determinism finding(s):",
+        file.display(),
+        warnings.len()
+    );
+    for warning in warnings {
+        println!("  Line {}: `{}`", warning.line_number, warning.line_content);
+        println!("    Advice: {}", warning.advice);
     }
 }

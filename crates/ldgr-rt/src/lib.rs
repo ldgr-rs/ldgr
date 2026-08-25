@@ -33,7 +33,7 @@ pub use ledger_format::StreamId;
 pub use net::{Conn, SharedNetwork, shared_network};
 pub use rng::DetRng;
 pub use runtime::{
-    Handle, IpcFault, JournalFault, RunConfig, RunResult, RuntimeError, TaskMain,
+    Handle, IpcFault, JournalFault, RunCompletion, RunConfig, RunResult, RuntimeError, TaskMain,
     register_workload, run, run_named,
 };
 pub use task::{TaskId, task_id_for};

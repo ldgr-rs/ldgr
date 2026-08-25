@@ -5,6 +5,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use clap_complete::Shell;
@@ -21,8 +24,76 @@ use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle, minimize_schedule};
 use ledger_format::Hash;
 use ledger_sim::{Policy, RunConfig, SimFault, Simulation};
 
+/// Cancel flag for an armed watchdog. Dropping the guard disarms the thread.
+struct WatchdogGuard {
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for WatchdogGuard {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Arm a runner-level wall-clock watchdog.
+///
+/// The executor is single-threaded, so a hang inside a task or a mutex
+/// cannot be interrupted in place. The watchdog is the host-side last
+/// line of defense: on expiry it prints a diagnostic and exits with
+/// code 2. The guard must stay alive for the whole command.
+fn arm_watchdog(deadline_ms: u64, context: &str) -> WatchdogGuard {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    let context = context.to_owned();
+    std::thread::spawn(move || {
+        let start = Instant::now();
+        // Poll in short slices so a dropped guard is honored promptly.
+        while start.elapsed().as_millis() < u128::from(deadline_ms) {
+            if thread_cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("ledger: deadline exceeded: wall clock passed {deadline_ms} ms");
+        eprintln!("ledger: command: {context}");
+        eprintln!(
+            "ledger: the run did not exit cleanly; re-run with a higher --deadline-ms to let it finish"
+        );
+        std::process::exit(2);
+    });
+    WatchdogGuard { cancel }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    #[test]
+    fn deadline_flag_parses_globally() {
+        let cli = Cli::try_parse_from(["ledger", "--deadline-ms", "250", "completions", "bash"])
+            .expect("global flag must parse on any subcommand");
+        assert_eq!(cli.deadline_ms, Some(250));
+    }
+
+    #[test]
+    fn dropped_guard_cancels_the_watchdog_thread() {
+        let guard = arm_watchdog(60_000, "test command");
+        let cancel = Arc::clone(&guard.cancel);
+        drop(guard);
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "drop must disarm the thread"
+        );
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Keep the guard alive for the whole command; dropping it disarms
+    // the watchdog thread before normal exit.
+    let _watchdog = cli
+        .deadline_ms
+        .map(|ms| arm_watchdog(ms, &std::env::args().skip(1).collect::<Vec<_>>().join(" ")));
     let verbose = is_verbose(cli.verbose.filter());
     let result = match &cli.command {
         Command::Sim {

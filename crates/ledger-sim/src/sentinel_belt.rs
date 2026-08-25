@@ -279,6 +279,7 @@ fn belt_armed() -> bool {
 /// and the kernel would kill the process.
 fn pre_warm_ambient_entropy() {
     // Deliberate discard: the map exists only to seed the hasher here.
+    // ledger-lint:allow:HashMap (compile probe; never populated)
     let _ = std::collections::HashMap::<u64, u64>::new();
 }
 

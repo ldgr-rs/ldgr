@@ -149,6 +149,7 @@ pub fn bytes_to_u64(bytes: &[u8]) -> u64 {
 /// In-memory fd table mapping virtual fds to `SimFs` path keys.
 #[derive(Debug, Default)]
 pub struct WasiFdTable {
+    // ledger-lint:allow:HashMap (fd-to-path lookups only; never iterated)
     map: HashMap<u32, String>,
 }
 

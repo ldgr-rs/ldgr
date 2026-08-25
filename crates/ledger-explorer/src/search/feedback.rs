@@ -137,7 +137,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         distinct_roots.insert(run.journal.root_hash());
         variants.push(format!("attempt={attempt} policy=feedback-search"));
         search_runs += 1;
-        let verdict = oracle.check(&run);
+        let verdict = super::effective_verdict(&run, oracle.check(&run));
         if verdict.violated {
             let finding = Finding {
                 seed: config.seed(),

@@ -447,6 +447,7 @@ mod tests {
             )
             .unwrap();
         let run = RunResult {
+            outcome: ledger_sim::RunOutcome::Completed,
             journal_error: None,
             journal,
             decisions: Vec::new(),

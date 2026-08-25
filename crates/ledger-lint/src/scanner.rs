@@ -112,6 +112,33 @@ const BARE_PREFIX_PATTERNS: &[(&str, &str)] = &[
     ("env::args", "ambient process args; pass inputs via Effects"),
 ];
 
+/// Files under these path prefixes are simulation-path code: hash-collection
+/// iteration order can reach replay behavior or journal-adjacent output.
+const WARN_SCOPE_PREFIXES: &[&str] = &[
+    "crates/ledger-sim/src/",
+    "crates/wasm-guest/src/",
+    "crates/ldgr-rt/src/",
+    "guests/",
+];
+
+/// Warn-level patterns for the simulation path.
+///
+/// Hash collections are deterministic within one build, but their iteration
+/// order is not stable across builds, so any iteration that can reach
+/// journal order, decision order, or reported output is a replay risk.
+/// Lookup-only use is fine; mark it with `// ledger-lint:allow:HashMap`
+/// (or `HashSet`) plus a reason.
+const WARN_PATTERNS: &[(&str, &str)] = &[
+    (
+        "HashMap",
+        "hash-map iteration order is unstable across builds; sort before iterating, derive order from the journal, or use BTreeMap; allow-marker lookup-only use",
+    ),
+    (
+        "HashSet",
+        "hash-set iteration order is unstable across builds; sort before iterating or use BTreeSet; allow-marker membership-only use",
+    ),
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintViolation {
     pub pattern: String,
@@ -170,6 +197,8 @@ fn collect_pattern_exemptions(source: &str) -> Vec<String> {
 pub struct ScanResult {
     /// Files that produced at least one violation, paired with their violations.
     pub violating_files: Vec<(PathBuf, Vec<LintViolation>)>,
+    /// Files that produced at least one warn-level finding, paired with them.
+    pub warning_files: Vec<(PathBuf, Vec<LintViolation>)>,
     /// Number of source files scanned, excluding allow-marked files.
     pub files_scanned: usize,
     /// Non-fatal errors encountered while walking directories or reading files.
@@ -181,6 +210,14 @@ impl ScanResult {
         self.violating_files
             .iter()
             .map(|(_path, violations)| violations.len())
+            .sum()
+    }
+
+    /// Total warn-level findings across all scanned files.
+    pub fn total_warnings(&self) -> usize {
+        self.warning_files
+            .iter()
+            .map(|(_path, warnings)| warnings.len())
             .sum()
     }
 
@@ -200,6 +237,10 @@ impl ScanResult {
         let violations = scan_source(&content);
         if !violations.is_empty() {
             self.violating_files.push((path.to_path_buf(), violations));
+        }
+        let warnings = scan_warnings(path, &content);
+        if !warnings.is_empty() {
+            self.warning_files.push((path.to_path_buf(), warnings));
         }
     }
 }
@@ -304,6 +345,53 @@ pub fn scan_source(source: &str) -> Vec<LintViolation> {
         }
     }
     violations
+}
+
+/// Return true when `path` is inside the warn scope for hash collections.
+fn is_warn_scoped(path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('\\', "/");
+    WARN_SCOPE_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
+/// Scan one source file for warn-level determinism risks.
+///
+/// Honors the same file-scoped allow directives as the forbidden-pattern
+/// scan: a full-file marker skips the file, and `ledger-lint:allow:HashMap`
+/// exempts that pattern for the whole file. Import lines never warn.
+pub fn scan_warnings(path: &Path, source: &str) -> Vec<LintViolation> {
+    if !is_warn_scoped(path) || has_full_allow_marker(source) {
+        return Vec::new();
+    }
+    let exemptions = collect_pattern_exemptions(source);
+    let exempted: Vec<bool> = WARN_PATTERNS
+        .iter()
+        .map(|(pattern, _)| exemptions.iter().any(|sub| pattern.contains(sub)))
+        .collect();
+    let mut warnings = Vec::new();
+    let mut in_block_comment = false;
+    for (line_idx, line) in source.lines().enumerate() {
+        let code = strip_comments(line, &mut in_block_comment);
+        let trimmed = code.trim();
+        if trimmed.is_empty() || is_import_line(trimmed) {
+            continue;
+        }
+        for (idx, &(pattern, advice)) in WARN_PATTERNS.iter().enumerate() {
+            if exempted[idx] {
+                continue;
+            }
+            if code.contains(pattern) {
+                warnings.push(LintViolation {
+                    pattern: pattern.to_string(),
+                    line_number: line_idx + 1,
+                    line_content: trimmed.to_string(),
+                    advice: advice.to_string(),
+                });
+            }
+        }
+    }
+    warnings
 }
 
 /// Remove line and block comments from one source line.
@@ -416,6 +504,34 @@ mod tests {
         let v = scan_source(code);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].pattern, "env::var");
+    }
+
+    #[test]
+    fn hashmap_warn_fires_only_inside_simulation_scope() {
+        let code = "fn f() { let m: HashMap<u8, u8> = HashMap::new(); }";
+        let in_scope = Path::new("crates/ledger-sim/src/x.rs");
+        let out_of_scope = Path::new("crates/ledger-cli/src/x.rs");
+        let warnings = scan_warnings(in_scope, code);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].pattern, "HashMap");
+        assert!(scan_warnings(out_of_scope, code).is_empty());
+    }
+
+    #[test]
+    fn imports_and_allow_markers_skip_hash_warnings() {
+        let code = "use std::collections::HashMap;\n\
+                    // ledger-lint:allow:HashMap (lookup-only fd map)\n\
+                    fn f(m: HashMap<u8, u8>) {}";
+        let in_scope = Path::new("crates/ledger-sim/src/x.rs");
+        assert!(scan_warnings(in_scope, code).is_empty());
+    }
+
+    #[test]
+    fn full_file_allow_suppresses_hash_warnings() {
+        let code = "// ledger-lint:allow (host passthrough)\n\
+                    fn f(s: HashSet<u8>) {}";
+        let in_scope = Path::new("crates/ledger-sim/src/x.rs");
+        assert!(scan_warnings(in_scope, code).is_empty());
     }
 
     #[test]

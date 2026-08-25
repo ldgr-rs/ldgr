@@ -649,6 +649,7 @@ fn campaign_report_renders_ndjson_coverage_records() {
         .expect("append must succeed");
     let root_hex = hash_to_hex(&journal.root_hash());
     let run = RunResult {
+        outcome: ledger_sim::RunOutcome::Completed,
         journal_error: None,
         journal,
         decisions: Vec::new(),

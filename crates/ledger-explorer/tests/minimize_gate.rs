@@ -86,6 +86,7 @@ fn failing_programs() -> Vec<Vec<Instruction>> {
 /// same shape the minimizer pipeline uses internally.
 fn run_for_check(journal: ledger_journal::Journal) -> RunResult {
     RunResult {
+        outcome: ledger_sim::RunOutcome::Completed,
         journal_error: None,
         journal,
         decisions: Vec::new(),

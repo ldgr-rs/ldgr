@@ -135,6 +135,8 @@ pub fn backoff_jittered(
 #[derive(Debug, Default)]
 pub struct SimNet {
     queue: VecDeque<Message>,
+    // ledger-lint:allow:HashSet (partition pairs are membership-checked;
+    // the set is never iterated)
     partitions: HashSet<(usize, usize)>,
     /// Optional reorder window: when nonzero, up to this many messages sharing
     /// a delivery tick are served newest-first instead of FIFO (UDP-style

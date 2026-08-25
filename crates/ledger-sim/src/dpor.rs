@@ -97,6 +97,9 @@ pub fn run_dpor(
     };
 
     let journal_entries = base.journal.entries().collect::<Vec<_>>();
+    // ledger-lint:allow:HashMap ledger-lint:allow:HashSet (explored-set
+    // membership and per-actor clock lookups keyed by ActorId; no iteration
+    // reaches decisions)
     let mut explored = HashSet::new();
     // `last_vc` holds each task's vector clock as of the current branch point:
     // entries journaled before the step under inspection, advanced per step

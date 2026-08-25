@@ -32,6 +32,7 @@ fn name_runtime_error(error: &RuntimeError) -> &'static str {
 /// `journal_root` and `steps` are public fields under every feature set.
 fn construct_run_result() -> RunResult {
     RunResult {
+        outcome: ldgr_rt::RunCompletion::Completed,
         journal_root: None,
         steps: 0,
     }

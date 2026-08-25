@@ -154,6 +154,31 @@ impl From<RunConfigBuilder> for RunConfig {
 // Result / error
 // ---------------------------------------------------------------------------
 
+/// Whether a run reached completion, and why it stopped when it did not.
+///
+/// Facade-local carrier: liveness detail requires the simulation backend;
+/// other builds report [`RunCompletion::Completed`] for their runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunCompletion {
+    /// Every task finished.
+    Completed,
+    /// The step budget ran out while tasks were still ready or blocked.
+    BudgetExhausted,
+    /// No task was ready and at least one task was still pending.
+    Blocked,
+}
+
+#[cfg(feature = "sim-link")]
+impl From<ledger_sim::RunOutcome> for RunCompletion {
+    fn from(outcome: ledger_sim::RunOutcome) -> Self {
+        match outcome {
+            ledger_sim::RunOutcome::Completed => Self::Completed,
+            ledger_sim::RunOutcome::BudgetExhausted => Self::BudgetExhausted,
+            ledger_sim::RunOutcome::Blocked => Self::Blocked,
+        }
+    }
+}
+
 /// Outcome of a completed run.
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -162,6 +187,8 @@ pub struct RunResult {
     pub journal_root: Option<[u8; 32]>,
     /// Number of executor steps consumed.
     pub steps: usize,
+    /// Whether the run completed, and the liveness reason when it did not.
+    pub outcome: RunCompletion,
 }
 
 /// Journal invariant failure raised by a simulation backend.
@@ -724,6 +751,7 @@ fn run_with_sim(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError
     Ok(RunResult {
         journal_root: Some(res.journal.root_hash()),
         steps: res.steps,
+        outcome: res.outcome.into(),
     })
 }
 
@@ -738,6 +766,7 @@ async fn run_via_ipc(config: RunConfig, main: Main) -> Result<RunResult, Runtime
     let outcome = engine.run_workload_with_steps(workload, config.seed(), config.max_steps(), 1)?;
     let root = outcome.journal_root().ok_or(RuntimeError::MissingRoot)?;
     Ok(RunResult {
+        outcome: RunCompletion::Completed,
         journal_root: Some(root),
         steps: outcome.steps,
     })
@@ -763,6 +792,7 @@ fn run_with_tokio(config: RunConfig, main: Main) -> Result<RunResult, RuntimeErr
     });
     clear_current();
     Ok(RunResult {
+        outcome: RunCompletion::Completed,
         journal_root: None,
         steps: 0,
     })

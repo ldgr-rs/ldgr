@@ -43,7 +43,8 @@ pub use executor::{Boundary, Executor};
 pub use net::{DnsTable, LinkConfig, Message, SimNet, backoff, backoff_jittered};
 pub use origin::{EffectOrigin, OriginSource};
 pub use runtime::{
-    Instruction, RunResult, RuntimeError, SCHED_ACTOR, SCHED_STREAM, Simulation, TaskBuilder,
+    Instruction, RunOutcome, RunResult, RuntimeError, SCHED_ACTOR, SCHED_STREAM, Simulation,
+    TaskBuilder,
 };
 pub use scheduler::{NoveltyModel, Scheduler, StepTrace};
 pub use seedtree::SeedTree;

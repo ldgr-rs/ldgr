@@ -10,6 +10,8 @@ pub enum CrashOperator {
     /// Drop all dirty, unsynced writes.
     DropAllUnsynced,
     /// Drop an adversarial subset of dirty paths.
+    // ledger-lint:allow:HashSet (apply_crash_operator sorts the subset
+    // before iterating, so restore order is deterministic)
     DropSubset(HashSet<String>),
     /// Simulate a torn write by persisting a truncated/partial value.
     TornWrite { path: String, partial_value: u64 },
@@ -302,7 +304,12 @@ impl SimFs {
                     .collect();
             }
             CrashOperator::DropSubset(paths_to_drop) => {
-                for path in paths_to_drop {
+                // HashSet order must not choose the restore sequence; sort
+                // so the crash operator stays deterministic even if the
+                // loop ever grows journaled steps.
+                let mut ordered: Vec<&String> = paths_to_drop.iter().collect();
+                ordered.sort();
+                for path in ordered {
                     if let Some((synced_val, synced_hash)) = self.synced.get(path) {
                         self.values
                             .insert(path.clone(), (*synced_val, *synced_hash, PageState::Clean));

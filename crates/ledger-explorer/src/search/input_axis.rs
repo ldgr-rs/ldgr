@@ -81,7 +81,7 @@ where
         let run = Simulation::new(base.clone(), workload.programs())
             .run()
             .map_err(|error| format!("simulation failed: {error:?}"))?;
-        let verdict = oracle.check(&run);
+        let verdict = super::effective_verdict(&run, oracle.check(&run));
         if verdict.violated {
             return Ok(Some(Finding {
                 seed: attempt_seed,
