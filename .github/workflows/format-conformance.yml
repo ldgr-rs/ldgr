@@ -2,6 +2,7 @@ name: format-conformance
 
 on:
   push:
+    branches: ["dev"]
     paths:
       - "crates/ledger-format/**"
       # ledger-sim owns the canonical RunConfig document encoding

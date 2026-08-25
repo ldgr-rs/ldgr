@@ -3,6 +3,7 @@ name: control-plane-ci
 on:
   workflow_dispatch:
   push:
+    branches: ["dev"]
     paths:
       - "crates/ledger-worker/**"
       - "crates/ledger-format/proto/**"

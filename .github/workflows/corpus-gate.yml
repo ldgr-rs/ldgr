@@ -8,6 +8,7 @@ name: corpus-gate
 on:
   workflow_dispatch:
   push:
+    branches: ["dev"]
     paths:
       - "crates/ledger-format/**"
       - "crates/ledger-journal/**"
