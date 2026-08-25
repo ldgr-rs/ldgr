@@ -59,8 +59,8 @@ A core dump for distributed systems, minus the gigabytes. The format is
 canonical RFC 8949 CBOR, checked against a Go reference implementation, and
 free forever. Longer term these artifacts get a public home: **ldgrhub**, a
 registry where findings are browsed by protocol class and replayed live in
-your browser. It is staged in phase 4 of the roadmap; the file format above
-is its foundation.
+your browser. It is on the [roadmap](ROADMAP.md); the
+file format above is its foundation.
 
 ## Quickstart
 
