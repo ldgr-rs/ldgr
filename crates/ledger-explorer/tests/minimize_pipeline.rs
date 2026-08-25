@@ -43,6 +43,7 @@ fn full_pipeline_minimizes_stale_read_and_preserves_violation() {
     );
 
     let run = RunResult {
+        outcome: ledger_sim::RunOutcome::Completed,
         journal_error: None,
         journal: repro.journal.clone(),
         decisions: Vec::new(),

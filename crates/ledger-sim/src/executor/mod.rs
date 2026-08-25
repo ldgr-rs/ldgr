@@ -230,12 +230,16 @@ impl Executor {
     /// Run until all tasks finish or the step budget is reached.
     pub fn run(mut self) -> Result<RunResult, RuntimeError> {
         self.journal_spawns()?;
+        // The while-condition exit means the budget ran out; the breaks in
+        // the loop record the earlier liveness outcomes.
+        let mut outcome = crate::RunOutcome::BudgetExhausted;
         while self.steps < self.config.max_steps() {
             self.wake_blocked_with_messages()?;
             if self.shared.ready.borrow().is_empty() {
                 self.advance_quiescent()?;
                 if self.shared.ready.borrow().is_empty() {
                     if self.all_tasks_done() {
+                        outcome = crate::RunOutcome::Completed;
                         break;
                     }
                     if let Some(earliest) = self.shared.net.borrow().earliest_delivery_time()
@@ -245,6 +249,7 @@ impl Executor {
                         self.wake_blocked_with_messages()?;
                     }
                     if self.shared.ready.borrow().is_empty() {
+                        outcome = crate::RunOutcome::Blocked;
                         break;
                     }
                 }
@@ -275,10 +280,10 @@ impl Executor {
         if let Some(error) = self.shared.journal_error.borrow().clone() {
             return Err(RuntimeError::Journal(error));
         }
-        if self.steps == self.config.max_steps() {
-            return Err(RuntimeError::StepLimit {
-                limit: self.config.max_steps(),
-            });
+        // The last step can complete every task exactly as the budget runs
+        // out; completion wins over the budget default in that case.
+        if outcome == crate::RunOutcome::BudgetExhausted && self.all_tasks_done() {
+            outcome = crate::RunOutcome::Completed;
         }
         let journal = self.shared.journal.borrow().clone();
         let mut monitor_issues = if self.config.monitor() {
@@ -313,6 +318,7 @@ impl Executor {
             trace,
             registers,
             steps: self.steps,
+            outcome,
             monitor_issues,
             applied_faults: self.shared.applied_faults.borrow().clone(),
             origins: self.shared.origins.borrow().snapshot(),
@@ -981,8 +987,38 @@ mod tests {
                 })
             }],
         );
-        let error = executor.run().unwrap_err();
-        assert!(matches!(error, RuntimeError::StepLimit { .. }));
+        let run = executor
+            .run()
+            .expect("budget exhaustion is an outcome, not an error");
+        assert_eq!(run.outcome, crate::RunOutcome::BudgetExhausted);
+        assert!(
+            run.steps > 0,
+            "a budget-exhausted run must have executed steps"
+        );
+    }
+
+    #[test]
+    fn quiesced_pending_tasks_report_blocked_outcome() {
+        let executor = executor_with(
+            9,
+            64,
+            [|b| {
+                boxed(async move {
+                    let _ = b.recv().await;
+                })
+            }],
+        );
+        let run = executor
+            .run()
+            .expect("quiescence with pending tasks is an outcome, not an error");
+        assert_eq!(run.outcome, crate::RunOutcome::Blocked);
+    }
+
+    #[test]
+    fn finished_run_reports_completed_outcome() {
+        let executor = executor_with(9, 64, [|_b| boxed(async {})]);
+        let run = executor.run().expect("empty task completes");
+        assert_eq!(run.outcome, crate::RunOutcome::Completed);
     }
 }
 

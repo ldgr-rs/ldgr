@@ -37,6 +37,7 @@ pub struct MinimizedRepro {
 /// fields are neutral.
 fn run_for_check(journal: Journal) -> RunResult {
     RunResult {
+        outcome: ledger_sim::RunOutcome::Completed,
         journal_error: None,
         journal,
         decisions: Vec::new(),

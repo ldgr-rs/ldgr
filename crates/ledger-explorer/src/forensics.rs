@@ -110,6 +110,7 @@ mod tests {
 
     fn run(journal: Journal) -> RunResult {
         RunResult {
+            outcome: ledger_sim::RunOutcome::Completed,
             journal_error: None,
             journal,
             decisions: Vec::new(),

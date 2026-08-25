@@ -107,7 +107,7 @@ pub fn run_campaign<W: Workload, O: Oracle>(
             .map_err(|error| format!("simulation failed: {error:?}"))?;
 
         distinct_roots.insert(run.journal.root_hash());
-        let verdict = oracle.check(&run);
+        let verdict = super::effective_verdict(&run, oracle.check(&run));
         if verdict.violated {
             findings.push(Finding {
                 seed: config.seed(),
@@ -181,7 +181,7 @@ pub fn run_monitored_campaign<W: Workload, O: Oracle>(
             .map_err(|error| format!("simulation failed: {error:?}"))?;
 
         distinct_roots.insert(run.journal.root_hash());
-        let primary = oracle.check(&run);
+        let primary = super::effective_verdict(&run, oracle.check(&run));
         let monitored = monitor_oracle.check(&run);
         let verdict = merge_monitor_verdict(primary, monitored);
         if verdict.violated {
@@ -210,4 +210,54 @@ pub fn search<W: Workload, O: Oracle>(
     attempts: usize,
 ) -> Result<Option<Finding>, String> {
     super::find_first_violation(workload, oracle, &base, attempts).map(|(finding, _)| finding)
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    use crate::oracle::Verdict;
+    use ledger_sim::{Instruction, RunConfig};
+
+    /// A workload whose single task blocks on a receive that never has a
+    /// sender: the run quiesces with a pending task.
+    struct DeadlockWorkload;
+
+    impl Workload for DeadlockWorkload {
+        fn programs(&self) -> Vec<Vec<Instruction>> {
+            vec![vec![Instruction::Receive]]
+        }
+
+        fn history(&self, _run: &RunResult) -> Vec<crate::oracle::HistoryOperation> {
+            Vec::new()
+        }
+    }
+
+    struct PassOracle;
+
+    impl Oracle for PassOracle {
+        fn check(&self, _run: &ledger_sim::RunResult) -> Verdict {
+            Verdict::pass()
+        }
+    }
+
+    #[test]
+    fn quiesced_pending_tasks_become_liveness_findings() {
+        let config = RunConfig::builder().seed([9; 32]).max_steps(64).build();
+        let report =
+            run_campaign(&DeadlockWorkload, &PassOracle, config, 2).expect("campaign succeeds");
+        assert_eq!(
+            report.findings.len(),
+            2,
+            "every attempt must surface as a liveness finding"
+        );
+        assert!(
+            report.findings[0].verdict.reason.contains("liveness"),
+            "reason must name liveness: {}",
+            report.findings[0].verdict.reason
+        );
+        assert!(
+            !report.findings[0].verdict.witnesses.is_empty(),
+            "liveness findings carry journal witnesses"
+        );
+    }
 }

@@ -289,6 +289,7 @@ mod tests {
 
     fn empty_run_with_journal(journal: Journal) -> RunResult {
         RunResult {
+            outcome: ledger_sim::RunOutcome::Completed,
             journal_error: None,
             journal,
             decisions: Vec::new(),

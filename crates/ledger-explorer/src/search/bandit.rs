@@ -271,7 +271,7 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
                 distinct,
             },
         );
-        let verdict = oracle.check(&run);
+        let verdict = super::effective_verdict(&run, oracle.check(&run));
         let found = verdict.violated;
         if found {
             findings.push(Finding {

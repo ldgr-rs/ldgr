@@ -79,6 +79,17 @@ pub enum Instruction {
     Done,
 }
 
+/// Whether a run reached completion, and why it stopped when it did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Every task finished.
+    Completed,
+    /// The step budget ran out while tasks were still ready or blocked.
+    BudgetExhausted,
+    /// No task was ready and at least one task was still pending.
+    Blocked,
+}
+
 /// Result of a completed deterministic run.
 #[derive(Debug, Clone)]
 pub struct RunResult {
@@ -97,6 +108,8 @@ pub struct RunResult {
     pub registers: Vec<u64>,
     /// Number of executed instructions.
     pub steps: usize,
+    /// Whether the run completed, and the liveness reason when it did not.
+    pub outcome: RunOutcome,
     /// Defects found by the journal-correctness monitor.
     ///
     /// The run does not fail on monitor issues by default; callers decide how
@@ -124,6 +137,11 @@ pub enum RuntimeError {
     /// Journal invariant failed.
     Journal(JournalError),
     /// The instruction budget was exhausted.
+    ///
+    /// No longer produced: budget exhaustion is now reported through
+    /// [`RunResult::outcome`] so the partial journal stays inspectable.
+    /// The variant remains because the runtime facade maps it in its
+    /// public contract.
     StepLimit { limit: usize },
 }
 

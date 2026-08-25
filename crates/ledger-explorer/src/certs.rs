@@ -648,6 +648,7 @@ mod tests {
         )
         .unwrap();
         let run = RunResult {
+            outcome: ledger_sim::RunOutcome::Completed,
             journal_error: None,
             journal: j,
             decisions: Vec::new(),
@@ -953,6 +954,7 @@ mod tests {
         lower_bound: u64,
     ) -> CampaignCertificate {
         let run = RunResult {
+            outcome: ledger_sim::RunOutcome::Completed,
             journal_error: None,
             journal: journal.clone(),
             decisions: Vec::new(),
@@ -1144,6 +1146,7 @@ mod tests {
             findings: vec![Finding {
                 seed: [7u8; 32],
                 run: RunResult {
+                    outcome: ledger_sim::RunOutcome::Completed,
                     journal_error: None,
                     journal: journal.clone(),
                     decisions: Vec::new(),
@@ -1284,6 +1287,7 @@ mod tests {
             .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 7 })
             .unwrap();
         let run = RunResult {
+            outcome: ledger_sim::RunOutcome::Completed,
             journal_error: None,
             journal: journal.clone(),
             decisions: Vec::new(),

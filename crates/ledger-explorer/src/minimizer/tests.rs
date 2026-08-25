@@ -146,6 +146,7 @@ fn chain_journal(values: &[u64]) -> Journal {
 
 fn run_for_test(journal: Journal) -> RunResult {
     RunResult {
+        outcome: ledger_sim::RunOutcome::Completed,
         journal_error: None,
         journal,
         decisions: Vec::new(),
