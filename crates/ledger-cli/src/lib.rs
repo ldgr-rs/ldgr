@@ -117,6 +117,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub ndjson: bool,
 
+    /// Wall-clock deadline for the whole command in milliseconds. On expiry
+    /// the runner prints a diagnostic and exits with code 2, guarding
+    /// against silent hangs in runs and campaigns.
+    #[arg(long, global = true, value_name = "MS")]
+    pub deadline_ms: Option<u64>,
+
     /// Verbosity: repeat `-v` for more detail, `-q` to quiet.
     #[command(flatten)]
     pub verbose: Verbosity,
