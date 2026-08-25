@@ -105,6 +105,8 @@ pub(crate) struct ExecutorShared {
     fault_classes_used: RefCell<HashSet<u64>>,
     /// Event ids whose scheduled fault injections took effect.
     applied_faults: RefCell<Vec<Hash>>,
+    /// Effect origins side channel keyed by entry hash (crate::origin).
+    origins: RefCell<crate::origin::OriginLog>,
     /// Fault schedule applied at exact causal positions.
     fault_schedule: Vec<SimFault>,
     /// Configured journaling-FS crash model, or `None` for the black-box
@@ -204,6 +206,7 @@ impl Executor {
             coverage: RefCell::new(HashMap::new()),
             fault_classes_used: RefCell::new(HashSet::new()),
             applied_faults: RefCell::new(Vec::new()),
+            origins: RefCell::new(crate::origin::OriginLog::default()),
             fault_schedule: config.fault_schedule().to_vec(),
             #[cfg(feature = "sim-fs-journaling")]
             fs_journaling: config.fs_journaling(),
@@ -312,6 +315,7 @@ impl Executor {
             steps: self.steps,
             monitor_issues,
             applied_faults: self.shared.applied_faults.borrow().clone(),
+            origins: self.shared.origins.borrow().snapshot(),
             journal_error: self.shared.journal_error.borrow().clone(),
         })
     }
@@ -479,6 +483,49 @@ mod tests {
         future: impl Future<Output = ()> + 'static,
     ) -> Pin<Box<dyn Future<Output = ()> + 'static>> {
         Box::pin(future)
+    }
+
+    #[test]
+    fn send_tracked_records_origin_in_the_shared_log() {
+        let executor = executor_with(
+            9,
+            256,
+            [|b| {
+                boxed(async move {
+                    b.send_tracked(1, 42);
+                })
+            }],
+        );
+        let run = executor.run().expect("run succeeds");
+        assert_eq!(run.origins.len(), 1, "tracked send must record one origin");
+        match &run.origins[0].1 {
+            crate::origin::OriginSource::Source(origin) => {
+                assert!(
+                    origin.file.ends_with("mod.rs"),
+                    "origin must point at the test call site, got {}",
+                    origin.file
+                );
+            }
+            other => panic!("expected a Source origin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn untracked_send_leaves_origins_empty() {
+        let executor = executor_with(
+            9,
+            256,
+            [|b| {
+                boxed(async move {
+                    b.send(1, 42);
+                })
+            }],
+        );
+        let run = executor.run().expect("run succeeds");
+        assert!(
+            run.origins.is_empty(),
+            "plain sends must not record origins"
+        );
     }
 
     /// A root task body: a function building a boxed future from a boundary.

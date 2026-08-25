@@ -5,6 +5,7 @@
 //! executor state. The `Effects`/`Net`/`Fs` trait implementations and the
 //! sleeping/receiving futures live here; the orchestration loop, the task
 //! table, and the shared state stay in the module root.
+use crate::origin::OriginSource;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
@@ -281,16 +282,25 @@ impl Boundary {
 
     /// Send a message immediately, journaling a `Send` entry.
     pub fn send(&self, to: usize, payload: u64) -> bool {
-        Net::send(
-            self,
-            Message {
-                from: self.task,
-                to,
-                payload,
-                send_id: [0; 32],
-                deliver_at: self.shared.time.borrow().now(),
-            },
-        )
+        self.send_inner(to, payload, None)
+    }
+
+    /// Send with origin capture: the caller's source location lands in the
+    /// session side channel keyed by the Send entry hash.
+    #[track_caller]
+    pub fn send_tracked(&self, to: usize, payload: u64) -> bool {
+        self.send_inner(to, payload, Some(core::panic::Location::caller().into()))
+    }
+
+    /// Snapshot the captured effect origins in append order.
+    pub fn origins_snapshot(&self) -> Vec<(ledger_format::Hash, OriginSource)> {
+        self.shared.origins.borrow().snapshot()
+    }
+
+    fn send_inner(&self, to: usize, payload: u64, at: Option<OriginSource>) -> bool {
+        // Behavior-identical to the historical Net::send path; the origin is
+        // recorded inside send_core against the journaled Send entry.
+        self.send_core(to, payload, 0, at)
     }
 
     /// Toggle a directed partition at the current point of the run.
@@ -329,7 +339,7 @@ impl Boundary {
     /// delay is added to the current virtual time, so identical seeds yield
     /// identical delivery order.
     pub fn send_timed(&self, to: usize, payload: u64, delay: u64) -> bool {
-        self.send_core(to, payload, delay)
+        self.send_core(to, payload, delay, None)
     }
 
     /// Single send path for `send` and `send_timed`.
@@ -337,7 +347,13 @@ impl Boundary {
     /// Journals `Send`, applies the fault and swarm policies, then delivers
     /// through the configured link or the direct queue. Delay 0 keeps
     /// unfaulted journals byte-identical.
-    fn send_core(&self, to: usize, payload: u64, base_delay: u64) -> bool {
+    fn send_core(
+        &self,
+        to: usize,
+        payload: u64,
+        base_delay: u64,
+        at: Option<OriginSource>,
+    ) -> bool {
         let now = self.shared.time.borrow().now();
         let id = match self.append(
             EntryKind::Send,
@@ -353,6 +369,9 @@ impl Boundary {
                 return false;
             }
         };
+        if let Some(origin) = at {
+            self.shared.origins.borrow_mut().record(id, origin);
+        }
         if self.shared.dropped_events.contains(&id) {
             if let Err(error) = self.append(
                 EntryKind::Fault {
@@ -780,7 +799,7 @@ impl Effects for Boundary {
 
 impl Net for Boundary {
     fn send(&self, message: Message) -> bool {
-        self.send_core(message.to, message.payload, 0)
+        self.send_core(message.to, message.payload, 0, None)
     }
 
     fn recv(&self, task: usize, now: u64) -> Option<Message> {

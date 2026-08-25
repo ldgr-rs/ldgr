@@ -297,6 +297,7 @@ mod tests {
             steps: 0,
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
+            origins: Vec::new(),
         }
     }
 

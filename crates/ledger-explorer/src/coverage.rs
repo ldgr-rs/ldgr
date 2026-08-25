@@ -455,6 +455,7 @@ mod tests {
             steps: 0,
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
+            origins: Vec::new(),
         };
         let root_hex = crate::certs::hash_to_hex(&run.journal.root_hash());
         let report = CampaignReport {

@@ -128,6 +128,28 @@ fn json_violation(reason: &str, steps: usize, root: Hash) -> String {
     .to_string()
 }
 
+/// Print captured origins for the witness entries of a violation.
+///
+/// Origins exist only for runs that flowed through origin-capturing calls
+/// (tracked facade sends, direct backend use). Instruction-program runs have
+/// no per-effect call sites, so this prints nothing there by design.
+fn print_effect_origins(origins: &[(Hash, ledger_sim::OriginSource)], witnesses: &[Hash]) {
+    let hits: Vec<_> = origins
+        .iter()
+        .filter(|(id, _)| witnesses.contains(id))
+        .collect();
+    if hits.is_empty() {
+        return;
+    }
+    println!("Effect origins:");
+    for (id, source) in hits {
+        if let ledger_sim::OriginSource::Source(origin) = source {
+            let hex = ledger_format::hash_to_hex(id);
+            println!("  {} at {}:{}", &hex[..8], origin.file, origin.line);
+        }
+    }
+}
+
 fn run_sim(
     cli: &Cli,
     verbose: bool,
@@ -185,6 +207,7 @@ fn run_sim(
                 ledger_format::hash_to_hex(&finding.run.journal.root_hash())
             );
             println!("Steps executed: {}", finding.run.steps);
+            print_effect_origins(&finding.run.origins, &finding.verdict.witnesses);
         }
     } else if cli.json {
         println!(r#"{{"status":"passed","runs":{runs}}}"#);
