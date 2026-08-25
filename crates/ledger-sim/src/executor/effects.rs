@@ -297,6 +297,18 @@ impl Boundary {
         self.shared.origins.borrow().snapshot()
     }
 
+    /// Give a Recv entry the origin of the Send that produced it, keeping
+    /// lineage continuous across the network boundary.
+    fn inherit_recv_origin(&self, recv_id: Option<Hash>, send_id: Hash) {
+        if let Some(id) = recv_id {
+            // Clone out before re-locking; the mutex is not reentrant.
+            let inherited = self.shared.origins.borrow().get(&send_id).cloned();
+            if let Some(origin) = inherited {
+                self.shared.origins.borrow_mut().record(id, origin);
+            }
+        }
+    }
+
     fn send_inner(&self, to: usize, payload: u64, at: Option<OriginSource>) -> bool {
         // Behavior-identical to the historical Net::send path; the origin is
         // recorded inside send_core against the journaled Send entry.
@@ -611,16 +623,20 @@ impl Boundary {
     pub(crate) fn recv_now(&self) -> Option<u64> {
         let now = self.shared.time.borrow().now();
         let message = self.shared.net.borrow_mut().recv_at(self.task, now)?;
-        if let Err(error) = self.append(
+        let recv_id = match self.append(
             EntryKind::Recv,
             [message.send_id],
             Payload::Number(message.payload),
         ) {
-            // The message is already consumed; surface the failed append
-            // instead of losing it on the return-None path.
-            self.shared.record_journal_error(error);
-            return None;
-        }
+            Ok(id) => Some(id),
+            Err(error) => {
+                // The message is already consumed; surface the failed append
+                // instead of losing it on the return-None path.
+                self.shared.record_journal_error(error);
+                None
+            }
+        };
+        self.inherit_recv_origin(recv_id, message.send_id);
         Some(message.payload)
     }
 
@@ -804,13 +820,18 @@ impl Net for Boundary {
 
     fn recv(&self, task: usize, now: u64) -> Option<Message> {
         let message = self.shared.net.borrow_mut().recv_at(task, now)?;
-        if let Err(error) = self.append(
+        let recv_id = match self.append(
             EntryKind::Recv,
             [message.send_id],
             Payload::Number(message.payload),
         ) {
-            self.shared.record_journal_error(error);
-        }
+            Ok(id) => Some(id),
+            Err(error) => {
+                self.shared.record_journal_error(error);
+                None
+            }
+        };
+        self.inherit_recv_origin(recv_id, message.send_id);
         Some(message)
     }
 
@@ -820,6 +841,17 @@ impl Net for Boundary {
 }
 
 impl Fs for Boundary {
+    fn write_loc(
+        &self,
+        path: &str,
+        value: u64,
+        at: OriginSource,
+    ) -> Result<Hash, ledger_journal::JournalError> {
+        let id = Fs::write(self, path, value)?;
+        self.shared.origins.borrow_mut().record(id, at);
+        Ok(id)
+    }
+
     fn write(&self, path: &str, value: u64) -> Result<Hash, ledger_journal::JournalError> {
         let mut journal = self.shared.journal.borrow_mut();
         let mut fs = self.shared.fs.borrow_mut();
@@ -835,6 +867,12 @@ impl Fs for Boundary {
         );
         self.inject_write_fault(id, path)?;
         self.maybe_crash_on_write(path, value)?;
+        Ok(id)
+    }
+
+    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, ledger_journal::JournalError> {
+        let id = Fs::fsync(self)?;
+        self.shared.origins.borrow_mut().record(id, at);
         Ok(id)
     }
 
@@ -873,16 +911,35 @@ impl Fs for Boundary {
     }
 
     fn crash(&self) {
-        if let Err(error) = self.append(
+        self.crash_impl();
+    }
+
+    fn crash_loc(&self, at: OriginSource) {
+        if let Some(id) = self.crash_impl() {
+            self.shared.origins.borrow_mut().record(id, at);
+        }
+    }
+}
+
+impl Boundary {
+    /// Journal the crash-fault entry and fold storage into the post-crash
+    /// state. Returns the entry id when journaling worked.
+    fn crash_impl(&self) -> Option<Hash> {
+        let id = match self.append(
             EntryKind::Fault {
                 fault: FaultSpec::CrashState(0),
             },
             [],
             Payload::Empty,
         ) {
-            self.shared.record_journal_error(error);
-        }
+            Ok(id) => Some(id),
+            Err(error) => {
+                self.shared.record_journal_error(error);
+                None
+            }
+        };
         self.fs_crash();
+        id
     }
 }
 
@@ -932,6 +989,10 @@ impl Future for RecvFuture {
                         self.task,
                         Some(id),
                     );
+                    let inherited = self.shared.origins.borrow().get(&message.send_id).cloned();
+                    if let Some(origin) = inherited {
+                        self.shared.origins.borrow_mut().record(id, origin);
+                    }
                 }
                 Err(error) => self.shared.record_journal_error(error),
             }

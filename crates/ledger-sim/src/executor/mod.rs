@@ -511,6 +511,48 @@ mod tests {
     }
 
     #[test]
+    fn recv_inherits_the_origin_of_its_send() {
+        let executor = executor_with(
+            9,
+            256,
+            [
+                |b| {
+                    boxed(async move {
+                        b.send_tracked(1, 42);
+                    })
+                },
+                |b| {
+                    boxed(async move {
+                        let _ = b.recv().await;
+                    })
+                },
+            ],
+        );
+        let run = executor.run().expect("run succeeds");
+        assert_eq!(run.origins.len(), 2, "recv must inherit the send origin");
+        assert_eq!(
+            run.origins[0].1, run.origins[1].1,
+            "inherited origin must match the send"
+        );
+    }
+
+    #[test]
+    fn tracked_storage_write_records_origin() {
+        use crate::effects::FsExt;
+        let executor = executor_with(
+            9,
+            256,
+            [|b| {
+                boxed(async move {
+                    let _ = b.fs().write_tracked("k", 7);
+                })
+            }],
+        );
+        let run = executor.run().expect("run succeeds");
+        assert_eq!(run.origins.len(), 1, "tracked write must record one origin");
+    }
+
+    #[test]
     fn untracked_send_leaves_origins_empty() {
         let executor = executor_with(
             9,

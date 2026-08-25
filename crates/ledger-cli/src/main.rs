@@ -525,6 +525,7 @@ fn run_ldfi(
             ledger_format::hash_to_hex(&report.journal_root)
         );
         println!("Steps executed: {}", report.steps);
+        print_effect_origins(&report.origins, &report.witnesses);
         println!("LDFI hypotheses:");
         for (index, hypothesis) in report.hypotheses.iter().enumerate() {
             println!(
@@ -560,7 +561,15 @@ fn ldfi_json(report: &LdfiReport) -> String {
             "explanation": hypothesis.explanation
         })).collect::<Vec<_>>(),
         "replay": {"applied": report.applied, "voided": report.voided, "prefix_ok": report.prefix_ok},
-        "schedule": report.schedule.iter().map(describe_injection).collect::<Vec<_>>()
+        "schedule": report.schedule.iter().map(describe_injection).collect::<Vec<_>>(),
+        "origins": report.origins.iter().map(|(id, source)| match source {
+            ledger_sim::OriginSource::Source(origin) => serde_json::json!({
+                "entry": ledger_format::hash_to_hex(id),
+                "file": origin.file,
+                "line": origin.line
+            }),
+            _ => serde_json::json!({"entry": ledger_format::hash_to_hex(id)}),
+        }).collect::<Vec<_>>()
     }).to_string()
 }
 
