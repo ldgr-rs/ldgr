@@ -1,9 +1,9 @@
 use super::input_axis::draw_inputs;
 use super::{
-    CampaignReport, Finding, QuadMutation, SWARM_CRASH_CEILING, Workload, describe_variant,
-    draw_fault_subset, draw_swarm,
+    describe_variant, draw_fault_subset, draw_swarm, CampaignReport, Finding, QuadMutation,
+    SearchError, Workload, SWARM_CRASH_CEILING,
 };
-use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
+use crate::memo::{hash_inputs, memo_key, CampaignMemo, MemoEntry};
 use crate::oracle::Oracle;
 use ledger_format::Hash;
 use ledger_sim::{Policy, RunConfig, SeedTree, SimFault, Simulation, SwarmConfig};
@@ -125,7 +125,10 @@ const BANDIT_FAULT_SAMPLES: usize = 4;
 /// The enumeration crosses every policy with the drawn swarm samples and the
 /// drawn fault subsets. The bandit derives each variant's canonical arm hash
 /// once at registration.
-fn enumerate_variants(base: &RunConfig, mutation: &QuadMutation) -> Vec<QuadVariant> {
+fn enumerate_variants(
+    base: &RunConfig,
+    mutation: &QuadMutation,
+) -> Result<Vec<QuadVariant>, SearchError> {
     let policies: Vec<Policy> = if mutation.policies.is_empty() {
         vec![base.policy()]
     } else {
@@ -140,8 +143,9 @@ fn enumerate_variants(base: &RunConfig, mutation: &QuadMutation) -> Vec<QuadVari
                     mutation.swarm_budget,
                     SWARM_CRASH_CEILING,
                 )
+                .map_err(SearchError::from)
             })
-            .collect()
+            .collect::<Result<Vec<_>, SearchError>>()?
     } else {
         vec![(*base.swarm()).clone()]
     };
@@ -171,7 +175,7 @@ fn enumerate_variants(base: &RunConfig, mutation: &QuadMutation) -> Vec<QuadVari
             }
         }
     }
-    variants
+    Ok(variants)
 }
 
 /// Run a UCB1 bandit campaign over the mutated quadruple variants.
@@ -189,8 +193,8 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
     mutation: &QuadMutation,
     exploration: f64,
     attempts: usize,
-) -> Result<CampaignReport, String> {
-    let candidates = enumerate_variants(&base, mutation);
+) -> Result<CampaignReport, SearchError> {
+    let candidates = enumerate_variants(&base, mutation)?;
     let mut bandit = QuadBandit::new();
     let mut variant_of: HashMap<u64, QuadVariant> = HashMap::new();
     for variant in candidates {
@@ -210,7 +214,7 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
         let arm = bandit.arm(exploration);
         let variant = variant_of
             .get(&arm)
-            .ok_or_else(|| format!("bandit selected unknown variant {arm:#x}"))?;
+            .ok_or(SearchError::UnknownArm { arm })?;
 
         let (programs, input_label, input_hash) = match &mutation.input_generator {
             Some(generator) => {
@@ -241,24 +245,28 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
             // keeps exploring without budget cost. A cache that also stored
             // the violated flag could replay the exact reward.
             bandit.reward(arm, 0.0);
-            let mut config = base.clone();
-            config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
-            *config.policy_mut() = variant.policy;
-            *config.swarm_mut() = variant.swarm.clone();
-            *config.fault_schedule_mut() = variant.faults.clone();
+            let mut seed = base.seed();
+            seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            let config = base
+                .clone()
+                .with_seed(seed)
+                .with_policy(variant.policy)
+                .with_swarm(variant.swarm.clone())
+                .with_fault_schedule(variant.faults.clone());
             variants.push(describe_variant(&config, attempt, input_label.as_deref()));
             continue;
         }
 
-        let mut config = base.clone();
-        config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
-        *config.policy_mut() = variant.policy;
-        *config.swarm_mut() = variant.swarm.clone();
-        *config.fault_schedule_mut() = variant.faults.clone();
+        let mut seed = base.seed();
+        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let config = base
+            .clone()
+            .with_seed(seed)
+            .with_policy(variant.policy)
+            .with_swarm(variant.swarm.clone())
+            .with_fault_schedule(variant.faults.clone());
 
-        let run = Simulation::new(config.clone(), programs)
-            .run()
-            .map_err(|error| format!("simulation failed: {error:?}"))?;
+        let run = Simulation::new(config.clone(), programs).run()?;
 
         let root = run.journal.root_hash();
         let distinct = !distinct_roots.contains(&root);
