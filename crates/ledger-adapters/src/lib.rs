@@ -62,6 +62,34 @@ pub enum AdapterError {
         #[source]
         source: serde_json::Error,
     },
+    /// Cycle detected in parent edges; trail is bounded diagnostic ids.
+    #[error("cycle detected: {trail:?}")]
+    CycleDetected {
+        /// Bounded trail of un-emitted span ids, capped at 32.
+        trail: Vec<String>,
+    },
+    /// File exceeds total byte budget.
+    #[error("file too large: limit {limit} bytes")]
+    FileTooLarge {
+        /// Configured `OtelIngestConfig::max_bytes`.
+        limit: usize,
+    },
+    /// One NDJSON line exceeds the per-line byte budget.
+    #[error("line too large at line {line}: limit {limit} bytes")]
+    LineTooLarge {
+        /// 1-based line number.
+        line: usize,
+        /// Configured `OtelIngestConfig::max_line_bytes`.
+        limit: usize,
+    },
+    /// Span attributes exceed configured limits.
+    #[error("attribute limit exceeded at span {span_index}: {reason}")]
+    AttributeLimitExceeded {
+        /// Index of offending span in the input batch.
+        span_index: usize,
+        /// Human-readable reason.
+        reason: String,
+    },
     /// Underlying journal rejected an append.
     #[error("journal error: {0}")]
     Journal(#[from] JournalError),
