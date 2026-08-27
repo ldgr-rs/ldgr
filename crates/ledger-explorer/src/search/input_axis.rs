@@ -1,6 +1,6 @@
-use super::{Finding, Workload};
+use super::{Finding, SearchError, Workload};
 use crate::oracle::Oracle;
-use crate::pbt::{EnergyDistribution, INPUT_SAMPLE_RANGE, PbtBridge};
+use crate::pbt::{EnergyDistribution, PbtBridge, INPUT_SAMPLE_RANGE};
 use ledger_format::Hash;
 use ledger_sim::{RunConfig, SeedTree, Simulation};
 
@@ -11,21 +11,21 @@ pub(super) const INPUT_AXIS_SAMPLE: usize = 16;
 /// The attempt seed is derived per attempt, so each attempt samples an
 /// independent, reproducible `gen/<generator>` input sequence. When `dist`
 /// is `None` or `Uniform`, the uniform modulo path is used; `Power`
-/// distributions are sampled via `PbtBridge::sample_energy`, whose exponent
+/// distributions are sampled via `PbtBridge::sample_energy`, whose typed
 /// validation error propagates to the caller.
 pub(super) fn draw_inputs(
     generator: &str,
     attempt_seed: Hash,
     dist: Option<&EnergyDistribution>,
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<u64>, SearchError> {
     let mut bridge = PbtBridge::new(generator, attempt_seed);
     let mut inputs = Vec::with_capacity(INPUT_AXIS_SAMPLE);
     for _ in 0..INPUT_AXIS_SAMPLE {
         let value = match dist {
             None | Some(EnergyDistribution::Uniform) => bridge.sample_range(0, INPUT_SAMPLE_RANGE),
-            Some(ed @ EnergyDistribution::Power { .. }) => bridge
-                .sample_energy(INPUT_SAMPLE_RANGE, ed)
-                .map_err(|error| format!("input energy distribution: {error}"))?,
+            Some(ed @ EnergyDistribution::Power { .. }) => {
+                bridge.sample_energy(INPUT_SAMPLE_RANGE, ed)?
+            }
         };
         inputs.push(value);
     }
@@ -48,7 +48,7 @@ pub fn search_input<W, O>(
     base: RunConfig,
     generator: &str,
     attempts: usize,
-) -> Result<Option<Finding>, String>
+) -> Result<Option<Finding>, SearchError>
 where
     W: Workload,
     O: Oracle,
@@ -69,7 +69,7 @@ pub fn search_input_energy<W, O>(
     generator: &str,
     energy: Option<&EnergyDistribution>,
     attempts: usize,
-) -> Result<Option<Finding>, String>
+) -> Result<Option<Finding>, SearchError>
 where
     W: Workload,
     O: Oracle,
@@ -78,9 +78,7 @@ where
         let attempt_seed = SeedTree::new(base.seed()).derive(&format!("input-axis/{attempt}"));
         let inputs = draw_inputs(generator, attempt_seed, energy)?;
         let workload = workload_template.with_inputs(&inputs);
-        let run = Simulation::new(base.clone(), workload.programs())
-            .run()
-            .map_err(|error| format!("simulation failed: {error:?}"))?;
+        let run = Simulation::new(base.clone(), workload.programs()).run()?;
         let verdict = super::effective_verdict(&run, oracle.check(&run));
         if verdict.violated {
             return Ok(Some(Finding {
