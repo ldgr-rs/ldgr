@@ -18,7 +18,7 @@ ledger-format -> ledger-journal -> ledger-sim -> ledger-explorer -> ledger-cli
 A second view shows how a system under test connects:
 
 ```text
- your SUT --> ledger-rt (Apache facade) --> effects boundary
+ your SUT --> ldgr-rt (Apache facade) --> effects boundary
    wasm guest ------------------------------'      |
                                                  v
         faultspec (scenarios) --> ledger-sim (simulated world)
@@ -86,30 +86,31 @@ reviewed. Never add a marker to hide a leak. Fix the boundary instead.
 
 ## The `.ldgr` artifact
 
-Every campaign finding becomes a `.ldgr` file. The file holds the seed, the
-schedule, and the causal history as canonical CBOR, content-addressed by
-hash. Forked runs share prefixes, so the artifact stays small. Most
-fixtures are under 261 bytes.
+A `.ldgr` run manifest is a canonical CBOR descriptor. It pins the format
+version, root seed, policy tag, journal root, entry count, actor heads, and
+extension fields. It does not contain the complete journal history inline.
+A portable finding consists of the manifest plus its referenced journal
+material and compatible workload build.
 
-Inspect any artifact:
+Inspect a manifest:
 
 ```bash
 ledger format corpora/bug-corpus-v1/mini-kv-stale-read.ldgr --check
 ```
 
-The check verifies canonical deterministic CBOR encoding. Attach the
-file to an issue. Anyone with ldgr replays the exact bug, byte for byte.
+The check validates canonical deterministic CBOR encoding. It does not replay
+the run.
 
 ## Replay and minimization
 
-`ledger repro` replays a manifest with the same build and verifies the
-journal root. `ledger minimize` shrinks the reproduction to the smallest
-schedule that still fails, so you debug one decision and not a thousand.
+`ledger repro` executes the built-in workload for a seed, replays its recorded
+decisions, and compares journal roots. `ledger minimize` searches for a failing
+run and applies schedule delta debugging. Its result is 1-minimal over the
+tested candidate set, not necessarily the globally smallest possible schedule.
 
-Both rely on the same guarantee: the journal is deterministic evidence, not
-an after-the-fact log. If two machines disagree on a journal root, the
-implementations differ or the inputs differ. Fix one, rerun, and compare
-again.
+Both rely on the same guarantee: the same build, configuration, seed, and
+inputs produce the same controlled effect order and journal bytes. If two such
+runs disagree on a journal root, the controlled execution path has drifted.
 
 ## Builds and checks
 

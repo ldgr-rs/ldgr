@@ -91,12 +91,14 @@ Export coverage when you have NDJSON coverage records (`{root_hex, run_index, fi
 cargo run -p ledger-cli -- coverage --input coverage.ndjson --format lcov > lcov.info
 ```
 
-Keep `.ldgr` artifacts when you have them (for example `repro.ldgr` from `ledger init`). They are a few hundred bytes and replay byte-identically on any machine:
+Keep `.ldgr` manifests when you have them, such as `repro.ldgr` from `ledger init`. A manifest is a small canonical descriptor that pins a run root. Keep it with the compatible workload build, run configuration, and referenced journal material:
 
 ```bash
 cargo run -p ledger-cli -- format /tmp/initdoc/repro.ldgr --check
 cargo run -p ledger-cli -- repro --seed 42
 ```
+
+The first command validates canonical CBOR encoding. The second command runs and verifies the built-in seed-based replay path; it does not load the manifest.
 
 ## Exit codes in CI
 

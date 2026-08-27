@@ -8,7 +8,7 @@ Normal tests run your code once on real time, real randomness, real threads and 
 
 Deterministic simulation testing replaces the real world with a simulated one. Your system runs against a controlled scheduler, virtual time and simulated effects. You pick a seed. The engine picks the interleaving. Every run is reproducible.
 
-When you fix a bug, you can prove the fix. Same seed, same config, same inputs give the same journal, byte for byte.
+With the same build, configuration, seed, and inputs, a controlled run gives the same journal bytes. This lets you compare a known failing run with the result after a fix.
 
 ## The causal journal
 
@@ -17,7 +17,7 @@ Every effect your system causes during simulation lands in a causal journal. Thi
 * Each effect becomes a journal entry with parents, a vector clock and a payload.
 * The DAG is content-addressed. The hash of a run is the root of that DAG.
 * The journal is the evidence. Replay is not re-running and hoping - it is walking the same decisions and checking that the journal matches.
-* A counterexample is data, not a story: seed, schedule and journal together. You can store it as a file, attach it to an issue and replay it on another machine with one command.
+* A counterexample is data, not a story: seed, decisions, and journal evidence belong together. A `.ldgr` manifest describes the run and pins its journal root; portable replay also needs the compatible build, workload, and referenced journal material.
 
 ## The effects boundary
 
@@ -31,7 +31,7 @@ So ldgr draws a boundary:
 * Use the simulated filesystem (SimFs), not real disk I/O.
 * Use the cooperative scheduler, not OS threads.
 
-Outside the boundary, normal host code is fine. The CLI, the worker and adapters run on the host. Inside the boundary, the engine enforces the rule and a lint fails the build if simulation code reaches for ambient APIs.
+Outside the boundary, normal host code is fine. The CLI, worker, and adapters run on the host. Inside the boundary, the engine enforces the rule and `ledger-lint` makes forbidden ambient APIs a CI failure.
 
 ## Schedules and policies
 
@@ -62,6 +62,6 @@ When an oracle says a run failed, ldgr hands you a finding. A finding carries:
 * The seed that found it.
 * The decisions the scheduler made.
 * The witnesses - the journal entries that show the violation.
-* The minimal fault set, when LDFI is involved.
+* A ranked fault cut, when LDFI is involved.
 
-You can replay that finding, verify its journal root, minimize its schedule and emit a certificate that attests to the result. The bug becomes an artifact you can check in CI, not a flaky log you chase.
+You can replay a finding, compare its journal root, and minimize its schedule. Campaigns can also emit an unsigned, verifiable certificate. Against a journal, a minimality extension checks bounded derivation-path coverage and inclusion minimality, and records a solver-derived lower bound. It does not prove that the complete run is globally smallest.

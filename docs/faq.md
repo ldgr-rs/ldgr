@@ -6,7 +6,7 @@ A normal test runs your code once on the real environment. ldgr runs your system
 
 ## Why does deterministic replay matter?
 
-It makes the bug boring. You see a failure once and you can replay the exact same bytes, on any machine, as many times as you want. You fix the code, replay the same seed and you can prove the fix. Teams use the journal root as the proof: same inputs give the same hash, byte for byte.
+It makes a controlled failure repeatable. With the same build, configuration, seed, and inputs, replay checks the same decisions and journal bytes. After a fix, you can run the same case and compare the resulting root and verdict. A different build or configuration can produce a different result.
 
 ## Can I test my real network code?
 
@@ -32,7 +32,7 @@ To fail a CI job on a finding, parse the output: `"status":"violation"` with `--
 
 ## Is this a fuzzer?
 
-The campaign loop is a schedule and fault fuzzer over deterministic executions. Each attempt picks a derived seed, runs the workload under a different schedule and checks the oracle. Counterexamples replay byte-identically and shrink to a minimal schedule. The project calls this deterministic simulation testing, which sits close to fuzzing but ranges over schedules and faults, not bytes.
+The campaign loop is a schedule and fault fuzzer over deterministic executions. Each attempt picks a derived seed, runs the workload under a different schedule, and checks the oracle. Under a fixed build and configuration, counterexamples replay byte-identically. Schedule minimization produces a 1-minimal result over the tested candidates. The project calls this deterministic simulation testing because it ranges over schedules and faults, not only bytes.
 
 ## Does it work with async Rust and tokio?
 
@@ -48,7 +48,7 @@ Policies are the `--policy` values on `sim`, `repro` and `minimize`: `random`, `
 
 ## How do I cite or compare this to other tools?
 
-ldgr journals effects at the journal level, does targeted fault injection with lineage and produces minimized, certified repros, and it is open and self-hosted. Property testing shrinks inputs; ldgr shrinks schedules. Real-cluster fault-injection tools exercise real deployments; ldgr exercises the simulated world, so findings replay byte-identically on a laptop. Use the comparison that fits your audience and point to your actual journal roots.
+ldgr journals effects in a causal DAG, uses lineage to target fault hypotheses, and minimizes schedules. Campaigns can carry verifiable fault-cut evidence. Property testing usually shrinks inputs; ldgr also shrinks controlled schedules. Real-cluster tools exercise wider deployment surfaces. ldgr exercises code behind its effects boundary and provides inspectable journal roots.
 
 ## What is the license?
 

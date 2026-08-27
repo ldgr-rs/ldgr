@@ -53,7 +53,7 @@ Journal root: eaddfb60... (64 hex chars)
 Steps executed: 10
 ```
 
-A passing run looks like `Simulation passed (10 runs evaluated, zero violations).` Either way the output is deterministic - same seed gives the same result. With `--json` or `--ndjson` you get machine-readable records that include `steps` and `journal_root`.
+A passing run looks like `Simulation passed (10 runs evaluated, zero violations).` With the same build, configuration, seed, and inputs, the output is deterministic. JSON violation records include `steps` and `journal_root`. NDJSON emits those fields for every attempt; a passing whole-campaign JSON result contains only `status` and `runs`.
 
 ## See a violation
 
@@ -66,10 +66,10 @@ Steps executed: 42
 ```
 
 * `Violation detected` is the oracle reason.
-* `Journal root` is the hash of the causal DAG for that run. Same inputs give the same root, byte for byte.
+* `Journal root` is the hash of the causal DAG for that run. The same build, configuration, seed, and inputs give the same root, byte for byte.
 * `Steps executed` is how many simulated instructions ran before the check.
 
-The violation carries the seed and the schedule that produced it, so you can replay it exactly. See [Replay and Minimize](tutorials/replay-minimize.md).
+The in-memory finding carries the seed and decisions that produced the violation. The current CLI `repro` path reruns a configured seed and verifies its replay internally. See [Replay and Minimize](tutorials/replay-minimize.md).
 
 ## What to do next
 

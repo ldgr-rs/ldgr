@@ -80,7 +80,7 @@ cargo run -p ledger-cli -- sim --seed 7 --runs 20
 cargo run -p ledger-cli -- sim --seed 7 --runs 20
 ```
 
-Compare the two outputs. The journal root and steps match byte for byte. Same seed, same config, same inputs give the same journal. That is the core guarantee.
+Compare the two outputs. The journal root and steps match byte for byte. The same build, configuration, seed, and inputs give the same journal. That is the core guarantee.
 
 ## Change the seed
 
