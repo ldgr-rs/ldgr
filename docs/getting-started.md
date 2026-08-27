@@ -11,7 +11,7 @@ This guide takes you from zero to your first passing simulation.
 ## Build
 
 ```bash
-git clone https://github.com/k5602/ldgr && cd ldgr
+git clone https://github.com/ldgr-rs/ldgr && cd ldgr
 cargo build -p ledger-cli
 ```
 

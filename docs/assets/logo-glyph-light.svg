@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <rect width="64" height="64" rx="14" fill="#F4F5F7"/>
+  <!-- Causal Diamond DAG: 4-node canonical graph (Seed Root -> Concurrent Effects -> Merge Sink) -->
+  <path d="M32 14 L14 32 L32 50 L50 32 Z" stroke="#9CA3AF" stroke-width="4" stroke-linejoin="round" stroke-linecap="round" fill="none"/>
+  <!-- Effect Nodes (explored branches) -->
+  <circle cx="14" cy="32" r="5" fill="#111827"/>
+  <circle cx="50" cy="32" r="5" fill="#111827"/>
+  <!-- Merge Sink Node (verified journal root) -->
+  <circle cx="32" cy="50" r="5" fill="#111827"/>
+  <!-- Seed Genesis Root Node (amber accent) -->
+  <circle cx="32" cy="14" r="5.5" fill="#D97706"/>
+</svg>

@@ -1,9 +1,14 @@
-# ldgr
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-lockup-dark.svg">
+    <img src="docs/assets/logo-lockup-light.svg" alt="ldgr - a causal diamond DAG: one root seed forks to concurrent effects and converges to a verified journal root" width="320">
+  </picture>
+</div>
 
-[![CI](https://github.com/k5602/ldgr/actions/workflows/ci.yml/badge.svg)](https://github.com/k5602/ldgr/actions/workflows/ci.yml)
-[![corpus-gate](https://github.com/k5602/ldgr/actions/workflows/corpus-gate.yml/badge.svg)](https://github.com/k5602/ldgr/actions/workflows/corpus-gate.yml)
-[![wasm-polyglot](https://github.com/k5602/ldgr/actions/workflows/wasm-polyglot.yml/badge.svg)](https://github.com/k5602/ldgr/actions/workflows/wasm-polyglot.yml)
-[![format-conformance](https://github.com/k5602/ldgr/actions/workflows/format-conformance.yml/badge.svg)](https://github.com/k5602/ldgr/actions/workflows/format-conformance.yml)
+[![CI](https://github.com/ldgr-rs/ldgr/actions/workflows/ci.yml/badge.svg)](https://github.com/ldgr-rs/ldgr/actions/workflows/ci.yml)
+[![corpus-gate](https://github.com/ldgr-rs/ldgr/actions/workflows/corpus-gate.yml/badge.svg)](https://github.com/ldgr-rs/ldgr/actions/workflows/corpus-gate.yml)
+[![wasm-polyglot](https://github.com/ldgr-rs/ldgr/actions/workflows/wasm-polyglot.yml/badge.svg)](https://github.com/ldgr-rs/ldgr/actions/workflows/wasm-polyglot.yml)
+[![format-conformance](https://github.com/ldgr-rs/ldgr/actions/workflows/format-conformance.yml/badge.svg)](https://github.com/ldgr-rs/ldgr/actions/workflows/format-conformance.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0%20%2F%20AGPL--3.0-blue)](#license)
 
 **ldgr** (short for *ledger*) is an open-source deterministic simulation
@@ -12,7 +17,7 @@ effect lands in a causal DAG journal. When something breaks, ldgr hands you
 the smallest reproduction, with a certificate you can check.
 
 <div align="center">
-  <img src="docs/demo.gif" alt="ldgr montage: explore finds a stale read, replay proves identical journal roots, LDFI derives a one-fault cut, minimize shrinks the schedule by 90 percent" width="680">
+  <img src="docs/assets/demo.gif" alt="ldgr montage: explore finds a stale read, replay proves identical journal roots, LDFI derives a one-fault cut, minimize shrinks the schedule by 90 percent" width="680">
 </div>
 
 Four commands, one story: explore hunts down a violation, replay proves the
@@ -29,11 +34,14 @@ in ways you cannot replay. Property tests shrink inputs, not interleavings.
 A deterministic engine makes the bug boring. Same seed in, same bytes out,
 forever. You debug once, on your laptop, at your own pace.
 
-## The name
+## The name and mark
 
 ldgr is "ledger" typed without vowels - the way you scribble it on a whiteboard
 next to an architecture diagram. It stuck because a journaling tool ought to
 have a name that is fast to type.
+
+The mark is a canonical four-node causal diamond DAG: one genesis seed root
+forks to two concurrent effects that converge back into a verified journal root.
 
 ## Bugs travel as files
 
@@ -67,7 +75,7 @@ file format above is its foundation.
 Rust 1.90 or newer (1.97 pinned via `rust-toolchain.toml`):
 
 ```sh
-git clone https://github.com/k5602/ldgr && cd ldgr
+git clone https://github.com/ldgr-rs/ldgr && cd ldgr
 cargo run -p ledger-cli -- sim
 ```
 

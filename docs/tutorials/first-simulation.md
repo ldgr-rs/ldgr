@@ -10,7 +10,7 @@ This lesson runs your first deterministic campaign. You build the CLI, run a cam
 ## Build the CLI
 
 ```bash
-git clone https://github.com/k5602/ldgr && cd ldgr
+git clone https://github.com/ldgr-rs/ldgr && cd ldgr
 cargo build -p ledger-cli
 ```
 
