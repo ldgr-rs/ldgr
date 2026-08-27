@@ -4,6 +4,89 @@ use crate::net::{DnsTable, LinkConfig};
 use crate::seedtree::SeedTree;
 use ledger_format::{ActorId, Hash};
 
+/// Error from [`Probability::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbabilityError {
+    /// Value is NaN or infinite.
+    NonFinite,
+    /// Value is outside 0.0 ..= 1.0 (includes -0.0).
+    OutOfRange,
+}
+
+impl core::fmt::Display for ProbabilityError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NonFinite => write!(f, "non-finite probability"),
+            Self::OutOfRange => write!(f, "probability out of range [0.0, 1.0]"),
+        }
+    }
+}
+
+impl std::error::Error for ProbabilityError {}
+
+/// Probability in 0.0 ..= 1.0, rejecting -0.0, NaN and infinities.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Probability(f64);
+
+impl Probability {
+    /// Zero probability.
+    pub const ZERO: Self = Self(0.0);
+    /// One probability.
+    pub const ONE: Self = Self(1.0);
+    /// One tenth probability.
+    pub const TENTH: Self = Self(0.1);
+
+    /// Create a probability, validating the range.
+    ///
+    /// Valid iff `v.is_finite() && !v.is_sign_negative() && v <= 1.0`.
+    pub fn new(v: f64) -> Result<Self, ProbabilityError> {
+        if !v.is_finite() {
+            return Err(ProbabilityError::NonFinite);
+        }
+        if v.is_sign_negative() || v > 1.0 {
+            return Err(ProbabilityError::OutOfRange);
+        }
+        Ok(Self(v))
+    }
+
+    /// Return the inner float.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+
+    /// Return the bit representation of the inner float.
+    pub fn to_bits(self) -> u64 {
+        self.0.to_bits()
+    }
+}
+
+impl TryFrom<f64> for Probability {
+    type Error = ProbabilityError;
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<Probability> for f64 {
+    fn from(value: Probability) -> Self {
+        value.get()
+    }
+}
+
+impl core::fmt::Display for Probability {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl core::str::FromStr for Probability {
+    type Err = ProbabilityError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let v: f64 = s.parse().map_err(|_| ProbabilityError::NonFinite)?;
+        Self::new(v)
+    }
+}
+
 /// One deterministic fault at an exact causal position (a journal entry id).
 ///
 /// The Explorer converts LDFI hypothesis cuts into these schedules; the
@@ -11,7 +94,9 @@ use ledger_format::{ActorId, Hash};
 /// name `SimFault` keeps this engine type distinct from the string-targeted
 /// [`ledger_faultspec::FaultInjection`]; the bridge in `ledger-explorer`
 /// converts between the two at the porting seam.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Derived `Ord` gives fault schedules one canonical deterministic order
+/// without string keys; the variant declaration order defines the rank.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimFault {
     /// Drop the message sent by this `Send` entry.
     Drop(Hash),
@@ -45,7 +130,7 @@ pub enum Policy {
     /// preemption instead of a pure UCB1 choice. Default is `0.1`.
     Bandit {
         exploration_constant: f64,
-        pct_mix: f64,
+        pct_mix: Probability,
     },
     /// Follow a previously recorded task decision sequence.
     ///
@@ -70,13 +155,13 @@ impl Eq for Policy {}
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwarmConfig {
     /// Drop probability for network messages (0.0 .. 1.0).
-    pub drop_probability: f64,
+    pub drop_probability: Probability,
     /// Delay probability for network messages (0.0 .. 1.0).
-    pub delay_probability: f64,
+    pub delay_probability: Probability,
     /// Maximum virtual time delay in ticks.
     pub max_delay_ticks: u64,
     /// Crash probability on storage write (0.0 .. 1.0).
-    pub crash_probability: f64,
+    pub crash_probability: Probability,
     /// Campaign budget on distinct fault classes sampled per run.
     ///
     /// This is a budget, not a semantic guarantee: once this many distinct
@@ -88,10 +173,10 @@ pub struct SwarmConfig {
 impl Default for SwarmConfig {
     fn default() -> Self {
         Self {
-            drop_probability: 0.0,
-            delay_probability: 0.0,
+            drop_probability: Probability::ZERO,
+            delay_probability: Probability::ZERO,
             max_delay_ticks: 0,
-            crash_probability: 0.0,
+            crash_probability: Probability::ZERO,
             fault_classes_per_run: 2,
         }
     }
@@ -210,51 +295,74 @@ impl RunConfig {
         self.fs_journaling
     }
 
-    // -----------------------------------------------------------------------
-    // Mutable accessors for in-place updates (escape hatch for campaign and
-    // bridge code that mutates a config after construction).
-    //
-    // Prefer the builder for new code. Each accessor exposes one field; the
-    // invariants documented on the builder setters apply to writes through
-    // these accessors as well.
-    // -----------------------------------------------------------------------
-
-    /// Mutable root seed.
-    pub fn seed_mut(&mut self) -> &mut Hash {
-        &mut self.seed
+    /// Consuming setter for the root seed.
+    pub fn with_seed(mut self, seed: Hash) -> Self {
+        self.seed = seed;
+        self
     }
 
-    /// Mutable scheduling policy.
-    pub fn policy_mut(&mut self) -> &mut Policy {
-        &mut self.policy
+    /// Consuming setter for the scheduling policy.
+    pub fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
     }
 
-    /// Mutable instruction budget.
-    ///
-    /// Expect `max_steps >= 1`; a budget of `0` yields an immediate
-    /// `StepLimit { limit: 0 }` (deterministic, no work runs).
-    pub fn max_steps_mut(&mut self) -> &mut usize {
-        &mut self.max_steps
+    /// Consuming setter for the instruction budget.
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps;
+        self
     }
 
-    /// Mutable swarm parameters.
-    pub fn swarm_mut(&mut self) -> &mut SwarmConfig {
-        &mut self.swarm
+    /// Consuming setter for swarm parameters.
+    pub fn with_swarm(mut self, swarm: SwarmConfig) -> Self {
+        self.swarm = swarm;
+        self
     }
 
-    /// Mutable DNS table.
-    pub fn dns_mut(&mut self) -> &mut DnsTable {
-        &mut self.dns
+    /// Consuming setter for the DNS table.
+    pub fn with_dns(mut self, dns: DnsTable) -> Self {
+        self.dns = dns;
+        self
     }
 
-    /// Mutable fault schedule.
-    pub fn fault_schedule_mut(&mut self) -> &mut Vec<SimFault> {
-        &mut self.fault_schedule
+    /// Consuming setter for the fault schedule.
+    pub fn with_fault_schedule(mut self, fault_schedule: Vec<SimFault>) -> Self {
+        self.fault_schedule = fault_schedule;
+        self
+    }
+
+    /// Consuming setter for per-link configuration.
+    pub fn with_links(mut self, links: Vec<(usize, usize, LinkConfig)>) -> Self {
+        self.links = links;
+        self
+    }
+
+    /// Consuming setter for dropped events.
+    pub fn with_dropped_events(mut self, dropped_events: Vec<Hash>) -> Self {
+        self.dropped_events = dropped_events;
+        self
     }
 
     /// Extend the fault schedule in place.
     pub fn extend_fault_schedule(&mut self, faults: impl IntoIterator<Item = SimFault>) {
         self.fault_schedule.extend(faults);
+    }
+
+    /// Convert into a builder initialized from this config.
+    pub fn into_builder(self) -> RunConfigBuilder {
+        RunConfigBuilder {
+            seed: self.seed,
+            policy: self.policy,
+            max_steps: self.max_steps,
+            dropped_events: self.dropped_events,
+            swarm: self.swarm,
+            links: self.links,
+            dns: self.dns,
+            fault_schedule: self.fault_schedule,
+            #[cfg(feature = "sim-fs-journaling")]
+            fs_journaling: self.fs_journaling,
+            monitor: self.monitor,
+        }
     }
 }
 
@@ -426,10 +534,10 @@ mod tests {
         let max_steps = 42_042;
         let dropped = vec![[1u8; 32], [2u8; 32]];
         let swarm = SwarmConfig {
-            drop_probability: 0.3,
-            delay_probability: 0.2,
+            drop_probability: Probability::new(0.3).unwrap(),
+            delay_probability: Probability::new(0.2).unwrap(),
             max_delay_ticks: 7,
-            crash_probability: 0.1,
+            crash_probability: Probability::new(0.1).unwrap(),
             fault_classes_per_run: 5,
         };
         let links = vec![(
@@ -438,7 +546,7 @@ mod tests {
             LinkConfig {
                 base_delay: 5,
                 jitter: 2,
-                loss_probability: 0.1,
+                loss_probability: Probability::new(0.1).unwrap(),
                 reorder_window: 3,
             },
         )];
@@ -490,5 +598,42 @@ mod tests {
     fn builder_fs_journaling_default_is_none() {
         let cfg = RunConfig::builder().build();
         assert_eq!(cfg.fs_journaling(), None);
+    }
+
+    #[test]
+    fn probability_constructor_matrix() {
+        assert!(Probability::new(0.0).is_ok());
+        assert!(Probability::new(1.0).is_ok());
+        assert_eq!(Probability::new(0.5).unwrap().get(), 0.5);
+        assert_eq!(Probability::ZERO.get(), 0.0);
+        assert_eq!(Probability::ONE.get(), 1.0);
+        assert_eq!(
+            Probability::new(-0.0).unwrap_err(),
+            ProbabilityError::OutOfRange
+        );
+        assert_eq!(
+            Probability::new(1.0000001).unwrap_err(),
+            ProbabilityError::OutOfRange
+        );
+        assert_eq!(
+            Probability::new(f64::NAN).unwrap_err(),
+            ProbabilityError::NonFinite
+        );
+        assert_eq!(
+            Probability::new(f64::INFINITY).unwrap_err(),
+            ProbabilityError::NonFinite
+        );
+        assert_eq!(
+            Probability::new(f64::NEG_INFINITY).unwrap_err(),
+            ProbabilityError::NonFinite
+        );
+        assert_eq!(
+            Probability::new(-0.5).unwrap_err(),
+            ProbabilityError::OutOfRange
+        );
+        assert_eq!(
+            Probability::new(2.0).unwrap_err(),
+            ProbabilityError::OutOfRange
+        );
     }
 }

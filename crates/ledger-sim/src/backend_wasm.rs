@@ -892,7 +892,7 @@ impl WasmBackend {
                     // guest instead of a silent success.
                     return Ok(record_write_failure(
                         &caller.data().effects.journal_error,
-                        error,
+                        error.into_journal(),
                     ));
                 }
                 let mem = memory.data_mut(&mut caller);
