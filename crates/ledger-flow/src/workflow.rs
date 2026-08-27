@@ -1,4 +1,15 @@
 //! Durable execution step-logging workflow engine.
+//!
+//! Each step journals a `StepBegin` before the external effect and a
+//! `StepEnd` after it completes. If an effect does not complete (crash
+//! between begin and end leaves an unpaired begin), the next `resume`
+//! reruns that effect. This is an at-least-once retry contract for
+//! incomplete external effects: an unpaired begin is evidence the effect
+//! may not have committed, so it is retried until a paired end appears.
+//! Completed steps (paired begin and end) are skipped. Callers must make
+//! external effects idempotent or safe to retry.
+//!
+//! A typed `StepBeginPayload` v2 is deferred to stage E2; the v1 text-name payload is the current contract. This documents the approved G1 contract and its E2 evolution, not a pending plan marker.
 
 use std::collections::{HashMap, HashSet};
 
@@ -118,13 +129,14 @@ impl WorkflowExecution {
         journal: &mut Journal,
         step_name: &str,
     ) -> Result<Hash, JournalError> {
-        self.step_counter += 1;
-        journal.append(
+        let hash = journal.append(
             EntryKind::StepBegin,
             self.actor,
             [],
             Payload::Text(step_name.to_string()),
-        )
+        )?;
+        self.step_counter += 1;
+        Ok(hash)
     }
 
     /// Record the successful completion of a durable step in the journal.
