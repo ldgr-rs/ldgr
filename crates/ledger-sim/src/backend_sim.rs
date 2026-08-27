@@ -320,30 +320,35 @@ impl SimBackend {
 }
 
 impl Fs for SimBackend {
-    fn write(&self, path: &str, value: u64) -> Result<Hash, JournalError> {
-        self.write_impl(path, value)
+    fn write(&self, path: &str, value: u64) -> Result<Hash, crate::effects::FsError> {
+        Ok(self.write_impl(path, value)?)
     }
 
-    fn write_loc(&self, path: &str, value: u64, at: OriginSource) -> Result<Hash, JournalError> {
+    fn write_loc(
+        &self,
+        path: &str,
+        value: u64,
+        at: OriginSource,
+    ) -> Result<Hash, crate::effects::FsError> {
         let id = self.write_impl(path, value)?;
         lock(&self.origins).record(id, at);
         Ok(id)
     }
 
-    fn fsync(&self) -> Result<Hash, JournalError> {
-        self.fsync_impl()
+    fn fsync(&self) -> Result<Hash, crate::effects::FsError> {
+        Ok(self.fsync_impl()?)
     }
 
-    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, JournalError> {
+    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, crate::effects::FsError> {
         let id = self.fsync_impl()?;
         lock(&self.origins).record(id, at);
         Ok(id)
     }
 
-    fn read(&self, path: &str) -> Result<Option<u64>, JournalError> {
+    fn read(&self, path: &str) -> Result<Option<u64>, crate::effects::FsError> {
         let mut journal = lock(&self.journal);
         let fs = lock(&*self.fs);
-        fs.read(&mut journal, self.actor, path)
+        Ok(fs.read(&mut journal, self.actor, path)?)
     }
 
     fn crash(&self) {

@@ -376,22 +376,22 @@ impl Net for TokioBackend {
 }
 
 impl Fs for TokioBackend {
-    fn write(&self, path: &str, value: u64) -> Result<Hash, JournalError> {
+    fn write(&self, path: &str, value: u64) -> Result<Hash, crate::effects::FsError> {
         let mut journal = self.journal.borrow_mut();
         let mut fs = self.fs.borrow_mut();
-        fs.write(&mut journal, 0, path, value)
+        Ok(fs.write(&mut journal, 0, path, value)?)
     }
 
-    fn fsync(&self) -> Result<Hash, JournalError> {
+    fn fsync(&self) -> Result<Hash, crate::effects::FsError> {
         let mut journal = self.journal.borrow_mut();
         let mut fs = self.fs.borrow_mut();
-        fs.fsync(&mut journal, 0)
+        Ok(fs.fsync(&mut journal, 0)?)
     }
 
-    fn read(&self, path: &str) -> Result<Option<u64>, JournalError> {
+    fn read(&self, path: &str) -> Result<Option<u64>, crate::effects::FsError> {
         let mut journal = self.journal.borrow_mut();
         let fs = self.fs.borrow();
-        fs.read(&mut journal, 0, path)
+        Ok(fs.read(&mut journal, 0, path)?)
     }
 
     fn crash(&self) {
