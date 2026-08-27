@@ -972,6 +972,7 @@ mod tests {
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
             origins: Vec::new(),
+            protection: ledger_sim::BeltStatus::NotArmed,
         }
     }
 
