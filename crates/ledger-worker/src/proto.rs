@@ -773,27 +773,33 @@ mod tests {
 
     #[test]
     fn run_config_hash_changes_with_dns() {
-        let mut a = RunConfig::builder().seed([9u8; 32]).build();
-        let mut b = RunConfig::builder().seed([9u8; 32]).build();
-        a.dns_mut().insert("alpha.test", 1);
-        b.dns_mut().insert("beta.test", 1);
+        let mut dns_a = ledger_sim::DnsTable::new();
+        dns_a.insert("alpha.test", 1);
+        let mut dns_b = ledger_sim::DnsTable::new();
+        dns_b.insert("beta.test", 1);
+        let a = RunConfig::builder().seed([9u8; 32]).dns(dns_a).build();
+        let b = RunConfig::builder().seed([9u8; 32]).dns(dns_b).build();
         assert_ne!(run_config_hash(&a).unwrap(), run_config_hash(&b).unwrap());
         // Same entries inserted in different order must hash equal (sorted encoding).
-        let mut c = RunConfig::builder().seed([9u8; 32]).build();
-        let mut d = RunConfig::builder().seed([9u8; 32]).build();
-        c.dns_mut().insert("z.test", 2);
-        c.dns_mut().insert("a.test", 1);
-        d.dns_mut().insert("a.test", 1);
-        d.dns_mut().insert("z.test", 2);
+        let mut dns_c = ledger_sim::DnsTable::new();
+        dns_c.insert("z.test", 2);
+        dns_c.insert("a.test", 1);
+        let mut dns_d = ledger_sim::DnsTable::new();
+        dns_d.insert("a.test", 1);
+        dns_d.insert("z.test", 2);
+        let c = RunConfig::builder().seed([9u8; 32]).dns(dns_c).build();
+        let d = RunConfig::builder().seed([9u8; 32]).dns(dns_d).build();
         assert_eq!(run_config_hash(&c).unwrap(), run_config_hash(&d).unwrap());
     }
 
     #[test]
     fn run_config_hash_changes_with_dns_actor() {
-        let mut a = RunConfig::builder().seed([5u8; 32]).build();
-        let mut b = RunConfig::builder().seed([5u8; 32]).build();
-        a.dns_mut().insert("host.test", 1);
-        b.dns_mut().insert("host.test", 2);
+        let mut dns_a = ledger_sim::DnsTable::new();
+        dns_a.insert("host.test", 1);
+        let mut dns_b = ledger_sim::DnsTable::new();
+        dns_b.insert("host.test", 2);
+        let a = RunConfig::builder().seed([5u8; 32]).dns(dns_a).build();
+        let b = RunConfig::builder().seed([5u8; 32]).dns(dns_b).build();
         assert_ne!(run_config_hash(&a).unwrap(), run_config_hash(&b).unwrap());
     }
 
