@@ -17,6 +17,7 @@ clap-verbosity-flag = { workspace = true }
 ledger-adapters = { path = "../ledger-adapters" }
 ledger-faultspec = { path = "../ledger-faultspec" }
 ledger-format = { path = "../ledger-format" }
+ledger-journal = { path = "../ledger-journal" }
 ledger-sim = { path = "../ledger-sim" }
 ledger-explorer = { path = "../ledger-explorer" }
 libc = "0.2"
