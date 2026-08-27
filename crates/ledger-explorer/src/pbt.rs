@@ -16,6 +16,17 @@ pub struct PbtBridge {
     rng: ChaCha20Rng,
 }
 
+/// Typed validation failure for energy-distribution sampling.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum PbtError {
+    /// The sample range must be positive.
+    #[error("sample range must be positive")]
+    EmptyRange,
+    /// The power exponent must be finite and positive.
+    #[error("invalid exponent {exponent}: must be finite and > 0")]
+    InvalidExponent { exponent: f64 },
+}
+
 /// Upper bound (exclusive) for input-axis samples.
 ///
 /// A small bounded domain keeps specific target values (for example 42)
@@ -60,17 +71,21 @@ impl PbtBridge {
     /// `u = v / u64::MAX`, `value = (range as f64 * u.pow(e)) as u64`
     /// clamped to `< range`. Returns `Err` when `range == 0` or when `e` is
     /// non-finite or `<= 0`. Deterministic from the existing `gen/<name>` stream.
-    pub fn sample_energy(&mut self, range: u64, dist: &EnergyDistribution) -> Result<u64, String> {
+    pub fn sample_energy(
+        &mut self,
+        range: u64,
+        dist: &EnergyDistribution,
+    ) -> Result<u64, PbtError> {
         if range == 0 {
-            return Err("range must be > 0".to_string());
+            return Err(PbtError::EmptyRange);
         }
         match dist {
             EnergyDistribution::Uniform => Ok(self.uniform_mod(range)),
             EnergyDistribution::Power { exponent } => {
                 if !exponent.is_finite() || *exponent <= 0.0 {
-                    return Err(format!(
-                        "invalid exponent {exponent}: must be finite and > 0"
-                    ));
+                    return Err(PbtError::InvalidExponent {
+                        exponent: *exponent,
+                    });
                 }
                 let v = self.sample_u64();
                 let u = v as f64 / u64::MAX as f64;
@@ -211,50 +226,40 @@ mod tests {
     #[test]
     fn invalid_exponent_returns_error() {
         let mut bridge = PbtBridge::new("invalid-exp", [17; 32]);
-        assert!(
-            bridge
-                .sample_energy(
-                    INPUT_SAMPLE_RANGE,
-                    &EnergyDistribution::Power { exponent: 0.0 }
-                )
-                .is_err()
-        );
-        assert!(
-            bridge
-                .sample_energy(
-                    INPUT_SAMPLE_RANGE,
-                    &EnergyDistribution::Power { exponent: -1.0 }
-                )
-                .is_err()
-        );
-        assert!(
-            bridge
-                .sample_energy(
-                    INPUT_SAMPLE_RANGE,
-                    &EnergyDistribution::Power { exponent: f64::NAN }
-                )
-                .is_err()
-        );
-        assert!(
-            bridge
-                .sample_energy(
-                    INPUT_SAMPLE_RANGE,
-                    &EnergyDistribution::Power {
-                        exponent: f64::INFINITY
-                    }
-                )
-                .is_err()
-        );
-        assert!(
-            bridge
-                .sample_energy(
-                    INPUT_SAMPLE_RANGE,
-                    &EnergyDistribution::Power {
-                        exponent: f64::NEG_INFINITY
-                    }
-                )
-                .is_err()
-        );
+        assert!(bridge
+            .sample_energy(
+                INPUT_SAMPLE_RANGE,
+                &EnergyDistribution::Power { exponent: 0.0 }
+            )
+            .is_err());
+        assert!(bridge
+            .sample_energy(
+                INPUT_SAMPLE_RANGE,
+                &EnergyDistribution::Power { exponent: -1.0 }
+            )
+            .is_err());
+        assert!(bridge
+            .sample_energy(
+                INPUT_SAMPLE_RANGE,
+                &EnergyDistribution::Power { exponent: f64::NAN }
+            )
+            .is_err());
+        assert!(bridge
+            .sample_energy(
+                INPUT_SAMPLE_RANGE,
+                &EnergyDistribution::Power {
+                    exponent: f64::INFINITY
+                }
+            )
+            .is_err());
+        assert!(bridge
+            .sample_energy(
+                INPUT_SAMPLE_RANGE,
+                &EnergyDistribution::Power {
+                    exponent: f64::NEG_INFINITY
+                }
+            )
+            .is_err());
     }
 
     #[test]
