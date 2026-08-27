@@ -1,9 +1,9 @@
 use super::input_axis::draw_inputs;
 use super::{
-    CampaignReport, Finding, SWARM_CAMPAIGN_MAX_DELAY_BUDGET, SWARM_CRASH_CEILING, Workload,
-    describe_variant, draw_fault_subset, draw_swarm,
+    describe_variant, draw_fault_subset, draw_swarm, CampaignReport, Finding, SearchError,
+    Workload, SWARM_CAMPAIGN_MAX_DELAY_BUDGET, SWARM_CRASH_CEILING,
 };
-use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
+use crate::memo::{hash_inputs, memo_key, CampaignMemo, MemoEntry};
 use crate::oracle::Oracle;
 use crate::pbt::EnergyDistribution;
 use ledger_format::Hash;
@@ -46,7 +46,7 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
     base: RunConfig,
     mutation: &QuadMutation,
     attempts: usize,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     let mut distinct_roots: HashSet<Hash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
@@ -59,35 +59,38 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
     let mut memo = CampaignMemo::new();
 
     for attempt in 0..attempts {
-        let mut config = base.clone();
-        config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let mut seed = base.seed();
+        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let mut config = base.clone().with_seed(seed);
 
         if mutation.policies.is_empty() {
-            *config.policy_mut() = base.policy();
+            config = config.with_policy(base.policy());
         } else {
             let digest = SeedTree::new(base_seed).derive(&format!("quad-policy/{attempt}"));
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&digest[..8]);
             let draw = u64::from_le_bytes(bytes) as usize;
-            *config.policy_mut() = mutation.policies[draw % mutation.policies.len()];
+            config = config.with_policy(mutation.policies[draw % mutation.policies.len()]);
         }
 
         if mutation.use_swarm {
-            *config.swarm_mut() = draw_swarm(
+            let swarm = draw_swarm(
                 base_seed,
                 &format!("quad-swarm/{attempt}"),
                 mutation.swarm_budget,
                 SWARM_CRASH_CEILING,
-            );
+            )?;
+            config = config.with_swarm(swarm);
         }
 
         if !mutation.fault_library.is_empty() {
             let mut rng = SeedTree::new(base_seed).rng(&format!("quad-faults/{attempt}"));
-            *config.fault_schedule_mut() = draw_fault_subset(
+            let schedule = draw_fault_subset(
                 &mutation.fault_library,
                 mutation.max_faults_per_run,
                 &mut rng,
             );
+            config = config.with_fault_schedule(schedule);
         }
 
         let (programs, input_label, input_hash) = match &mutation.input_generator {
@@ -118,9 +121,7 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
             continue;
         }
 
-        let run = Simulation::new(config.clone(), programs)
-            .run()
-            .map_err(|error| format!("simulation failed: {error:?}"))?;
+        let run = Simulation::new(config.clone(), programs).run()?;
 
         let root = run.journal.root_hash();
         let distinct = !distinct_roots.contains(&root);
@@ -166,25 +167,24 @@ pub fn run_swarm_campaign<W: Workload, O: Oracle>(
     oracle: &O,
     base: RunConfig,
     attempts: usize,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     let mut distinct_roots: HashSet<Hash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
     let base_seed = base.seed();
 
     for attempt in 0..attempts {
-        let mut config = base.clone();
-        config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
-        *config.swarm_mut() = draw_swarm(
+        let mut seed = base.seed();
+        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let swarm = draw_swarm(
             base_seed,
             &format!("swarm/{attempt}"),
             SWARM_CAMPAIGN_MAX_DELAY_BUDGET,
             SWARM_CRASH_CEILING,
-        );
+        )?;
+        let config = base.clone().with_seed(seed).with_swarm(swarm);
 
-        let run = Simulation::new(config.clone(), workload.programs())
-            .run()
-            .map_err(|error| format!("simulation failed: {error:?}"))?;
+        let run = Simulation::new(config.clone(), workload.programs()).run()?;
 
         distinct_roots.insert(run.journal.root_hash());
         let verdict = oracle.check(&run);
