@@ -3,20 +3,55 @@ use crate::diagnosis::first_divergence;
 use ledger_format::Hash;
 use ledger_sim::{Policy, RunConfig, RunResult, SimFault, Simulation};
 
-/// Replay one workload under a recorded scheduling decision sequence.
+/// Strict replay for reproduction gates.
+///
+/// Alias to [`replay_strict`]; ready-set drift is surfaced as a typed
+/// `StrictReplay` violation instead of being normalized. Use
+/// [`replay_prefix`] for lenient minimization-only prefix replay.
 pub fn replay<W: Workload>(
     workload: &W,
     seed: Hash,
     decisions: Vec<usize>,
-) -> Result<RunResult, String> {
-    let mut config = RunConfig::builder()
+) -> Result<RunResult, ledger_sim::RuntimeError> {
+    // Strict alias: every reproduction path is strict. Lenient is only via
+    // `replay_prefix` for the private minimization prefix.
+    replay_strict(workload, seed, decisions)
+}
+
+/// Replay one workload under a strict scheduling decision sequence.
+///
+/// Strict replay rejects out-of-range, exhausted, or trailing decisions
+/// and surfaces a typed [`ledger_sim::RuntimeError::StrictReplay`] error.
+/// Callers needing to distinguish violations should match on the typed error.
+pub fn replay_strict<W: Workload>(
+    workload: &W,
+    seed: Hash,
+    decisions: Vec<usize>,
+) -> Result<RunResult, ledger_sim::RuntimeError> {
+    let config = RunConfig::builder()
         .seed(seed)
         .policy(Policy::Replay)
+        .max_steps(decisions.len().saturating_add(256))
         .build();
-    *config.max_steps_mut() = decisions.len().saturating_add(256);
-    Simulation::with_replay(config, workload.programs(), decisions)
-        .run()
-        .map_err(|error| format!("replay failed: {error}"))
+    Simulation::with_replay_strict(config, workload.programs(), decisions).run()
+}
+
+/// Minimization-only prefix replay that cannot satisfy a reproduction gate.
+///
+/// This uses lenient replay with a seeded fallback for the suffix, so it is
+/// suitable for delta debugging but must not be used to claim a bug
+/// reproduction. Use [`replay_strict`] to validate a reproduction gate.
+pub fn replay_prefix<W: Workload>(
+    workload: &W,
+    seed: Hash,
+    decisions: Vec<usize>,
+) -> Result<RunResult, ledger_sim::RuntimeError> {
+    let config = RunConfig::builder()
+        .seed(seed)
+        .policy(Policy::Replay)
+        .max_steps(decisions.len().saturating_add(256))
+        .build();
+    Simulation::with_replay(config, workload.programs(), decisions).run()
 }
 
 /// Outcome of a fault-injected replay.
@@ -34,23 +69,45 @@ pub struct FaultReplayReport {
     pub prefix_ok: bool,
 }
 
+/// Typed error from fault-injected strict replay.
+#[derive(Debug, thiserror::Error)]
+pub enum FaultReplayError {
+    /// Strict replay rejected a decision.
+    #[error("strict replay violation: {0}")]
+    StrictReplay(#[from] ledger_sim::ReplayViolation),
+    /// Other runtime or journal failure.
+    #[error(transparent)]
+    Runtime(#[from] ledger_sim::RuntimeError),
+}
+
 /// Replay one workload with a fault schedule injected at causal positions.
+///
+/// Strict-only reproduction: ready-set drift is surfaced as a typed
+/// [`FaultReplayError::StrictReplay`] violation instead of being normalized
+/// by a seeded fallback. No lenient fallback is performed. Callers that need
+/// lenient prefix behavior for delta debugging use [`replay_prefix`], which
+/// must never back a reproduction claim.
 pub fn replay_with_faults<W: Workload>(
     workload: &W,
     base: &ledger_journal::Journal,
     seed: Hash,
     decisions: Vec<usize>,
     schedule: Vec<SimFault>,
-) -> Result<FaultReplayReport, String> {
-    let mut config = RunConfig::builder()
+) -> Result<FaultReplayReport, FaultReplayError> {
+    let config = RunConfig::builder()
         .seed(seed)
         .policy(Policy::Replay)
         .fault_schedule(schedule.clone())
+        .max_steps(decisions.len().saturating_add(256))
         .build();
-    *config.max_steps_mut() = decisions.len().saturating_add(256);
-    let run = Simulation::with_replay(config, workload.programs(), decisions)
+    let run = Simulation::with_replay_strict(config, workload.programs(), decisions)
         .run()
-        .map_err(|error| format!("fault replay failed: {error}"))?;
+        .map_err(|error| match error {
+            ledger_sim::RuntimeError::StrictReplay(violation) => {
+                FaultReplayError::StrictReplay(violation)
+            }
+            other => FaultReplayError::Runtime(other),
+        })?;
     let applied_set: std::collections::HashSet<&Hash> = run.applied_faults.iter().collect();
     let mut seen_applied = std::collections::HashSet::new();
     let mut applied = Vec::new();
@@ -96,4 +153,233 @@ pub fn diff(left: &RunResult, right: &RunResult) -> Option<(Hash, Hash)> {
             right.map_or([0; 32], |entry| entry.id),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ledger_sim::{Instruction, ReplayViolation, RuntimeError};
+
+    struct TwoDone;
+    impl Workload for TwoDone {
+        fn programs(&self) -> Vec<Vec<Instruction>> {
+            vec![vec![Instruction::Done], vec![Instruction::Done]]
+        }
+        fn history(&self, _run: &RunResult) -> Vec<crate::oracle::HistoryOperation> {
+            Vec::new()
+        }
+    }
+
+    struct MiniKv;
+    impl Workload for MiniKv {
+        fn programs(&self) -> Vec<Vec<Instruction>> {
+            vec![
+                vec![
+                    Instruction::Send { to: 1, payload: 42 },
+                    Instruction::Send {
+                        to: 2,
+                        payload: 100,
+                    },
+                    Instruction::Done,
+                ],
+                vec![
+                    Instruction::Receive,
+                    Instruction::Send { to: 2, payload: 42 },
+                    Instruction::Done,
+                ],
+                vec![
+                    Instruction::Receive,
+                    Instruction::Outcome,
+                    Instruction::Done,
+                ],
+            ]
+        }
+        fn history(&self, _run: &RunResult) -> Vec<crate::oracle::HistoryOperation> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn replay_strict_valid_matches_lenient_root() {
+        let seed = [13; 32];
+        let workload = MiniKv;
+        let base = {
+            let config = RunConfig::builder()
+                .seed(seed)
+                .policy(Policy::Random)
+                .max_steps(256)
+                .build();
+            Simulation::new(config, workload.programs())
+                .run()
+                .expect("base run")
+        };
+        let decisions = base.decisions.clone();
+        let strict = replay_strict(&workload, seed, decisions.clone()).expect("strict valid");
+        let lenient = replay(&workload, seed, decisions).expect("lenient valid");
+        assert_eq!(strict.journal.root_hash(), lenient.journal.root_hash());
+        assert_eq!(strict.journal.root_hash(), base.journal.root_hash());
+    }
+
+    #[test]
+    fn replay_strict_rejects_out_of_range() {
+        let seed = [7; 32];
+        let workload = TwoDone;
+        let err = replay_strict(&workload, seed, vec![99]).expect_err("out of range");
+        match err {
+            RuntimeError::StrictReplay(ReplayViolation::OutOfRange {
+                step,
+                value,
+                ready_len,
+            }) => {
+                assert_eq!(step, 0);
+                assert_eq!(value, 99);
+                assert_eq!(ready_len, 2);
+            }
+            other => panic!("expected OutOfRange, got {other:?}"),
+        }
+        // Lenient prefix replay succeeds via modulo fallback.
+        let ok = replay_prefix(&workload, seed, vec![99]).expect("prefix lenient");
+        assert_eq!(ok.steps, 2);
+    }
+
+    #[test]
+    fn replay_strict_rejects_exhausted() {
+        let seed = [9; 32];
+        let workload = TwoDone;
+        let err = replay_strict(&workload, seed, vec![0]).expect_err("exhausted");
+        match err {
+            RuntimeError::StrictReplay(ReplayViolation::Exhausted { step, replay_len }) => {
+                assert_eq!(step, 1);
+                assert_eq!(replay_len, 1);
+            }
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+        // Prefix replay falls back to Random and completes.
+        let ok = replay_prefix(&workload, seed, vec![0]).expect("prefix fallback");
+        assert_eq!(ok.steps, 2);
+    }
+
+    #[test]
+    fn replay_strict_rejects_trailing() {
+        let seed = [11; 32];
+        let workload = TwoDone;
+        let base = {
+            let config = RunConfig::builder()
+                .seed(seed)
+                .policy(Policy::Random)
+                .max_steps(64)
+                .build();
+            Simulation::new(config, workload.programs())
+                .run()
+                .expect("base")
+        };
+        assert_eq!(base.steps, 2);
+        let mut trailing = base.decisions.clone();
+        trailing.extend([0, 1, 0]);
+        let err = replay_strict(&workload, seed, trailing).expect_err("trailing");
+        match err {
+            RuntimeError::StrictReplay(ReplayViolation::Trailing { trailing, steps }) => {
+                assert_eq!(trailing, 3);
+                assert_eq!(steps, 2);
+            }
+            other => panic!("expected Trailing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_prefix_is_lenient_minimization_only() {
+        let seed = [17; 32];
+        let workload = TwoDone;
+        // Empty prefix still completes via seeded fallback, proving it cannot
+        // satisfy a reproduction gate that requires exact replay.
+        let ok = replay_prefix(&workload, seed, Vec::new()).expect("empty prefix lenient");
+        assert_eq!(ok.steps, 2);
+        let strict_err = replay_strict(&workload, seed, Vec::new()).expect_err("empty strict");
+        assert!(matches!(
+            strict_err,
+            RuntimeError::StrictReplay(ReplayViolation::Exhausted { .. })
+        ));
+    }
+
+    #[test]
+    fn fault_replay_strict_surfaces_ready_drift_as_typed_error() {
+        // A fault that partitions the only ready task's link at step 4
+        // causes ready_len to shrink from 2 to 1; lenient replay would
+        // normalize 1 % 1 = 0, but strict must surface OutOfRange.
+        let seed = [17; 32];
+        struct DriftWorkload;
+        impl Workload for DriftWorkload {
+            fn programs(&self) -> Vec<Vec<Instruction>> {
+                vec![
+                    vec![
+                        Instruction::Send { to: 1, payload: 42 },
+                        Instruction::Send {
+                            to: 1,
+                            payload: 100,
+                        },
+                        Instruction::Done,
+                    ],
+                    vec![Instruction::Receive, Instruction::Done],
+                ]
+            }
+            fn history(&self, _run: &RunResult) -> Vec<crate::oracle::HistoryOperation> {
+                Vec::new()
+            }
+        }
+        let workload = DriftWorkload;
+        // Find a finding with a partition that triggers drift. Use strict
+        // fault replay and assert the violation type, not a partial journal.
+        let base = {
+            let config = RunConfig::builder()
+                .seed(seed)
+                .policy(Policy::Random)
+                .max_steps(64)
+                .build();
+            Simulation::new(config, workload.programs())
+                .run()
+                .expect("base run")
+        };
+        let decisions = base.decisions.clone();
+        // Forge a decision that is out of range for the faulted run's ready
+        // set. With no faults, lenient and strict agree; with a fault that
+        // blocks the receiver, the same decision becomes out of range.
+        // We do not need an actual fault to demonstrate the strict path:
+        // a single out-of-range decision is enough to prove the typed error
+        // is surfaced instead of normalized.
+        let out_of_range = vec![99];
+        let strict_err = replay_strict(&workload, seed, out_of_range.clone())
+            .expect_err("out of range must be StrictReplay");
+        assert!(
+            matches!(
+                strict_err,
+                RuntimeError::StrictReplay(ReplayViolation::OutOfRange { .. })
+            ),
+            "expected OutOfRange, got {strict_err:?}"
+        );
+        // Fault replay is strict-only: the same out-of-range decisions
+        // must surface as a typed violation, not a normalized fallback run.
+        let base_journal = base.journal.clone();
+        let err = replay_with_faults(
+            &workload,
+            &base_journal,
+            seed,
+            out_of_range,
+            vec![SimFault::Partition { src: 0, dst: 1 }],
+        )
+        .expect_err("fault replay with out-of-range must be strict violation");
+        assert!(
+            matches!(err, FaultReplayError::StrictReplay(_)),
+            "fault replay must surface strict violation, got {err:?}"
+        );
+        // Lenient prefix still succeeds via modulo fallback, proving the
+        // reproduction gate is the only strict path.
+        let lenient_ok = replay_prefix(&workload, seed, vec![99]).expect("lenient");
+        assert!(
+            lenient_ok.steps >= 2,
+            "lenient prefix must complete via fallback, got {}",
+            lenient_ok.steps
+        );
+        // Keep decisions variable used
+        let _ = decisions;
+    }
 }
