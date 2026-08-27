@@ -3,7 +3,7 @@
 use ledger_explorer::ldfi::solve_with;
 use ledger_explorer::minimizer::minimize_schedule;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec, Oracle};
-use ledger_explorer::search::{replay, search};
+use ledger_explorer::search::{replay_prefix, search};
 use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::MiniKvWorkload;
 use ledger_sim::{Policy, RunConfig};
@@ -45,7 +45,7 @@ fn main() {
 
         println!("\n3. Minimizing schedule decisions...");
         let report = minimize_schedule(&finding.run.decisions, |d| {
-            let r = replay(&workload, finding.seed, d.to_vec());
+            let r = replay_prefix(&workload, finding.seed, d.to_vec());
             r.as_ref()
                 .map(|run| oracle.check(run).violated)
                 .unwrap_or(false)

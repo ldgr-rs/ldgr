@@ -11,7 +11,7 @@ fn main() {
         .seed([100; 32])
         .policy(Policy::Bandit {
             exploration_constant: 1.414,
-            pct_mix: 0.1,
+            pct_mix: ledger_sim::Probability::new(0.1).unwrap(),
         })
         .max_steps(256)
         .build();
