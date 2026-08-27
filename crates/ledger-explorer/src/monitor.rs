@@ -7,8 +7,9 @@
 
 use ledger_format::{EntryKind, Hash};
 use ledger_journal::Entry;
-use ledger_sim::RunResult;
+use ledger_sim::{OnlineAction, RunResult, StepMonitor};
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::oracle::{Oracle, Verdict};
 
@@ -39,12 +40,38 @@ pub trait OnlineMonitor {
     fn reset(&mut self) {}
 }
 
+/// Adapter that feeds journal deltas to a set of `OnlineMonitor`s.
+///
+/// The returned `StepMonitor` iterates the journal delta in append order
+/// and calls each monitor's `on_entry` in sequence; the first `Halt` wins
+/// and is surfaced as `OnlineAction::Halt`. The adapter is read-only over
+/// the journal and consumes no seed draws, so the partial journal remains
+/// deterministic and replayable.
+pub fn monitors_to_step_monitor(mut monitors: Vec<Box<dyn OnlineMonitor>>) -> StepMonitor {
+    Box::new(move |journal: &ledger_journal::Journal, start: usize| {
+        for entry in journal.entries().skip(start) {
+            for monitor in monitors.iter_mut() {
+                match monitor.on_entry(entry) {
+                    MonitorAction::Continue => {}
+                    MonitorAction::Warn(_) => {}
+                    MonitorAction::Halt(reason) => {
+                        return OnlineAction::Halt {
+                            reason: format!("{}: {}", monitor.name(), reason).into(),
+                        };
+                    }
+                }
+            }
+        }
+        OnlineAction::Continue
+    })
+}
+
 /// Oracle that replays the journal through a set of online monitors.
 ///
 /// Deterministic: replay order is [`Journal::entries`] append order and no
 /// ambient state is consulted.
 pub struct MonitorOracle {
-    monitors: RefCell<Vec<Box<dyn OnlineMonitor>>>,
+    monitors: Rc<RefCell<Vec<Box<dyn OnlineMonitor>>>>,
     warnings: RefCell<Vec<String>>,
 }
 
@@ -58,7 +85,7 @@ impl MonitorOracle {
     /// Create an empty monitor oracle.
     pub fn new() -> Self {
         Self {
-            monitors: RefCell::new(Vec::new()),
+            monitors: Rc::new(RefCell::new(Vec::new())),
             warnings: RefCell::new(Vec::new()),
         }
     }
@@ -69,6 +96,35 @@ impl MonitorOracle {
         self
     }
 
+    /// Build a mid-run `StepMonitor` sharing the same monitor state.
+    ///
+    /// The returned monitor feeds delta entries in order and the first halt
+    /// wins, matching `monitors_to_step_monitor` semantics. Sharing the
+    /// underlying monitors lets a campaign attach the same logical monitors
+    /// for mid-run halting and post-run `Oracle::check` without cloning
+    /// trait objects. The mid-run path only calls `on_entry`; quiescence
+    /// halts are still surfaced by the post-run `Oracle`.
+    pub fn to_step_monitor(&self) -> StepMonitor {
+        let shared = Rc::clone(&self.monitors);
+        Box::new(move |journal: &ledger_journal::Journal, start: usize| {
+            let mut monitors = shared.borrow_mut();
+            for entry in journal.entries().skip(start) {
+                for monitor in monitors.iter_mut() {
+                    match monitor.on_entry(entry) {
+                        MonitorAction::Continue => {}
+                        MonitorAction::Warn(_) => {}
+                        MonitorAction::Halt(reason) => {
+                            return OnlineAction::Halt {
+                                reason: format!("{}: {}", monitor.name(), reason).into(),
+                            };
+                        }
+                    }
+                }
+            }
+            OnlineAction::Continue
+        })
+    }
+
     /// Warnings surfaced by the last [`Oracle::check`] run.
     ///
     /// A warning is a non-violation signal (for example a liveness gap at
@@ -76,6 +132,14 @@ impl MonitorOracle {
     /// check or when no monitor warned.
     pub fn warnings(&self) -> Vec<String> {
         self.warnings.borrow().clone()
+    }
+
+    /// Reset all attached monitors to their initial state.
+    pub fn reset(&self) {
+        let mut monitors = self.monitors.borrow_mut();
+        for monitor in monitors.iter_mut() {
+            monitor.reset();
+        }
     }
 }
 
@@ -197,7 +261,6 @@ pub struct LivenessMonitor {
     expected_kind: EntryKind,
     max_gap_steps: usize,
     steps_since: usize,
-    seen: bool,
     name: String,
 }
 
@@ -208,7 +271,6 @@ impl LivenessMonitor {
             expected_kind,
             max_gap_steps,
             steps_since: 0,
-            seen: false,
             name: format!("liveness:{:?}", expected_kind),
         }
     }
@@ -229,7 +291,6 @@ impl OnlineMonitor for LivenessMonitor {
     fn on_entry(&mut self, entry: &Entry) -> MonitorAction {
         if entry.data.kind == self.expected_kind {
             self.steps_since = 0;
-            self.seen = true;
             MonitorAction::Continue
         } else {
             self.steps_since += 1;
@@ -260,12 +321,8 @@ impl OnlineMonitor for LivenessMonitor {
                 "quiescence: trailing gap at bound {} for {:?}",
                 self.max_gap_steps, self.expected_kind
             ))
-        } else if !self.seen && self.steps_since == 0 {
-            // Empty journal with no occurrences: only halt if bound is 0 and we
-            // expect at least one occurrence. For max_gap > 0 an empty journal
-            // has not yet exceeded the bound.
-            MonitorAction::Continue
         } else {
+            // Gap below bound, including empty journal: no violation yet.
             MonitorAction::Continue
         }
     }
@@ -276,7 +333,6 @@ impl OnlineMonitor for LivenessMonitor {
 
     fn reset(&mut self) {
         self.steps_since = 0;
-        self.seen = false;
     }
 }
 
@@ -299,6 +355,7 @@ mod tests {
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
             origins: Vec::new(),
+            protection: ledger_sim::BeltStatus::NotArmed,
         }
     }
 
@@ -791,5 +848,102 @@ mod tests {
         let v2 = mk_oracle().check(&r2);
         assert_eq!(v1, v2);
         assert!(v1.violated);
+    }
+
+    #[test]
+    fn monitors_to_step_monitor_feeds_delta_in_order_first_halt_wins() {
+        // Two monitors: first halts on payload 10, second on payload 20.
+        let m1 = SafetyMonitor::new(
+            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(10)),
+            "payload 10 forbidden",
+        )
+        .with_name("m1");
+        let m2 = SafetyMonitor::new(
+            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(20)),
+            "payload 20 forbidden",
+        )
+        .with_name("m2");
+        let mut step_monitor = monitors_to_step_monitor(vec![Box::new(m1), Box::new(m2)]);
+        let mut journal = Journal::new();
+        journal
+            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .unwrap();
+        // First delta [0,1): no halt.
+        assert_eq!(
+            step_monitor(&journal, 0),
+            ledger_sim::OnlineAction::Continue
+        );
+        // Append an entry that halts m1.
+        let _id10 = journal
+            .append(EntryKind::Outcome, 1, [], Payload::Number(10))
+            .unwrap();
+        // Delta from 1 must halt with m1's reason, not m2's.
+        let action = step_monitor(&journal, 1);
+        assert!(
+            matches!(action, ledger_sim::OnlineAction::Halt { ref reason } if reason.as_str().contains("m1")),
+            "first halt must be from m1, got {action:?}"
+        );
+        // Even if later entries would halt m2, first halt wins and later
+        // entries are not inspected beyond the halting entry.
+        let _id20 = journal
+            .append(EntryKind::Outcome, 1, [], Payload::Number(20))
+            .unwrap();
+        // Reset with fresh monitors to verify order across entries: when delta
+        // contains 10 then 20, the monitor that sees 10 first halts.
+        let m1b = SafetyMonitor::new(
+            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(10)),
+            "payload 10 forbidden",
+        )
+        .with_name("m1");
+        let m2b = SafetyMonitor::new(
+            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(20)),
+            "payload 20 forbidden",
+        )
+        .with_name("m2");
+        let mut step_monitor2 = monitors_to_step_monitor(vec![Box::new(m1b), Box::new(m2b)]);
+        let mut journal2 = Journal::new();
+        journal2
+            .append(EntryKind::Outcome, 1, [], Payload::Number(10))
+            .unwrap();
+        journal2
+            .append(EntryKind::Outcome, 1, [], Payload::Number(20))
+            .unwrap();
+        let action2 = step_monitor2(&journal2, 0);
+        assert!(
+            matches!(
+                action2,
+                ledger_sim::OnlineAction::Halt { ref reason } if reason.as_str().contains("m1")
+            ),
+            "when delta contains both, first halt in entry order wins (m1), got {action2:?}"
+        );
+    }
+
+    #[test]
+    fn step_monitor_sharing_via_oracle_is_deterministic() {
+        let monitor = SafetyMonitor::new(
+            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(99)),
+            "no 99",
+        );
+        let oracle = MonitorOracle::new().with_monitor(Box::new(monitor));
+        let mut step_monitor = oracle.to_step_monitor();
+        let mut journal = Journal::new();
+        journal
+            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .unwrap();
+        assert_eq!(
+            step_monitor(&journal, 0),
+            ledger_sim::OnlineAction::Continue
+        );
+        let _id = journal
+            .append(EntryKind::Outcome, 1, [], Payload::Number(99))
+            .unwrap();
+        let action = step_monitor(&journal, 1);
+        assert!(matches!(action, ledger_sim::OnlineAction::Halt { .. }));
+        // Oracle's post-run check on the same journal must also halt, even
+        // though the mid-run path already consumed the entry, because it
+        // resets and replays.
+        let run = empty_run_with_journal(journal);
+        let verdict = oracle.check(&run);
+        assert!(verdict.violated);
     }
 }
