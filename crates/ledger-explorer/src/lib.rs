@@ -31,11 +31,11 @@ pub use attest_uri::{
     predicate_type_campaign_v1, tool_information_uri,
 };
 pub use certs::{
-    CampaignCertificate, CertError, MinimalityExtension, ResolvedDependency, StatisticalBound,
-    Subject, certificate_for_report,
+    CampaignCertificate, CertError, LineagePolicy, RecordedSolverData, ResolvedDependency,
+    StatisticalBound, Subject, check_cert_bytes,
 };
 pub use coverage::{
-    CovError, CoverageBuilder, CoverageReport, RootRecord, record, to_jacoco, to_lcov, to_sarif,
+    CovError, CoverageBuilder, CoverageReport, RootRecord, to_jacoco, to_lcov, to_sarif,
 };
 pub use diagnosis::first_divergence;
 pub use forensics::{MotifLift, rank_motifs_by_lift};
@@ -55,8 +55,8 @@ pub use oracle::{
 pub use pbt::{InputsWorkload, PbtBridge};
 pub use search::{
     CampaignPersist, CampaignReport, Finding, QuadBandit, QuadMutation, Workload, diff, escalate,
-    replay, replay_with_faults, run_bandit_campaign, run_campaign, run_campaign_quad,
-    run_feedback_campaign, run_feedback_campaign_with_state, run_joint_campaign,
+    replay_prefix, replay_strict, replay_with_faults, run_bandit_campaign, run_campaign,
+    run_campaign_quad, run_feedback_campaign, run_feedback_campaign_with_state, run_joint_campaign,
     run_joint_campaign_with_state, run_monitored_campaign, run_swarm_campaign, search,
     search_input, search_input_energy,
 };

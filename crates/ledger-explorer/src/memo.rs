@@ -121,15 +121,15 @@ pub fn canonical_variant_bytes(
         } => {
             bytes.push(2);
             bytes.extend_from_slice(&exploration_constant.to_bits().to_le_bytes());
-            bytes.extend_from_slice(&pct_mix.to_bits().to_le_bytes());
+            bytes.extend_from_slice(&pct_mix.get().to_bits().to_le_bytes());
         }
         Policy::Replay => bytes.push(3),
         Policy::Dpor => bytes.push(4),
     }
-    bytes.extend_from_slice(&swarm.drop_probability.to_bits().to_le_bytes());
-    bytes.extend_from_slice(&swarm.delay_probability.to_bits().to_le_bytes());
+    bytes.extend_from_slice(&swarm.drop_probability.get().to_bits().to_le_bytes());
+    bytes.extend_from_slice(&swarm.delay_probability.get().to_bits().to_le_bytes());
     bytes.extend_from_slice(&swarm.max_delay_ticks.to_le_bytes());
-    bytes.extend_from_slice(&swarm.crash_probability.to_bits().to_le_bytes());
+    bytes.extend_from_slice(&swarm.crash_probability.get().to_bits().to_le_bytes());
     bytes.extend_from_slice(&swarm.fault_classes_per_run.to_le_bytes());
     bytes.extend_from_slice(&(faults.len() as u64).to_le_bytes());
     for fault in faults {
@@ -210,10 +210,10 @@ mod tests {
 
     fn test_swarm() -> SwarmConfig {
         SwarmConfig {
-            drop_probability: 0.1,
-            delay_probability: 0.2,
+            drop_probability: ledger_sim::Probability::new(0.1).unwrap(),
+            delay_probability: ledger_sim::Probability::new(0.2).unwrap(),
             max_delay_ticks: 4,
-            crash_probability: 0.05,
+            crash_probability: ledger_sim::Probability::new(0.05).unwrap(),
             fault_classes_per_run: 2,
         }
     }
