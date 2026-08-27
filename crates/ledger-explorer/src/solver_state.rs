@@ -1305,6 +1305,8 @@ mod tests {
         let (fresh_hyps, fresh_cert) = fresh
             .solve_with_certificate(&journal, &verdict)
             .expect("fresh solve must succeed");
+        let fresh_cert =
+            fresh_cert.expect("non-empty fresh solve must return recorded solver data");
         assert!(!fresh_hyps.is_empty());
 
         let mut persist_journal = journal.fork();
@@ -1329,6 +1331,8 @@ mod tests {
         let (resumed_hyps, resumed_cert) = resumed
             .solve_with_certificate(&loaded_journal, &verdict)
             .expect("resumed solve must succeed");
+        let resumed_cert =
+            resumed_cert.expect("non-empty resumed solve must return recorded solver data");
         assert_eq!(
             fresh_hyps, resumed_hyps,
             "hypotheses must be byte-identical"
@@ -1581,9 +1585,13 @@ mod tests {
             .expect("append witness");
         let verdict = Verdict::fail(vec![witness], "no faultables");
         let mut maxsat = MaxSatSolver::new();
-        let (maxsat_hyps, _) = maxsat
+        let (maxsat_hyps, solver_data) = maxsat
             .solve_with_certificate(&journal, &verdict)
             .expect("maxsat solve");
+        assert!(
+            solver_data.is_none(),
+            "an empty cut must not produce recorded solver data"
+        );
         assert_eq!(maxsat_hyps.len(), 1);
         assert_eq!(maxsat_hyps[0].total_cost, 0);
         let artifact = maxsat.snapshot_state().expect("snapshot");

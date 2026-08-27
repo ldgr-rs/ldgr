@@ -101,22 +101,24 @@ impl MaxSatSolver {
         (tag, cadical)
     }
 
-    /// Solve and produce a minimality certificate.
+    /// Solve and return optional recorded solver data for a certificate.
+    ///
+    /// Empty input returns no hypotheses and `None`. Any solve with an empty
+    /// cut also returns `None`, so present data always satisfies the statement
+    /// requirement for a non-empty cut.
     pub fn solve_with_certificate(
         &mut self,
         journal: &Journal,
         verdict: &Verdict,
-    ) -> Result<(Vec<FaultHypothesis>, crate::certs::MinimalityExtension), SolverError> {
+    ) -> Result<
+        (
+            Vec<FaultHypothesis>,
+            Option<crate::certs::RecordedSolverData>,
+        ),
+        SolverError,
+    > {
         if verdict.witnesses.is_empty() && journal.is_empty() {
-            return Ok((
-                Vec::new(),
-                crate::certs::MinimalityExtension {
-                    cut: Vec::new(),
-                    lower_bound: 0,
-                    method: crate::maxsat::LOWER_BOUND_METHOD.into(),
-                    horizon: self.inner.config.max_horizon,
-                },
-            ));
+            return Ok((Vec::new(), None));
         }
         // Encode first: Auto resolves against the encoding size, so no key
         // may be derived before this point.
@@ -174,15 +176,17 @@ impl MaxSatSolver {
         let mut hypotheses = vec![hypothesis];
         hypotheses = samc_prune(journal, hypotheses);
         self.inner.hypothesis_cache.insert(key, hypotheses.clone());
-        let extension = crate::certs::MinimalityExtension {
-            cut: solution.cut,
-            lower_bound: solution.lower_bound_proof.unsat_core_cost,
-            method: solution.lower_bound_proof.method.to_string(),
-            // The horizon under which the cut was derived; the verifier
-            // re-derives the same hazard at this horizon.
-            horizon: self.inner.config.max_horizon,
+        let solver_data = if solution.cut.is_empty() {
+            None
+        } else {
+            Some(crate::certs::RecordedSolverData {
+                cut: solution.cut,
+                recorded_lower_bound: solution.lower_bound_proof.unsat_core_cost,
+                method: solution.lower_bound_proof.method.to_string(),
+                horizon: self.inner.config.max_horizon,
+            })
         };
-        Ok((hypotheses, extension))
+        Ok((hypotheses, solver_data))
     }
 }
 
