@@ -3,7 +3,7 @@ use super::candidate_journal;
 use super::ddmin::{causal_slice_forward, ddmin, minimize_schedule};
 use super::input::minimize_input;
 use crate::oracle::Oracle;
-use crate::search::{Finding, Workload, replay};
+use crate::search::{Finding, Workload, replay_prefix};
 use ledger_format::Hash;
 use ledger_journal::Journal;
 use ledger_sim::RunResult;
@@ -47,6 +47,7 @@ fn run_for_check(journal: Journal) -> RunResult {
         monitor_issues: Vec::new(),
         applied_faults: Vec::new(),
         origins: Vec::new(),
+        protection: ledger_sim::BeltStatus::NotArmed,
     }
 }
 
@@ -109,7 +110,7 @@ where
 
     // Schedule-delta debugging over the recorded decisions.
     let schedule = minimize_schedule(&finding.run.decisions, |decisions| {
-        replay(workload, finding.seed, decisions.to_vec())
+        replay_prefix(workload, finding.seed, decisions.to_vec())
             .map(|run| oracle.check(&run).violated)
             // Deliberate discard: same ddmin probe semantics as above; an
             // unbuildable candidate counts as non-violating, not as an error.
