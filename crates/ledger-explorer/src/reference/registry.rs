@@ -15,6 +15,22 @@ use ledger_sim::{Policy, RunConfig, RunResult, RuntimeError, SimFault, Simulatio
 // Corpus scenario registry
 // ---------------------------------------------------------------------------
 
+/// Typed failure of a reference-scenario fault replay.
+///
+/// Strict-replay rejections surface as the typed
+/// [`RuntimeError::StrictReplay`] source, so callers match the variant
+/// instead of error text.
+#[derive(Debug, thiserror::Error)]
+pub enum ReferenceReplayError {
+    /// The engine rejected the replay run.
+    #[error("{name}: reference fault replay failed")]
+    Engine {
+        name: &'static str,
+        #[source]
+        source: RuntimeError,
+    },
+}
+
 /// The Mini-KV workload as a `static` so oracles borrowing it are `'static`.
 static MINI_KV: MiniKvWorkload = MiniKvWorkload;
 
@@ -322,7 +338,8 @@ impl CorpusScenario {
                     .max_steps(4096)
                     .build();
                 let oracle = HistoryOracle::new(&MINI_KV, KeyValueSpec::default());
-                crate::search::search(&MINI_KV, &oracle, config, 256)?
+                crate::search::search(&MINI_KV, &oracle, config, 256)
+                    .map_err(|error| format!("{}: mini-kv search failed: {error}", self.name))?
                     .ok_or_else(|| "mini-kv-stale-read: no violating seed found".to_string())
             }
         }
@@ -340,7 +357,7 @@ impl CorpusScenario {
         seed: [u8; 32],
         witness: &RunResult,
         schedule: Vec<SimFault>,
-    ) -> Result<RunResult, String> {
+    ) -> Result<RunResult, ReferenceReplayError> {
         match &self.runner {
             CorpusRunner::Tasks { builders, .. } => {
                 let config = RunConfig::builder()
@@ -351,22 +368,28 @@ impl CorpusScenario {
                     .build();
                 Simulation::with_tasks(config, builders())
                     .run()
-                    .map_err(|error| {
-                        format!("{}: reference fault replay failed: {error}", self.name)
+                    .map_err(|source| ReferenceReplayError::Engine {
+                        name: self.name,
+                        source,
                     })
             }
             CorpusRunner::MiniKv => {
-                let mut config = RunConfig::builder()
+                let config = RunConfig::builder()
                     .seed(seed)
                     .policy(Policy::Replay)
+                    .max_steps(witness.decisions.len().saturating_add(256))
                     .fault_schedule(schedule)
                     .build();
-                *config.max_steps_mut() = witness.decisions.len().saturating_add(256);
-                Simulation::with_replay(config, MINI_KV.programs(), witness.decisions.clone())
-                    .run()
-                    .map_err(|error| {
-                        format!("{}: workload fault replay failed: {error}", self.name)
-                    })
+                Simulation::with_replay_strict(
+                    config,
+                    MINI_KV.programs(),
+                    witness.decisions.clone(),
+                )
+                .run()
+                .map_err(|source| ReferenceReplayError::Engine {
+                    name: self.name,
+                    source,
+                })
             }
         }
     }
