@@ -312,6 +312,11 @@ impl PersistentJournal {
         &self.snapshots
     }
 
+    /// Return the in-memory journal backing this persistent journal.
+    pub fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
     /// Audit the in-memory journal for structural and causal integrity.
     ///
     /// Delegates to [`JournalCorrectnessMonitor::verify`].

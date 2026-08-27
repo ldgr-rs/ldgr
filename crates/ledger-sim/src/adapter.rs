@@ -102,13 +102,13 @@ impl ProgramFuture {
             }
             Instruction::FsWrite { path, value } => {
                 if let Err(error) = self.boundary.fs().write(&path, value) {
-                    self.boundary.record_journal_error(error);
+                    self.boundary.record_journal_error(error.into_journal());
                 }
                 Step::Continue
             }
             Instruction::FsFsync => {
                 if let Err(error) = self.boundary.fs().fsync() {
-                    self.boundary.record_journal_error(error);
+                    self.boundary.record_journal_error(error.into_journal());
                 }
                 Step::Continue
             }
@@ -116,7 +116,7 @@ impl ProgramFuture {
                 match self.boundary.fs().read(&path) {
                     Ok(Some(value)) => self.boundary.set_register(value),
                     Ok(None) => {}
-                    Err(error) => self.boundary.record_journal_error(error),
+                    Err(error) => self.boundary.record_journal_error(error.into_journal()),
                 }
                 Step::Continue
             }
