@@ -1,15 +1,15 @@
 use super::input_axis::INPUT_AXIS_SAMPLE;
-use super::{CampaignReport, Finding, Workload, find_first_violation};
+use super::{find_first_violation, CampaignReport, Finding, SearchError, Workload};
 use crate::ldfi::hypothesis_to_schedule;
 use crate::maxsat::encode_hazard;
-use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
+use crate::memo::{hash_inputs, memo_key, CampaignMemo, MemoEntry};
 use crate::oracle::Oracle;
-use crate::pbt::{INPUT_SAMPLE_RANGE, PbtBridge, gen_id};
-use crate::solver::{FaultSolver, HittingSetSolver, SolverConfig, select_solver};
+use crate::pbt::{gen_id, PbtBridge, INPUT_SAMPLE_RANGE};
+use crate::solver::{select_solver, FaultSolver, HittingSetSolver, SolverConfig};
 use crate::solver_state::{load as load_solver_state, save as save_solver_state};
 use ledger_format::{ActorId, Hash};
 use ledger_journal::Journal;
-use ledger_sim::{Policy, RunConfig, SeedTree, Simulation, canonical_hash};
+use ledger_sim::{canonical_hash, Policy, RunConfig, SeedTree, Simulation};
 use std::collections::HashSet;
 
 /// Opt-in cross-round state for the stateful campaign variants.
@@ -47,25 +47,21 @@ impl CampaignPersist {
     /// via the trait defaults. An artifact whose state key, resolved engine,
     /// or run-config hash does not match the solver fails loudly instead of
     /// pre-warming with foreign state.
-    pub(super) fn resume_into(&self, solver: &mut dyn FaultSolver) -> Result<(), String> {
-        let artifacts = load_solver_state(&self.journal)
-            .map_err(|error| format!("campaign solver-state load: {error}"))?;
+    pub(super) fn resume_into(&self, solver: &mut dyn FaultSolver) -> Result<(), SearchError> {
+        let artifacts = load_solver_state(&self.journal)?;
         for artifact in &artifacts {
-            solver
-                .warm_from_artifact(artifact)
-                .map_err(|error| format!("campaign solver-state warm: {error}"))?;
+            solver.warm_from_artifact(artifact)?;
         }
         Ok(())
     }
 
     /// Persist `solver`'s cache state. Identical states dedup by content
     /// address, so repeated saves never grow the internal journal.
-    pub(super) fn persist_from(&mut self, solver: &dyn FaultSolver) -> Result<(), String> {
+    pub(super) fn persist_from(&mut self, solver: &dyn FaultSolver) -> Result<(), SearchError> {
         let Some(artifact) = solver.snapshot_state() else {
             return Ok(());
         };
-        save_solver_state(&mut self.journal, CAMPAIGN_PERSIST_ACTOR, &artifact)
-            .map_err(|error| format!("campaign solver-state persist: {error}"))?;
+        save_solver_state(&mut self.journal, CAMPAIGN_PERSIST_ACTOR, &artifact)?;
         Ok(())
     }
 }
@@ -78,7 +74,7 @@ pub fn run_joint_campaign<W: Workload, O: Oracle>(
     oracle: &O,
     base: RunConfig,
     attempts: usize,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     run_joint_campaign_with_state(workload, oracle, base, attempts, None)
 }
 
@@ -101,7 +97,7 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
     base: RunConfig,
     attempts: usize,
     mut state: Option<&mut CampaignPersist>,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     let mut distinct_roots: HashSet<Hash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
@@ -125,23 +121,19 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
         // for the joint generator. The canonical run-config hash joins the
         // solver keys so state persisted under one run config never pre-warms
         // a campaign under another.
-        let run_config_hash =
-            canonical_hash(&base).map_err(|error| format!("canonical run-config hash: {error}"))?;
+        let run_config_hash = canonical_hash(&base)?;
         let base_cfg = HittingSetSolver::new().config().clone();
         let cfg = SolverConfig {
             input_class: Some(gen_id("joint")),
             run_config_hash: Some(run_config_hash),
             ..base_cfg
         };
-        let encoded = encode_hazard(&finding.run.journal, &finding.verdict, &cfg)
-            .map_err(|error| format!("ldfi encode: {error}"))?;
+        let encoded = encode_hazard(&finding.run.journal, &finding.verdict, &cfg)?;
         let mut solver = select_solver(&cfg, &encoded);
         if let Some(shared) = state.as_deref_mut() {
             shared.resume_into(solver.as_mut())?;
         }
-        let hypotheses = solver
-            .solve(&finding.run.journal, &finding.verdict)
-            .map_err(|error| format!("ldfi solve: {error}"))?;
+        let hypotheses = solver.solve(&finding.run.journal, &finding.verdict)?;
         if let Some(shared) = state.as_deref_mut() {
             shared.persist_from(solver.as_ref())?;
         }
@@ -186,11 +178,12 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
             perturbed.swap(pivot, pivot + 1);
         }
 
-        let mut config = base.clone();
-        *config.seed_mut() = attempt_seed;
-        *config.policy_mut() = Policy::Replay;
-        *config.fault_schedule_mut() = schedule.clone();
-        *config.max_steps_mut() = perturbed.len().saturating_add(256);
+        let config = base
+            .clone()
+            .with_seed(attempt_seed)
+            .with_policy(Policy::Replay)
+            .with_fault_schedule(schedule.clone())
+            .with_max_steps(perturbed.len().saturating_add(256));
 
         let key = memo_key(
             &Policy::Replay,
@@ -206,9 +199,8 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
             continue;
         }
 
-        let run = Simulation::with_replay(config.clone(), joint_workload.programs(), perturbed)
-            .run()
-            .map_err(|error| format!("joint simulation failed: {error:?}"))?;
+        let run =
+            Simulation::with_replay(config.clone(), joint_workload.programs(), perturbed).run()?;
 
         let root = run.journal.root_hash();
         let distinct = !distinct_roots.contains(&root);
