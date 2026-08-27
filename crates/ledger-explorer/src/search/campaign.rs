@@ -1,3 +1,4 @@
+use super::SearchError;
 use crate::monitor::{MonitorOracle, OnlineMonitor};
 use crate::oracle::{Oracle, Verdict};
 use crate::pbt::InputsWorkload;
@@ -95,16 +96,15 @@ pub fn run_campaign<W: Workload, O: Oracle>(
     oracle: &O,
     base: RunConfig,
     attempts: usize,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     let mut distinct_roots: HashSet<Hash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
 
     for attempt in 0..attempts {
-        let mut config = base.clone();
-        config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
-        let run = Simulation::new(config.clone(), workload.programs())
-            .run()
-            .map_err(|error| format!("simulation failed: {error:?}"))?;
+        let mut seed = base.seed();
+        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let config = base.clone().with_seed(seed);
+        let run = Simulation::new(config.clone(), workload.programs()).run()?;
 
         distinct_roots.insert(run.journal.root_hash());
         let verdict = super::effective_verdict(&run, oracle.check(&run));
@@ -160,7 +160,7 @@ pub fn run_monitored_campaign<W: Workload, O: Oracle>(
     base: RunConfig,
     monitors: Vec<Box<dyn OnlineMonitor>>,
     attempts: usize,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     let monitor_names = monitors
         .iter()
         .map(|monitor| monitor.name().to_string())
@@ -174,11 +174,17 @@ pub fn run_monitored_campaign<W: Workload, O: Oracle>(
     let mut findings: Vec<Finding> = Vec::new();
 
     for attempt in 0..attempts {
-        let mut config = base.clone();
-        config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let mut seed = base.seed();
+        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let config = base.clone().with_seed(seed);
+        // Reset monitors before the mid-run delta feed so each attempt
+        // starts from a clean state; the shared monitors are also used by
+        // the post-run oracle, which resets again at check time.
+        monitor_oracle.reset();
+        let step_monitor = monitor_oracle.to_step_monitor();
         let run = Simulation::new(config.clone(), workload.programs())
-            .run()
-            .map_err(|error| format!("simulation failed: {error:?}"))?;
+            .with_step_monitor(step_monitor)
+            .run()?;
 
         distinct_roots.insert(run.journal.root_hash());
         let primary = super::effective_verdict(&run, oracle.check(&run));
@@ -208,7 +214,7 @@ pub fn search<W: Workload, O: Oracle>(
     oracle: &O,
     base: RunConfig,
     attempts: usize,
-) -> Result<Option<Finding>, String> {
+) -> Result<Option<Finding>, SearchError> {
     super::find_first_violation(workload, oracle, &base, attempts).map(|(finding, _)| finding)
 }
 
@@ -259,5 +265,112 @@ mod liveness_tests {
             !report.findings[0].verdict.witnesses.is_empty(),
             "liveness findings carry journal witnesses"
         );
+    }
+
+    #[test]
+    fn monitor_halt_becomes_liveness_style_finding() {
+        use ledger_format::{EntryKind, Payload};
+        use ledger_journal::Journal;
+        // Effective verdict must treat MonitorHalt as a liveness-style
+        // violation with a journal-tail witness.
+        let mut journal = Journal::new();
+        journal
+            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .unwrap();
+        let run = ledger_sim::RunResult {
+            outcome: ledger_sim::RunOutcome::MonitorHalt("test halt".into()),
+            journal_error: None,
+            journal,
+            decisions: vec![0],
+            trace: Vec::new(),
+            registers: vec![0],
+            steps: 1,
+            monitor_issues: Vec::new(),
+            applied_faults: Vec::new(),
+            origins: Vec::new(),
+            protection: ledger_sim::BeltStatus::NotArmed,
+        };
+        let verdict = super::super::effective_verdict(&run, Verdict::pass());
+        assert!(verdict.violated, "MonitorHalt must be a finding");
+        assert!(
+            verdict.reason.contains("monitor halt"),
+            "reason must name monitor halt: {}",
+            verdict.reason
+        );
+        assert!(
+            verdict.reason.contains("test halt"),
+            "reason must carry halt reason: {}",
+            verdict.reason
+        );
+        assert!(!verdict.witnesses.is_empty());
+    }
+
+    #[test]
+    fn monitored_campaign_halts_violating_runs_mid_step() {
+        use crate::monitor::SafetyMonitor;
+        use ledger_format::{EntryKind, Payload};
+        use ledger_journal::Entry;
+        struct ViolatingWorkload;
+        impl Workload for ViolatingWorkload {
+            fn programs(&self) -> Vec<Vec<Instruction>> {
+                vec![vec![
+                    Instruction::Set(99),
+                    Instruction::Outcome,
+                    Instruction::Done,
+                ]]
+            }
+            fn history(&self, _run: &RunResult) -> Vec<crate::oracle::HistoryOperation> {
+                Vec::new()
+            }
+        }
+        struct PassOracle;
+        impl Oracle for PassOracle {
+            fn check(&self, _run: &ledger_sim::RunResult) -> Verdict {
+                Verdict::pass()
+            }
+        }
+        // Halt when Outcome payload is 99.
+        let monitor = SafetyMonitor::new(
+            |entry: &Entry| {
+                if entry.data.kind == EntryKind::Outcome {
+                    !matches!(&entry.data.payload, Payload::Number(99))
+                } else {
+                    true
+                }
+            },
+            "outcome 99 forbidden",
+        );
+        let base = RunConfig::builder().seed([7; 32]).max_steps(64).build();
+        let report = run_monitored_campaign(
+            &ViolatingWorkload,
+            &PassOracle,
+            base,
+            vec![Box::new(monitor)],
+            2,
+        )
+        .expect("monitored campaign");
+        assert_eq!(
+            report.findings.len(),
+            2,
+            "every attempt must halt via the mid-run monitor"
+        );
+        for finding in &report.findings {
+            assert!(finding.verdict.violated);
+            assert!(
+                finding.verdict.reason.contains("monitor"),
+                "verdict must name monitor: {}",
+                finding.verdict.reason
+            );
+            // The halted run's outcome must be MonitorHalt, and steps must be
+            // bounded strictly below max.
+            assert!(
+                matches!(finding.run.outcome, ledger_sim::RunOutcome::MonitorHalt(_)),
+                "run outcome must be MonitorHalt, got {:?}",
+                finding.run.outcome
+            );
+            assert!(finding.run.steps < 64);
+            assert!(!finding.run.journal.entries().collect::<Vec<_>>().is_empty());
+        }
+        assert_eq!(report.monitors, vec!["safety".to_string()]);
     }
 }
