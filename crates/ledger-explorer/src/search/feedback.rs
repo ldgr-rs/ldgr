@@ -1,9 +1,11 @@
 use super::{
-    CampaignPersist, CampaignReport, Finding, Workload, fault_injection_target, replay_with_faults,
+    CampaignPersist, CampaignReport, Finding, SearchError, Workload, fault_injection_target,
+    replay_with_faults,
 };
 use crate::ldfi::{hypothesis_to_schedule, solve_with};
 use crate::maxsat::encode_hazard;
 use crate::oracle::Oracle;
+use crate::search::replay::FaultReplayError;
 use crate::solver::{SolverConfig, select_solver};
 use ledger_format::Hash;
 use ledger_sim::{RunConfig, SimFault, Simulation, canonical_hash};
@@ -78,12 +80,58 @@ pub fn escalate(injection: &SimFault) -> Option<SimFault> {
 /// Run the feedback reproduction campaign without cross-campaign state.
 ///
 /// See [`run_feedback_campaign_with_state`] for the stateful variant.
+/// Rebuild one feedback schedule: drop suppressed or voided injections,
+/// replace targets with their escalated fault, and finish in the canonical
+/// `Ord` order so the schedule stays deterministic.
+fn rebuild_schedule(
+    base: Vec<SimFault>,
+    suppressed: &BTreeSet<Hash>,
+    voided: &BTreeSet<SimFault>,
+    escalated: &BTreeMap<Hash, SimFault>,
+) -> Vec<SimFault> {
+    let base: Vec<SimFault> = base
+        .into_iter()
+        .filter(|injection| match fault_injection_target(injection) {
+            Some(hash) => !suppressed.contains(&hash),
+            None => !voided.contains(injection),
+        })
+        .collect();
+    let mut seen_targets: BTreeSet<Hash> = BTreeSet::new();
+    let mut rebuilt: Vec<SimFault> = Vec::with_capacity(base.len());
+    for injection in base {
+        if let Some(hash) = fault_injection_target(&injection) {
+            if let Some(esc) = escalated.get(&hash)
+                && seen_targets.insert(hash)
+            {
+                rebuilt.push(esc.clone());
+                continue;
+            }
+            if seen_targets.contains(&hash) {
+                continue;
+            }
+            seen_targets.insert(hash);
+        }
+        rebuilt.push(injection);
+    }
+    for (hash, esc) in escalated {
+        let present = rebuilt
+            .iter()
+            .any(|injection| fault_injection_target(injection) == Some(*hash));
+        if !present && !suppressed.contains(hash) {
+            rebuilt.push(esc.clone());
+        }
+    }
+    rebuilt.sort();
+    rebuilt.dedup();
+    rebuilt
+}
+
 pub fn run_feedback_campaign<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
     base: RunConfig,
     attempts: usize,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     run_feedback_campaign_with_state(workload, oracle, base, attempts, None)
 }
 
@@ -105,7 +153,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
     base: RunConfig,
     attempts: usize,
     mut state: Option<&mut CampaignPersist>,
-) -> Result<CampaignReport, String> {
+) -> Result<CampaignReport, SearchError> {
     if attempts == 0 {
         return Ok(CampaignReport {
             runs_executed: 0,
@@ -129,11 +177,10 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         if search_runs >= budget && budget > 0 {
             break;
         }
-        let mut config = base.clone();
-        config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
-        let run = Simulation::new(config.clone(), workload.programs())
-            .run()
-            .map_err(|error| format!("simulation failed: {error:?}"))?;
+        let mut seed = base.seed();
+        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let config = base.clone().with_seed(seed);
+        let run = Simulation::new(config.clone(), workload.programs()).run()?;
         distinct_roots.insert(run.journal.root_hash());
         variants.push(format!("attempt={attempt} policy=feedback-search"));
         search_runs += 1;
@@ -181,21 +228,18 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
     // pre-warms this solver from prior rounds and stores this round's caches.
     // The canonical run-config hash joins the solver keys, so artifacts
     // persisted under another run config never pre-warm this campaign.
-    let run_config_hash =
-        canonical_hash(&base).map_err(|error| format!("canonical run-config hash: {error}"))?;
+    let run_config_hash = canonical_hash(&base)?;
     let cfg = SolverConfig {
         max_horizon: Some(64),
         run_config_hash: Some(run_config_hash),
         ..SolverConfig::default()
     };
-    let encoded = encode_hazard(&finding.run.journal, &finding.verdict, &cfg)
-        .map_err(|error| format!("ldfi encode: {error}"))?;
+    let encoded = encode_hazard(&finding.run.journal, &finding.verdict, &cfg)?;
     let mut ldfi_solver = select_solver(&cfg, &encoded);
     if let Some(shared) = state.as_deref_mut() {
         shared.resume_into(ldfi_solver.as_mut())?;
     }
-    let hypotheses = solve_with(ldfi_solver.as_mut(), &finding.run.journal, &finding.verdict)
-        .map_err(|error| format!("ldfi solve: {error}"))?;
+    let hypotheses = solve_with(ldfi_solver.as_mut(), &finding.run.journal, &finding.verdict)?;
     if let Some(shared) = state.as_deref_mut() {
         shared.persist_from(ldfi_solver.as_ref())?;
     }
@@ -203,35 +247,83 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         .first()
         .map(|hyp| hypothesis_to_schedule(hyp, &finding.run.journal))
         .unwrap_or_default();
-    // Deterministic initial sort.
-    schedule.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-    // Deduplicate deterministically.
-    {
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        let mut deduped = Vec::new();
-        for inj in schedule {
-            let key = format!("{inj:?}");
-            if seen.insert(key) {
-                deduped.push(inj);
-            }
-        }
-        schedule = deduped;
-    }
+    // Canonical deterministic order from the derived `Ord` on `SimFault`.
+    schedule.sort();
+    schedule.dedup();
 
     let mut suppressed: BTreeSet<Hash> = BTreeSet::new();
-    let mut voided_sigs: BTreeSet<String> = BTreeSet::new();
+    let mut voided_sigs: BTreeSet<SimFault> = BTreeSet::new();
     let mut escalated_map: BTreeMap<Hash, SimFault> = BTreeMap::new();
     let mut feedback_executed: usize = 0;
 
     for round in 0..remaining {
-        let report = replay_with_faults(
+        let report_res = replay_with_faults(
             workload,
             &finding.run.journal,
             finding.seed,
             finding.run.decisions.clone(),
             schedule.clone(),
-        )?;
-
+        );
+        let report = match report_res {
+            Ok(report) => report,
+            Err(FaultReplayError::StrictReplay(_)) => {
+                // Strict replay surfaces ready-set drift as a typed
+                // violation instead of normalizing it. For fault injection
+                // this drift is expected after the first fault diverges the
+                // ready set, so treat it as a non-reproducing attempt and
+                // continue the feedback loop rather than failing the campaign.
+                // Mark the whole schedule voided for the suppression loop.
+                for injection in &schedule {
+                    if let Some(hash) = fault_injection_target(injection) {
+                        suppressed.insert(hash);
+                    } else {
+                        voided_sigs.insert(injection.clone());
+                    }
+                }
+                variants.push(format!(
+                    "round={round} applied=0 voided={} escalated=none suppressed={} strict_violation",
+                    schedule.len(),
+                    suppressed.len()
+                ));
+                // Use a synthetic root for distinct counting so the
+                // violation still contributes deterministically. The round
+                // number fills the full width so late rounds cannot collide
+                // with earlier ones.
+                let mut synthetic = [0u8; 32];
+                synthetic[..8].copy_from_slice(&round.to_le_bytes());
+                distinct_roots.insert(synthetic);
+                feedback_executed += 1;
+                // Re-solve for the next round with the updated suppression.
+                let mut round_solver = select_solver(&cfg, &encoded);
+                if let Some(shared) = state.as_deref_mut() {
+                    shared.resume_into(round_solver.as_mut())?;
+                }
+                let hyps = solve_with(
+                    round_solver.as_mut(),
+                    &finding.run.journal,
+                    &finding.verdict,
+                )?;
+                if let Some(shared) = state.as_deref_mut() {
+                    shared.persist_from(round_solver.as_ref())?;
+                }
+                let filtered: Vec<_> = hyps
+                    .into_iter()
+                    .filter(|hyp| !hyp.events.iter().any(|event| suppressed.contains(event)))
+                    .collect();
+                let next_base_schedule = filtered
+                    .first()
+                    .map(|hyp| hypothesis_to_schedule(hyp, &finding.run.journal))
+                    .unwrap_or_default();
+                schedule = rebuild_schedule(
+                    next_base_schedule,
+                    &suppressed,
+                    &voided_sigs,
+                    &escalated_map,
+                );
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let applied = report.applied.clone();
         let voided = report.voided.clone();
 
@@ -239,7 +331,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
             if let Some(hash) = fault_injection_target(inj) {
                 suppressed.insert(hash);
             } else {
-                voided_sigs.insert(format!("{inj:?}"));
+                voided_sigs.insert(inj.clone());
             }
         }
 
@@ -297,8 +389,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
             round_solver.as_mut(),
             &finding.run.journal,
             &finding.verdict,
-        )
-        .map_err(|error| format!("ldfi solve: {error}"))?;
+        )?;
         if let Some(shared) = state.as_deref_mut() {
             shared.persist_from(round_solver.as_ref())?;
         }
@@ -306,58 +397,17 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
             .into_iter()
             .filter(|hyp| !hyp.events.iter().any(|event| suppressed.contains(event)))
             .collect();
-        let mut next_base_schedule = filtered
+        let next_base_schedule = filtered
             .first()
             .map(|hyp| hypothesis_to_schedule(hyp, &finding.run.journal))
             .unwrap_or_default();
 
-        // Drop suppressed / voided from rebuilt schedule.
-        next_base_schedule.retain(|inj| {
-            if let Some(hash) = fault_injection_target(inj) {
-                !suppressed.contains(&hash)
-            } else {
-                !voided_sigs.contains(&format!("{inj:?}"))
-            }
-        });
-
-        // Apply escalations: replace or add.
-        let mut next_schedule_vec: Vec<SimFault> = Vec::new();
-        let mut seen_targets: BTreeSet<Hash> = BTreeSet::new();
-        for inj in next_base_schedule {
-            if let Some(hash) = fault_injection_target(&inj) {
-                if let Some(esc) = next_escalated_map.get(&hash)
-                    && seen_targets.insert(hash)
-                {
-                    next_schedule_vec.push(esc.clone());
-                    continue;
-                }
-                if seen_targets.contains(&hash) {
-                    continue;
-                }
-                seen_targets.insert(hash);
-            }
-            next_schedule_vec.push(inj);
-        }
-        for (hash, esc) in &next_escalated_map {
-            let present = next_schedule_vec
-                .iter()
-                .any(|inj| fault_injection_target(inj) == Some(*hash));
-            if !present && !suppressed.contains(hash) {
-                next_schedule_vec.push(esc.clone());
-            }
-        }
-
-        // Deterministic sort and dedup.
-        next_schedule_vec.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        let mut deduped_next: Vec<SimFault> = Vec::new();
-        let mut seen_keys: BTreeSet<String> = BTreeSet::new();
-        for inj in next_schedule_vec {
-            let key = format!("{inj:?}");
-            if seen_keys.insert(key) {
-                deduped_next.push(inj);
-            }
-        }
-        schedule = deduped_next;
+        schedule = rebuild_schedule(
+            next_base_schedule,
+            &suppressed,
+            &voided_sigs,
+            &next_escalated_map,
+        );
         escalated_map = next_escalated_map;
     }
 
