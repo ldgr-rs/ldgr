@@ -175,6 +175,7 @@ impl From<ledger_sim::RunOutcome> for RunCompletion {
             ledger_sim::RunOutcome::Completed => Self::Completed,
             ledger_sim::RunOutcome::BudgetExhausted => Self::BudgetExhausted,
             ledger_sim::RunOutcome::Blocked => Self::Blocked,
+            ledger_sim::RunOutcome::MonitorHalt(_) => Self::Blocked,
         }
     }
 }
@@ -279,6 +280,93 @@ impl core::error::Error for IpcFault {
     }
 }
 
+/// Belt activation failed or the belt is not active while required.
+#[derive(Debug)]
+pub struct BeltFault {
+    message: Box<str>,
+    source: Option<Box<dyn core::error::Error + Send + Sync>>,
+}
+
+impl BeltFault {
+    /// Build from a description when the typed cause is unavailable.
+    pub fn from_message(message: impl Into<Box<str>>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Preserve the typed belt status.
+    #[cfg(feature = "sim-link")]
+    pub(crate) fn from_belt_status(status: ledger_sim::BeltStatus) -> Self {
+        Self {
+            message: status.to_string().into(),
+            source: None,
+        }
+    }
+
+    /// Description carried by this fault.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl core::fmt::Display for BeltFault {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl core::error::Error for BeltFault {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        let source: &(dyn core::error::Error + 'static) = self.source.as_deref()?;
+        Some(source)
+    }
+}
+
+/// Local mirror of the engine strict-replay violation. It keeps the engine
+/// type out of this crate's public API outside the `sim-link` feature, so
+/// the dependency stays optional and the license graph unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum StrictReplayViolation {
+    /// Decision value is outside the ready set.
+    #[error("decision {value} at step {step} is outside the ready set of {ready_len} tasks")]
+    OutOfRange {
+        step: usize,
+        value: usize,
+        ready_len: usize,
+    },
+    /// Replay stream exhausted before the run finished.
+    #[error("replay exhausted at step {step} after {replay_len} decisions")]
+    Exhausted { step: usize, replay_len: usize },
+    /// Replay is longer than the run; leftover decisions remain.
+    #[error("replay carries {trailing} trailing decisions for {steps} steps")]
+    Trailing { trailing: usize, steps: usize },
+}
+
+#[cfg(feature = "sim-link")]
+impl From<ledger_sim::ReplayViolation> for StrictReplayViolation {
+    fn from(violation: ledger_sim::ReplayViolation) -> Self {
+        match violation {
+            ledger_sim::ReplayViolation::OutOfRange {
+                step,
+                value,
+                ready_len,
+            } => Self::OutOfRange {
+                step,
+                value,
+                ready_len,
+            },
+            ledger_sim::ReplayViolation::Exhausted { step, replay_len } => {
+                Self::Exhausted { step, replay_len }
+            }
+            ledger_sim::ReplayViolation::Trailing { trailing, steps } => {
+                Self::Trailing { trailing, steps }
+            }
+        }
+    }
+}
+
 /// Errors from [`run`] and [`run_named`].
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -287,6 +375,9 @@ pub enum RuntimeError {
     /// Journal invariant failed during a simulated run.
     #[error("journal error: {0}")]
     Journal(JournalFault),
+    /// Belt activation failed or the belt is not active while required.
+    #[error("belt error: {0}")]
+    Belt(BeltFault),
     /// Engine-process transport failure (spawn, connect, wire, timeout).
     #[error("ipc error: {0}")]
     Ipc(IpcFault),
@@ -296,6 +387,10 @@ pub enum RuntimeError {
     /// A named workload was requested that no backend registry holds.
     #[error("no workload registered under {name:?}")]
     UnknownWorkload { name: Box<str> },
+    /// Strict replay rejected the recorded decisions instead of
+    /// normalizing or falling back.
+    #[error("strict replay rejected: {0}")]
+    StrictReplay(#[source] StrictReplayViolation),
     /// A caller program cannot cross the IPC process boundary. Rebuild with
     /// `sim-link` for in-process deterministic execution, or run a registered
     /// server workload by name with [`run_named`] (for example `"kv"`).
@@ -745,6 +840,12 @@ fn run_with_sim(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError
         ledger_sim::RuntimeError::StepLimit { limit } => RuntimeError::StepLimit { limit },
         ledger_sim::RuntimeError::Journal(err) => {
             RuntimeError::Journal(JournalFault::from_journal_error(err))
+        }
+        ledger_sim::RuntimeError::StrictReplay(violation) => {
+            RuntimeError::StrictReplay(violation.into())
+        }
+        ledger_sim::RuntimeError::Belt(status) => {
+            RuntimeError::Belt(BeltFault::from_belt_status(status))
         }
     })?;
     clear_current();
