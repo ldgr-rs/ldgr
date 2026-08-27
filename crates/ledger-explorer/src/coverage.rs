@@ -67,7 +67,7 @@ impl CoverageBuilder {
 
     /// Record a root hash for one run.
     pub fn record(&mut self, root: Hash, run_index: usize, finding: bool) {
-        let hex = crate::certs::hash_to_hex(&root);
+        let hex = ledger_format::hash_to_hex(&root);
         self.records.push(RootRecord {
             root_hex: hex,
             run_index,
@@ -77,13 +77,25 @@ impl CoverageBuilder {
 
     /// Record a pre-encoded hex string for one run.
     ///
-    /// The hex must be 64 lowercase hex chars; this is validated on use.
-    pub fn record_hex(&mut self, root_hex: String, run_index: usize, finding: bool) {
+    /// The hex must be 64 lowercase hex digits, otherwise an error is returned.
+    pub fn record_hex(
+        &mut self,
+        root_hex: String,
+        run_index: usize,
+        finding: bool,
+    ) -> Result<(), CovError> {
+        if root_hex.len() != 64 || !root_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(CovError::Serialization(format!(
+                "root_hex must be 64 hex chars, got {}",
+                root_hex.len()
+            )));
+        }
         self.records.push(RootRecord {
-            root_hex,
+            root_hex: root_hex.to_ascii_lowercase(),
             run_index,
             finding,
         });
+        Ok(())
     }
 
     /// Number of records accumulated so far.
@@ -122,15 +134,7 @@ impl CoverageBuilder {
         } else {
             total_runs
         };
-        let distinct_roots = if distinct == 0 && total == 0 {
-            0
-        } else if distinct == 0 {
-            // No records but caller may have run attempts without distinct tracking.
-            // Prefer distinct passed via report in from_campaign; here leave zero.
-            0
-        } else {
-            distinct
-        };
+        let distinct_roots = distinct;
         CoverageReport {
             total_runs: total,
             distinct_roots,
@@ -138,11 +142,6 @@ impl CoverageBuilder {
             roots: self.records,
         }
     }
-}
-
-/// Free function form of [`CoverageBuilder::record`].
-pub fn record(root: Hash, run_index: usize, finding: bool, acc: &mut CoverageBuilder) {
-    acc.record(root, run_index, finding);
 }
 
 impl CoverageReport {
@@ -299,14 +298,17 @@ mod tests {
     }
 
     #[test]
-    fn free_record_function() {
+    fn builder_record_and_hex_validation() {
         let mut builder = CoverageBuilder::new();
-        record(hash_of(7), 0, true, &mut builder);
-        let report = builder.finish(1);
+        builder.record(hash_of(7), 0, true);
+        assert!(builder.record_hex("00".repeat(32), 1, false).is_ok());
+        assert!(builder.record_hex("invalid".to_string(), 2, false).is_err());
+        assert!(builder.record_hex("00".repeat(63), 3, false).is_err());
+        let report = builder.finish(2);
         assert_eq!(report.findings, 1);
         assert_eq!(
             report.roots[0].root_hex,
-            crate::certs::hash_to_hex(&hash_of(7))
+            ledger_format::hash_to_hex(&hash_of(7))
         );
     }
 
@@ -355,7 +357,7 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|message| message.contains(&crate::certs::hash_to_hex(&hash_of(9))))
+                .any(|message| message.contains(&ledger_format::hash_to_hex(&hash_of(9))))
         );
     }
 
@@ -457,8 +459,9 @@ mod tests {
             monitor_issues: Vec::new(),
             applied_faults: Vec::new(),
             origins: Vec::new(),
+            protection: ledger_sim::BeltStatus::NotArmed,
         };
-        let root_hex = crate::certs::hash_to_hex(&run.journal.root_hash());
+        let root_hex = ledger_format::hash_to_hex(&run.journal.root_hash());
         let report = CampaignReport {
             runs_executed: 5,
             distinct_roots: 3,
