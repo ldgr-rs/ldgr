@@ -18,6 +18,7 @@ getrandom.workspace = true
 libc = { workspace = true, optional = true }
 ledger-format = { path = "../ledger-format" }
 ledger-journal = { path = "../ledger-journal" }
+thiserror = { workspace = true }
 
 [build-dependencies]
 cc = "1"
