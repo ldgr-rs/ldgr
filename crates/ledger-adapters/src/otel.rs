@@ -9,31 +9,16 @@
 //!
 //! This module implements a true Layer-A lineage pipeline:
 //! - content-addressed deduplication by the full-span content hash
-//!   (`span_content_hash`: trace_id, span_id, name, parent_span_id, events)
-//!   via `HashMap<Hash, ()>` so duplicate traces (LazyMOP 99% dup) execute
-//!   once,
-//! - parent causality preservation: if `OtelSpan::parent_span_id` is set, the
-//!   child's journal entry includes the parent entry hash as an observed
-//!   parent (lookup via `HashMap<span_id, Hash>`), so lineage is preserved
-//!   and the VC is approximate but causally faithful,
-//! - canonical topological ordering (`topo_order_spans`): spans are appended
-//!   dependency-first, so a child that appears before its parent in the
-//!   input keeps its causal edge; cycle members fall back to input order
-//!   and are rejected for `BitExact`,
-//! - fidelity enforcement: `BitExact` requires every referenced parent to be
-//!   present somewhere in the batch and no parent cycles; otherwise
-//!   `FidelityMismatch` is returned,
-//! - host-daemon file ingest (`ingest_otel_file`) reads newline-delimited JSON
-//!   spans via `std::fs` (allowed here as the host daemon path, analogous
-//!   to `TokioBackend`).
-//!
-//! Determinism: same spans in same order produce same journal root and same
-//! envelope hash after dedup. Reordered acyclic batches preserve every
-//! causal edge via topological ordering; only causally independent spans
-//! may permute the output.
+//!   (`span_content_hash`: trace_id, span_id, name, parent_span_id, events,
+//!   attributes) via `HashMap<Hash, ()>` so duplicate traces execute once,
+//! - parent causality preservation via topo ordering, child before parent
+//!   still resolves,
+//! - canonical topological ordering with bounded cycle diagnostics,
+//! - fidelity enforcement and attribute limits,
+//! - host-daemon file ingest with streaming caps.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::envelope::{EntryMapping, EnvelopeHeader, Fidelity, InterchangeEnvelope};
@@ -51,9 +36,10 @@ pub struct OtelEvent {
 ///
 /// `parent_span_id` preserves OTel causality in the journal: when set,
 /// the child's journal entry includes the parent entry's hash as an
-/// observed parent (approximate VC). Serde defaults to `None` so JSON
-/// without the field still parses.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// observed parent. `attributes` holds span attributes for limit
+/// enforcement and dedup hashing. Serde defaults keep JSON without the
+/// field parsing.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OtelSpan {
     pub trace_id: String,
     pub span_id: String,
@@ -61,6 +47,8 @@ pub struct OtelSpan {
     pub parent_span_id: Option<String>,
     pub name: String,
     pub events: Vec<OtelEvent>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
 }
 
 /// Config for the Layer-A dedup pipeline.
@@ -72,6 +60,14 @@ pub struct OtelIngestConfig {
     pub dedup: bool,
     /// Maximum number of spans accepted.
     pub max_spans: usize,
+    /// Maximum total bytes for file ingest (default 256 MiB).
+    pub max_bytes: usize,
+    /// Maximum bytes per NDJSON line (default 1 MiB).
+    pub max_line_bytes: usize,
+    /// Maximum attributes per span (default 4096).
+    pub max_attributes_per_span: usize,
+    /// Maximum total attribute bytes per span (default 256 KiB).
+    pub max_attribute_bytes_total: usize,
 }
 
 impl Default for OtelIngestConfig {
@@ -80,17 +76,22 @@ impl Default for OtelIngestConfig {
             fidelity: Fidelity::LineageOnly,
             dedup: true,
             max_spans: 100_000,
+            max_bytes: 256 * 1024 * 1024,
+            max_line_bytes: 1024 * 1024,
+            max_attributes_per_span: 4096,
+            max_attribute_bytes_total: 256 * 1024,
         }
     }
 }
 
 impl OtelIngestConfig {
-    /// Create a new config.
+    /// Create a new config with defaults for byte and attribute limits.
     pub fn new(fidelity: Fidelity, dedup: bool, max_spans: usize) -> Self {
         Self {
             fidelity,
             dedup,
             max_spans,
+            ..Self::default()
         }
     }
 }
@@ -106,8 +107,7 @@ fn hash_field(hasher: &mut blake3::Hasher, field: &[u8]) {
 /// length-prefixed `trace_id`, `span_id`, `name`, then the
 /// `parent_span_id` state (absent marker byte, or present marker byte plus
 /// length-prefixed value), then a canonical digest of the event sequence
-/// (each event contributes its length-prefixed name, the only event content
-/// [`OtelEvent`] carries). Length prefixes keep the encoding injective;
+/// and sorted attributes. Length prefixes keep the encoding injective;
 /// identical span content always yields an identical hash.
 fn span_content_hash(span: &OtelSpan) -> Hash {
     let mut hasher = blake3::Hasher::new();
@@ -128,14 +128,21 @@ fn span_content_hash(span: &OtelSpan) -> Hash {
         hash_field(&mut events, event.name.as_bytes());
     }
     hash_field(&mut hasher, events.finalize().as_bytes());
+    // attributes sorted via BTreeMap for determinism
+    let mut attr_hasher = blake3::Hasher::new();
+    for (k, v) in &span.attributes {
+        hash_field(&mut attr_hasher, k.as_bytes());
+        hash_field(&mut attr_hasher, v.as_bytes());
+    }
+    hash_field(&mut hasher, attr_hasher.finalize().as_bytes());
     *hasher.finalize().as_bytes()
 }
 
 /// True if any span references a `parent_span_id` that is not present in
 /// the batch-wide set of span ids. Batch-wide membership means forward
-/// references never trigger this check; they resolve after
-/// [`topo_order_spans`] reordering. A dangling parent makes the VC
-/// non-deterministic, so the batch is not BitExact-certifiable.
+/// references never trigger this check; they resolve after topological
+/// reordering. A dangling parent makes the VC non-deterministic, so the
+/// batch is not BitExact-certifiable.
 fn has_missing_parent(spans: &[OtelSpan]) -> bool {
     let ids: HashSet<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
     spans.iter().any(|s| {
@@ -159,13 +166,10 @@ fn has_missing_parent(spans: &[OtelSpan]) -> bool {
 /// they are appended in input order after the acyclic prefix, so the
 /// result always has `spans.len()` entries.
 pub fn topo_order_spans(spans: &[OtelSpan]) -> Vec<usize> {
-    let n = spans.len();
-    let (mut order, emitted) = kahn_emission(spans);
-    if emitted < n {
-        // Cycle members trail in input order so callers still receive
-        // every index exactly once.
+    let (mut order, emitted) = topo_order_with_count(spans);
+    if emitted < spans.len() {
         let done: HashSet<usize> = order.iter().copied().collect();
-        for i in 0..n {
+        for i in 0..spans.len() {
             if !done.contains(&i) {
                 order.push(i);
             }
@@ -174,9 +178,12 @@ pub fn topo_order_spans(spans: &[OtelSpan]) -> Vec<usize> {
     order
 }
 
-/// True if the batch contains a parent cycle, self-parents included.
-fn has_parent_cycle(spans: &[OtelSpan]) -> bool {
-    kahn_emission(spans).1 != spans.len()
+/// Crate-private ordering helper built on `kahn_emission`.
+///
+/// Returns the dependency-first emission order and the emitted count.
+/// Callers must check `emitted != spans.len()` to detect cycles.
+pub(crate) fn topo_order_with_count(spans: &[OtelSpan]) -> (Vec<usize>, usize) {
+    kahn_emission(spans)
 }
 
 /// Kahn emission over batch-local parent edges.
@@ -221,6 +228,59 @@ fn kahn_emission(spans: &[OtelSpan]) -> (Vec<usize>, usize) {
     (order, emitted)
 }
 
+/// Bounded diagnostic trail for cycles: ids of un-emitted spans capped at 32.
+fn bounded_trail(spans: &[OtelSpan], order: &[usize]) -> Vec<String> {
+    let emitted: HashSet<usize> = order.iter().copied().collect();
+    let mut trail = Vec::new();
+    for (idx, span) in spans.iter().enumerate() {
+        if !emitted.contains(&idx) {
+            trail.push(span.span_id.clone());
+            if trail.len() >= 32 {
+                break;
+            }
+        }
+    }
+    trail
+}
+
+/// Enforce attribute count and total bytes limits for a batch.
+///
+/// Returns `AttributeLimitExceeded` on first violation.
+fn check_attribute_limits(
+    spans: &[OtelSpan],
+    config: &OtelIngestConfig,
+) -> Result<(), AdapterError> {
+    for (idx, span) in spans.iter().enumerate() {
+        if span.attributes.len() > config.max_attributes_per_span {
+            return Err(AdapterError::AttributeLimitExceeded {
+                span_index: idx,
+                reason: format!(
+                    "attribute count {} exceeds limit {}",
+                    span.attributes.len(),
+                    config.max_attributes_per_span
+                ),
+            });
+        }
+        let total_bytes: usize = span.attributes.iter().map(|(k, v)| k.len() + v.len()).sum();
+        if total_bytes > config.max_attribute_bytes_total {
+            return Err(AdapterError::AttributeLimitExceeded {
+                span_index: idx,
+                reason: format!(
+                    "attribute bytes {total_bytes} exceeds limit {}",
+                    config.max_attribute_bytes_total
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate attributes using default limits for legacy paths.
+fn check_attributes_with_defaults(spans: &[OtelSpan]) -> Result<(), AdapterError> {
+    let cfg = OtelIngestConfig::default();
+    check_attribute_limits(spans, &cfg)
+}
+
 /// Ingest with explicit fidelity.
 ///
 /// The `fidelity` param is honoured: `LineageOnly` journals receive an
@@ -228,20 +288,26 @@ fn kahn_emission(spans: &[OtelSpan]) -> (Vec<usize>, usize) {
 /// The marker makes `Journal`-only consumers able to reject lineage-only
 /// data even if the wrapper is stripped.
 ///
-/// Validation mirrors the dedup pipeline: `BitExact` rejects missing parents
-/// and parent cycles with `FidelityMismatch`; `LineageOnly` stays lenient.
+/// Validation uses the shared ordering helper so forward parent edges
+/// resolve. Cycles are rejected with `CycleDetected` and a bounded trail.
 pub fn ingest_otel_with_fidelity(
     spans: Vec<OtelSpan>,
     fidelity: Fidelity,
 ) -> Result<Journal, AdapterError> {
-    if fidelity == Fidelity::BitExact && (has_missing_parent(&spans) || has_parent_cycle(&spans)) {
+    check_attributes_with_defaults(&spans)?;
+    if fidelity == Fidelity::BitExact && has_missing_parent(&spans) {
         return Err(AdapterError::FidelityMismatch);
     }
+    let (order, emitted) = topo_order_with_count(&spans);
+    if emitted != spans.len() {
+        let trail = bounded_trail(&spans, &order);
+        return Err(AdapterError::CycleDetected { trail });
+    }
     let mut journal = Journal::new();
-    // Preserve causality via parent lookup even in legacy path so
-    // behaviour is consistent with the dedup pipeline.
+    // Preserve causality via parent lookup; first-wins binding for duplicate ids.
     let mut span_id_to_hash: HashMap<String, Hash> = HashMap::new();
-    for span in &spans {
+    for &idx in &order {
+        let span = &spans[idx];
         let observed = span
             .parent_span_id
             .as_ref()
@@ -256,7 +322,7 @@ pub fn ingest_otel_with_fidelity(
                 Payload::Text(span.name.clone()),
             )
             .map_err(AdapterError::Journal)?;
-        span_id_to_hash.insert(span.span_id.clone(), hash);
+        span_id_to_hash.entry(span.span_id.clone()).or_insert(hash);
         for event in &span.events {
             journal
                 .append(EntryKind::Send, 1, [], Payload::Text(event.name.clone()))
@@ -274,19 +340,26 @@ pub fn ingest_otel_with_fidelity(
 /// (BLAKE3 over canonical bytes) and can be used for dedup. Callers
 /// must check `is_certifiable()` before producing certificates.
 ///
-/// Validation mirrors the dedup pipeline: `BitExact` rejects missing parents
-/// and parent cycles with `FidelityMismatch`; `LineageOnly` stays lenient.
+/// Validation uses the shared ordering helper so forward parent edges
+/// resolve. Cycles are rejected with `CycleDetected` and a bounded trail.
 pub fn ingest_otel_enveloped(
     spans: Vec<OtelSpan>,
     fidelity: Fidelity,
 ) -> Result<IngestedJournal, AdapterError> {
-    if fidelity == Fidelity::BitExact && (has_missing_parent(&spans) || has_parent_cycle(&spans)) {
+    check_attributes_with_defaults(&spans)?;
+    if fidelity == Fidelity::BitExact && has_missing_parent(&spans) {
         return Err(AdapterError::FidelityMismatch);
+    }
+    let (order, emitted) = topo_order_with_count(&spans);
+    if emitted != spans.len() {
+        let trail = bounded_trail(&spans, &order);
+        return Err(AdapterError::CycleDetected { trail });
     }
     let mut journal = Journal::new();
     let mut mappings = Vec::new();
     let mut span_id_to_hash: HashMap<String, Hash> = HashMap::new();
-    for span in &spans {
+    for &idx in &order {
+        let span = &spans[idx];
         let observed = span
             .parent_span_id
             .as_ref()
@@ -301,7 +374,7 @@ pub fn ingest_otel_enveloped(
                 Payload::Text(span.name.clone()),
             )
             .map_err(AdapterError::Journal)?;
-        span_id_to_hash.insert(span.span_id.clone(), hash);
+        span_id_to_hash.entry(span.span_id.clone()).or_insert(hash);
         mappings.push(EntryMapping {
             kind: EntryKind::Outcome.into(),
             external_type: "otel.span".to_string(),
@@ -328,20 +401,19 @@ pub fn ingest_otel_enveloped(
 /// Layer-A lineage pipeline with content-addressed dedup and fidelity enforcement.
 ///
 /// Deduplicates spans by the full-span content hash (`span_content_hash`:
-/// trace_id, span_id, name, parent_span_id, events) using
+/// trace_id, span_id, name, parent_span_id, events, attributes) using
 /// `HashMap<Hash, ()>` so duplicate traces (LazyMOP 99% dup) execute once.
 /// Dedup keeps the first occurrence in input order.
 ///
 /// Causality is preserved regardless of input order: spans are reordered
-/// dependency-first via [`topo_order_spans`] before the journal build, so a
+/// dependency-first via the shared helper before the journal build, so a
 /// child that appears before its parent still receives the parent entry
 /// hash as an observed parent. Parent lookup binds to the first occurrence
-/// of a duplicated `span_id`. Cycle members trail in input order and their
-/// unresolved parents drop out of the observed set.
+/// of a duplicated `span_id`. Cycles are rejected with `CycleDetected`.
 ///
 /// Fidelity is enforced: `BitExact` requires every referenced
 /// `parent_span_id` to exist somewhere in the batch (forward references
-/// resolve after reordering) and no parent cycles; otherwise returns
+/// resolve after reordering); otherwise returns
 /// `AdapterError::FidelityMismatch`.
 ///
 /// Determinism: same spans in same order produce the same journal root and
@@ -358,6 +430,7 @@ pub fn ingest_otel_dedup(
             limit: config.max_spans,
         });
     }
+    check_attribute_limits(&spans, &config)?;
 
     // Dedup phase: content-addressed by full-span hash.
     let deduped: Vec<OtelSpan> = if config.dedup {
@@ -376,20 +449,16 @@ pub fn ingest_otel_dedup(
         spans
     };
 
-    // Canonical dependency-first order and single Kahn pass for cycle check.
-    // Reuse the Kahn emission so BitExact validation does not run a second
-    // topological pass.
-    let (mut order, emitted) = kahn_emission(&deduped);
-    let has_cycle = emitted != deduped.len();
-    if has_cycle {
-        let done: HashSet<usize> = order.iter().copied().collect();
-        for i in 0..deduped.len() {
-            if !done.contains(&i) {
-                order.push(i);
-            }
-        }
+    // Attribute limits after dedup already checked pre-dedup, but deduped
+    // retains same attributes, so no second check needed. Still ensure
+    // post-dedup length respects cap (dedup can only shrink).
+    // Cycle check via shared helper.
+    let (order, emitted) = topo_order_with_count(&deduped);
+    if emitted != deduped.len() {
+        let trail = bounded_trail(&deduped, &order);
+        return Err(AdapterError::CycleDetected { trail });
     }
-    if config.fidelity == Fidelity::BitExact && (has_missing_parent(&deduped) || has_cycle) {
+    if config.fidelity == Fidelity::BitExact && has_missing_parent(&deduped) {
         return Err(AdapterError::FidelityMismatch);
     }
 
@@ -398,7 +467,7 @@ pub fn ingest_otel_dedup(
     let mut mappings = Vec::new();
     let mut span_id_to_hash: HashMap<String, Hash> = HashMap::new();
 
-    for idx in order {
+    for &idx in &order {
         let span = &deduped[idx];
         let observed: Vec<Hash> = span
             .parent_span_id
@@ -415,7 +484,7 @@ pub fn ingest_otel_dedup(
             )
             .map_err(AdapterError::Journal)?;
         // First occurrence of a span_id owns parent resolution, matching
-        // topo_order_spans binding.
+        // topo ordering binding.
         span_id_to_hash.entry(span.span_id.clone()).or_insert(hash);
         mappings.push(EntryMapping {
             kind: EntryKind::Outcome.into(),
@@ -452,28 +521,72 @@ pub fn ingest_otel_dedup(
 /// or `ingest_otel_file_with_config`.
 ///
 /// # Errors
-/// Returns `AdapterError::Serialization` for I/O or JSON parse errors.
+/// Returns `AdapterError` variants for I/O, JSON parse, limits, or cycles.
 pub fn ingest_otel_file(path: &Path) -> Result<IngestedJournal, AdapterError> {
     ingest_otel_file_with_config(path, OtelIngestConfig::default())
 }
 
-/// File ingest with explicit config.
+/// File ingest with explicit config and streaming caps.
 ///
+/// Uses `BufReader` plus `.take(max_bytes + 1)` to enforce total byte cap
+/// without reading the whole file into memory. Enforces per-line byte cap,
+/// total byte cap, and span cap mid-stream.
 /// See `ingest_otel_file` for the host-daemon allowance.
 pub fn ingest_otel_file_with_config(
     path: &Path,
     config: OtelIngestConfig,
 ) -> Result<IngestedJournal, AdapterError> {
-    let content = std::fs::read_to_string(path)?;
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, Read};
+
+    let file = File::open(path)?;
+    let take_limit = (config.max_bytes as u64).saturating_add(1);
+    // BufReader over a Take to bound total bytes without reading whole file.
+    let mut reader = BufReader::new(file.take(take_limit));
     let mut spans = Vec::new();
-    for (idx, line) in content.lines().enumerate() {
+    let mut line = String::new();
+    let mut line_number: usize = 0;
+    let mut total_bytes: usize = 0;
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+        total_bytes = total_bytes.saturating_add(bytes_read);
+        if total_bytes > config.max_bytes {
+            return Err(AdapterError::FileTooLarge {
+                limit: config.max_bytes,
+            });
+        }
+        if bytes_read > config.max_line_bytes {
+            return Err(AdapterError::LineTooLarge {
+                line: line_number,
+                limit: config.max_line_bytes,
+            });
+        }
+        // Also guard trimmed length when newline handling differs.
+        if line.len() > config.max_line_bytes {
+            return Err(AdapterError::LineTooLarge {
+                line: line_number,
+                limit: config.max_line_bytes,
+            });
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+        // Enforce per-line byte cap on trimmed payload as well.
+        if trimmed.len() > config.max_line_bytes {
+            return Err(AdapterError::LineTooLarge {
+                line: line_number,
+                limit: config.max_line_bytes,
+            });
+        }
         let span: OtelSpan =
             serde_json::from_str(trimmed).map_err(|source| AdapterError::SpanParse {
-                line: idx + 1,
+                line: line_number,
                 source,
             })?;
         spans.push(span);
@@ -501,6 +614,7 @@ mod tests {
                 parent_span_id: None,
                 name: "op-a".into(),
                 events: vec![OtelEvent { name: "ev1".into() }],
+                ..Default::default()
             },
             OtelSpan {
                 trace_id: "trace1".into(),
@@ -508,6 +622,7 @@ mod tests {
                 parent_span_id: None,
                 name: "op-b".into(),
                 events: vec![],
+                ..Default::default()
             },
         ]
     }
@@ -525,6 +640,7 @@ mod tests {
             parent_span_id: parent.map(Into::into),
             name: name.into(),
             events,
+            ..Default::default()
         }
     }
 
@@ -533,6 +649,7 @@ mod tests {
             fidelity,
             dedup,
             max_spans: 100,
+            ..Default::default()
         }
     }
 
@@ -626,12 +743,14 @@ mod tests {
             parent_span_id: None,
             name: "op".into(),
             events: vec![],
+            ..Default::default()
         };
         let spans = vec![span.clone(), span.clone(), span.clone()];
         let config = OtelIngestConfig {
             fidelity: Fidelity::BitExact,
             dedup: true,
             max_spans: 10,
+            ..Default::default()
         };
         let ing = ingest_otel_dedup(spans, config).unwrap();
         // Only one Outcome entry, no marker for BitExact.
@@ -641,6 +760,7 @@ mod tests {
             fidelity: Fidelity::BitExact,
             dedup: false,
             max_spans: 10,
+            ..Default::default()
         };
         let ing2 = ingest_otel_dedup(
             vec![span.clone(), span.clone(), span.clone()],
@@ -659,6 +779,7 @@ mod tests {
                 parent_span_id: None,
                 name: "op-a".into(),
                 events: vec![],
+                ..Default::default()
             },
             OtelSpan {
                 trace_id: "t".into(),
@@ -666,6 +787,7 @@ mod tests {
                 parent_span_id: None,
                 name: "op-a".into(),
                 events: vec![],
+                ..Default::default()
             },
             OtelSpan {
                 trace_id: "t".into(),
@@ -673,12 +795,14 @@ mod tests {
                 parent_span_id: None,
                 name: "op-b".into(),
                 events: vec![],
+                ..Default::default()
             },
         ];
         let config = OtelIngestConfig {
             fidelity: Fidelity::LineageOnly,
             dedup: true,
             max_spans: 10,
+            ..Default::default()
         };
         let a = ingest_otel_dedup(spans.clone(), config).unwrap();
         let b = ingest_otel_dedup(spans, config).unwrap();
@@ -699,11 +823,13 @@ mod tests {
             parent_span_id: Some("missing-parent".into()),
             name: "child-op".into(),
             events: vec![],
+            ..Default::default()
         }];
         let config_be = OtelIngestConfig {
             fidelity: Fidelity::BitExact,
             dedup: true,
             max_spans: 10,
+            ..Default::default()
         };
         let err = ingest_otel_dedup(spans.clone(), config_be).unwrap_err();
         assert!(matches!(err, AdapterError::FidelityMismatch));
@@ -712,6 +838,7 @@ mod tests {
             fidelity: Fidelity::LineageOnly,
             dedup: true,
             max_spans: 10,
+            ..Default::default()
         };
         let ing = ingest_otel_dedup(spans, config_lo).unwrap();
         assert!(!ing.is_certifiable());
@@ -726,6 +853,7 @@ mod tests {
             parent_span_id: None,
             name: "parent-op".into(),
             events: vec![],
+            ..Default::default()
         };
         let child = OtelSpan {
             trace_id: "t".into(),
@@ -733,11 +861,13 @@ mod tests {
             parent_span_id: Some("parent".into()),
             name: "child-op".into(),
             events: vec![],
+            ..Default::default()
         };
         let config = OtelIngestConfig {
             fidelity: Fidelity::LineageOnly,
             dedup: false,
             max_spans: 10,
+            ..Default::default()
         };
         let ing = ingest_otel_dedup(vec![parent.clone(), child.clone()], config).unwrap();
         // Find entries by payload text.
@@ -836,18 +966,54 @@ mod tests {
     }
 
     #[test]
-    fn cycle_falls_back_lineage_only() {
+    fn cycle_rejected_with_bounded_trail() {
         let a = make_span("t", "a", Some("b"), "op-a", vec![]);
         let b = make_span("t", "b", Some("a"), "op-b", vec![]);
-        // BitExact rejects cycles outright.
-        let err = ingest_otel_dedup(vec![a.clone(), b.clone()], config(Fidelity::BitExact, true))
-            .unwrap_err();
-        assert!(matches!(err, AdapterError::FidelityMismatch));
-        // LineageOnly downgrade: ingest succeeds; cycle members append in
-        // input order and unresolved parents are dropped.
-        let lo = ingest_otel_dedup(vec![a, b], config(Fidelity::LineageOnly, true)).unwrap();
-        assert!(!lo.is_certifiable());
-        assert_eq!(outcome_count(&lo.journal), 2);
+        // Both fidelities now reject cycles with CycleDetected.
+        let err_be =
+            ingest_otel_dedup(vec![a.clone(), b.clone()], config(Fidelity::BitExact, true))
+                .unwrap_err();
+        match err_be {
+            AdapterError::CycleDetected { trail } => {
+                assert!(trail.len() <= 32);
+                assert!(trail.contains(&"a".to_string()) || trail.contains(&"b".to_string()));
+            }
+            other => panic!("expected CycleDetected, got {other:?}"),
+        }
+        let err_lo =
+            ingest_otel_dedup(vec![a, b], config(Fidelity::LineageOnly, true)).unwrap_err();
+        match err_lo {
+            AdapterError::CycleDetected { trail } => {
+                assert!(trail.len() <= 32);
+            }
+            other => panic!("expected CycleDetected for lineage, got {other:?}"),
+        }
+        // Legacy paths also reject cycles.
+        let a2 = make_span("t", "a", Some("b"), "op-a", vec![]);
+        let b2 = make_span("t", "b", Some("a"), "op-b", vec![]);
+        let err_env =
+            ingest_otel_enveloped(vec![a2.clone(), b2.clone()], Fidelity::LineageOnly).unwrap_err();
+        assert!(matches!(err_env, AdapterError::CycleDetected { .. }));
+        let err_fid = ingest_otel_with_fidelity(vec![a2, b2], Fidelity::LineageOnly).unwrap_err();
+        assert!(matches!(err_fid, AdapterError::CycleDetected { .. }));
+        // Bounded trail capped at 32 for large cycle.
+        let many: Vec<OtelSpan> = (0..50)
+            .map(|i| {
+                let next = (i + 1) % 50;
+                make_span(
+                    "t",
+                    &format!("s{i}"),
+                    Some(&format!("s{next}")),
+                    &format!("op{i}"),
+                    vec![],
+                )
+            })
+            .collect();
+        let err_many = ingest_otel_dedup(many, config(Fidelity::LineageOnly, true)).unwrap_err();
+        match err_many {
+            AdapterError::CycleDetected { trail } => assert!(trail.len() <= 32),
+            other => panic!("expected CycleDetected for large cycle, got {other:?}"),
+        }
     }
 
     #[test]
@@ -859,6 +1025,7 @@ mod tests {
                 parent_span_id: None,
                 name: "op".into(),
                 events: vec![],
+                ..Default::default()
             },
             OtelSpan {
                 trace_id: "t".into(),
@@ -866,12 +1033,14 @@ mod tests {
                 parent_span_id: None,
                 name: "op2".into(),
                 events: vec![],
+                ..Default::default()
             },
         ];
         let config = OtelIngestConfig {
             fidelity: Fidelity::LineageOnly,
             dedup: true,
             max_spans: 1,
+            ..Default::default()
         };
         let err = ingest_otel_dedup(spans, config).unwrap_err();
         assert!(matches!(err, AdapterError::SpanLimitExceeded { .. }));
@@ -889,6 +1058,7 @@ mod tests {
             parent_span_id: None,
             name: "op-file-a".into(),
             events: vec![],
+            ..Default::default()
         };
         let span2 = OtelSpan {
             trace_id: "t".into(),
@@ -896,6 +1066,7 @@ mod tests {
             parent_span_id: Some("s1".into()),
             name: "op-file-b".into(),
             events: vec![OtelEvent { name: "ev".into() }],
+            ..Default::default()
         };
         writeln!(file, "{}", serde_json::to_string(&span1).unwrap()).unwrap();
         writeln!(file, "{}", serde_json::to_string(&span2).unwrap()).unwrap();
@@ -931,13 +1102,14 @@ mod tests {
     }
 
     #[test]
-    fn enveloped_bitexact_rejects_missing_parent_and_cycle() {
+    fn enveloped_bitexact_rejects_missing_parent() {
         let missing = OtelSpan {
             trace_id: "t".into(),
             span_id: "child".into(),
             parent_span_id: Some("no-such".into()),
             name: "child-op".into(),
             events: vec![],
+            ..Default::default()
         };
         let err = ingest_otel_enveloped(vec![missing.clone()], Fidelity::BitExact).unwrap_err();
         assert!(matches!(err, AdapterError::FidelityMismatch));
@@ -949,19 +1121,13 @@ mod tests {
             parent_span_id: Some("no-such".into()),
             name: "child-op".into(),
             events: vec![],
+            ..Default::default()
         };
         let err2 = ingest_otel_with_fidelity(vec![with_fid_missing.clone()], Fidelity::BitExact)
             .unwrap_err();
         assert!(matches!(err2, AdapterError::FidelityMismatch));
         ingest_otel_with_fidelity(vec![with_fid_missing], Fidelity::LineageOnly).unwrap();
-        // Cycle case.
-        let a = make_span("t", "a", Some("b"), "op-a", vec![]);
-        let b = make_span("t", "b", Some("a"), "op-b", vec![]);
-        let err3 =
-            ingest_otel_enveloped(vec![a.clone(), b.clone()], Fidelity::BitExact).unwrap_err();
-        assert!(matches!(err3, AdapterError::FidelityMismatch));
-        let err4 = ingest_otel_with_fidelity(vec![a, b], Fidelity::BitExact).unwrap_err();
-        assert!(matches!(err4, AdapterError::FidelityMismatch));
+        // Cycle case now returns CycleDetected for both paths, checked in cycle_rejected test.
     }
 
     #[test]
@@ -976,6 +1142,7 @@ mod tests {
                 parent_span_id: None,
                 name: format!("op{i}"),
                 events: vec![],
+                ..Default::default()
             };
             writeln!(file, "{}", serde_json::to_string(&span).unwrap()).unwrap();
         }
@@ -984,6 +1151,7 @@ mod tests {
             fidelity: Fidelity::LineageOnly,
             dedup: false,
             max_spans: 2,
+            ..Default::default()
         };
         let err = ingest_otel_file_with_config(&path, config).unwrap_err();
         assert!(matches!(err, AdapterError::SpanLimitExceeded { .. }));
@@ -997,6 +1165,7 @@ mod tests {
             fidelity: Fidelity::BitExact,
             dedup: true,
             max_spans: 10,
+            ..Default::default()
         };
         let ing = ingest_otel_dedup(spans, config).unwrap();
         assert!(ing.is_certifiable());
