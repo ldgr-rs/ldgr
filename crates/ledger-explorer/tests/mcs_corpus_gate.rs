@@ -6,10 +6,11 @@
 //! (`ledger_explorer::reference::corpus_scenarios`); this gate holds no
 //! private name-to-builder mapping.
 
-use ledger_explorer::MaxSatSolver;
 use ledger_explorer::certs::MAX_EVENT_COST;
 use ledger_explorer::ldfi::hypothesis_to_schedule;
 use ledger_explorer::reference::corpus_scenario;
+use ledger_explorer::reference::ReferenceReplayError;
+use ledger_explorer::MaxSatSolver;
 use ledger_format::RunManifest;
 use std::fs;
 use std::path::Path;
@@ -52,6 +53,8 @@ fn mcs_certificates_on_bug_corpus_v1() {
         let (hyps, cert) = solver
             .solve_with_certificate(&run.journal, &verdict)
             .unwrap_or_else(|e| panic!("{name}: solve_with_certificate must succeed: {e:?}"));
+        let cert = cert
+            .unwrap_or_else(|| panic!("{name}: non-empty solve must return recorded solver data"));
         assert!(
             !hyps.is_empty(),
             "{name}: solver must return at least one hypothesis"
@@ -65,13 +68,13 @@ fn mcs_certificates_on_bug_corpus_v1() {
         // faultable kind, bounded by the shared cost-model maximum.
         let upper = (cert.cut.len() as u64).saturating_mul(MAX_EVENT_COST);
         assert!(
-            cert.lower_bound <= upper,
-            "{name}: lower_bound {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
-            cert.lower_bound
+            cert.recorded_lower_bound <= upper,
+            "{name}: recorded solver bound {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
+            cert.recorded_lower_bound
         );
         assert!(
-            cert.lower_bound <= hyps[0].total_cost,
-            "{name}: lower_bound must not exceed total_cost"
+            cert.recorded_lower_bound <= hyps[0].total_cost,
+            "{name}: recorded solver bound must not exceed total_cost"
         );
 
         // Map cut to executable fault schedule and verify replay reproduces
@@ -79,7 +82,7 @@ fn mcs_certificates_on_bug_corpus_v1() {
         // full schedule over-blocks progress.
         let hyp = ledger_explorer::ldfi::FaultHypothesis {
             events: cert.cut.clone(),
-            total_cost: cert.lower_bound,
+            total_cost: cert.recorded_lower_bound,
             explanation: "mcs cut".to_string(),
         };
         let schedule = hypothesis_to_schedule(&hyp, &run.journal);
@@ -89,10 +92,18 @@ fn mcs_certificates_on_bug_corpus_v1() {
         );
 
         let holds = |sched: &[ledger_sim::SimFault]| -> bool {
-            let replay = scenario
-                .replay_faults(manifest.root_seed, &run, sched.to_vec())
-                .unwrap_or_else(|e| panic!("{name}: fault replay must run: {e}"));
-            scenario.check(&replay).violated
+            match scenario.replay_faults(manifest.root_seed, &run, sched.to_vec()) {
+                Ok(replay) => scenario.check(&replay).violated,
+                Err(ReferenceReplayError::Engine {
+                    source: ledger_sim::RuntimeError::StrictReplay(_),
+                    ..
+                }) => {
+                    // Strict violation is Wave 1 evidence that the schedule
+                    // diverged; treat as not reproducing and try next single.
+                    false
+                }
+                Err(error) => panic!("{name}: fault replay must run: {error}"),
+            }
         };
 
         let mut violated = holds(&schedule);
@@ -100,7 +111,7 @@ fn mcs_certificates_on_bug_corpus_v1() {
             "{name} full schedule violated={} cut_len={} lb={} schedule_len={}",
             violated,
             cert.cut.len(),
-            cert.lower_bound,
+            cert.recorded_lower_bound,
             schedule.len()
         );
         if !violated {
@@ -138,7 +149,7 @@ fn mcs_certificates_on_bug_corpus_v1() {
             "{name}: fault-injected replay must reproduce the violation"
         );
 
-        table.push((name.clone(), cert.cut.len(), cert.lower_bound));
+        table.push((name.clone(), cert.cut.len(), cert.recorded_lower_bound));
         checked += 1;
     }
 
