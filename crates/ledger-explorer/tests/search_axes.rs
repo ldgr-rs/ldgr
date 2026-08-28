@@ -36,7 +36,7 @@ fn quad_campaign_mutates_all_axes() {
             Policy::Random,
             Policy::Bandit {
                 exploration_constant: 1.0,
-                pct_mix: 0.1,
+                pct_mix: ledger_sim::Probability::new(0.1).unwrap(),
             },
         ],
         use_swarm: true,
