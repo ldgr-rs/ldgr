@@ -229,6 +229,7 @@ fn otel_ingest_lineage_only_non_empty_and_no_cert() {
         parent_span_id: None,
         name: "op-a".into(),
         events: vec![OtelEvent { name: "ev1".into() }],
+        ..Default::default()
     }];
     let journal = ingest_otel_with_fidelity(spans, Fidelity::LineageOnly).unwrap();
     assert!(!journal.is_empty());
@@ -250,6 +251,7 @@ fn otel_ingest_lineage_only_non_empty_and_no_cert() {
             parent_span_id: None,
             name: "op".into(),
             events: vec![],
+            ..Default::default()
         }],
         Fidelity::LineageOnly,
     )
@@ -270,6 +272,7 @@ fn otel_ingest_deterministic() {
             parent_span_id: None,
             name: "op".into(),
             events: vec![],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: "t".into(),
@@ -277,6 +280,7 @@ fn otel_ingest_deterministic() {
             parent_span_id: None,
             name: "op2".into(),
             events: vec![],
+            ..Default::default()
         },
     ];
     let a = ingest_otel_with_fidelity(spans.clone(), Fidelity::LineageOnly).unwrap();
@@ -317,6 +321,7 @@ fn otel_enveloped_certifiable_only_bitexact() {
         parent_span_id: None,
         name: "op".into(),
         events: vec![],
+        ..Default::default()
     }];
     let lo = ingest_otel_enveloped(spans.clone(), Fidelity::LineageOnly).unwrap();
     let be = ingest_otel_enveloped(spans, Fidelity::BitExact).unwrap();
