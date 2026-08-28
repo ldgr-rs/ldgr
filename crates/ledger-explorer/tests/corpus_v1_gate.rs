@@ -13,7 +13,7 @@
 //! corpus-v1 gate at 12 of 12, bit-exact from seed.
 
 use ledger_explorer::reference::{CorpusRunner, corpus_scenarios};
-use ledger_explorer::search::replay;
+use ledger_explorer::search::replay_strict;
 use ledger_format::RunManifest;
 use std::fs;
 use std::path::Path;
@@ -46,7 +46,7 @@ fn every_scenario_reproduces_bit_exact_and_violates() {
             CorpusRunner::MiniKv => {
                 // Schedule-dependent entry: the found seed must reproduce the
                 // same root bit-exactly on a recorded-decision replay.
-                let replayed = replay(
+                let replayed = replay_strict(
                     &ledger_explorer::workloads::MiniKvWorkload,
                     finding.seed,
                     finding.run.decisions.clone(),
