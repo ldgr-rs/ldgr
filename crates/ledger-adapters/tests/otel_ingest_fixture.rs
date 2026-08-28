@@ -19,6 +19,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "http.request".to_string(),
             }],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -28,6 +29,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "auth.check".to_string(),
             }],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -37,6 +39,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "payment.start".to_string(),
             }],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -46,6 +49,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "db.query".to_string(),
             }],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -53,6 +57,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             parent_span_id: Some("span-002".to_string()),
             name: "cache".to_string(),
             events: vec![],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -62,6 +67,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "db.write".to_string(),
             }],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -71,6 +77,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "fraud.score".to_string(),
             }],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -78,6 +85,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             parent_span_id: Some("span-006".to_string()),
             name: "replica-write".to_string(),
             events: vec![],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -87,6 +95,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "risk.eval".to_string(),
             }],
+            ..Default::default()
         },
         OtelSpan {
             trace_id: trace.to_string(),
@@ -96,6 +105,7 @@ fn golden_spans() -> Vec<OtelSpan> {
             events: vec![OtelEvent {
                 name: "log.flush".to_string(),
             }],
+            ..Default::default()
         },
     ]
 }
@@ -111,6 +121,7 @@ fn ingest_golden() -> ledger_adapters::IngestedJournal {
         fidelity: Fidelity::LineageOnly,
         dedup: true,
         max_spans: 100,
+        ..Default::default()
     };
     ingest_otel_dedup(golden_spans(), config)
         .unwrap_or_else(|error| panic!("golden ingest must succeed: {error}"))
@@ -332,6 +343,7 @@ fn golden_ingest_reordered_input_still_preserves_causality() {
         fidelity: Fidelity::LineageOnly,
         dedup: true,
         max_spans: 100,
+        ..Default::default()
     };
     let ing = ingest_otel_dedup(spans, config)
         .unwrap_or_else(|error| panic!("reordered ingest must succeed: {error}"));
