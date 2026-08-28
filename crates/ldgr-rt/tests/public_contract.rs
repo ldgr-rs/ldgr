@@ -21,11 +21,13 @@ fn name_runtime_error(error: &RuntimeError) -> &'static str {
     match error {
         RuntimeError::StepLimit { .. } => "step_limit",
         RuntimeError::Journal(_) => "journal",
+        RuntimeError::Belt(_) => "belt",
         RuntimeError::Ipc(_) => "ipc",
         RuntimeError::MissingRoot => "missing_root",
         RuntimeError::UnknownWorkload { .. } => "unknown_workload",
         RuntimeError::ProgramNotTransportable => "program_not_transportable",
         RuntimeError::Runtime(_) => "runtime",
+        RuntimeError::StrictReplay(_) => "strict_replay",
     }
 }
 
@@ -228,10 +230,10 @@ fn handle_current_is_installed_inside_run() {
 #[cfg(all(feature = "sim", not(feature = "sim-link")))]
 #[test]
 fn named_run_reaches_server_workload_under_ipc() {
-    if resolve_engine_for_test().is_none() {
-        eprintln!("skipping: no engine binary for IPC transport");
-        return;
-    }
+    assert!(
+        resolve_engine_for_test().is_some(),
+        "engine binary required for IPC transport: build `cargo build -p ledger-cli` or set LEDGER_ENGINE_BIN (see resolve_engine_for_test precedence)"
+    );
     let config = RunConfig::builder().seed([21u8; 32]).max_steps(256).build();
     let a = ldgr_rt::run_named(config.clone(), "kv").expect("named kv run must succeed");
     let b = ldgr_rt::run_named(config, "kv").expect("named kv rerun must succeed");
