@@ -112,15 +112,15 @@ See [Getting started](docs/getting-started.md) for setup and the
   cooperative scheduling, SimNet, and SimFs replace ambient host effects.
 - **A causal journal.** Each effect records its causal parents, vector clock,
   actor sequence, and payload in a content-addressed DAG.
-- **Schedule and fault exploration.** Random, PCT, bandit, replay, and DPOR
+- **Schedule and fault exploration.** Random, PCT, bandit, replay, and bounded single-base DPOR
   paths explore interleavings. LDFI uses journal lineage to rank fault cuts.
 - **Focused counterexamples.** Causal slicing and delta debugging produce a
   1-minimal result for the tested candidate set. This is not a claim of the
   globally smallest possible reproduction.
-- **Verifiable fault-cut evidence.** Campaigns can carry unsigned, verifiable
-  in-toto statements. Against a journal, a minimality extension verifies that
-  the recorded cut hits every bounded derivation path and is inclusion-minimal.
-  It also records a solver-derived lower bound.
+- **Bounded certificate validation.** Campaigns can carry unsigned in-toto
+  statements with recorded solver data. Statement validation enforces schema
+  and size bounds. Journal binding checks the subject root and confirms that
+  recorded cut members are faultable entries in the supplied journal.
 - **Native and Wasm paths.** Differential tests compare covered native and
   `wasm32-wasip1` workloads by output bytes and journal root.
 - **A determinism tripwire.** `ledger-lint` makes forbidden ambient APIs a CI
@@ -196,8 +196,10 @@ determinism contract.
   invariants.
 - OpenTelemetry ingest gives approximate lineage only. It does not provide
   deterministic replay or certificates.
-- Current certificates are unsigned. Signing and tenant keys remain roadmap
-  work.
+- Current certificates are unsigned. Wave 1 validates bounded statements and
+  binds recorded solver data to a supplied journal. It does not derive stronger
+  causal claims from journal parent paths. Signing and tenant keys remain
+  roadmap work.
 
 ## The name and mark
 
