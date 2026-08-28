@@ -659,6 +659,7 @@ fn campaign_report_renders_ndjson_coverage_records() {
         monitor_issues: Vec::new(),
         applied_faults: Vec::new(),
         origins: Vec::new(),
+        protection: ledger_sim::BeltStatus::NotArmed,
     };
     let report = CampaignReport {
         runs_executed: 9,
