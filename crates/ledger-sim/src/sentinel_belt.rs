@@ -14,10 +14,11 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::sentinel::{BeltStatus, LeakClass, Sentinel};
+use crate::sentinel::{BeltStatus, EffectiveProtection, LeakClass, ProtectionMode, Sentinel};
 
 /// Classic BPF load of a 32-bit word at an absolute seccomp_data offset.
 const BPF_LD_W_ABS: u16 = 0x20;
@@ -72,7 +73,14 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 static BELT_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Belt status recorded by the last run-entry hook call.
-static LAST_BELT_STATUS: OnceLock<BeltStatus> = OnceLock::new();
+///
+/// Replaceable per-run status: each run overwrites the slot so a later
+/// successful install does not report stale state from an earlier failure.
+static LAST_BELT_STATUS: OnceLock<Mutex<Option<BeltStatus>>> = OnceLock::new();
+
+fn belt_status_slot() -> &'static Mutex<Option<BeltStatus>> {
+    LAST_BELT_STATUS.get_or_init(|| Mutex::new(None))
+}
 
 /// Ambient calls detected by one probe run under the interposition shim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,17 +116,21 @@ pub fn shim_path() -> PathBuf {
 /// It requires no_new_privs, so it cannot be installed by an unprivileged
 /// process that later needs capabilities. Call this only inside a subprocess.
 ///
-/// The action is `SECCOMP_RET_KILL_PROCESS`, not
-/// `SECCOMP_RET_USER_NOTIF`. USER_NOTIF requires a
-/// supervising thread that owns the listener fd and services every
+/// The filter is process-wide and irrevocable once installed. The action is
+/// `SECCOMP_RET_KILL_PROCESS`, not `SECCOMP_RET_USER_NOTIF`. USER_NOTIF
+/// requires a supervising thread that owns the listener fd and services every
 /// notification with a SECCOMP_IOCTL_NOTIF_RECV loop; without that thread the
 /// kernel blocks the syscall and the process deadlocks. The sim is
 /// single-threaded by invariant (determinism rules forbid OS threads inside a
 /// simulation), so no supervisor exists to answer notifications. KILL_PROCESS
 /// keeps the denylist effective without a second thread: an ambient syscall
 /// terminates the process instead of leaking nondeterminism into the journal.
-/// Hardware-entropy reads (RDRAND/RDSEED) are instructions and stay outside
-/// seccomp either way; `scan_rdrand_rdseed` reports their presence.
+/// Because the kill is delivered by the kernel as a process-wide termination,
+/// it kills the whole sim process mid-run and that outcome can never become a
+/// normal run error (no `RunResult` or `RuntimeError` can be produced from a
+/// killed process). Hardware-entropy reads (RDRAND/RDSEED) are instructions and
+/// stay outside seccomp either way; `scan_rdrand_rdseed` reports their
+/// presence.
 pub fn install_seccomp_denylist() -> Result<(), SentinelError> {
     let Some(arch) = native_audit_arch() else {
         return Err(SentinelError::UnsupportedArch);
@@ -202,7 +214,15 @@ impl TscTrapGuard {
     /// the run entry can propagate the typed error instead of pretending the
     /// trap is in place.
     pub fn arm_if_armed() -> Self {
-        if belt_armed() {
+        Self::arm_for_effective(effective_protection_from_env())
+    }
+
+    /// Enter a section where RDTSC reads are trapped when effective protection demands it.
+    ///
+    /// When effective protection is `Some`, the trap is attempted regardless of the
+    /// env arming gate; when `None` (env Disabled with no host option) the guard stays inactive.
+    pub fn arm_for_effective(effective: EffectiveProtection) -> Self {
+        if effective.is_enabled() {
             match trap_rdtsc() {
                 Ok(()) => Self {
                     active: true,
@@ -219,6 +239,13 @@ impl TscTrapGuard {
                 activation_error: None,
             }
         }
+    }
+
+    /// Enter a section where RDTSC reads are trapped for a host-requested mode.
+    ///
+    /// Host option `Some` overrides env; `None` falls back to env mode.
+    pub fn arm_for_host(host: Option<ProtectionMode>) -> Self {
+        Self::arm_for_effective(effective_protection(host))
     }
 
     /// Typed activation failure, when the RDTSC trap could not be installed.
@@ -250,21 +277,45 @@ pub fn arm_belt() {
 /// Return true when the process belt is armed.
 ///
 /// The belt is armed by `arm_belt` or by a truthy `LEDGER_SENTINEL_BELT`
-/// environment value (`1`, `true`, `on`, `yes`). By default, the belt is not
-/// armed so it does not install permanent seccomp filters on the host process.
-/// The env read is a host-side gate at run entry: it never feeds the journal,
-/// the scheduler, or any simulated effect, so it cannot perturb a deterministic run.
+/// environment value (`1`, `true`, `on`, `yes`, `required`). By default, the
+/// belt is not armed so it does not install permanent seccomp filters on the
+/// host process. The env read is a host-side gate at run entry: it never feeds
+/// the journal, the scheduler, or any simulated effect, so it cannot perturb a
+/// deterministic run. Env parsing is delegated to [`crate::sentinel::belt_env_mode`]
+/// so callers can test the pure mapping.
+#[cfg(test)]
 fn belt_armed() -> bool {
     if ARMED.load(Ordering::Relaxed) {
         return true;
     }
-    match std::env::var_os("LEDGER_SENTINEL_BELT") {
-        Some(value) => matches!(
-            value.to_string_lossy().as_ref(),
-            "1" | "true" | "on" | "yes"
-        ),
-        None => false,
+    !matches!(
+        crate::sentinel::belt_env_mode(std::env::var_os("LEDGER_SENTINEL_BELT").as_deref()),
+        crate::sentinel::BeltMode::Disabled
+    )
+}
+
+/// Effective protection derived from env only (host None).
+fn effective_protection_from_env() -> EffectiveProtection {
+    effective_protection(None)
+}
+
+/// Effective protection: host option if set, else env mode.
+///
+/// `None` means disabled (env Disabled with no host) and keeps not-armed behavior.
+/// `arm_belt()` counts as an explicit host-side arming request.
+fn effective_protection(host: Option<ProtectionMode>) -> EffectiveProtection {
+    if let Some(mode) = host {
+        return mode.into();
     }
+    if ARMED.load(Ordering::Relaxed) {
+        return match crate::sentinel::belt_env_mode(
+            std::env::var_os("LEDGER_SENTINEL_BELT").as_deref(),
+        ) {
+            crate::sentinel::BeltMode::Required => EffectiveProtection::Required,
+            _ => EffectiveProtection::BestEffort,
+        };
+    }
+    crate::sentinel::belt_env_mode(std::env::var_os("LEDGER_SENTINEL_BELT").as_deref()).into()
 }
 
 /// Warm the per-thread entropy caches the sim runtime relies on.
@@ -302,32 +353,50 @@ pub fn install_process_belt() -> Result<ProcessBeltStatus, SentinelError> {
 ///
 /// Warms this thread's entropy caches, then installs the seccomp denylist and
 /// the RDTSC trap when the process belt is armed. The belt is NOT armed by
-/// default: `LEDGER_SENTINEL_BELT` must be set to `1`, `true`, `on`, or
-/// `yes`, or [`arm_belt`] must be called. Installation happens once per
-/// process: seccomp filters cannot be removed, and stacking identical
-/// filters is wasteful; a status record accompanies the install so later
-/// calls report it instead of reinstalling. The returned status is the
-/// report a caller can log or assert; on failures the hook also emits a
-/// warning line.
+/// default: `LEDGER_SENTINEL_BELT` must be set to `1`, `true`, `on`, `yes`, or
+/// `required`, or [`arm_belt`] must be called. Installation happens once per
+/// process: seccomp filters cannot be removed, so the denylist is process-wide
+/// and irrevocable; stacking identical filters is wasteful; a status record
+/// accompanies the install so later calls report it instead of reinstalling.
+/// The filter uses `SECCOMP_RET_KILL_PROCESS`, which kills the whole sim
+/// process mid-run if an ambient syscall is issued after activation and that
+/// termination can never become a normal `RunResult` or `RuntimeError`.
+/// The returned status is the report a caller can log or assert; on failures
+/// the hook also emits a warning line.
 pub fn activate_process_belt() -> BeltStatus {
+    activate_process_belt_for_effective(effective_protection_from_env())
+}
+
+/// Attempt belt installation for a host-requested protection mode.
+///
+/// When `host` is `Some`, installation is attempted regardless of the env gate.
+/// When `host` is `None`, env mode is used and `Disabled` keeps not-armed behavior.
+/// `Required` must be `Active` to succeed; `BestEffort` always returns status.
+///
+/// This is the common execution boundary entry: both `Simulation::run` and
+/// direct `Executor::run` route through it so no path bypasses enforcement.
+pub fn activate_process_belt_for_effective(effective: EffectiveProtection) -> BeltStatus {
     // Warm this thread's entropy caches before the filter installs, so the
     // sim's own collections never hit the blocked OS-entropy syscall.
     pre_warm_ambient_entropy();
-    if !belt_armed() {
+    if !effective.is_enabled() {
         let status = BeltStatus::NotArmed;
         record_belt_status(&status);
         return status;
-    }
+    };
     if BELT_INSTALLED.load(Ordering::Relaxed) {
         if let Some(status) = belt_status() {
             return status;
         }
-        // The installed mark exists but no status was recorded (the record is
-        // first-wins and no report exists yet). Never fabricate an `Active`
+        // The installed mark exists but no status was recorded. Never fabricate an `Active`
         // claim with a made-up scan result: fall through to a real install,
         // whose stacked denylist is identical and harmless.
         return install_and_record();
     }
+    // Not yet installed: respect the legacy arm gate as a hint but attempt
+    // installation for any effective Required/BestEffort regardless of env.
+    // The legacy `belt_armed` check is irrelevant now: effective Some already
+    // demands an attempt. We directly install.
     install_and_record()
 }
 
@@ -374,14 +443,20 @@ fn install_and_record_with(
 /// Returns None when no run has called the hook yet. The status is host state,
 /// never journaled, so it does not affect determinism.
 pub fn belt_status() -> Option<BeltStatus> {
-    LAST_BELT_STATUS.get().cloned()
+    belt_status_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
 }
 
-/// Record the belt status once; the first call wins.
+/// Record the belt status for this run, replacing any prior per-run status.
+///
+/// The installed flag remains immutable (OnceLock/AtomicBool); the per-run
+/// status slot is replaceable so a failed install followed by success reports fresh.
 fn record_belt_status(status: &BeltStatus) {
-    // Discard the Err from a second set: the first recorded status is the
-    // authoritative one for the process.
-    let _ = LAST_BELT_STATUS.set(status.clone());
+    if let Ok(mut guard) = belt_status_slot().lock() {
+        *guard = Some(status.clone());
+    }
 }
 
 /// Return true when RDRAND or RDSEED opcodes appear in an executable mapping.
@@ -626,6 +701,10 @@ mod tests {
     /// a made-up scan.
     #[test]
     fn installed_mark_without_record_never_fabricates_active() {
+        // Reset global for this test: separate immutable installed flag from
+        // replaceable per-run status.
+        BELT_INSTALLED.store(false, Ordering::Relaxed);
+        *belt_status_slot().lock().expect("lock") = None;
         let status = install_and_record_with(|| {
             Ok(ProcessBeltStatus {
                 seccomp_installed: true,
@@ -649,8 +728,9 @@ mod tests {
                 rdrand_rdseed_present: true
             })
         );
-        // A failing installer keeps the typed error inside the variant; the
-        // process-global record keeps the first report (first call wins).
+        // A failing installer keeps the typed error inside the variant and
+        // overwrites the per-run status slot so later runs report fresh state;
+        // the immutable installed flag stays true.
         let failed = install_and_record_with(|| Err(SentinelError::Prctl("PR_SET_TSC", 22)));
         assert_eq!(
             failed,
@@ -659,10 +739,48 @@ mod tests {
         );
         assert_eq!(
             belt_status(),
-            Some(BeltStatus::Active {
-                rdrand_rdseed_present: true
-            })
+            Some(BeltStatus::Failed(SentinelError::Prctl("PR_SET_TSC", 22))),
+            "per-run status is replaceable, so failed overwrites prior Active"
         );
+        assert!(BELT_INSTALLED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_then_success_reports_fresh_status() {
+        // Prove replaceable per-run slot: failed -> successful reports fresh.
+        BELT_INSTALLED.store(false, Ordering::Relaxed);
+        *belt_status_slot().lock().expect("lock") = None;
+        let failed = install_and_record_with(|| Err(SentinelError::Prctl("PR_SET_TSC", 22)));
+        assert_eq!(
+            failed,
+            BeltStatus::Failed(SentinelError::Prctl("PR_SET_TSC", 22))
+        );
+        assert_eq!(
+            belt_status(),
+            Some(BeltStatus::Failed(SentinelError::Prctl("PR_SET_TSC", 22)))
+        );
+        assert!(!BELT_INSTALLED.load(Ordering::Relaxed));
+        let success = install_and_record_with(|| {
+            Ok(ProcessBeltStatus {
+                seccomp_installed: true,
+                rdtsc_trapped: true,
+                rdrand_rdseed_present: false,
+            })
+        });
+        assert_eq!(
+            success,
+            BeltStatus::Active {
+                rdrand_rdseed_present: false
+            }
+        );
+        assert_eq!(
+            belt_status(),
+            Some(BeltStatus::Active {
+                rdrand_rdseed_present: false
+            }),
+            "successful install after failed must report fresh Active"
+        );
+        assert!(BELT_INSTALLED.load(Ordering::Relaxed));
     }
 
     /// The TSC guard must never claim an active trap it did not install, and

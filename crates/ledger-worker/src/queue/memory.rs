@@ -484,10 +484,12 @@ mod tests {
     }
     #[test]
     fn dns_affects_queued_hash() {
-        let mut cfg_a = RunConfig::builder().seed([3u8; 32]).build();
-        let mut cfg_b = RunConfig::builder().seed([3u8; 32]).build();
-        cfg_a.dns_mut().insert("a.test", 1);
-        cfg_b.dns_mut().insert("b.test", 1);
+        let mut dns_a = ledger_sim::DnsTable::new();
+        dns_a.insert("a.test", 1);
+        let mut dns_b = ledger_sim::DnsTable::new();
+        dns_b.insert("b.test", 1);
+        let cfg_a = RunConfig::builder().seed([3u8; 32]).dns(dns_a).build();
+        let cfg_b = RunConfig::builder().seed([3u8; 32]).dns(dns_b).build();
         let mut q = InMemoryQueue::new(Duration::from_secs(60));
         q.push(Task::new("ta", cfg_a, "trivial"));
         q.push(Task::new("tb", cfg_b, "trivial"));
