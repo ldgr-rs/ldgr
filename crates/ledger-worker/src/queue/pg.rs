@@ -379,8 +379,11 @@ mod tests {
 
     #[test]
     fn args_projection_rejects_non_random_policy() {
-        let mut task = Task::new("rt-2", RunConfig::default(), "kv");
-        *task.run_config.policy_mut() = ledger_sim::Policy::Replay;
+        let task = Task::new(
+            "rt-2",
+            RunConfig::default().with_policy(ledger_sim::Policy::Replay),
+            "kv",
+        );
         let err = task_args(&task).unwrap_err();
         assert!(err.to_string().contains("random"), "got {err}");
     }
