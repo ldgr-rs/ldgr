@@ -82,7 +82,7 @@
 
 use ledger_format::{CborError, CborValue, Hash};
 
-use crate::config::{Policy, RunConfig, SimFault, SwarmConfig};
+use crate::config::{Policy, Probability, RunConfig, SimFault, SwarmConfig};
 use crate::net::LinkConfig;
 
 /// Current format version of the canonical RunConfig bytes.
@@ -143,6 +143,8 @@ pub enum ConfigCanonicalError {
     DnsNameTooLong(usize),
     /// Two DNS entries carry the same name; the table would collapse them.
     DuplicateDnsName(String),
+    /// A probability field is outside 0.0 ..= 1.0 or is -0.0.
+    ProbabilityOutOfRange(&'static str),
 }
 
 impl core::fmt::Display for ConfigCanonicalError {
@@ -183,6 +185,9 @@ impl core::fmt::Display for ConfigCanonicalError {
                 write!(f, "DNS name exceeds {MAX_DNS_NAME_LEN} bytes, got {len}")
             }
             Self::DuplicateDnsName(name) => write!(f, "duplicate DNS name in document: {name}"),
+            Self::ProbabilityOutOfRange(field) => {
+                write!(f, "probability out of range in field: {field}")
+            }
         }
     }
 }
@@ -437,7 +442,7 @@ fn link_value(link: &LinkConfig) -> Result<CborValue, ConfigCanonicalError> {
     Ok(CborValue::Array(vec![
         CborValue::Unsigned(link.base_delay),
         CborValue::Unsigned(link.jitter),
-        float(link.loss_probability, "links.loss_probability")?,
+        float(link.loss_probability.get(), "links.loss_probability")?,
         CborValue::Unsigned(u64_of_usize(link.reorder_window)),
     ]))
 }
@@ -449,10 +454,10 @@ fn swarm_value(swarm: &SwarmConfig) -> Result<CborValue, ConfigCanonicalError> {
         ));
     }
     Ok(CborValue::Array(vec![
-        float(swarm.drop_probability, "swarm.drop_probability")?,
-        float(swarm.delay_probability, "swarm.delay_probability")?,
+        float(swarm.drop_probability.get(), "swarm.drop_probability")?,
+        float(swarm.delay_probability.get(), "swarm.delay_probability")?,
         CborValue::Unsigned(swarm.max_delay_ticks),
-        float(swarm.crash_probability, "swarm.crash_probability")?,
+        float(swarm.crash_probability.get(), "swarm.crash_probability")?,
         CborValue::Unsigned(u64_of_usize(swarm.fault_classes_per_run)),
     ]))
 }
@@ -470,7 +475,7 @@ fn policy_value(policy: &Policy) -> Result<CborValue, ConfigCanonicalError> {
         } => CborValue::Array(vec![
             CborValue::Unsigned(2),
             float(*exploration_constant, "policy.bandit.exploration_constant")?,
-            float(*pct_mix, "policy.bandit.pct_mix")?,
+            float(pct_mix.get(), "policy.bandit.pct_mix")?,
         ]),
         Policy::Replay => CborValue::Array(vec![CborValue::Unsigned(3)]),
         Policy::Dpor => CborValue::Array(vec![CborValue::Unsigned(4)]),
@@ -565,6 +570,26 @@ fn finite_float_of(value: &CborValue, field: &'static str) -> Result<f64, Config
     }
 }
 
+fn probability_of(
+    value: &CborValue,
+    field: &'static str,
+) -> Result<Probability, ConfigCanonicalError> {
+    match value {
+        CborValue::Float(v) => {
+            if !v.is_finite() {
+                return Err(ConfigCanonicalError::NonFiniteFloat(field));
+            }
+            if v.is_sign_negative() || *v > 1.0 {
+                return Err(ConfigCanonicalError::ProbabilityOutOfRange(field));
+            }
+            // Validated, so construction cannot fail.
+            Ok(Probability::new(*v)
+                .map_err(|_| ConfigCanonicalError::ProbabilityOutOfRange(field))?)
+        }
+        _ => Err(ConfigCanonicalError::WrongFieldType(field)),
+    }
+}
+
 fn decode_hash(value: &CborValue, field: &'static str) -> Result<Hash, ConfigCanonicalError> {
     match value {
         CborValue::Bytes(bytes) => <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
@@ -612,7 +637,7 @@ fn decode_policy(value: &CborValue) -> Result<Policy, ConfigCanonicalError> {
                     &rest[0],
                     "policy.bandit.exploration_constant",
                 )?,
-                pct_mix: finite_float_of(&rest[1], "policy.bandit.pct_mix")?,
+                pct_mix: probability_of(&rest[1], "policy.bandit.pct_mix")?,
             })
         }
         3 => {
@@ -637,10 +662,10 @@ fn decode_swarm(value: &CborValue) -> Result<SwarmConfig, ConfigCanonicalError> 
         return Err(ConfigCanonicalError::InvalidMaxDelayTicks(max_delay_ticks));
     }
     Ok(SwarmConfig {
-        drop_probability: finite_float_of(&items[0], "swarm.drop_probability")?,
-        delay_probability: finite_float_of(&items[1], "swarm.delay_probability")?,
+        drop_probability: probability_of(&items[0], "swarm.drop_probability")?,
+        delay_probability: probability_of(&items[1], "swarm.delay_probability")?,
         max_delay_ticks,
-        crash_probability: finite_float_of(&items[3], "swarm.crash_probability")?,
+        crash_probability: probability_of(&items[3], "swarm.crash_probability")?,
         fault_classes_per_run: usize_of(&items[4], "swarm.fault_classes_per_run")?,
     })
 }
@@ -673,7 +698,7 @@ fn decode_link(value: &CborValue) -> Result<(usize, usize, LinkConfig), ConfigCa
         LinkConfig {
             base_delay: u64_of(&link_items[0], "links.base_delay")?,
             jitter,
-            loss_probability: finite_float_of(&link_items[2], "links.loss_probability")?,
+            loss_probability: probability_of(&link_items[2], "links.loss_probability")?,
             reorder_window: usize_of(&link_items[3], "links.reorder_window")?,
         },
     ))
@@ -802,4 +827,458 @@ fn expect_len(
 
 fn expect_empty(items: &[CborValue], field: &'static str) -> Result<(), ConfigCanonicalError> {
     expect_len(items, 0, field)
+}
+
+#[cfg(test)]
+mod probability_tests {
+    use super::*;
+    use crate::config::{Probability, SwarmConfig};
+    use crate::net::LinkConfig;
+    use ledger_format::CborValue;
+
+    fn minimal_fields() -> Vec<(&'static str, CborValue)> {
+        vec![
+            ("dns", CborValue::Array(Vec::new())),
+            ("seed", CborValue::Bytes(vec![0u8; 32])),
+            ("links", CborValue::Array(Vec::new())),
+            (
+                "swarm",
+                CborValue::Array(vec![
+                    CborValue::Float(0.0),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(0),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(2),
+                ]),
+            ),
+            ("policy", CborValue::Array(vec![CborValue::Unsigned(0)])),
+            ("monitor", CborValue::Bool(true)),
+            ("max_steps", CborValue::Unsigned(10_000)),
+            ("dropped_events", CborValue::Array(Vec::new())),
+            ("fs_journaling", CborValue::Null),
+            ("fault_schedule", CborValue::Array(Vec::new())),
+        ]
+    }
+
+    fn craft_document(fields: Vec<(&str, CborValue)>) -> Vec<u8> {
+        let entries = fields
+            .into_iter()
+            .map(|(name, value)| (CborValue::Text(name.to_string()), value))
+            .collect();
+        CborValue::Array(vec![
+            CborValue::Unsigned(FORMAT_VERSION),
+            CborValue::Map(entries),
+        ])
+        .try_to_canonical_bytes()
+        .expect("crafted document encodes")
+    }
+
+    fn set_field(
+        fields: &mut Vec<(&'static str, CborValue)>,
+        name: &'static str,
+        value: CborValue,
+    ) {
+        for (field_name, slot) in fields.iter_mut() {
+            if *field_name == name {
+                *slot = value;
+                return;
+            }
+        }
+        panic!("field {name} not present");
+    }
+
+    #[test]
+    fn probability_decode_rejects_invalid_per_slot() {
+        // NaN is non-canonical CBOR, rejected at CBOR layer; infinities at run-config layer
+        assert_eq!(
+            crate::config::Probability::new(f64::NAN).unwrap_err(),
+            crate::config::ProbabilityError::NonFinite
+        );
+        let invalid = [
+            (
+                f64::INFINITY,
+                ConfigCanonicalError::NonFiniteFloat("swarm.drop_probability"),
+            ),
+            (
+                f64::NEG_INFINITY,
+                ConfigCanonicalError::NonFiniteFloat("swarm.drop_probability"),
+            ),
+        ];
+        for (value, expected) in invalid {
+            let mut fields = minimal_fields();
+            set_field(
+                &mut fields,
+                "swarm",
+                CborValue::Array(vec![
+                    CborValue::Float(value),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(0),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(2),
+                ]),
+            );
+            let bytes = match CborValue::Array(vec![
+                CborValue::Unsigned(FORMAT_VERSION),
+                CborValue::Map(
+                    fields
+                        .into_iter()
+                        .map(|(n, v)| (CborValue::Text(n.to_string()), v))
+                        .collect(),
+                ),
+            ])
+            .try_to_canonical_bytes()
+            {
+                Ok(b) => b,
+                Err(e) => panic!("craft failed for value {:?} err {:?}", value, e),
+            };
+            let err = from_canonical_bytes(&bytes).expect_err("must reject");
+            assert_eq!(err, expected);
+        }
+        // -0.0 is non-canonical CBOR, rejected at CBOR layer; >1 at Probability layer
+        assert_eq!(
+            crate::config::Probability::new(-0.0).unwrap_err(),
+            crate::config::ProbabilityError::OutOfRange
+        );
+        {
+            let fields = vec![
+                ("dns", CborValue::Array(Vec::new())),
+                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                ("links", CborValue::Array(Vec::new())),
+                (
+                    "swarm",
+                    CborValue::Array(vec![
+                        CborValue::Float(-0.0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(2),
+                    ]),
+                ),
+                ("policy", CborValue::Array(vec![CborValue::Unsigned(0)])),
+                ("monitor", CborValue::Bool(true)),
+                ("max_steps", CborValue::Unsigned(10_000)),
+                ("dropped_events", CborValue::Array(Vec::new())),
+                ("fs_journaling", CborValue::Null),
+                ("fault_schedule", CborValue::Array(Vec::new())),
+            ];
+            let entries = fields
+                .into_iter()
+                .map(|(n, v)| (CborValue::Text(n.to_string()), v))
+                .collect();
+            let doc = CborValue::Array(vec![
+                CborValue::Unsigned(FORMAT_VERSION),
+                CborValue::Map(entries),
+            ]);
+            let err = doc.try_to_canonical_bytes().expect_err("must reject -0.0");
+            assert_eq!(err, ledger_format::CborError::NonCanonicalFloat);
+        }
+        {
+            let mut fields = minimal_fields();
+            set_field(
+                &mut fields,
+                "swarm",
+                CborValue::Array(vec![
+                    CborValue::Float(1.0000001),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(0),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(2),
+                ]),
+            );
+            let bytes = craft_document(fields);
+            let err = from_canonical_bytes(&bytes).expect_err("must reject");
+            assert_eq!(
+                err,
+                ConfigCanonicalError::ProbabilityOutOfRange("swarm.drop_probability")
+            );
+        }
+        // Swarm delay slot: -0.0 is CBOR non-canonical, 1.5 is out of range
+        {
+            assert_eq!(
+                crate::config::Probability::new(-0.0).unwrap_err(),
+                crate::config::ProbabilityError::OutOfRange
+            );
+            let fields = vec![
+                ("dns", CborValue::Array(Vec::new())),
+                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                ("links", CborValue::Array(Vec::new())),
+                (
+                    "swarm",
+                    CborValue::Array(vec![
+                        CborValue::Float(0.0),
+                        CborValue::Float(-0.0),
+                        CborValue::Unsigned(0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(2),
+                    ]),
+                ),
+                ("policy", CborValue::Array(vec![CborValue::Unsigned(0)])),
+                ("monitor", CborValue::Bool(true)),
+                ("max_steps", CborValue::Unsigned(10_000)),
+                ("dropped_events", CborValue::Array(Vec::new())),
+                ("fs_journaling", CborValue::Null),
+                ("fault_schedule", CborValue::Array(Vec::new())),
+            ];
+            let entries = fields
+                .into_iter()
+                .map(|(n, v)| (CborValue::Text(n.to_string()), v))
+                .collect();
+            let doc = CborValue::Array(vec![
+                CborValue::Unsigned(FORMAT_VERSION),
+                CborValue::Map(entries),
+            ]);
+            let err = doc.try_to_canonical_bytes().expect_err("must reject -0.0");
+            assert_eq!(err, ledger_format::CborError::NonCanonicalFloat);
+        }
+        // Swarm crash slot
+        {
+            let mut fields = minimal_fields();
+            set_field(
+                &mut fields,
+                "swarm",
+                CborValue::Array(vec![
+                    CborValue::Float(0.0),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(0),
+                    CborValue::Float(1.5),
+                    CborValue::Unsigned(2),
+                ]),
+            );
+            let bytes = craft_document(fields);
+            assert_eq!(
+                from_canonical_bytes(&bytes).unwrap_err(),
+                ConfigCanonicalError::ProbabilityOutOfRange("swarm.crash_probability")
+            );
+        }
+        // Link loss slot: -0.0 is CBOR non-canonical
+        {
+            assert_eq!(
+                crate::config::Probability::new(-0.0).unwrap_err(),
+                crate::config::ProbabilityError::OutOfRange
+            );
+            let fields = vec![
+                ("dns", CborValue::Array(Vec::new())),
+                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                (
+                    "links",
+                    CborValue::Array(vec![CborValue::Array(vec![
+                        CborValue::Unsigned(0),
+                        CborValue::Unsigned(1),
+                        CborValue::Array(vec![
+                            CborValue::Unsigned(0),
+                            CborValue::Unsigned(0),
+                            CborValue::Float(-0.0),
+                            CborValue::Unsigned(0),
+                        ]),
+                    ])]),
+                ),
+                (
+                    "swarm",
+                    CborValue::Array(vec![
+                        CborValue::Float(0.0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(2),
+                    ]),
+                ),
+                ("policy", CborValue::Array(vec![CborValue::Unsigned(0)])),
+                ("monitor", CborValue::Bool(true)),
+                ("max_steps", CborValue::Unsigned(10_000)),
+                ("dropped_events", CborValue::Array(Vec::new())),
+                ("fs_journaling", CborValue::Null),
+                ("fault_schedule", CborValue::Array(Vec::new())),
+            ];
+            let entries = fields
+                .into_iter()
+                .map(|(n, v)| (CborValue::Text(n.to_string()), v))
+                .collect();
+            let doc = CborValue::Array(vec![
+                CborValue::Unsigned(FORMAT_VERSION),
+                CborValue::Map(entries),
+            ]);
+            let err = doc.try_to_canonical_bytes().expect_err("must reject -0.0");
+            assert_eq!(err, ledger_format::CborError::NonCanonicalFloat);
+        }
+        {
+            assert_eq!(
+                crate::config::Probability::new(f64::NAN).unwrap_err(),
+                crate::config::ProbabilityError::NonFinite
+            );
+            let fields = vec![
+                ("dns", CborValue::Array(Vec::new())),
+                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                (
+                    "links",
+                    CborValue::Array(vec![CborValue::Array(vec![
+                        CborValue::Unsigned(0),
+                        CborValue::Unsigned(1),
+                        CborValue::Array(vec![
+                            CborValue::Unsigned(0),
+                            CborValue::Unsigned(0),
+                            CborValue::Float(f64::NAN),
+                            CborValue::Unsigned(0),
+                        ]),
+                    ])]),
+                ),
+                (
+                    "swarm",
+                    CborValue::Array(vec![
+                        CborValue::Float(0.0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(2),
+                    ]),
+                ),
+                ("policy", CborValue::Array(vec![CborValue::Unsigned(0)])),
+                ("monitor", CborValue::Bool(true)),
+                ("max_steps", CborValue::Unsigned(10_000)),
+                ("dropped_events", CborValue::Array(Vec::new())),
+                ("fs_journaling", CborValue::Null),
+                ("fault_schedule", CborValue::Array(Vec::new())),
+            ];
+            let entries = fields
+                .into_iter()
+                .map(|(n, v)| (CborValue::Text(n.to_string()), v))
+                .collect();
+            let doc = CborValue::Array(vec![
+                CborValue::Unsigned(FORMAT_VERSION),
+                CborValue::Map(entries),
+            ]);
+            let err = doc.try_to_canonical_bytes().expect_err("must reject NAN");
+            assert_eq!(err, ledger_format::CborError::NonCanonicalFloat);
+        }
+        // Bandit pct_mix slot
+        {
+            let mut fields = minimal_fields();
+            set_field(
+                &mut fields,
+                "policy",
+                CborValue::Array(vec![
+                    CborValue::Unsigned(2),
+                    CborValue::Float(1.414),
+                    CborValue::Float(2.0),
+                ]),
+            );
+            let bytes = craft_document(fields);
+            assert_eq!(
+                from_canonical_bytes(&bytes).unwrap_err(),
+                ConfigCanonicalError::ProbabilityOutOfRange("policy.bandit.pct_mix")
+            );
+        }
+        {
+            assert_eq!(
+                crate::config::Probability::new(-0.0).unwrap_err(),
+                crate::config::ProbabilityError::OutOfRange
+            );
+            let fields = vec![
+                ("dns", CborValue::Array(Vec::new())),
+                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                ("links", CborValue::Array(Vec::new())),
+                (
+                    "swarm",
+                    CborValue::Array(vec![
+                        CborValue::Float(0.0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(0),
+                        CborValue::Float(0.0),
+                        CborValue::Unsigned(2),
+                    ]),
+                ),
+                (
+                    "policy",
+                    CborValue::Array(vec![
+                        CborValue::Unsigned(2),
+                        CborValue::Float(1.414),
+                        CborValue::Float(-0.0),
+                    ]),
+                ),
+                ("monitor", CborValue::Bool(true)),
+                ("max_steps", CborValue::Unsigned(10_000)),
+                ("dropped_events", CborValue::Array(Vec::new())),
+                ("fs_journaling", CborValue::Null),
+                ("fault_schedule", CborValue::Array(Vec::new())),
+            ];
+            let entries = fields
+                .into_iter()
+                .map(|(n, v)| (CborValue::Text(n.to_string()), v))
+                .collect();
+            let doc = CborValue::Array(vec![
+                CborValue::Unsigned(FORMAT_VERSION),
+                CborValue::Map(entries),
+            ]);
+            let err = doc.try_to_canonical_bytes().expect_err("must reject -0.0");
+            assert_eq!(err, ledger_format::CborError::NonCanonicalFloat);
+        }
+        {
+            let mut fields = minimal_fields();
+            set_field(
+                &mut fields,
+                "policy",
+                CborValue::Array(vec![
+                    CborValue::Unsigned(2),
+                    CborValue::Float(1.414),
+                    CborValue::Float(f64::INFINITY),
+                ]),
+            );
+            let bytes = craft_document(fields);
+            assert_eq!(
+                from_canonical_bytes(&bytes).unwrap_err(),
+                ConfigCanonicalError::NonFiniteFloat("policy.bandit.pct_mix")
+            );
+        }
+    }
+
+    #[test]
+    fn roundtrip_stable_hash_over_generated_valid_configs() {
+        let valid_probs = [0.0, 0.1, 0.5, 1.0];
+        let mut configs = Vec::new();
+        for &drop in &valid_probs {
+            for &delay in &valid_probs {
+                for &crash in &valid_probs {
+                    for &loss in &valid_probs {
+                        for &pct in &valid_probs {
+                            let cfg = crate::config::RunConfig::builder()
+                                .swarm(SwarmConfig {
+                                    drop_probability: Probability::new(drop).unwrap(),
+                                    delay_probability: Probability::new(delay).unwrap(),
+                                    max_delay_ticks: 7,
+                                    crash_probability: Probability::new(crash).unwrap(),
+                                    fault_classes_per_run: 2,
+                                })
+                                .links(vec![(
+                                    0,
+                                    1,
+                                    LinkConfig {
+                                        base_delay: 1,
+                                        jitter: 0,
+                                        loss_probability: Probability::new(loss).unwrap(),
+                                        reorder_window: 0,
+                                    },
+                                )])
+                                .policy(crate::config::Policy::Bandit {
+                                    exploration_constant: 1.414,
+                                    pct_mix: Probability::new(pct).unwrap(),
+                                })
+                                .build();
+                            configs.push(cfg);
+                        }
+                    }
+                }
+            }
+        }
+        for cfg in configs {
+            let bytes = to_canonical_bytes(&cfg).expect("encodes");
+            let decoded = from_canonical_bytes(&bytes).expect("decodes");
+            assert_eq!(cfg.swarm(), decoded.swarm());
+            assert_eq!(cfg.links(), decoded.links());
+            assert_eq!(cfg.policy(), decoded.policy());
+            let h1 = canonical_hash(&cfg).expect("hash");
+            let h2 = canonical_hash(&decoded).expect("hash decoded");
+            assert_eq!(h1, h2);
+            let bytes2 = to_canonical_bytes(&decoded).expect("re-encodes");
+            assert_eq!(bytes, bytes2);
+        }
+    }
 }
