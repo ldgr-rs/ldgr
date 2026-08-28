@@ -5,24 +5,24 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use clap_complete::Shell;
 
-use ledger_cli::format_check::{FormatCheckOutcome, check_file};
+use ledger_cli::format_check::{check_file, FormatCheckOutcome};
 use ledger_cli::ldfi_cmd::{self, LdfiReport};
 use ledger_cli::scaffold;
 use ledger_cli::scaffold_consensus;
 use ledger_cli::{
-    Cli, Command, DefaultMiniKv, MaxSatEngineArg, generate_completions, is_verbose, seed_from_u64,
+    generate_completions, is_verbose, seed_from_u64, Cli, Command, DefaultMiniKv, MaxSatEngineArg,
 };
-use ledger_explorer::search::{Workload, replay, search};
-use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle, minimize_schedule};
+use ledger_explorer::search::{replay_prefix, replay_strict, search, Workload};
+use ledger_explorer::{minimize_schedule, HistoryOracle, KeyValueSpec, Oracle};
 use ledger_format::Hash;
-use ledger_sim::{Policy, RunConfig, SimFault, Simulation};
+use ledger_sim::{Policy, ReplayViolation, RunConfig, RuntimeError, SimFault, Simulation};
 
 /// Cancel flag for an armed watchdog. Dropping the guard disarms the thread.
 struct WatchdogGuard {
@@ -117,12 +117,14 @@ fn main() -> ExitCode {
             exploration_constant,
             priority_changes,
             max_steps,
+            decisions,
         } => run_repro(
             &cli,
             verbose,
             *seed,
             policy.to_policy(*exploration_constant, *priority_changes),
             *max_steps,
+            decisions.as_deref(),
         ),
         Command::Minimize {
             seed,
@@ -160,7 +162,9 @@ fn main() -> ExitCode {
         Command::Completions { shell } => run_completions(*shell),
         Command::Ingest { input, fidelity } => run_ingest(&cli, input, *fidelity),
         Command::Cert { cmd } => match cmd {
-            ledger_cli::CertCommand::Verify { path } => run_cert_verify(&cli, path),
+            ledger_cli::CertCommand::Verify { path, journal } => {
+                run_cert_verify(&cli, path, journal.as_deref())
+            }
         },
         Command::Faults { cmd } => match cmd {
             ledger_cli::FaultsCommand::Compile { file } => run_faults_compile(&cli, file),
@@ -240,8 +244,9 @@ fn run_sim(
 
     if cli.ndjson {
         for attempt in 0..runs {
-            let mut attempt_config = config.clone();
-            attempt_config.seed_mut()[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            let mut attempt_seed = config.seed();
+            attempt_seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            let attempt_config = config.clone().with_seed(attempt_seed);
             let run = Simulation::new(attempt_config, workload.programs()).run()?;
             let verdict = oracle.check(&run);
             let status = if verdict.violated {
@@ -294,22 +299,60 @@ fn run_repro(
     seed: u64,
     policy: Policy,
     max_steps: usize,
+    decisions_path: Option<&Path>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let workload = DefaultMiniKv;
     let seed_hash = seed_from_u64(seed);
+    // Artifact path uses strict replay against the supplied decisions.
+    if let Some(path) = decisions_path {
+        let decisions = read_decisions_artifact(path)?;
+        let replay_result = replay_strict(&workload, seed_hash, decisions);
+        let replayed = match replay_result {
+            Ok(value) => value,
+            Err(RuntimeError::StrictReplay(violation)) => {
+                return strict_violation_exit(cli, &violation);
+            }
+            Err(other) => return Err(other.into()),
+        };
+        // Valid artifact replayed successfully.
+        if cli.json || cli.ndjson {
+            let value = serde_json::json!({
+                "reproducible": true,
+                "journal_root": ledger_format::hash_to_hex(&replayed.journal.root_hash()),
+                "strict": true
+            });
+            println!("{}", value);
+        } else {
+            println!("Replay status: reproducible = true");
+            println!(
+                "Journal root: {}",
+                ledger_format::hash_to_hex(&replayed.journal.root_hash())
+            );
+            println!("strict: true");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    // No artifact: run fresh then strict replay the recorded decisions.
     let config = RunConfig::builder()
         .seed(seed_hash)
         .policy(policy)
         .max_steps(max_steps)
         .build();
     let run = Simulation::new(config, workload.programs()).run()?;
-    let replayed = replay(&workload, seed_hash, run.decisions.clone())?;
-
+    let replay_result = replay_strict(&workload, seed_hash, run.decisions.clone());
+    let replayed = match replay_result {
+        Ok(value) => value,
+        Err(RuntimeError::StrictReplay(violation)) => {
+            return strict_violation_exit(cli, &violation);
+        }
+        Err(other) => return Err(other.into()),
+    };
     let matches = run.journal.root_hash() == replayed.journal.root_hash();
     if cli.json || cli.ndjson {
         let value = serde_json::json!({
             "reproducible": matches,
-            "journal_root": ledger_format::hash_to_hex(&replayed.journal.root_hash())
+            "journal_root": ledger_format::hash_to_hex(&replayed.journal.root_hash()),
+            "strict": true
         });
         println!("{}", value);
     } else {
@@ -318,8 +361,85 @@ fn run_repro(
             "Journal root: {}",
             ledger_format::hash_to_hex(&replayed.journal.root_hash())
         );
+        println!("strict: true");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Maximum decisions artifact size (1 MiB) to bound parsing.
+const DECISIONS_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Read and parse a decisions artifact capped at [`DECISIONS_MAX_BYTES`].
+fn read_decisions_artifact(path: &Path) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > DECISIONS_MAX_BYTES {
+        return Err(format!(
+            "decisions artifact too large: {} bytes > {} limit",
+            metadata.len(),
+            DECISIONS_MAX_BYTES
+        )
+        .into());
+    }
+    let file = std::fs::File::open(path)?;
+    let mut raw = String::new();
+    let mut limited = file.take(DECISIONS_MAX_BYTES + 1);
+    use std::io::Read as _;
+    limited.read_to_string(&mut raw)?;
+    if raw.len() as u64 > DECISIONS_MAX_BYTES {
+        return Err(format!(
+            "decisions artifact too large: {} bytes > {} limit",
+            raw.len(),
+            DECISIONS_MAX_BYTES
+        )
+        .into());
+    }
+    let decisions: Vec<usize> = serde_json::from_str(&raw)?;
+    Ok(decisions)
+}
+
+/// Emit a typed strict violation and exit 1.
+fn strict_violation_exit(
+    cli: &Cli,
+    violation: &ReplayViolation,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let violation_json = match violation {
+        ReplayViolation::OutOfRange {
+            step,
+            value,
+            ready_len,
+        } => serde_json::json!({
+            "kind": "OutOfRange",
+            "step": step,
+            "value": value,
+            "ready_len": ready_len,
+            "reason": violation.to_string()
+        }),
+        ReplayViolation::Exhausted { step, replay_len } => serde_json::json!({
+            "kind": "Exhausted",
+            "step": step,
+            "replay_len": replay_len,
+            "reason": violation.to_string()
+        }),
+        ReplayViolation::Trailing { trailing, steps } => serde_json::json!({
+            "kind": "Trailing",
+            "trailing": trailing,
+            "steps": steps,
+            "reason": violation.to_string()
+        }),
+    };
+    if cli.json || cli.ndjson {
+        let value = serde_json::json!({
+            "reproducible": false,
+            "strict": true,
+            "violation": violation_json,
+            "reason": violation.to_string()
+        });
+        println!("{}", value);
+    } else {
+        println!("Replay status: reproducible = false");
+        println!("strict replay violation: {violation}");
+    }
+    Ok(ExitCode::from(1))
 }
 
 fn run_minimize(
@@ -339,7 +459,7 @@ fn run_minimize(
         .build();
     if let Some(finding) = search(&workload, &oracle, config, runs)? {
         let report = minimize_schedule(&finding.run.decisions, |decisions| {
-            replay(&workload, finding.seed, decisions.to_vec())
+            replay_prefix(&workload, finding.seed, decisions.to_vec())
                 .map(|run| oracle.check(&run).violated)
                 .unwrap_or(false)
         });
@@ -646,27 +766,21 @@ fn ldfi_json(report: &LdfiReport) -> String {
 
 fn describe_injection(injection: &SimFault) -> String {
     match injection {
-        SimFault::Drop(id) => format!("drop:{}", hex_prefix(id)),
-        SimFault::Delay { send, ticks } => format!("delay:{}:{ticks}", hex_prefix(send)),
+        SimFault::Drop(id) => format!("drop:{}", &ledger_format::hash_to_hex(id)[..8]),
+        SimFault::Delay { send, ticks } => {
+            format!("delay:{}:{ticks}", &ledger_format::hash_to_hex(send)[..8])
+        }
         SimFault::Partition { src, dst } => format!("partition:{src}->{dst}"),
-        SimFault::Crash(id) => format!("crash:{}", hex_prefix(id)),
-        SimFault::Corrupt { write, xor_mask } => {
-            format!("corrupt:{}:mask={xor_mask}", hex_prefix(write))
-        }
-        SimFault::CrashState { write, state } => {
-            format!("crash-state:{}:{state}", hex_prefix(write))
-        }
+        SimFault::Crash(id) => format!("crash:{}", &ledger_format::hash_to_hex(id)[..8]),
+        SimFault::Corrupt { write, xor_mask } => format!(
+            "corrupt:{}:mask={xor_mask}",
+            &ledger_format::hash_to_hex(write)[..8]
+        ),
+        SimFault::CrashState { write, state } => format!(
+            "crash-state:{}:{state}",
+            &ledger_format::hash_to_hex(write)[..8]
+        ),
     }
-}
-
-/// Renders the first four bytes of a hash as lowercase hex.
-fn hex_prefix(hash: &Hash) -> String {
-    hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// Renders a 32-byte hash as 64-char lowercase hex.
-fn hex_hash(hash: &Hash) -> String {
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn run_ingest(
@@ -676,8 +790,8 @@ fn run_ingest(
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let config = ledger_adapters::OtelIngestConfig::new(fidelity.to_fidelity(), true, 100_000);
     let ingested = ledger_adapters::otel::ingest_otel_file_with_config(input, config)?;
-    let root_hex = hex_hash(&ingested.journal.root_hash());
-    let envelope_hash = hex_hash(&ingested.envelope_hash()?);
+    let root_hex = ledger_format::hash_to_hex(&ingested.journal.root_hash());
+    let envelope_hash = ledger_format::hash_to_hex(&ingested.envelope_hash()?);
     let fidelity_str = fidelity.as_str();
     let certifiable = ingested.is_certifiable();
     let entries = ingested.journal.len();
@@ -695,9 +809,13 @@ fn run_ingest(
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_cert_verify(cli: &Cli, path: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn run_cert_verify(
+    cli: &Cli,
+    path: &Path,
+    journal: Option<&Path>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let effective_json = cli.json || cli.ndjson;
-    match ledger_cli::cert_cmd::run_verify(path, effective_json) {
+    match ledger_cli::cert_cmd::run_verify(path, journal, effective_json) {
         Ok(output) => {
             println!("{output}");
             Ok(ExitCode::SUCCESS)
