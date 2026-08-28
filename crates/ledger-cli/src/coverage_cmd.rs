@@ -102,7 +102,9 @@ pub fn run(input: &Path, format: &str) -> Result<String, CoverageCmdError> {
             }
         })?;
         let normalized = ledger_format::hash_to_hex(&bytes);
-        builder.record_hex(normalized, parsed.run_index, parsed.finding);
+        builder
+            .record_hex(normalized, parsed.run_index, parsed.finding)
+            .map_err(CoverageCmdError::Export)?;
         max_index =
             Some(max_index.map_or(parsed.run_index, |current| current.max(parsed.run_index)));
     }

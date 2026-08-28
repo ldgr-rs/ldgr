@@ -1,63 +1,69 @@
 // ledger-lint:allow (host application; certificate verification reads files on disk)
 //! `ledger cert verify` command.
 
+use std::io::Read;
 use std::path::Path;
 
+use ledger_explorer::certs::{CERT_MAX_BYTES, check_cert_bytes};
+use ledger_explorer::search::PersistentJournal;
 use ledger_explorer::{CampaignCertificate, CertError};
 
 /// Errors from `ledger cert verify`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CertVerifyError {
     /// The certificate file could not be read.
-    Io(std::io::Error),
-    /// The JSON did not parse into a certificate; carries the `schema:`
-    /// distinction from [`CertError`].
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    /// The JSON did not parse into a certificate.
+    #[error(transparent)]
     Decode(CertError),
-    /// The signature or statement failed verification.
+    /// The persistent journal could not be opened.
+    #[error("journal open: {0}")]
+    JournalOpen(#[from] ledger_journal::JournalError),
+    /// Statement validation or journal binding failed.
+    #[error(transparent)]
     Verification(CertError),
     /// JSON serialization failed.
-    Json(serde_json::Error),
-}
-
-impl std::fmt::Display for CertVerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "io: {error}"),
-            Self::Decode(error) | Self::Verification(error) => write!(f, "{error}"),
-            Self::Json(error) => write!(f, "json: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for CertVerifyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(error) => Some(error),
-            Self::Decode(error) | Self::Verification(error) => Some(error),
-            Self::Json(error) => Some(error),
-        }
-    }
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 /// Verifies a campaign certificate JSON file.
 ///
-/// Reads `path`, parses it with `CampaignCertificate::from_json`, then
-/// calls `verify`. On success returns human text when `json` is false or a
-/// JSON object when `json` is true. On failure returns a
-/// [`CertVerifyError`] that preserves the `schema:` vs `verification:`
-/// distinction from `CertError`.
+/// Reads `path` through a bounded reader, validates the statement, and
+/// optionally binds it to a journal.
 ///
 /// # Errors
-/// Returns [`CertVerifyError`] when the file cannot be read, parsed, or
-/// verified.
-pub fn run_verify(path: &Path, json: bool) -> Result<String, CertVerifyError> {
-    let raw = std::fs::read_to_string(path).map_err(CertVerifyError::Io)?;
+/// Returns [`CertVerifyError`] when the file cannot be read, parsed, validated,
+/// or bound to the supplied journal.
+pub fn run_verify(
+    path: &Path,
+    journal: Option<&Path>,
+    json: bool,
+) -> Result<String, CertVerifyError> {
+    let file = std::fs::File::open(path).map_err(CertVerifyError::Io)?;
+    let mut raw = String::new();
+    let mut limited = file.take((CERT_MAX_BYTES + 1) as u64);
+    limited
+        .read_to_string(&mut raw)
+        .map_err(CertVerifyError::Io)?;
+    check_cert_bytes(raw.len()).map_err(CertVerifyError::Decode)?;
     let cert = CampaignCertificate::from_json(&raw).map_err(CertVerifyError::Decode)?;
-    cert.verify().map_err(CertVerifyError::Verification)?;
+    let mode_label = if let Some(journal_dir) = journal {
+        let persistent =
+            PersistentJournal::open(journal_dir).map_err(CertVerifyError::JournalOpen)?;
+        cert.verify_with_journal(persistent.journal())
+            .map_err(CertVerifyError::Verification)?;
+        "journal-bound"
+    } else {
+        cert.verify().map_err(CertVerifyError::Verification)?;
+        "statement-validated"
+    };
 
     if json {
         let value = serde_json::json!({
             "valid": true,
+            "mode": mode_label,
             "subject": {
                 "name": cert.subject.name,
                 "digest": ledger_format::hash_to_hex(&cert.subject.digest)
@@ -65,10 +71,11 @@ pub fn run_verify(path: &Path, json: bool) -> Result<String, CertVerifyError> {
             "predicate_type": cert.predicate_type,
             "runs_executed": cert.runs_executed,
             "findings_count": cert.findings_count,
-            "minimality": cert.minimality.as_ref().map(|entry| serde_json::json!({
+            "solver_data": cert.solver_data.as_ref().map(|entry| serde_json::json!({
                 "cut": entry.cut.iter().map(ledger_format::hash_to_hex).collect::<Vec<_>>(),
-                "lower_bound": entry.lower_bound,
-                "method": entry.method
+                "recorded_lower_bound": entry.recorded_lower_bound,
+                "method": entry.method,
+                "horizon": entry.horizon
             })).unwrap_or(serde_json::Value::Null),
             "statistical": cert.statistical.as_ref().map(|entry| serde_json::json!({
                 "upper_p": entry.upper_p,
@@ -80,6 +87,7 @@ pub fn run_verify(path: &Path, json: bool) -> Result<String, CertVerifyError> {
     } else {
         let mut out = String::new();
         out.push_str("certificate valid\n");
+        out.push_str(&format!("mode: {mode_label}\n"));
         out.push_str(&format!(
             "subject digest: {}\n",
             ledger_format::hash_to_hex(&cert.subject.digest)
@@ -88,16 +96,17 @@ pub fn run_verify(path: &Path, json: bool) -> Result<String, CertVerifyError> {
         out.push_str(&format!("predicate type: {}\n", cert.predicate_type));
         out.push_str(&format!("runs: {}\n", cert.runs_executed));
         out.push_str(&format!("findings: {}\n", cert.findings_count));
-        match &cert.minimality {
+        match &cert.solver_data {
             Some(entry) => {
                 out.push_str(&format!(
-                    "minimality: cut={} lower_bound={} method={}\n",
+                    "solver data: cut={} recorded_lower_bound={} method={} horizon={:?}\n",
                     entry.cut.len(),
-                    entry.lower_bound,
-                    entry.method
+                    entry.recorded_lower_bound,
+                    entry.method,
+                    entry.horizon
                 ));
             }
-            None => out.push_str("minimality: none\n"),
+            None => out.push_str("solver data: none\n"),
         }
         match &cert.statistical {
             Some(entry) => {
