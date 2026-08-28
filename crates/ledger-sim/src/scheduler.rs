@@ -112,6 +112,49 @@ const MIX_OFFSET_BIT: u64 = 1 << 63;
 /// Dedicated offset region in the `bandit` stream for PCT-style perturbations.
 const PCT_OFFSET_BIT: u64 = 1 << 62;
 
+/// Typed violation for strict replay.
+///
+/// Strict replay rejects an out-of-range decision, an exhausted stream, or
+/// a trailing leftover instead of normalizing or falling back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayViolation {
+    /// Decision value is outside the ready set.
+    OutOfRange {
+        step: usize,
+        value: usize,
+        ready_len: usize,
+    },
+    /// Replay stream exhausted before the run finished.
+    Exhausted { step: usize, replay_len: usize },
+    /// Replay is longer than the run, leftover decisions remain.
+    Trailing { trailing: usize, steps: usize },
+}
+
+impl std::fmt::Display for ReplayViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange {
+                step,
+                value,
+                ready_len,
+            } => write!(
+                f,
+                "out of range at step {step}: value {value} >= ready_len {ready_len}"
+            ),
+            Self::Exhausted { step, replay_len } => write!(
+                f,
+                "replay exhausted at step {step}: replay_len {replay_len}"
+            ),
+            Self::Trailing { trailing, steps } => write!(
+                f,
+                "trailing replay: {trailing} leftover after {steps} steps"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayViolation {}
+
 /// Scheduler state for one run.
 #[derive(Debug, Clone)]
 pub struct Scheduler {
@@ -121,6 +164,10 @@ pub struct Scheduler {
     replay: Vec<usize>,
     /// Policy used when `replay` is exhausted under `Policy::Replay`.
     fallback: Policy,
+    /// Whether strict replay is enabled.
+    strict: bool,
+    /// Pending strict violation, taken by the executor before journaling.
+    violation: Option<ReplayViolation>,
     /// Priority per task id for the PCT policy.
     ///
     /// The vector is keyed by stable task id, never by ready-list position:
@@ -163,6 +210,8 @@ impl Scheduler {
             decisions: Vec::new(),
             replay,
             fallback,
+            strict: false,
+            violation: None,
             pct_priorities: Vec::new(),
             pct_preemptions: 0,
             pct_last_chosen: None,
@@ -170,6 +219,51 @@ impl Scheduler {
             novelty: NoveltyModel::new(),
             trace: Vec::new(),
             trace_enabled: matches!(policy, Policy::Dpor),
+        }
+    }
+
+    /// Create a scheduler with an explicit fallback and strict replay enabled.
+    pub fn with_fallback_strict(
+        policy: Policy,
+        seed_tree: SeedTree,
+        replay: Vec<usize>,
+        fallback: Policy,
+    ) -> Self {
+        Self {
+            policy,
+            seed_tree,
+            decisions: Vec::new(),
+            replay,
+            fallback,
+            strict: true,
+            violation: None,
+            pct_priorities: Vec::new(),
+            pct_preemptions: 0,
+            pct_last_chosen: None,
+            pct_generation: 0,
+            novelty: NoveltyModel::new(),
+            trace: Vec::new(),
+            trace_enabled: matches!(policy, Policy::Dpor),
+        }
+    }
+
+    /// Take a pending strict violation, if any.
+    pub fn take_violation(&mut self) -> Option<ReplayViolation> {
+        self.violation.take()
+    }
+
+    /// Check for a trailing leftover after the run, recording a violation if present.
+    ///
+    /// `steps` must be the number of decisions consumed, not poll count, to
+    /// avoid misreporting if they diverge.
+    pub(crate) fn check_trailing(&mut self, steps: usize) -> Option<ReplayViolation> {
+        if self.strict && self.replay.len() > steps {
+            let trailing = self.replay.len() - steps;
+            let violation = ReplayViolation::Trailing { trailing, steps };
+            self.violation = Some(violation.clone());
+            Some(violation)
+        } else {
+            None
         }
     }
 
@@ -181,6 +275,41 @@ impl Scheduler {
     /// misattributed after a `swap_remove` reordering.
     pub fn choose(&mut self, ready: &[usize], step: usize) -> usize {
         assert!(!ready.is_empty(), "scheduler requires a ready task");
+        // Strict path rejects out-of-range and exhausted decisions without
+        // normalizing or drawing fallback RNG, keeping the lenient path
+        // byte-identical when not strict.
+        if self.strict && matches!(self.policy, Policy::Replay) {
+            match self.replay.get(step).copied() {
+                Some(value) => {
+                    if value >= ready.len() {
+                        self.violation = Some(ReplayViolation::OutOfRange {
+                            step,
+                            value,
+                            ready_len: ready.len(),
+                        });
+                        return 0;
+                    }
+                    let choice = value;
+                    if self.trace_enabled {
+                        self.trace.push(StepTrace {
+                            step,
+                            ready: ready.to_vec(),
+                            chosen: choice,
+                            journal_len: 0,
+                        });
+                    }
+                    self.decisions.push(choice);
+                    return choice;
+                }
+                None => {
+                    self.violation = Some(ReplayViolation::Exhausted {
+                        step,
+                        replay_len: self.replay.len(),
+                    });
+                    return 0;
+                }
+            }
+        }
         let policy = self.policy;
         let choice = match policy {
             Policy::Replay => match self.replay.get(step).copied() {
@@ -228,7 +357,7 @@ impl Scheduler {
                     .seed_tree
                     .draw_u64("bandit", step as u64 | MIX_OFFSET_BIT);
                 let mix = (mix % 100) as f64 / 100.0;
-                if mix < pct_mix {
+                if mix < pct_mix.get() {
                     self.select_bandit_pct(ready, step)
                 } else {
                     self.select_bandit(ready, step, exploration_constant)
@@ -446,7 +575,7 @@ mod tests {
         let mut scheduler = Scheduler::new(
             Policy::Bandit {
                 exploration_constant: 0.0,
-                pct_mix: 0.0,
+                pct_mix: crate::config::Probability::ZERO,
             },
             SeedTree::new([0; 32]),
             Vec::new(),
@@ -473,7 +602,7 @@ mod tests {
             .seed([11; 32])
             .policy(Policy::Bandit {
                 exploration_constant: 1.414,
-                pct_mix: 0.1,
+                pct_mix: crate::config::Probability::new(0.1).unwrap(),
             })
             .max_steps(256)
             .build();
@@ -533,7 +662,7 @@ mod tests {
         let mut mixed = Scheduler::new(
             Policy::Bandit {
                 exploration_constant: 1.414,
-                pct_mix: 0.0,
+                pct_mix: crate::config::Probability::ZERO,
             },
             seed.clone(),
             Vec::new(),
@@ -565,7 +694,7 @@ mod tests {
         let mut sched = Scheduler::new(
             Policy::Bandit {
                 exploration_constant: 1.414,
-                pct_mix: 0.0,
+                pct_mix: crate::config::Probability::ZERO,
             },
             seed,
             Vec::new(),
