@@ -22,7 +22,15 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_verbosity_flag::{Verbosity, VerbosityFilter};
 
 use ledger_format::{EntryKind, Hash, Payload};
-use ledger_sim::{Instruction, Policy, RunResult};
+use ledger_sim::{Instruction, Policy, Probability, RunResult};
+
+/// Default pct_mix 0.1 without unwrap or expect; 0.1 is known valid.
+pub(crate) fn default_pct_mix() -> Probability {
+    match Probability::new(0.1) {
+        Ok(prob) => prob,
+        Err(_) => Probability::ZERO,
+    }
+}
 
 /// Re-exports the completion shell selector for test consumers.
 pub use clap_complete::Shell;
@@ -171,6 +179,13 @@ pub enum Command {
         /// Maximum instructions per run.
         #[arg(long, default_value_t = 256)]
         max_steps: usize,
+        /// Path to JSON decisions artifact (Vec<usize>) from a real run.
+        ///
+        /// When present, strict replay uses the artifact instead of the
+        /// internally generated trace. Mutating the artifact exercises the
+        /// typed strict violations (Exhausted, OutOfRange, Trailing).
+        #[arg(long, value_name = "FILE")]
+        decisions: Option<PathBuf>,
     },
     /// Minimize a failing run using schedule-delta debugging.
     Minimize {
@@ -309,6 +324,9 @@ pub enum CertCommand {
     Verify {
         /// Path to the certificate JSON file.
         path: PathBuf,
+        /// Directory of the persisted journal for journal-anchored validation.
+        #[arg(long)]
+        journal: Option<PathBuf>,
     },
 }
 
@@ -349,7 +367,7 @@ impl PolicyArg {
             Self::Pct => Policy::Pct { priority_changes },
             Self::Bandit => Policy::Bandit {
                 exploration_constant,
-                pct_mix: 0.1,
+                pct_mix: default_pct_mix(),
             },
             Self::Replay => Policy::Replay,
         }

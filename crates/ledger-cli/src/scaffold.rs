@@ -174,7 +174,7 @@ const MAIN_RS_TEMPLATE: &str = r#"//! Two-task Send/Receive reference simulation
 use ledger_explorer::search::{Workload, search};
 use ledger_explorer::{HistoryOracle, KeyValueSpec, SolverConfig, select_solver, solve_with};
 use ledger_format::{EntryKind, Payload};
-use ledger_sim::{Instruction, Policy, RunConfig, RunResult};
+use ledger_sim::{Instruction, Policy, Probability, RunConfig, RunResult};
 
 /// Two-task workload: task 0 sends value 42 to task 1, task 1 receives it.
 struct TwoTask;
@@ -228,7 +228,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let config = RunConfig::builder().seed(seed).policy(Policy::Bandit {
             exploration_constant: 1.414,
-            pct_mix: 0.1,
+            // 0.1 is in [0,1] so construction is infallible
+            pct_mix: Probability::new(0.1).unwrap_or(Probability::ZERO),
         }).max_steps(256).build();
     let workload = TwoTask;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
@@ -271,6 +272,11 @@ Build and run:
 ```sh
 cargo run -- <seed>
 ```
+
+Sentinel belt: `LEDGER_SENTINEL_BELT=1` arms the belt best-effort,
+`LEDGER_SENTINEL_BELT=required` requires it (the run fails with a typed
+`Belt` error if the belt cannot activate), `LEDGER_SENTINEL_BELT=0`
+disables it.
 "#;
 
 /// Determinism rules copied into `AGENTS.md`.
@@ -477,8 +483,10 @@ Run under sim (deterministic journal, virtual time):
 cargo run --features sim
 ```
 
-Sentinel belt: set `LEDGER_SENTINEL_BELT=1` to arm the leak detector,
-or `LEDGER_SENTINEL_BELT=0` to disable it. See `ledger-sim/src/sentinel_belt.rs`.
+Sentinel belt: set `LEDGER_SENTINEL_BELT=1` to arm the leak detector
+best-effort, `LEDGER_SENTINEL_BELT=required` to require it (the run fails
+with a typed `Belt` error if the belt cannot activate), or
+`LEDGER_SENTINEL_BELT=0` to disable it. See `ledger-sim/src/sentinel_belt.rs`.
 
 The same async code runs under tokio via `ldgr-rt`. Under `--features sim`
 caller programs do not cross the ldgr-rt IPC boundary: `run` reports
