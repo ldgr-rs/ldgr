@@ -4,6 +4,18 @@ use crate::oracle::Verdict;
 use crate::solver_cache::{ClauseCache, WeightedClause};
 use ledger_format::{EntryKind, Hash, Payload};
 use ledger_journal::{Journal, JournalError};
+
+#[test]
+fn empty_input_has_no_recorded_solver_data() {
+    let mut solver = MaxSatSolver::new();
+    let (hypotheses, solver_data) = solver
+        .solve_with_certificate(&Journal::new(), &Verdict::pass())
+        .expect("empty solve must succeed");
+
+    assert!(hypotheses.is_empty());
+    assert_eq!(solver_data, None);
+}
+
 #[test]
 fn hitting_set_solver_detects_two_disjoint_supports() {
     let mut journal = Journal::new();
@@ -189,9 +201,10 @@ fn maxsat_solver_matches_hitting_set_optimum() {
     // Certificate method is present via solve_with_certificate.
     let (_, ext) = maxsat
         .solve_with_certificate(&journal, &verdict)
-        .expect("certificate must be produced");
+        .expect("certificate solve must succeed");
+    let ext = ext.expect("non-empty solve must return recorded solver data");
     assert_eq!(ext.method, "mcs-lower-bound-v1");
-    assert!(ext.lower_bound <= got[0].total_cost);
+    assert!(ext.recorded_lower_bound <= got[0].total_cost);
 }
 
 #[test]
