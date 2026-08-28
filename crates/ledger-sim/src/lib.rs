@@ -32,23 +32,27 @@ pub use backend_sim::{SimBackend, SimStreamRng};
 pub use backend_tokio::{TokioBackend, VirtualOverride};
 #[cfg(feature = "backend-wasm")]
 pub use backend_wasm::{WASI_RANDOM_STREAM, WasmBackend, WasmError, WasmResult};
-pub use config::{Policy, RunConfig, RunConfigBuilder, SimFault, SwarmConfig};
+pub use config::{
+    Policy, Probability, ProbabilityError, RunConfig, RunConfigBuilder, SimFault, SwarmConfig,
+};
 pub use config_canonical::{
     ConfigCanonicalError, FORMAT_VERSION, MAX_DNS_NAME_LEN, canonical_hash, from_canonical_bytes,
     to_canonical_bytes,
 };
 pub use dpor::{DporConfig, DporReport, DporRun, run_dpor};
-pub use effects::{Effects, Fs, FsExt, Net, NetExt, TaskId};
+pub use effects::{Effects, Fs, FsError, FsExt, Net, NetExt, TaskId};
 pub use executor::{Boundary, Executor};
 pub use net::{DnsTable, LinkConfig, Message, SimNet, backoff, backoff_jittered};
 pub use origin::{EffectOrigin, OriginSource};
 pub use runtime::{
-    Instruction, RunOutcome, RunResult, RuntimeError, SCHED_ACTOR, SCHED_STREAM, Simulation,
-    TaskBuilder,
+    Instruction, OnlineAction, RunOutcome, RunResult, RuntimeError, SCHED_ACTOR, SCHED_STREAM,
+    Simulation, StepMonitor, TaskBuilder,
 };
-pub use scheduler::{NoveltyModel, Scheduler, StepTrace};
+pub use scheduler::{NoveltyModel, ReplayViolation, Scheduler, StepTrace};
 pub use seedtree::SeedTree;
-pub use sentinel::{BeltStatus, LeakClass, Sentinel, TscTrapGuard, activate_process_belt};
+pub use sentinel::{
+    BeltStatus, LeakClass, ProtectionMode, Sentinel, TscTrapGuard, activate_process_belt,
+};
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
 pub use sentinel_belt::{
     DetectionReport, ProcessBeltStatus, SentinelError, allow_rdtsc, arm_belt, belt_status,

@@ -129,6 +129,8 @@ pub struct Executor {
     shared: Rc<ExecutorShared>,
     config: RunConfig,
     steps: usize,
+    step_monitor: Option<crate::runtime::StepMonitor>,
+    protection_mode: Option<crate::sentinel::ProtectionMode>,
 }
 
 /// The executor itself drives all wakeups: a fired timer or a deliverable
@@ -180,9 +182,66 @@ impl Executor {
         fallback: Policy,
         builder: impl FnOnce(&Rc<ExecutorShared>),
     ) -> Self {
+        Self::with_shared_and_replay_and_fallback_inner(config, replay, fallback, false, builder)
+    }
+
+    /// Create a strict executor with a recorded replay decision sequence.
+    ///
+    /// The replay-exhaustion fallback is unused in strict mode; exhausted or
+    /// out-of-range decisions surface as [`crate::runtime::RuntimeError::StrictReplay`].
+    pub(crate) fn with_shared_and_replay_strict(
+        config: RunConfig,
+        replay: Vec<usize>,
+        builder: impl FnOnce(&Rc<ExecutorShared>),
+    ) -> Self {
+        // Force Replay policy for strict mode: a strict executor must replay,
+        // otherwise the policy would be silently ignored.
+        let mut forced = config;
+        forced.policy = Policy::Replay;
+        Self::with_shared_and_replay_and_fallback_inner(
+            forced,
+            replay,
+            Policy::Random,
+            true,
+            builder,
+        )
+    }
+
+    /// Attach a mid-run step monitor.
+    pub fn with_step_monitor(mut self, monitor: crate::runtime::StepMonitor) -> Self {
+        self.step_monitor = Some(monitor);
+        self
+    }
+
+    /// Set the host-side protection mode for this run.
+    ///
+    /// Host option overrides env. `None` falls back to env; `Disabled` env with no host keeps not-armed.
+    pub fn with_protection_mode(mut self, mode: crate::sentinel::ProtectionMode) -> Self {
+        self.protection_mode = Some(mode);
+        self
+    }
+
+    /// Effective protection for this run: host if set, else env.
+    pub(crate) fn effective_protection(&self) -> crate::sentinel::EffectiveProtection {
+        if let Some(mode) = self.protection_mode {
+            return mode.into();
+        }
+        crate::sentinel::belt_env_mode_from_env().into()
+    }
+
+    fn with_shared_and_replay_and_fallback_inner(
+        config: RunConfig,
+        replay: Vec<usize>,
+        fallback: Policy,
+        strict: bool,
+        builder: impl FnOnce(&Rc<ExecutorShared>),
+    ) -> Self {
         let seed_tree = config.seed_tree();
-        let scheduler =
-            Scheduler::with_fallback(config.policy(), seed_tree.clone(), replay, fallback);
+        let scheduler = if strict {
+            Scheduler::with_fallback_strict(config.policy(), seed_tree.clone(), replay, fallback)
+        } else {
+            Scheduler::with_fallback(config.policy(), seed_tree.clone(), replay, fallback)
+        };
         let mut net = SimNet::new();
         for &(from, to, cfg) in config.links() {
             net.set_link(from, to, cfg);
@@ -227,54 +286,136 @@ impl Executor {
             shared,
             config,
             steps: 0,
+            step_monitor: None,
+            protection_mode: None,
         }
     }
 
-    /// Run until all tasks finish or the step budget is reached.
+    /// Run until all tasks finish, the budget is reached, or a monitor halts.
     pub fn run(mut self) -> Result<RunResult, RuntimeError> {
+        // Common execution boundary: belt activation + enforcement.
+        // Effective policy drives attempt regardless of env gate; Required rejects incomplete.
+        let effective = self.effective_protection();
+        // Tsc trap: attempt when effective Some, else no trap.
+        let tsc_guard = crate::sentinel::TscTrapGuard::arm_for_effective(effective);
+        if let Some(error) = tsc_guard.activation_error() {
+            if effective.is_required() {
+                return Err(RuntimeError::Belt(crate::sentinel::BeltStatus::Failed(
+                    error.clone(),
+                )));
+            }
+            eprintln!("ledger-sim sentinel: RDTSC trap activation failed: {error}");
+        }
+        // Keep guard alive for whole run.
+        let _guard = tsc_guard;
+        let belt_status = crate::sentinel::activate_process_belt_for_effective(effective);
+        if effective.is_required()
+            && !matches!(belt_status, crate::sentinel::BeltStatus::Active { .. })
+        {
+            return Err(RuntimeError::Belt(belt_status));
+        }
+        // BestEffort continues and reports status via RunResult.protection.
+        let run_protection = belt_status.clone();
         self.journal_spawns()?;
-        // The while-condition exit means the budget ran out; the breaks in
-        // the loop record the earlier liveness outcomes.
-        let mut outcome = crate::RunOutcome::BudgetExhausted;
-        while self.steps < self.config.max_steps() {
-            self.wake_blocked_with_messages()?;
-            if self.shared.ready.borrow().is_empty() {
-                self.advance_quiescent()?;
-                if self.shared.ready.borrow().is_empty() {
-                    if self.all_tasks_done() {
-                        outcome = crate::RunOutcome::Completed;
-                        break;
-                    }
-                    if let Some(earliest) = self.shared.net.borrow().earliest_delivery_time()
-                        && earliest > self.shared.time.borrow().now()
-                    {
-                        self.shared.time.borrow_mut().advance_to(earliest);
-                        self.wake_blocked_with_messages()?;
-                    }
-                    if self.shared.ready.borrow().is_empty() {
-                        outcome = crate::RunOutcome::Blocked;
-                        break;
+        // Feed initial prefix (spawn entries) to monitor so it observes entry 0.
+        let mut early_halt: Option<crate::RunOutcome> = None;
+        if let Some(monitor) = self.step_monitor.as_mut() {
+            let journal = self.shared.journal.borrow();
+            if !journal.is_empty() {
+                match monitor(&journal, 0) {
+                    crate::runtime::OnlineAction::Continue => {}
+                    crate::runtime::OnlineAction::Halt { reason } => {
+                        early_halt = Some(crate::RunOutcome::MonitorHalt(reason));
                     }
                 }
             }
-            let choice = {
-                let ready = self.shared.ready.borrow();
-                let step = self.steps;
-                let choice = self.shared.scheduler.borrow_mut().choose(&ready, step);
-                self.journal_rng_draw(choice)?;
-                choice
-            };
-            let task_id = self.shared.ready.borrow_mut().swap_remove(choice);
-            self.poll_task(task_id)?;
-            // The DPOR driver is the only consumer of the per-step journal
-            // boundary; skip the bookkeeping under every other policy.
-            let trace_active = self.shared.scheduler.borrow().trace_active();
-            if trace_active {
-                let journal_len = self.shared.journal.borrow().len();
-                self.shared
-                    .scheduler
-                    .borrow_mut()
-                    .note_step_journal_len(journal_len);
+        }
+        let mut outcome = if let Some(h) = early_halt.clone() {
+            h
+        } else {
+            crate::RunOutcome::BudgetExhausted
+        };
+        if early_halt.is_none() {
+            // The while-condition exit means the budget ran out; the breaks in
+            // the loop record the earlier liveness outcomes.
+            while self.steps < self.config.max_steps() {
+                // Capture journal delta start for the mid-run monitor. The
+                // callback is read-only and consumes no seed draws, so it never
+                // perturbs determinism.
+                let monitor_start = if self.step_monitor.is_some() {
+                    Some(self.shared.journal.borrow().len())
+                } else {
+                    None
+                };
+                self.wake_blocked_with_messages()?;
+                if self.shared.ready.borrow().is_empty() {
+                    self.advance_quiescent()?;
+                    if self.shared.ready.borrow().is_empty() {
+                        if self.all_tasks_done() {
+                            outcome = crate::RunOutcome::Completed;
+                            break;
+                        }
+                        if let Some(earliest) = self.shared.net.borrow().earliest_delivery_time()
+                            && earliest > self.shared.time.borrow().now()
+                        {
+                            self.shared.time.borrow_mut().advance_to(earliest);
+                            self.wake_blocked_with_messages()?;
+                        }
+                        if self.shared.ready.borrow().is_empty() {
+                            outcome = crate::RunOutcome::Blocked;
+                            break;
+                        }
+                    }
+                }
+                let choice = {
+                    let ready_snapshot = self.shared.ready.borrow().clone();
+                    let step = self.steps;
+                    let choice = {
+                        let mut scheduler = self.shared.scheduler.borrow_mut();
+                        let choice = scheduler.choose(&ready_snapshot, step);
+                        if let Some(violation) = scheduler.take_violation() {
+                            return Err(RuntimeError::StrictReplay(violation));
+                        }
+                        choice
+                    };
+                    self.journal_rng_draw(choice)?;
+                    choice
+                };
+                let task_id = self.shared.ready.borrow_mut().swap_remove(choice);
+                self.poll_task(task_id)?;
+                // Invoke the mid-run monitor over the step delta, if any. Halt
+                // stops the run with a deterministic partial journal.
+                if let Some(start) = monitor_start
+                    && let Some(monitor) = self.step_monitor.as_mut()
+                {
+                    let journal = self.shared.journal.borrow();
+                    match monitor(&journal, start) {
+                        crate::runtime::OnlineAction::Continue => {}
+                        crate::runtime::OnlineAction::Halt { reason } => {
+                            outcome = crate::RunOutcome::MonitorHalt(reason);
+                            break;
+                        }
+                    }
+                }
+                // The DPOR driver is the only consumer of the per-step journal
+                // boundary; skip the bookkeeping under every other policy.
+                let trace_active = self.shared.scheduler.borrow().trace_active();
+                if trace_active {
+                    let journal_len = self.shared.journal.borrow().len();
+                    self.shared
+                        .scheduler
+                        .borrow_mut()
+                        .note_step_journal_len(journal_len);
+                }
+            }
+        }
+        // Strict replay must not have leftover decisions, measured against
+        // decisions consumed rather than poll count.
+        {
+            let mut scheduler = self.shared.scheduler.borrow_mut();
+            let consumed = scheduler.decisions().len();
+            if let Some(violation) = scheduler.check_trailing(consumed) {
+                return Err(RuntimeError::StrictReplay(violation));
             }
         }
         // A recorded append failure means the DAG is incomplete: reject the
@@ -329,6 +470,7 @@ impl Executor {
             applied_faults: self.shared.applied_faults.borrow().clone(),
             origins: self.shared.origins.borrow().snapshot(),
             journal_error: self.shared.journal_error.borrow().clone(),
+            protection: run_protection,
         })
     }
 
@@ -725,7 +867,7 @@ mod tests {
     #[test]
     fn swarm_max_u64_delay_bound_run_completes() {
         let mut cfg = config(11, 2048);
-        cfg.swarm.delay_probability = 1.0;
+        cfg.swarm.delay_probability = crate::config::Probability::ONE;
         cfg.swarm.max_delay_ticks = u64::MAX;
         let executor = Executor::with_shared(cfg, |shared| {
             for (task_id, body) in [
@@ -1100,11 +1242,10 @@ mod swarm_tests {
 
     #[test]
     fn swarm_drop_probability_one_drops_every_message() {
-        let mut config = base_config(10);
-        *config.swarm_mut() = SwarmConfig {
-            drop_probability: 1.0,
+        let config = base_config(10).with_swarm(SwarmConfig {
+            drop_probability: crate::config::Probability::ONE,
             ..SwarmConfig::default()
-        };
+        });
         let run = Simulation::new(config, two_task_programs()).run().unwrap();
         let kinds = run
             .journal
@@ -1130,12 +1271,11 @@ mod swarm_tests {
     #[test]
     fn crash_budget_one_journals_exactly_one_crash_state() {
         use crate::runtime::Instruction;
-        let mut config = base_config(13);
-        *config.swarm_mut() = SwarmConfig {
-            crash_probability: 1.0,
+        let config = base_config(13).with_swarm(SwarmConfig {
+            crash_probability: crate::config::Probability::ONE,
             fault_classes_per_run: 1,
             ..SwarmConfig::default()
-        };
+        });
         let programs = vec![vec![
             Instruction::FsWrite {
                 path: "a".into(),
@@ -1177,12 +1317,11 @@ mod swarm_tests {
     #[test]
     fn crash_budget_two_is_deterministic_and_bounded() {
         use crate::runtime::Instruction;
-        let mut config = base_config(14);
-        *config.swarm_mut() = SwarmConfig {
-            crash_probability: 1.0,
+        let config = base_config(14).with_swarm(SwarmConfig {
+            crash_probability: crate::config::Probability::ONE,
             fault_classes_per_run: 2,
             ..SwarmConfig::default()
-        };
+        });
         let programs = vec![vec![
             Instruction::FsWrite {
                 path: "a".into(),
@@ -1303,8 +1442,7 @@ mod swarm_tests {
         let default = Simulation::new(base_config(10), two_task_programs())
             .run()
             .unwrap();
-        let mut with_swarm = base_config(10);
-        *with_swarm.swarm_mut() = SwarmConfig::default();
+        let with_swarm = base_config(10).with_swarm(SwarmConfig::default());
         let swarm = Simulation::new(with_swarm, two_task_programs())
             .run()
             .unwrap();
@@ -1315,11 +1453,10 @@ mod swarm_tests {
     #[test]
     fn swarm_crash_on_write_journals_crash_state() {
         use crate::runtime::Instruction;
-        let mut config = base_config(11);
-        *config.swarm_mut() = SwarmConfig {
-            crash_probability: 1.0,
+        let config = base_config(11).with_swarm(SwarmConfig {
+            crash_probability: crate::config::Probability::ONE,
             ..SwarmConfig::default()
-        };
+        });
         let programs = vec![vec![
             Instruction::FsWrite {
                 path: "k".into(),
@@ -1347,14 +1484,13 @@ mod swarm_tests {
 
     #[test]
     fn swarm_features_are_deterministic() {
-        let mut config = base_config(12);
-        *config.swarm_mut() = SwarmConfig {
-            drop_probability: 0.3,
-            delay_probability: 0.3,
+        let config = base_config(12).with_swarm(SwarmConfig {
+            drop_probability: crate::config::Probability::new(0.3).unwrap(),
+            delay_probability: crate::config::Probability::new(0.3).unwrap(),
             max_delay_ticks: 5,
-            crash_probability: 0.2,
+            crash_probability: crate::config::Probability::new(0.2).unwrap(),
             fault_classes_per_run: 2,
-        };
+        });
         let programs = vec![
             vec![
                 crate::runtime::Instruction::Send { to: 1, payload: 1 },
@@ -1460,7 +1596,7 @@ mod link_integration_tests {
                 .seed([9; 32])
                 .max_steps(512)
                 .swarm(crate::config::SwarmConfig {
-                    delay_probability: 0.5,
+                    delay_probability: crate::config::Probability::new(0.5).unwrap(),
                     max_delay_ticks: 3,
                     ..crate::config::SwarmConfig::default()
                 })
@@ -1469,7 +1605,7 @@ mod link_integration_tests {
                     1,
                     LinkConfig {
                         jitter: 4,
-                        loss_probability: 0.2,
+                        loss_probability: crate::config::Probability::new(0.2).unwrap(),
                         ..LinkConfig::default()
                     },
                 )])
@@ -1592,5 +1728,98 @@ mod delay_fault_regression {
             first.journal.root_hash(),
             "delay 0 keeps byte-identical journals"
         );
+    }
+}
+
+#[cfg(test)]
+mod lane_s_direct_executor_protection {
+    use crate::config::RunConfig;
+    use crate::executor::Executor;
+    use crate::sentinel::ProtectionMode;
+
+    #[test]
+    fn direct_executor_required_enforces_belt() {
+        let config = RunConfig::builder().seed([9; 32]).max_steps(16).build();
+        let executor = Executor::new(config, vec![]).with_protection_mode(ProtectionMode::Required);
+        let result = executor.run();
+        // On non-linux, Required without belt must be Belt error; on linux with belt, may succeed
+        #[cfg(not(all(feature = "sentinel", target_os = "linux")))]
+        assert!(
+            matches!(result, Err(crate::runtime::RuntimeError::Belt(_))),
+            "direct Executor Required must enforce belt, got {result:?}"
+        );
+        #[cfg(all(feature = "sentinel", target_os = "linux"))]
+        {
+            match result {
+                Ok(run) => assert!(matches!(
+                    run.protection,
+                    crate::sentinel::BeltStatus::Active { .. }
+                )),
+                Err(crate::runtime::RuntimeError::Belt(_)) => {}
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn direct_executor_best_effort_reports_protection() {
+        let config = RunConfig::builder().seed([10; 32]).max_steps(16).build();
+        let executor =
+            Executor::new(config, vec![]).with_protection_mode(ProtectionMode::BestEffort);
+        let run = executor
+            .run()
+            .expect("BestEffort direct executor must succeed");
+        // Protection field must be present and structured
+        let _ = run.protection.clone();
+        assert!(matches!(
+            run.protection,
+            crate::sentinel::BeltStatus::Active { .. }
+                | crate::sentinel::BeltStatus::NotArmed
+                | crate::sentinel::BeltStatus::Unavailable
+                | crate::sentinel::BeltStatus::Failed(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod lane_s_monitor_prefix {
+    use crate::config::RunConfig;
+    use crate::executor::Executor;
+    use crate::runtime::{OnlineAction, RunResult};
+    use ledger_format::EntryKind;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn monitor_sees_initial_spawn_entries() {
+        let config = RunConfig::builder().seed([11; 32]).max_steps(32).build();
+        let saw_spawn = Rc::new(Cell::new(false));
+        let saw = saw_spawn.clone();
+        let executor = Executor::with_shared(config, |shared| {
+            // Create two tasks to get two Spawn entries
+            for task_id in 0..2 {
+                let boundary = crate::executor::Boundary::for_task(shared.clone(), task_id);
+                let fut = Box::pin(async move {
+                    let _ = boundary.outcome(42);
+                });
+                shared
+                    .tasks
+                    .borrow_mut()
+                    .push(crate::executor::make_task_entry(fut));
+            }
+        })
+        .with_step_monitor(Box::new(move |journal, start| {
+            if start == 0 {
+                for entry in journal.entries() {
+                    if entry.data.kind == EntryKind::Spawn {
+                        saw.set(true);
+                        break;
+                    }
+                }
+            }
+            OnlineAction::Continue
+        }));
+        let _result: RunResult = executor.run().expect("run with prefix monitor");
+        assert!(saw_spawn.get(), "monitor must see Spawn at entry 0");
     }
 }
