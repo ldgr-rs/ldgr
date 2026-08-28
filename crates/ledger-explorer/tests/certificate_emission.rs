@@ -1,9 +1,9 @@
-use ledger_explorer::CampaignCertificate;
-use ledger_explorer::MaxSatSolver;
 use ledger_explorer::certs::MAX_EVENT_COST;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::run_campaign;
 use ledger_explorer::workloads::MiniKvWorkload;
+use ledger_explorer::CampaignCertificate;
+use ledger_explorer::MaxSatSolver;
 use ledger_sim::{Policy, RunConfig};
 
 fn temp_cert_path(name: &str) -> std::path::PathBuf {
@@ -50,7 +50,7 @@ fn certificate_write_and_verify_roundtrip() {
 }
 
 #[test]
-fn certificate_for_report_helper_is_equivalent() {
+fn from_campaign_is_deterministic() {
     let config = RunConfig::builder()
         .seed([3; 32])
         .policy(Policy::Random)
@@ -65,9 +65,12 @@ fn certificate_for_report_helper_is_equivalent() {
     .unwrap();
     let digest = [7u8; 32];
     let builder = "helper-builder";
-    let cert_a = ledger_explorer::certificate_for_report(&report, digest, builder);
+    let cert_a =
+        ledger_explorer::CampaignCertificate::from_campaign(&report, builder, Vec::new(), digest)
+            .unwrap();
     let cert_b =
-        ledger_explorer::CampaignCertificate::from_campaign(&report, builder, Vec::new(), digest);
+        ledger_explorer::CampaignCertificate::from_campaign(&report, builder, Vec::new(), digest)
+            .unwrap();
     assert_eq!(cert_a.builder_id, cert_b.builder_id);
     assert_eq!(
         cert_a.external_parameters_digest,
@@ -77,12 +80,9 @@ fn certificate_for_report_helper_is_equivalent() {
     assert_eq!(cert_a.to_json().unwrap(), cert_b.to_json().unwrap());
 }
 
-/// End-to-end minimality certificate: a real violating sim, a real weighted
-/// MaxSAT cut with its lower-bound proof, and `verify()` accepting the
-/// result. A tampered lower_bound above the cut's summed event cost must be
-/// rejected.
+/// A solver cut round-trips as recorded data and binds to its journal.
 #[test]
-fn minimality_certificate_from_real_cut_verifies() {
+fn recorded_solver_data_from_real_cut_verifies() {
     let config = RunConfig::builder()
         .seed([0; 32])
         .policy(Policy::Random)
@@ -101,27 +101,27 @@ fn minimality_certificate_from_real_cut_verifies() {
     let (hypotheses, extension) = solver
         .solve_with_certificate(&finding.run.journal, &finding.verdict)
         .expect("weighted MaxSAT solve must succeed");
+    let extension = extension.expect("non-empty solve must return recorded solver data");
     assert!(!extension.cut.is_empty(), "the real cut must be non-empty");
     assert!(
-        extension.lower_bound <= hypotheses[0].total_cost,
-        "the lower bound must not exceed the solved cut cost"
+        extension.recorded_lower_bound <= hypotheses[0].total_cost,
+        "the recorded bound must not exceed the solved cut cost"
     );
 
     let mut certificate = CampaignCertificate::from_campaign(
         &report,
-        "test-builder-minimality",
+        "test-builder-solver-data",
         Vec::new(),
         [2u8; 32],
-    );
-    certificate.minimality = Some(extension.clone());
+    )
+    .unwrap();
+    certificate.solver_data = Some(extension.clone());
     assert!(
         certificate.verify().is_ok(),
         "verify must accept the real cut: {:?}",
         certificate.verify()
     );
-    // Journal-anchored verification recomputes the exact event costs and the
-    // derivation paths from the finding journal; the real solver cut must
-    // satisfy every obligation.
+    // Journal binding checks the root, members, and recorded costs.
     assert!(
         certificate
             .verify_with_journal(&finding.run.journal)
@@ -138,28 +138,26 @@ fn minimality_certificate_from_real_cut_verifies() {
         "roundtripped certificates must keep satisfying journal-anchored verification"
     );
     assert_eq!(
-        decoded.minimality.as_ref().unwrap().horizon,
-        certificate.minimality.as_ref().unwrap().horizon,
+        decoded.solver_data.as_ref().unwrap().horizon,
+        certificate.solver_data.as_ref().unwrap().horizon,
         "the recorded solver horizon must survive the roundtrip"
     );
 
-    // Negative: a lower_bound above the cut's summed event cost (at most
-    // MAX_EVENT_COST per event under the solver cost model) must fail
-    // verification.
+    // A recorded bound above the maximum cut cost must fail validation.
     let tampered_bound = certificate
-        .minimality
+        .solver_data
         .as_ref()
-        .map(|m| m.cut.len() as u64 * MAX_EVENT_COST + 1)
+        .map(|data| data.cut.len() as u64 * MAX_EVENT_COST + 1)
         .unwrap();
     let mut tampered = certificate.clone();
-    tampered.minimality = Some(ledger_explorer::MinimalityExtension {
-        cut: certificate.minimality.as_ref().unwrap().cut.clone(),
-        lower_bound: tampered_bound,
+    tampered.solver_data = Some(ledger_explorer::RecordedSolverData {
+        cut: certificate.solver_data.as_ref().unwrap().cut.clone(),
+        recorded_lower_bound: tampered_bound,
         method: extension.method.clone(),
         horizon: extension.horizon,
     });
     assert!(
         tampered.verify().is_err(),
-        "verify must reject lower_bound {tampered_bound} above the cut's summed event cost"
+        "verify must reject recorded bound {tampered_bound} above the cut cost"
     );
 }

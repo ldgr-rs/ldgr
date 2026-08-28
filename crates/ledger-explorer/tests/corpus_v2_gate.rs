@@ -197,6 +197,8 @@ fn ldfi_finds_every_v2_bug_with_valid_minimal_certificate() {
         let (mcs_hyps, cert) = maxsat
             .solve_with_certificate(&run.journal, &verdict)
             .unwrap_or_else(|error| panic!("{name}: mcs solve must succeed: {error:?}"));
+        let cert = cert
+            .unwrap_or_else(|| panic!("{name}: non-empty solve must return recorded solver data"));
         assert!(!mcs_hyps.is_empty(), "{name}: mcs must return hypotheses");
         assert!(!cert.cut.is_empty(), "{name}: mcs cut must be non-empty");
         assert_eq!(
@@ -205,13 +207,13 @@ fn ldfi_finds_every_v2_bug_with_valid_minimal_certificate() {
         );
         let upper = (cert.cut.len() as u64).saturating_mul(MAX_EVENT_COST);
         assert!(
-            cert.lower_bound <= upper,
-            "{name}: lower_bound {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
-            cert.lower_bound
+            cert.recorded_lower_bound <= upper,
+            "{name}: recorded solver bound {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
+            cert.recorded_lower_bound
         );
         let hyp = ledger_explorer::ldfi::FaultHypothesis {
             events: cert.cut.clone(),
-            total_cost: cert.lower_bound,
+            total_cost: cert.recorded_lower_bound,
             explanation: "mcs cut".to_string(),
         };
         let schedule = hypothesis_to_schedule(&hyp, &run.journal);
@@ -253,14 +255,15 @@ fn ldfi_finds_every_v2_bug_with_valid_minimal_certificate() {
             monitors: Vec::new(),
             memo_hits: 0,
         };
-        // Attach the MCS minimality extension so verify_with_journal checks it.
+        // Attach recorded solver data so journal binding checks its members and costs.
         let mut cert_for_verify = CampaignCertificate::from_campaign(
             &cert_report,
             "corpus-v2-ldfi",
             Vec::new(),
             [9u8; 32],
-        );
-        cert_for_verify.minimality = Some(cert.clone());
+        )
+        .unwrap();
+        cert_for_verify.solver_data = Some(cert.clone());
         // Also bind subject to the actual run root for journal anchoring.
         cert_for_verify.subject.digest = run.journal.root_hash();
         cert_for_verify
