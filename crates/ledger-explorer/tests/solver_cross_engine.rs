@@ -174,6 +174,10 @@ fn builtin_bnb_is_deterministic_valid_and_minimal_on_randomized_encodings() {
         let (second_hyp, extension_b) = second
             .solve_with_certificate(&case.journal, &case.verdict)
             .expect("builtin solve must succeed");
+        let extension_a =
+            extension_a.expect("non-empty builtin solve must return recorded solver data");
+        let extension_b =
+            extension_b.expect("non-empty builtin solve must return recorded solver data");
         let first_cost = first_hyp[0].total_cost;
         let second_cost = second_hyp[0].total_cost;
         assert_eq!(
@@ -185,14 +189,14 @@ fn builtin_bnb_is_deterministic_valid_and_minimal_on_randomized_encodings() {
             "case {index}: the builtin cost must be deterministic"
         );
         assert_eq!(
-            extension_a.lower_bound, extension_b.lower_bound,
-            "case {index}: the builtin lower bound must be deterministic"
+            extension_a.recorded_lower_bound, extension_b.recorded_lower_bound,
+            "case {index}: the recorded solver bound must be deterministic"
         );
         assert_cut_valid_and_minimal(encoding, &extension_a.cut);
         assert_cost_consistent(&case.journal, &extension_a.cut, first_cost);
         assert!(
-            extension_a.lower_bound <= first_cost,
-            "case {index}: the certificate lower bound must not exceed the cut cost"
+            extension_a.recorded_lower_bound <= first_cost,
+            "case {index}: the recorded solver bound must not exceed the cut cost"
         );
     }
 }
@@ -221,6 +225,10 @@ fn bnb_and_cadical_agree_on_randomized_bounded_encodings() {
         let (cadical_hyp, cadical_ext) = cadical
             .solve_with_certificate(&case.journal, &case.verdict)
             .expect("cadical solve must succeed");
+        let builtin_ext =
+            builtin_ext.expect("non-empty builtin solve must return recorded solver data");
+        let cadical_ext =
+            cadical_ext.expect("non-empty cadical solve must return recorded solver data");
         let builtin_cost = builtin_hyp[0].total_cost;
         let cadical_cost = cadical_hyp[0].total_cost;
 
@@ -241,17 +249,17 @@ fn bnb_and_cadical_agree_on_randomized_bounded_encodings() {
             "case {index}: the lower-bound method must match across engines"
         );
         assert_eq!(
-            builtin_ext.lower_bound, cadical_ext.lower_bound,
-            "case {index}: the lower-bound proofs must agree across engines"
+            builtin_ext.recorded_lower_bound, cadical_ext.recorded_lower_bound,
+            "case {index}: the recorded solver bounds must agree across engines"
         );
         assert!(
-            builtin_ext.lower_bound <= builtin_cost,
+            builtin_ext.recorded_lower_bound <= builtin_cost,
             "case {index}: the bound must never exceed the cut cost"
         );
         println!(
-            "case {index}: hard={} builtin_cost={builtin_cost} cadical_cost={cadical_cost} lower_bound={} builtin_cut={} cadical_cut={}",
+            "case {index}: hard={} builtin_cost={builtin_cost} cadical_cost={cadical_cost} recorded_bound={} builtin_cut={} cadical_cut={}",
             encoding.hard.len(),
-            builtin_ext.lower_bound,
+            builtin_ext.recorded_lower_bound,
             builtin_ext.cut.len(),
             cadical_ext.cut.len(),
         );
@@ -287,12 +295,13 @@ fn cadical_request_falls_back_to_builtin_truthfully_without_the_feature() {
     let (hypotheses, extension) = solver
         .solve_with_certificate(&case.journal, &case.verdict)
         .expect("the branch-and-bound fallback must solve without the feature");
+    let extension = extension.expect("non-empty solve must return recorded solver data");
     let cost = hypotheses[0].total_cost;
     assert_cut_valid_and_minimal(&encoding, &extension.cut);
     assert_cost_consistent(&case.journal, &extension.cut, cost);
     assert!(
-        extension.lower_bound <= cost,
-        "the fallback certificate lower bound must not exceed the cut cost"
+        extension.recorded_lower_bound <= cost,
+        "the recorded solver bound must not exceed the cut cost"
     );
     assert_eq!(
         extension.horizon,

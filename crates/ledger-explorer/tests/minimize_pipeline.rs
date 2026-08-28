@@ -53,6 +53,7 @@ fn full_pipeline_minimizes_stale_read_and_preserves_violation() {
         monitor_issues: Vec::new(),
         applied_faults: Vec::new(),
         origins: Vec::new(),
+        protection: ledger_sim::BeltStatus::NotArmed,
     };
     assert!(
         oracle.check(&run).violated,
