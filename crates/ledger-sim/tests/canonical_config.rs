@@ -22,8 +22,8 @@ use std::path::Path;
 use ledger_format::cbor::{self, CborValue};
 use ledger_format::hash_from_hex;
 use ledger_sim::{
-    ConfigCanonicalError, FORMAT_VERSION, LinkConfig, Policy, RunConfig, SimFault, SwarmConfig,
-    canonical_hash, from_canonical_bytes, to_canonical_bytes,
+    canonical_hash, from_canonical_bytes, to_canonical_bytes, ConfigCanonicalError, LinkConfig,
+    Policy, RunConfig, SimFault, SwarmConfig, FORMAT_VERSION,
 };
 
 fn fixtures_dir() -> std::path::PathBuf {
@@ -79,14 +79,14 @@ fn shapes() -> Vec<RunConfig> {
         RunConfig::builder()
             .policy(Policy::Bandit {
                 exploration_constant: std::f64::consts::SQRT_2,
-                pct_mix: 0.1,
+                pct_mix: ledger_sim::Probability::new(0.1).unwrap(),
             })
             .build(),
         // Both floats encode as half-precision CBOR floats.
         RunConfig::builder()
             .policy(Policy::Bandit {
                 exploration_constant: 0.5,
-                pct_mix: 0.25,
+                pct_mix: ledger_sim::Probability::new(0.25).unwrap(),
             })
             .build(),
         RunConfig::builder().policy(Policy::Replay).build(),
@@ -143,7 +143,7 @@ fn shape_names() -> Vec<&'static str> {
 
 /// Every optional field populated, to exercise every sub-encoding once.
 fn rich() -> RunConfig {
-    let mut config = RunConfig::builder()
+    let config = RunConfig::builder()
         .seed([0x42; 32])
         .policy(Policy::Pct {
             priority_changes: 3,
@@ -151,10 +151,10 @@ fn rich() -> RunConfig {
         .max_steps(42_042)
         .dropped_events(vec![[0xaa; 32], [0xbb; 32]])
         .swarm(SwarmConfig {
-            drop_probability: 0.1,
-            delay_probability: 0.2,
+            drop_probability: ledger_sim::Probability::new(0.1).unwrap(),
+            delay_probability: ledger_sim::Probability::new(0.2).unwrap(),
             max_delay_ticks: 7,
-            crash_probability: 0.05,
+            crash_probability: ledger_sim::Probability::new(0.05).unwrap(),
             fault_classes_per_run: 4,
         })
         .links(vec![
@@ -164,7 +164,7 @@ fn rich() -> RunConfig {
                 LinkConfig {
                     base_delay: 5,
                     jitter: 2,
-                    loss_probability: 0.5,
+                    loss_probability: ledger_sim::Probability::new(0.5).unwrap(),
                     reorder_window: 3,
                 },
             ),
@@ -174,7 +174,7 @@ fn rich() -> RunConfig {
                 LinkConfig {
                     base_delay: 9,
                     jitter: 1,
-                    loss_probability: 0.1,
+                    loss_probability: ledger_sim::Probability::new(0.1).unwrap(),
                     reorder_window: 0,
                 },
             ),
@@ -199,10 +199,11 @@ fn rich() -> RunConfig {
         .monitor(false)
         .build();
     // Insert out of sorted order; the encoder must sort via DnsTable::iter.
-    config.dns_mut().insert("beta.test", 2);
-    config.dns_mut().insert("alpha.test", 1);
-    config.dns_mut().insert("z.example", 4);
-    config
+    let mut dns = ledger_sim::DnsTable::new();
+    dns.insert("beta.test", 2);
+    dns.insert("alpha.test", 1);
+    dns.insert("z.example", 4);
+    config.with_dns(dns)
 }
 
 /// Machine-readable description of one shape, shared with the Go conformance
@@ -889,12 +890,14 @@ fn canonical_hash_matches_blake3_of_canonical_bytes() {
 
 #[test]
 fn same_dns_different_insert_order_encodes_equal() {
-    let mut a = RunConfig::builder().seed([9u8; 32]).build();
-    let mut b = RunConfig::builder().seed([9u8; 32]).build();
-    a.dns_mut().insert("z.test", 2);
-    a.dns_mut().insert("a.test", 1);
-    b.dns_mut().insert("a.test", 1);
-    b.dns_mut().insert("z.test", 2);
+    let mut dns_a = ledger_sim::DnsTable::new();
+    dns_a.insert("z.test", 2);
+    dns_a.insert("a.test", 1);
+    let mut dns_b = ledger_sim::DnsTable::new();
+    dns_b.insert("a.test", 1);
+    dns_b.insert("z.test", 2);
+    let a = RunConfig::builder().seed([9u8; 32]).dns(dns_a).build();
+    let b = RunConfig::builder().seed([9u8; 32]).dns(dns_b).build();
     assert_eq!(
         to_canonical_bytes(&a).expect("a"),
         to_canonical_bytes(&b).expect("b"),
@@ -904,43 +907,56 @@ fn same_dns_different_insert_order_encodes_equal() {
 
 #[test]
 fn encode_rejects_non_finite_floats() {
-    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let config = RunConfig::builder()
-            .swarm(SwarmConfig {
-                drop_probability: value,
-                ..SwarmConfig::default()
-            })
-            .build();
-        let error = to_canonical_bytes(&config).expect_err("non-finite must fail");
+    for value in [f64::INFINITY, f64::NEG_INFINITY] {
+        let err = ledger_sim::Probability::new(value).unwrap_err();
+        assert_eq!(err, ledger_sim::ProbabilityError::NonFinite);
+        // Decode path still rejects raw non-finite CBOR with typed error.
+        let mut fields = minimal_fields();
+        set_field(
+            &mut fields,
+            "swarm",
+            CborValue::Array(vec![
+                CborValue::Float(value),
+                CborValue::Float(0.0),
+                CborValue::Unsigned(0),
+                CborValue::Float(0.0),
+                CborValue::Unsigned(2),
+            ]),
+        );
+        let bytes = craft_document(fields);
         assert_eq!(
-            error,
+            from_canonical_bytes(&bytes).expect_err("non-finite must fail"),
             ConfigCanonicalError::NonFiniteFloat("swarm.drop_probability")
         );
+    }
+    // NaN is non-canonical CBOR
+    assert_eq!(
+        ledger_sim::Probability::new(f64::NAN).unwrap_err(),
+        ledger_sim::ProbabilityError::NonFinite
+    );
+    {
+        let mut raw = Vec::new();
+        ledger_format::cbor::array(&mut raw, 2);
+        ledger_format::cbor::unsigned(&mut raw, 1);
+        raw.push(0xfb);
+        raw.extend_from_slice(&f64::NAN.to_bits().to_be_bytes());
+        let err = from_canonical_bytes(&raw).expect_err("nan bits");
+        assert!(matches!(err, ConfigCanonicalError::Cbor(_)));
     }
     let bandit = RunConfig::builder()
         .policy(Policy::Bandit {
             exploration_constant: f64::INFINITY,
-            pct_mix: 0.1,
+            pct_mix: ledger_sim::Probability::new(0.1).unwrap(),
         })
         .build();
     assert_eq!(
         to_canonical_bytes(&bandit).expect_err("infinite bandit constant"),
         ConfigCanonicalError::NonFiniteFloat("policy.bandit.exploration_constant")
     );
-    let link = RunConfig::builder()
-        .links(vec![(
-            0,
-            1,
-            LinkConfig {
-                loss_probability: f64::NAN,
-                ..LinkConfig::default()
-            },
-        )])
-        .build();
-    assert_eq!(
-        to_canonical_bytes(&link).expect_err("nan link loss"),
-        ConfigCanonicalError::NonFiniteFloat("links.loss_probability")
-    );
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let err = ledger_sim::Probability::new(value).unwrap_err();
+        assert_eq!(err, ledger_sim::ProbabilityError::NonFinite);
+    }
 }
 
 /// A swarm delay bound of `u64::MAX` has no representable draw modulus on

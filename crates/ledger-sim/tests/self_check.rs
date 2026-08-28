@@ -74,7 +74,7 @@ fn self_check_covers_each_scheduling_policy() {
         },
         Policy::Bandit {
             exploration_constant: 1.414,
-            pct_mix: 0.1,
+            pct_mix: ledger_sim::Probability::new(0.1).unwrap(),
         },
     ];
     let programs = mini_kv_programs();
