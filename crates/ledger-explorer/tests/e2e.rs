@@ -1,7 +1,7 @@
 use ledger_explorer::ldfi::solve_with;
 use ledger_explorer::minimizer::{causal_slice, minimize_schedule};
 use ledger_explorer::oracle::{AssertionOracle, HistoryOracle, KeyValueSpec, Oracle};
-use ledger_explorer::search::{Workload, diff, replay, run_campaign, search};
+use ledger_explorer::search::{Workload, diff, replay_prefix, replay_strict, run_campaign, search};
 use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::{MiniKvWorkload, StorageCrashWorkload, TwoPhaseCommitWorkload};
 use ledger_sim::{Policy, RunConfig};
@@ -31,7 +31,8 @@ fn mini_kv_finds_and_reproduces_stale_read() {
     .expect("solve");
     assert!(!hypotheses.is_empty());
 
-    let replayed = replay(&MiniKvWorkload, finding.seed, finding.run.decisions.clone()).unwrap();
+    let replayed =
+        replay_strict(&MiniKvWorkload, finding.seed, finding.run.decisions.clone()).unwrap();
     assert_eq!(
         finding.run.journal.root_hash(),
         replayed.journal.root_hash()
@@ -45,7 +46,7 @@ fn bandit_scheduler_discovers_diverse_journal_roots() {
         .seed([1; 32])
         .policy(Policy::Bandit {
             exploration_constant: 1.414,
-            pct_mix: 0.1,
+            pct_mix: ledger_sim::Probability::new(0.1).unwrap(),
         })
         .max_steps(256)
         .dropped_events(Vec::new())
@@ -126,7 +127,7 @@ fn schedule_minimizer_reduces_decision_sequence() {
     let finding = search(&workload, &oracle, config, 256).unwrap().unwrap();
 
     let report = minimize_schedule(&finding.run.decisions, |decisions| {
-        let replayed = replay(&workload, finding.seed, decisions.to_vec());
+        let replayed = replay_prefix(&workload, finding.seed, decisions.to_vec());
         replayed
             .as_ref()
             .map(|run| oracle.check(run).violated)
