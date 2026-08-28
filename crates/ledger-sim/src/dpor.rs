@@ -1,4 +1,4 @@
-//! Bounded source-DPOR exploration driver.
+//! Bounded single-trace single-base source-DPOR exploration driver.
 //!
 //! The driver runs one base execution under a `Dpor` policy (which behaves like
 //! `Random`), records its scheduler trace, and re-runs each causally plausible
@@ -12,9 +12,11 @@
 //! represented by at most one flip per branch point and same-class reorderings
 //! of already-ordered tasks are never explored.
 //!
-//! This is the bounded variant: it explores flips around one base run only and
-//! never re-analyzes flip runs as new bases, so it cannot claim the full
-//! one-execution-per-class guarantee of optimal DPOR.
+//! This is a bounded single-trace single-base variant: it explores schedule
+//! flips around one base trace only and never re-analyzes flip runs as new
+//! bases. It therefore makes no completeness claim; it does not guarantee one
+//! execution per causal equivalence class, only bounded exploration of
+//! alternative schedules around the single base run.
 
 use std::collections::{HashMap, HashSet};
 
@@ -60,11 +62,15 @@ pub struct DporReport {
     pub explored_flip_keys: Vec<(usize, usize)>,
 }
 
-/// Explore causally distinct schedules around one base run.
+/// Explore causally distinct schedules around one base run (bounded
+/// single-trace single-base DPOR).
 ///
 /// The base run is the first entry of the report. Each subsequent run forces a
 /// decision different from the base run's at one trace step and lets the
-/// `Random` fallback continue. The same seed produces an identical report.
+/// `Random` fallback continue. This is bounded single-base DPOR: only flips
+/// around the single base trace are explored, with no recursive re-analysis
+/// of flip runs, so no completeness guarantee is claimed. The same seed
+/// produces an identical report.
 pub fn run_dpor(
     programs: Vec<Vec<Instruction>>,
     cfg: &DporConfig,
