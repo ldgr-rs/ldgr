@@ -1,8 +1,10 @@
 //! Determinism leak sentinel and runtime ground-truth verification.
 // ledger-lint:allow:rdrand (the belt scan report names the hardware-entropy intrinsics)
 // ledger-lint:allow:rdseed (the belt scan report names the hardware-entropy intrinsics)
+// ledger-lint:allow:env::var (the belt install gate reads LEDGER_SENTINEL_BELT; host-side configuration, not simulation state)
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 
 /// Leak classes checked by the sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,9 +75,129 @@ impl core::fmt::Display for BeltStatus {
     }
 }
 
+/// Whether the process belt must be active for a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtectionMode {
+    /// Belt must be active; failure is a typed run error.
+    Required,
+    /// Belt is best-effort; failures warn and continue.
+    #[default]
+    BestEffort,
+}
+
+/// Belt mode derived from the host environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BeltMode {
+    /// Belt is disabled.
+    #[default]
+    Disabled,
+    /// Belt is best-effort.
+    BestEffort,
+    /// Belt is required.
+    Required,
+}
+
+/// Effective protection for a run, derived from host and env.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffectiveProtection {
+    /// Belt is disabled for this run.
+    #[default]
+    Disabled,
+    /// Belt is best-effort for this run.
+    BestEffort,
+    /// Belt is required for this run.
+    Required,
+}
+
+impl EffectiveProtection {
+    /// True when the belt is required.
+    pub fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    /// True when the belt is enabled in any mode.
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    /// True when an active belt is needed.
+    pub fn needs_active_belt(self) -> bool {
+        self.is_required()
+    }
+}
+
+impl From<ProtectionMode> for EffectiveProtection {
+    fn from(mode: ProtectionMode) -> Self {
+        match mode {
+            ProtectionMode::Required => Self::Required,
+            ProtectionMode::BestEffort => Self::BestEffort,
+        }
+    }
+}
+
+impl From<BeltMode> for EffectiveProtection {
+    fn from(mode: BeltMode) -> Self {
+        match mode {
+            BeltMode::Disabled => Self::Disabled,
+            BeltMode::BestEffort => Self::BestEffort,
+            BeltMode::Required => Self::Required,
+        }
+    }
+}
+
+impl From<Option<ProtectionMode>> for EffectiveProtection {
+    fn from(value: Option<ProtectionMode>) -> Self {
+        match value {
+            Some(ProtectionMode::Required) => Self::Required,
+            Some(ProtectionMode::BestEffort) => Self::BestEffort,
+            None => Self::Disabled,
+        }
+    }
+}
+
+impl From<EffectiveProtection> for Option<ProtectionMode> {
+    fn from(value: EffectiveProtection) -> Self {
+        match value {
+            EffectiveProtection::Disabled => None,
+            EffectiveProtection::BestEffort => Some(ProtectionMode::BestEffort),
+            EffectiveProtection::Required => Some(ProtectionMode::Required),
+        }
+    }
+}
+
+/// Pure env parsing for `LEDGER_SENTINEL_BELT`.
+///
+/// `None` means the variable is unset. The value is compared
+/// case-insensitively after lossy UTF-8 conversion: `required` maps to
+/// `Required`, `1`/`true`/`on`/`yes` map to `BestEffort`, everything else
+/// maps to `Disabled`. The parse never reads ambient state beyond its
+/// argument, so it is deterministic and testable.
+pub(crate) fn belt_env_mode(value: Option<&OsStr>) -> BeltMode {
+    match value {
+        None => BeltMode::Disabled,
+        Some(raw) => {
+            let lower = raw.to_string_lossy().to_ascii_lowercase();
+            match lower.as_str() {
+                "required" => BeltMode::Required,
+                "1" | "true" | "on" | "yes" => BeltMode::BestEffort,
+                _ => BeltMode::Disabled,
+            }
+        }
+    }
+}
+
+/// Host-side gate: read the belt mode from the process environment. The belt
+/// is an installation gate, not simulation state, so the env read is
+/// host-side by design and covered by this file's lint markers.
+pub(crate) fn belt_env_mode_from_env() -> BeltMode {
+    belt_env_mode(std::env::var_os("LEDGER_SENTINEL_BELT").as_deref())
+}
+
 /// Belt hook invoked at the sim run entry on Linux builds with `sentinel`.
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
-pub use crate::sentinel_belt::{TscTrapGuard, activate_process_belt};
+pub use crate::sentinel_belt::{
+    activate_process_belt, activate_process_belt_for_effective, TscTrapGuard,
+};
 
 /// Sentinel belt errors.
 ///
@@ -143,6 +265,11 @@ pub fn activate_process_belt() -> BeltStatus {
     BeltStatus::Unavailable
 }
 
+#[cfg(not(all(feature = "sentinel", target_os = "linux")))]
+pub fn activate_process_belt_for_effective(_effective: EffectiveProtection) -> BeltStatus {
+    BeltStatus::Unavailable
+}
+
 /// Dummy TSC trap guard for platforms without the belt.
 #[cfg(not(all(feature = "sentinel", target_os = "linux")))]
 #[derive(Debug, Default)]
@@ -152,6 +279,11 @@ pub struct TscTrapGuard;
 impl TscTrapGuard {
     /// No-op constructor for platforms without the belt.
     pub fn arm_if_armed() -> Self {
+        Self
+    }
+
+    /// No-op for effective mode on platforms without the belt.
+    pub fn arm_for_effective(_effective: EffectiveProtection) -> Self {
         Self
     }
 
@@ -282,5 +414,50 @@ mod tests {
         )));
         assert_eq!(status, again);
         assert_eq!(status.to_string(), again.to_string());
+    }
+
+    #[test]
+    fn belt_env_mode_pure_matrix() {
+        use std::ffi::OsStr;
+        assert_eq!(belt_env_mode(None), BeltMode::Disabled);
+        assert_eq!(belt_env_mode(Some(OsStr::new(""))), BeltMode::Disabled);
+        assert_eq!(belt_env_mode(Some(OsStr::new("0"))), BeltMode::Disabled);
+        assert_eq!(belt_env_mode(Some(OsStr::new("false"))), BeltMode::Disabled);
+        assert_eq!(belt_env_mode(Some(OsStr::new("off"))), BeltMode::Disabled);
+        assert_eq!(belt_env_mode(Some(OsStr::new("no"))), BeltMode::Disabled);
+        assert_eq!(belt_env_mode(Some(OsStr::new("1"))), BeltMode::BestEffort);
+        assert_eq!(
+            belt_env_mode(Some(OsStr::new("true"))),
+            BeltMode::BestEffort
+        );
+        assert_eq!(belt_env_mode(Some(OsStr::new("on"))), BeltMode::BestEffort);
+        assert_eq!(belt_env_mode(Some(OsStr::new("yes"))), BeltMode::BestEffort);
+        assert_eq!(
+            belt_env_mode(Some(OsStr::new("TRUE"))),
+            BeltMode::BestEffort
+        );
+        assert_eq!(belt_env_mode(Some(OsStr::new("YES"))), BeltMode::BestEffort);
+        assert_eq!(
+            belt_env_mode(Some(OsStr::new("required"))),
+            BeltMode::Required
+        );
+        assert_eq!(
+            belt_env_mode(Some(OsStr::new("REQUIRED"))),
+            BeltMode::Required
+        );
+        assert_eq!(
+            belt_env_mode(Some(OsStr::new("Required"))),
+            BeltMode::Required
+        );
+        assert_eq!(
+            belt_env_mode(Some(OsStr::new("unknown"))),
+            BeltMode::Disabled
+        );
+    }
+
+    #[test]
+    fn protection_mode_default_is_best_effort() {
+        assert_eq!(ProtectionMode::default(), ProtectionMode::BestEffort);
+        assert_eq!(BeltMode::default(), BeltMode::Disabled);
     }
 }
