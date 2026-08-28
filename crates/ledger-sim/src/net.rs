@@ -1,6 +1,7 @@
 //! Deterministic simulated network with timed delivery queues and partitions.
 //! Version 0.2: DnsTable exposes sorted `iter()` for deterministic RunConfig hashing.
 
+use crate::config::Probability;
 use ledger_format::{FaultSpec, Hash};
 use rand_core::Rng;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -32,7 +33,7 @@ pub struct LinkConfig {
     /// Uniform jitter range in ticks: a send draws `[0, jitter]` extra ticks.
     pub jitter: u64,
     /// Message loss probability in `0.0 ..= 1.0`.
-    pub loss_probability: f64,
+    pub loss_probability: Probability,
     /// Per-link reorder window override; `0` uses the global window.
     pub reorder_window: usize,
 }
@@ -42,7 +43,7 @@ impl Default for LinkConfig {
         Self {
             base_delay: 0,
             jitter: 0,
-            loss_probability: 0.0,
+            loss_probability: Probability::ZERO,
             reorder_window: 0,
         }
     }
@@ -210,8 +211,8 @@ impl SimNet {
             // this fallback only guards direct construction.
             total = total.saturating_add(draw(cfg.jitter.saturating_add(1)));
         }
-        if cfg.loss_probability > 0.0
-            && draw(1_000_000_000) < (cfg.loss_probability * 1_000_000_000.0) as u64
+        if cfg.loss_probability.get() > 0.0
+            && draw(1_000_000_000) < (cfg.loss_probability.get() * 1_000_000_000.0) as u64
         {
             return false;
         }
@@ -434,7 +435,7 @@ mod tests {
             0,
             1,
             LinkConfig {
-                loss_probability: 1.0,
+                loss_probability: Probability::ONE,
                 ..LinkConfig::default()
             },
         );
@@ -454,7 +455,7 @@ mod tests {
             0,
             1,
             LinkConfig {
-                loss_probability: 0.0,
+                loss_probability: Probability::ZERO,
                 ..LinkConfig::default()
             },
         );
