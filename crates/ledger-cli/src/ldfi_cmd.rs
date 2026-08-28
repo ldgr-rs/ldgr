@@ -7,26 +7,26 @@
 use ledger_explorer::ldfi::hypothesis_to_schedule;
 use ledger_explorer::maxsat::encode_hazard;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
-use ledger_explorer::search::{replay_with_faults, search};
-use ledger_explorer::{FaultHypothesis, SolverConfig, SolverError, select_solver, solve_with};
+use ledger_explorer::search::{replay_with_faults, search, FaultReplayError, SearchError};
+use ledger_explorer::{select_solver, solve_with, FaultHypothesis, SolverConfig, SolverError};
 use ledger_format::Hash;
 use ledger_sim::{Policy, RunConfig, SimFault};
 use thiserror::Error;
 
-use crate::{DefaultMiniKv, MaxSatEngineArg, seed_from_u64};
+use crate::{default_pct_mix, seed_from_u64, DefaultMiniKv, MaxSatEngineArg};
 
 /// Errors from the `ldfi` campaign driver.
 #[derive(Debug, Error)]
 pub enum LdfiCmdError {
-    /// Campaign search failed; the explorer search API reports a message.
-    #[error("ldfi search failed: {0}")]
-    Search(String),
+    /// Campaign search failed.
+    #[error(transparent)]
+    Search(#[from] SearchError),
     /// Ranking the fault hypotheses failed.
-    #[error("ldfi solve: {0}")]
+    #[error(transparent)]
     Solve(#[from] SolverError),
-    /// Fault replay failed; the explorer replay API reports a message.
-    #[error("ldfi replay failed: {0}")]
-    Replay(String),
+    /// Fault replay failed.
+    #[error(transparent)]
+    Replay(#[from] FaultReplayError),
 }
 
 #[derive(Debug, Clone)]
@@ -86,14 +86,12 @@ pub fn run_ldfi(
         .seed(seed_from_u64(seed))
         .policy(Policy::Bandit {
             exploration_constant: 1.414,
-            pct_mix: 0.1,
+            pct_mix: default_pct_mix(),
         })
         .max_steps(max_steps)
         .build();
 
-    let Some(finding) =
-        search(&workload, &oracle, config, attempts).map_err(LdfiCmdError::Search)?
-    else {
+    let Some(finding) = search(&workload, &oracle, config, attempts)? else {
         return Ok(None);
     };
 
@@ -119,8 +117,7 @@ pub fn run_ldfi(
         finding.seed,
         finding.run.decisions.clone(),
         schedule.clone(),
-    )
-    .map_err(LdfiCmdError::Replay)?;
+    )?;
 
     Ok(Some(LdfiReport {
         attempts,
