@@ -46,6 +46,43 @@ pub trait NetExt: Net {
 
 impl<T: Net + ?Sized> NetExt for T {}
 
+/// Source-preserving storage error.
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct FsError(pub ledger_journal::JournalError);
+
+impl core::fmt::Display for FsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl core::error::Error for FsError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl From<ledger_journal::JournalError> for FsError {
+    fn from(error: ledger_journal::JournalError) -> Self {
+        Self(error)
+    }
+}
+
+impl core::ops::Deref for FsError {
+    type Target = ledger_journal::JournalError;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl FsError {
+    /// Extract the underlying journal error.
+    pub fn into_journal(self) -> ledger_journal::JournalError {
+        self.0
+    }
+}
+
 /// Storage boundary exposed to systems under test.
 ///
 /// Implementors serve the layered simulated storage surface: page-cache write,
@@ -53,30 +90,25 @@ impl<T: Net + ?Sized> NetExt for T {}
 /// backend, so the caller never sees the journal.
 pub trait Fs {
     /// Write a value to the page cache and return its journal entry id.
-    fn write(&self, path: &str, value: u64) -> Result<Hash, ledger_journal::JournalError>;
+    fn write(&self, path: &str, value: u64) -> Result<Hash, FsError>;
 
     /// Write with origin capture; see [`Net::send_loc`]. Default delegates.
-    fn write_loc(
-        &self,
-        path: &str,
-        value: u64,
-        at: OriginSource,
-    ) -> Result<Hash, ledger_journal::JournalError> {
+    fn write_loc(&self, path: &str, value: u64, at: OriginSource) -> Result<Hash, FsError> {
         let _ = at;
         self.write(path, value)
     }
 
     /// Flush all dirty page-cache entries to durable synced storage.
-    fn fsync(&self) -> Result<Hash, ledger_journal::JournalError>;
+    fn fsync(&self) -> Result<Hash, FsError>;
 
     /// Flush with origin capture; see [`Net::send_loc`]. Default delegates.
-    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, ledger_journal::JournalError> {
+    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, FsError> {
         let _ = at;
         self.fsync()
     }
 
     /// Read a value from page cache, recording provenance of the observed write.
-    fn read(&self, path: &str) -> Result<Option<u64>, ledger_journal::JournalError>;
+    fn read(&self, path: &str) -> Result<Option<u64>, FsError>;
 
     /// Crash storage into the deterministic post-crash state.
     fn crash(&self);
@@ -93,12 +125,12 @@ pub trait Fs {
 /// entry id observable at this boundary to key an origin against.
 pub trait FsExt: Fs {
     #[track_caller]
-    fn write_tracked(&self, path: &str, value: u64) -> Result<Hash, ledger_journal::JournalError> {
+    fn write_tracked(&self, path: &str, value: u64) -> Result<Hash, FsError> {
         self.write_loc(path, value, Location::caller().into())
     }
 
     #[track_caller]
-    fn fsync_tracked(&self) -> Result<Hash, ledger_journal::JournalError> {
+    fn fsync_tracked(&self) -> Result<Hash, FsError> {
         self.fsync_loc(Location::caller().into())
     }
 
@@ -141,4 +173,39 @@ pub trait Effects {
     fn net(&self) -> &dyn Net;
 
     fn fs(&self) -> &dyn Fs;
+}
+
+#[cfg(test)]
+mod fs_error_tests {
+    use super::FsError;
+    use core::error::Error;
+    use ledger_journal::JournalError;
+
+    #[test]
+    fn fs_error_preserves_source_and_display() {
+        let journal_err = JournalError::InvalidPayload("bad payload".to_string());
+        let fs_err = FsError(journal_err.clone());
+        // Display delegates to inner
+        assert_eq!(fs_err.to_string(), journal_err.to_string());
+        // Source preserves inner
+        assert!(fs_err.source().is_some());
+        assert_eq!(
+            fs_err.source().unwrap().to_string(),
+            journal_err.to_string()
+        );
+        // From conversion
+        let from: FsError = journal_err.clone().into();
+        assert_eq!(from.0, journal_err);
+        // Deref delegates
+        assert_eq!(*from, journal_err);
+        // into_journal extracts
+        assert_eq!(from.into_journal(), journal_err);
+    }
+
+    #[test]
+    fn fs_error_into_journal_round_trips() {
+        let err = JournalError::MissingParent([1u8; 32]);
+        let fs_err = FsError(err.clone());
+        assert_eq!(fs_err.into_journal(), err);
+    }
 }

@@ -118,7 +118,7 @@ impl Boundary {
     /// byte-identical to the pre-swarm path.
     fn swarm_send_policy(&self, send_id: Hash) -> SwarmAction {
         let swarm = &self.shared.swarm;
-        if swarm.drop_probability > 0.0 && self.net_draw() < swarm.drop_probability {
+        if swarm.drop_probability.get() > 0.0 && self.net_draw() < swarm.drop_probability.get() {
             if let Err(error) = self.append(
                 EntryKind::Fault {
                     fault: FaultSpec::Drop,
@@ -130,9 +130,9 @@ impl Boundary {
             }
             return SwarmAction::Drop;
         }
-        if swarm.delay_probability > 0.0
+        if swarm.delay_probability.get() > 0.0
             && swarm.max_delay_ticks > 0
-            && self.net_draw() < swarm.delay_probability
+            && self.net_draw() < swarm.delay_probability.get()
         {
             let delay = self.net_draw_delay(swarm.max_delay_ticks);
             return SwarmAction::Delay(delay);
@@ -168,10 +168,10 @@ impl Boundary {
         value: u64,
     ) -> Result<(), ledger_journal::JournalError> {
         let swarm = &self.shared.swarm;
-        if swarm.crash_probability <= 0.0 {
+        if swarm.crash_probability.get() <= 0.0 {
             return Ok(());
         }
-        if self.fs_draw() >= swarm.crash_probability {
+        if self.fs_draw() >= swarm.crash_probability.get() {
             return Ok(());
         }
         // The probability and choice draws above always happen so the fs
@@ -848,13 +848,13 @@ impl Fs for Boundary {
         path: &str,
         value: u64,
         at: OriginSource,
-    ) -> Result<Hash, ledger_journal::JournalError> {
+    ) -> Result<Hash, crate::effects::FsError> {
         let id = Fs::write(self, path, value)?;
         self.shared.origins.borrow_mut().record(id, at);
         Ok(id)
     }
 
-    fn write(&self, path: &str, value: u64) -> Result<Hash, ledger_journal::JournalError> {
+    fn write(&self, path: &str, value: u64) -> Result<Hash, crate::effects::FsError> {
         let mut journal = self.shared.journal.borrow_mut();
         let mut fs = self.shared.fs.borrow_mut();
         let id = fs.write(&mut journal, self.task as ActorId, path, value)?;
@@ -872,13 +872,13 @@ impl Fs for Boundary {
         Ok(id)
     }
 
-    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, ledger_journal::JournalError> {
+    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, crate::effects::FsError> {
         let id = Fs::fsync(self)?;
         self.shared.origins.borrow_mut().record(id, at);
         Ok(id)
     }
 
-    fn fsync(&self) -> Result<Hash, ledger_journal::JournalError> {
+    fn fsync(&self) -> Result<Hash, crate::effects::FsError> {
         let mut journal = self.shared.journal.borrow_mut();
         let mut fs = self.shared.fs.borrow_mut();
         let id = fs.fsync(&mut journal, self.task as ActorId)?;
@@ -894,7 +894,7 @@ impl Fs for Boundary {
         Ok(id)
     }
 
-    fn read(&self, path: &str) -> Result<Option<u64>, ledger_journal::JournalError> {
+    fn read(&self, path: &str) -> Result<Option<u64>, crate::effects::FsError> {
         let mut journal = self.shared.journal.borrow_mut();
         let fs = self.shared.fs.borrow();
         let value = fs.read(&mut journal, self.task as ActorId, path)?;
