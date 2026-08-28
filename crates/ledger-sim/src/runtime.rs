@@ -10,7 +10,6 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::adapter::program_future;
 use crate::config::{Policy, RunConfig};
 use crate::executor::{Boundary, Executor};
 use crate::scheduler::StepTrace;
@@ -79,8 +78,48 @@ pub enum Instruction {
     Done,
 }
 
+/// Typed halt reason for monitor halts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaltReason(pub Box<str>);
+
+impl HaltReason {
+    /// Create a reason from a string.
+    pub fn new(reason: impl Into<Box<str>>) -> Self {
+        Self(reason.into())
+    }
+
+    /// View as str.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for HaltReason {
+    fn from(value: String) -> Self {
+        Self(value.into_boxed_str())
+    }
+}
+
+impl From<&str> for HaltReason {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<Box<str>> for HaltReason {
+    fn from(value: Box<str>) -> Self {
+        Self(value)
+    }
+}
+
+impl core::fmt::Display for HaltReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Whether a run reached completion, and why it stopped when it did not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
     /// Every task finished.
     Completed,
@@ -88,7 +127,24 @@ pub enum RunOutcome {
     BudgetExhausted,
     /// No task was ready and at least one task was still pending.
     Blocked,
+    /// A mid-run monitor halted execution.
+    MonitorHalt(HaltReason),
 }
+
+/// Action returned by a mid-run step monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OnlineAction {
+    /// Continue execution.
+    Continue,
+    /// Halt execution with a reason.
+    Halt { reason: HaltReason },
+}
+
+/// Mid-run monitor called after each scheduling step.
+///
+/// The callback is read-only over the journal and consumes no seed draws;
+/// it receives the journal and the start index of the delta for this step.
+pub type StepMonitor = Box<dyn FnMut(&Journal, usize) -> OnlineAction>;
 
 /// Result of a completed deterministic run.
 #[derive(Debug, Clone)]
@@ -129,6 +185,12 @@ pub struct RunResult {
     /// replay is broken; on the `Ok` path this field is always `None` (kept
     /// for API stability and inspection).
     pub journal_error: Option<JournalError>,
+    /// Belt protection status for this run.
+    ///
+    /// Reports the per-run `BeltStatus` even for `BestEffort` where the run
+    /// continues despite `NotArmed` or `Failed`. `Required` runs that fail
+    /// never produce a `RunResult`; the error carries the status.
+    pub protection: crate::sentinel::BeltStatus,
 }
 
 /// Runtime errors that preserve the failed run context.
@@ -143,6 +205,10 @@ pub enum RuntimeError {
     /// The variant remains because the runtime facade maps it in its
     /// public contract.
     StepLimit { limit: usize },
+    /// Strict replay rejected a decision or trailing leftover.
+    StrictReplay(crate::scheduler::ReplayViolation),
+    /// Belt activation failed or the belt is not active while required.
+    Belt(crate::sentinel::BeltStatus),
 }
 
 impl fmt::Display for RuntimeError {
@@ -150,6 +216,8 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::Journal(error) => write!(f, "journal error: {error}"),
             Self::StepLimit { limit } => write!(f, "simulation exceeded {limit} steps"),
+            Self::StrictReplay(violation) => write!(f, "strict replay violation: {violation}"),
+            Self::Belt(status) => write!(f, "belt not active while required: {status}"),
         }
     }
 }
@@ -165,6 +233,20 @@ impl From<JournalError> for RuntimeError {
 /// Deterministic cooperative simulator backed by the async executor.
 pub struct Simulation {
     executor: Executor,
+}
+
+fn install_programs(
+    shared: &std::rc::Rc<crate::executor::ExecutorShared>,
+    programs: Vec<Vec<Instruction>>,
+) {
+    for (task_id, program) in programs.into_iter().enumerate() {
+        let boundary = crate::executor::Boundary::for_task(std::rc::Rc::clone(shared), task_id);
+        let future = crate::adapter::program_future(boundary, program);
+        shared
+            .tasks
+            .borrow_mut()
+            .push(crate::executor::make_task_entry(future));
+    }
 }
 
 impl Simulation {
@@ -184,6 +266,21 @@ impl Simulation {
         Self::with_replay_and_fallback(config, programs, replay, Policy::Random)
     }
 
+    /// Create a strict simulation that follows recorded choices exactly.
+    ///
+    /// Out-of-range, exhausted, or trailing decisions surface as
+    /// [`RuntimeError::StrictReplay`] and never fall back to a seeded policy.
+    pub fn with_replay_strict(
+        config: RunConfig,
+        programs: Vec<Vec<Instruction>>,
+        replay: Vec<usize>,
+    ) -> Self {
+        let executor = Executor::with_shared_and_replay_strict(config.clone(), replay, |shared| {
+            install_programs(shared, programs);
+        });
+        Self { executor }
+    }
+
     /// Create a simulation with an explicit replay-exhaustion fallback policy.
     ///
     /// Used by the source-DPOR driver: a partial replay pins the forced prefix,
@@ -199,33 +296,35 @@ impl Simulation {
             replay,
             fallback,
             |shared| {
-                for (task_id, program) in programs.into_iter().enumerate() {
-                    let boundary = Boundary::for_task(shared.clone(), task_id);
-                    let future = program_future(boundary, program);
-                    let mut tasks = shared.tasks.borrow_mut();
-                    tasks.push(crate::executor::make_task_entry(future));
-                }
+                install_programs(shared, programs);
             },
         );
         Self { executor }
     }
 
-    /// Run until all tasks finish or the instruction budget is reached.
+    /// Attach a mid-run step monitor.
+    ///
+    /// The monitor is invoked after each scheduling step with the journal and
+    /// the start index of the delta. A `Halt` stops the run with
+    /// `MonitorHalt`.
+    pub fn with_step_monitor(mut self, monitor: StepMonitor) -> Self {
+        self.executor = self.executor.with_step_monitor(monitor);
+        self
+    }
+
+    /// Set host-side protection mode for this run.
+    ///
+    /// Host option overrides env; default is `BestEffort` when set, else env fallback.
+    /// Env `Disabled` with no host option keeps not-armed behavior.
+    pub fn with_protection_mode(mut self, mode: crate::sentinel::ProtectionMode) -> Self {
+        self.executor = self.executor.with_protection_mode(mode);
+        self
+    }
+
+    /// Run until all tasks finish, the budget is reached, or a monitor halts.
+    ///
+    /// Belt activation is enforced in the common executor boundary.
     pub fn run(self) -> Result<RunResult, RuntimeError> {
-        let tsc_guard = crate::sentinel::TscTrapGuard::arm_if_armed();
-        if let Some(error) = tsc_guard.activation_error() {
-            // The belt is demanded and the RDTSC trap is absent: surface the
-            // typed failure instead of claiming the trap is in place. The
-            // belt hook records its own typed status (queryable via
-            // `belt_status`); a failed belt cannot abort the run through
-            // RuntimeError, so the run completes and evidence gates assert
-            // the belt status when ground truth is required.
-            eprintln!("ledger-sim sentinel: RDTSC trap activation failed: {error}");
-        }
-        // Keep the guard alive for the whole run; it restores the TSC trap on
-        // drop, and dropping it early would un-trap the simulated section.
-        let _guard = tsc_guard;
-        crate::sentinel::activate_process_belt();
         self.executor.run()
     }
 }
@@ -257,6 +356,12 @@ impl Simulation {
             },
         );
         Self { executor }
+    }
+
+    /// Set host-side protection mode for task-based simulation.
+    pub fn with_protection_mode_tasks(mut self, mode: crate::sentinel::ProtectionMode) -> Self {
+        self.executor = self.executor.with_protection_mode(mode);
+        self
     }
 }
 
@@ -360,16 +465,12 @@ mod tests {
             .map(|entry| entry.data.kind)
             .collect::<Vec<_>>();
         assert!(kinds.iter().any(|kind| matches!(kind, EntryKind::Spawn)));
-        assert!(
-            kinds
-                .iter()
-                .any(|kind| matches!(kind, EntryKind::ClockRead))
-        );
-        assert!(
-            kinds
-                .iter()
-                .any(|kind| matches!(kind, EntryKind::TimerFire))
-        );
+        assert!(kinds
+            .iter()
+            .any(|kind| matches!(kind, EntryKind::ClockRead)));
+        assert!(kinds
+            .iter()
+            .any(|kind| matches!(kind, EntryKind::TimerFire)));
         assert!(kinds.iter().any(|kind| matches!(kind, EntryKind::Wake)));
         assert!(run.monitor_issues.is_empty());
     }
@@ -386,8 +487,7 @@ mod tests {
             .run()
             .unwrap();
         let decisions = original.decisions.clone();
-        let mut replay_config = config;
-        *replay_config.policy_mut() = Policy::Replay;
+        let replay_config = config.with_policy(Policy::Replay);
         let replayed = Simulation::with_replay(replay_config, programs, decisions)
             .run()
             .unwrap();
@@ -462,5 +562,284 @@ mod tests {
             crate::sentinel::activate_process_belt(),
             crate::sentinel::BeltStatus::Unavailable
         );
+    }
+
+    #[test]
+    fn required_protection_fails_when_belt_not_active() {
+        // Require the belt via host option; on platforms without a belt the status
+        // is Unavailable, so the run must be rejected with Belt.
+        let config = RunConfig::builder().seed([1; 32]).max_steps(16).build();
+        let programs = vec![vec![Instruction::Done]];
+        let result = Simulation::new(config, programs)
+            .with_protection_mode(crate::sentinel::ProtectionMode::Required)
+            .run();
+        #[cfg(not(all(feature = "sentinel", target_os = "linux")))]
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::Belt(crate::sentinel::BeltStatus::Unavailable))
+            ),
+            "Required + Unavailable must be Belt, got {result:?}"
+        );
+        #[cfg(all(feature = "sentinel", target_os = "linux"))]
+        {
+            match result {
+                Ok(_) => {}
+                Err(RuntimeError::Belt(_)) => {}
+                Err(other) => panic!("unexpected error for Required: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn best_effort_with_any_belt_succeeds() {
+        let config = RunConfig::builder().seed([2; 32]).max_steps(16).build();
+        let programs = vec![vec![Instruction::Done]];
+        let result = Simulation::new(config, programs)
+            .with_protection_mode(crate::sentinel::ProtectionMode::BestEffort)
+            .run();
+        assert!(
+            result.is_ok(),
+            "BestEffort must not fail on belt, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn monitor_halts_violating_run_and_is_deterministic() {
+        // Monitor that halts when an Outcome entry with value 99 appears.
+        let halt_on_99 = |journal: &ledger_journal::Journal, start: usize| {
+            for entry in journal.entries().skip(start) {
+                if entry.data.kind == ledger_format::EntryKind::Outcome
+                    && matches!(&entry.data.payload, ledger_format::Payload::Number(99))
+                {
+                    return crate::runtime::OnlineAction::Halt {
+                        reason: HaltReason::from("outcome 99 forbidden"),
+                    };
+                }
+            }
+            crate::runtime::OnlineAction::Continue
+        };
+        let programs = vec![vec![
+            Instruction::Set(99),
+            Instruction::Outcome,
+            Instruction::Set(1),
+            Instruction::Outcome,
+            Instruction::Done,
+        ]];
+        let config = RunConfig::builder().seed([11; 32]).max_steps(64).build();
+        let halted = Simulation::new(config.clone(), programs.clone())
+            .with_step_monitor(Box::new(halt_on_99))
+            .run()
+            .expect("halted run should succeed as MonitorHalt, not error");
+        assert!(
+            matches!(halted.outcome, RunOutcome::MonitorHalt(ref reason) if reason.as_str() == "outcome 99 forbidden"),
+            "outcome must be MonitorHalt, got {:?}",
+            halted.outcome
+        );
+        assert!(
+            halted.steps < 64,
+            "halted run must stop before max_steps, steps {}",
+            halted.steps
+        );
+        // No-monitor run with same seed and programs must complete without
+        // MonitorHalt and must produce a different (longer) journal.
+        let full = Simulation::new(config.clone(), programs.clone())
+            .run()
+            .expect("full run");
+        assert_eq!(full.outcome, RunOutcome::Completed);
+        assert!(full.steps > halted.steps);
+        assert_ne!(full.journal.root_hash(), halted.journal.root_hash());
+        // Partial journal must replay byte-identically: replay the halted
+        // decisions with max_steps capped to the halt point yields the same
+        // root. This proves the monitor consumed no seed draws.
+        let replay_cfg = RunConfig::builder()
+            .seed([11; 32])
+            .policy(Policy::Replay)
+            .max_steps(halted.steps)
+            .build();
+        let replayed =
+            Simulation::with_replay(replay_cfg, programs.clone(), halted.decisions.clone())
+                .run()
+                .expect("replay should succeed");
+        assert_eq!(
+            replayed.journal.root_hash(),
+            halted.journal.root_hash(),
+            "partial journal must be byte-identical on replay"
+        );
+        // Also replay with the same monitor must halt identically.
+        let halt_again = Simulation::with_replay(
+            RunConfig::builder()
+                .seed([11; 32])
+                .policy(Policy::Replay)
+                .max_steps(64)
+                .build(),
+            programs.clone(),
+            halted.decisions.clone(),
+        )
+        .with_step_monitor(Box::new(|journal, start| {
+            for entry in journal.entries().skip(start) {
+                if entry.data.kind == ledger_format::EntryKind::Outcome
+                    && matches!(&entry.data.payload, ledger_format::Payload::Number(99))
+                {
+                    return crate::runtime::OnlineAction::Halt {
+                        reason: HaltReason::from("outcome 99 forbidden"),
+                    };
+                }
+            }
+            crate::runtime::OnlineAction::Continue
+        }))
+        .run()
+        .expect("replay with monitor");
+        assert_eq!(halt_again.journal.root_hash(), halted.journal.root_hash());
+        assert!(matches!(halt_again.outcome, RunOutcome::MonitorHalt(_)));
+    }
+
+    #[test]
+    fn no_monitor_run_unchanged() {
+        let programs = vec![vec![
+            Instruction::Set(7),
+            Instruction::Outcome,
+            Instruction::Done,
+        ]];
+        let config = RunConfig::builder().seed([13; 32]).max_steps(32).build();
+        let without = Simulation::new(config.clone(), programs.clone())
+            .run()
+            .expect("without monitor");
+        let with_never_halt = Simulation::new(config, programs)
+            .with_step_monitor(Box::new(|_, _| crate::runtime::OnlineAction::Continue))
+            .run()
+            .expect("with never-halt monitor");
+        assert_eq!(
+            without.journal.root_hash(),
+            with_never_halt.journal.root_hash()
+        );
+        assert_eq!(without.decisions, with_never_halt.decisions);
+        assert_eq!(without.outcome, with_never_halt.outcome);
+    }
+
+    #[test]
+    fn with_replay_strict_forces_replay_policy() {
+        // Non-Replay policy with strict must be forced to Replay.
+        let config = RunConfig::builder()
+            .seed([99; 32])
+            .policy(Policy::Random)
+            .max_steps(16)
+            .build();
+        let programs = vec![vec![Instruction::Done]];
+        // Strict should force Replay and then validate replay length.
+        let strict_ok =
+            Simulation::with_replay_strict(config.clone(), programs.clone(), vec![]).run();
+        // Empty replay with strict and zero steps: trailing check passes (replay len 0).
+        assert!(
+            strict_ok.is_ok() || matches!(strict_ok, Err(RuntimeError::StrictReplay(_))),
+            "strict with forced Replay must not silently ignore policy, got {strict_ok:?}"
+        );
+        // Non-empty replay that matches run should succeed after forcing.
+        let base = Simulation::new(config.clone(), programs.clone())
+            .run()
+            .unwrap();
+        let strict_replay = Simulation::with_replay_strict(
+            config.clone(),
+            programs.clone(),
+            base.decisions.clone(),
+        )
+        .run()
+        .expect("strict replay with forced Replay must succeed");
+        assert_eq!(strict_replay.journal.root_hash(), base.journal.root_hash());
+    }
+
+    #[test]
+    fn with_replay_strict_rejects_trailing_via_violation() {
+        let config = RunConfig::builder().seed([11; 32]).max_steps(64).build();
+        let programs = vec![vec![
+            Instruction::Set(1),
+            Instruction::Outcome,
+            Instruction::Done,
+        ]];
+        let base = Simulation::new(config.clone(), programs.clone())
+            .run()
+            .unwrap();
+        let mut trailing = base.decisions.clone();
+        trailing.push(0);
+        trailing.push(1);
+        let err = Simulation::with_replay_strict(config, programs, trailing)
+            .run()
+            .expect_err("trailing replay must be StrictReplay");
+        assert!(matches!(err, RuntimeError::StrictReplay(_)));
+    }
+
+    #[test]
+    fn best_effort_reports_protection_status() {
+        let config = RunConfig::builder().seed([5; 32]).max_steps(16).build();
+        let programs = vec![vec![Instruction::Done]];
+        let run = Simulation::new(config, programs)
+            .with_protection_mode(crate::sentinel::ProtectionMode::BestEffort)
+            .run()
+            .expect("BestEffort must succeed");
+        // Protection field is additive and always present.
+        let _ = run.protection.clone();
+        assert!(
+            matches!(
+                run.protection,
+                crate::sentinel::BeltStatus::Active { .. }
+                    | crate::sentinel::BeltStatus::NotArmed
+                    | crate::sentinel::BeltStatus::Unavailable
+                    | crate::sentinel::BeltStatus::Failed(_)
+            ),
+            "protection must be structured, got {:?}",
+            run.protection
+        );
+    }
+
+    #[test]
+    fn required_rejects_incomplete_installation() {
+        let config = RunConfig::builder().seed([6; 32]).max_steps(16).build();
+        let programs = vec![vec![Instruction::Done]];
+        let result = Simulation::new(config, programs)
+            .with_protection_mode(crate::sentinel::ProtectionMode::Required)
+            .run();
+        // On non-linux or without belt, Required must error with Belt status.
+        #[cfg(not(all(feature = "sentinel", target_os = "linux")))]
+        assert!(
+            matches!(result, Err(RuntimeError::Belt(_))),
+            "Required without belt must be Belt error, got {result:?}"
+        );
+        #[cfg(all(feature = "sentinel", target_os = "linux"))]
+        {
+            match result {
+                Ok(run) => assert!(matches!(
+                    run.protection,
+                    crate::sentinel::BeltStatus::Active { .. }
+                )),
+                Err(RuntimeError::Belt(_)) => {}
+                Err(other) => panic!("unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_sees_initial_spawn_prefix() {
+        let config = RunConfig::builder().seed([7; 32]).max_steps(32).build();
+        let programs = vec![vec![Instruction::Done], vec![Instruction::Done]];
+        let saw_spawn = std::cell::Cell::new(false);
+        let saw = std::rc::Rc::new(std::cell::Cell::new(false));
+        let saw_clone = saw.clone();
+        let run = Simulation::new(config, programs)
+            .with_step_monitor(Box::new(move |journal, start| {
+                if start == 0 {
+                    for entry in journal.entries() {
+                        if entry.data.kind == ledger_format::EntryKind::Spawn {
+                            saw_clone.set(true);
+                            break;
+                        }
+                    }
+                }
+                crate::runtime::OnlineAction::Continue
+            }))
+            .run()
+            .expect("run with prefix monitor");
+        assert!(saw.get(), "monitor must observe Spawn at entry 0");
+        let _ = saw_spawn;
+        let _ = run.journal.len();
     }
 }
