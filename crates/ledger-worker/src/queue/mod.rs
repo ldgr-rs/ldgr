@@ -22,6 +22,7 @@ pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 ///
 /// `Queued` and `Leased` are transient; `Failed`, `Cancelled`, and `Done`
 /// are terminal. Terminal tasks never re-enter the queue.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
     /// Waiting in the queue for a worker lease.

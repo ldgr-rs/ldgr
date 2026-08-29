@@ -215,6 +215,7 @@ pub async fn run_assigned_task(
     heartbeat: Duration,
 ) -> Result<TaskOutcome, SessionError> {
     let task_id = task.id.clone();
+    let attempts = task.attempts;
     let mut exec = tokio::task::spawn_blocking(move || execute_task(task));
     let mut ticker = tokio::time::interval(heartbeat.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -225,7 +226,7 @@ pub async fn run_assigned_task(
         message: Some(session_request::Message::Heartbeat(Heartbeat {
             worker_id: worker_id.to_string(),
             task_id: task_id.clone(),
-            attempts: 0,
+            attempts,
         })),
     };
     if tx.send(hello_hb).await.is_err() {
@@ -239,7 +240,7 @@ pub async fn run_assigned_task(
                     message: Some(session_request::Message::Heartbeat(Heartbeat {
                         worker_id: worker_id.to_string(),
                         task_id: task_id.clone(),
-                        attempts: 0,
+                        attempts,
                     })),
                 };
                 if tx.send(msg).await.is_err() {
