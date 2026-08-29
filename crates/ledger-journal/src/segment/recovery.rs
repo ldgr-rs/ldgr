@@ -25,8 +25,8 @@ use ledger_format::Hash;
 
 use super::{
     ArchivedSegment, INDEX_ENTRY_LEN, MANIFEST_FILE, MIN_FRAME_PAYLOAD, SealedSegment,
-    SegmentStore, TRAILER_LEN, WAL_FILE, decode_frame_payload, next_frame, read_u32_be_at,
-    read_u64_be_at, read_u64_le_at, segment_file_name, segment_io,
+    SegmentStore, TRAILER_LEN, WAL_FILE, decode_frame_payload, next_frame, prefix_of,
+    read_u32_be_at, read_u64_be_at, read_u64_le_at, segment_file_name, segment_io,
 };
 
 impl SegmentStore {
@@ -368,6 +368,55 @@ pub(crate) fn parse_segment_bytes(
         let offset = read_u64_be_at(entry, 0);
         let prefix = read_u32_be_at(entry, 8);
         samples.push((offset, prefix));
+    }
+
+    // Format review section 12: the complete decompressed segment is
+    // verified before it becomes readable. Every frame is decoded (which
+    // re-verifies each entry hash), then the entry count, the segment root,
+    // and every sparse-index sample are recomputed from the decoded frames.
+    // A sampled tail check would accept a corrupted middle.
+    let compressed = &bytes[data_offset as usize..index_start];
+    let block = zstd::decode_all(compressed).map_err(segment_io)?;
+    if block.len() as u64 != uncompressed_len {
+        return Err(JournalError::SegmentCorrupt(format!(
+            "segment {id} uncompressed length mismatch: expected {uncompressed_len}, got {}",
+            block.len()
+        )));
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut decoded = 0u64;
+    let mut sample_pos = 0usize;
+    let mut offset = 0usize;
+    while let Some((next, payload)) = next_frame(&block, offset)? {
+        let entry = decode_frame_payload(payload)?;
+        if sample_pos < samples.len() && samples[sample_pos].0 == offset as u64 {
+            if samples[sample_pos].1 != prefix_of(&entry.id) {
+                return Err(JournalError::SegmentCorrupt(format!(
+                    "segment {id} sparse index prefix mismatch at offset {}",
+                    offset
+                )));
+            }
+            sample_pos += 1;
+        }
+        hasher.update(&entry.id);
+        decoded += 1;
+        offset = next;
+    }
+    if decoded != entry_count {
+        return Err(JournalError::SegmentCorrupt(format!(
+            "segment {id} entry count mismatch: header says {entry_count}, decoded {decoded}"
+        )));
+    }
+    if *hasher.finalize().as_bytes() != root_hash {
+        return Err(JournalError::SegmentCorrupt(format!(
+            "segment {id} root hash mismatch after full decode"
+        )));
+    }
+    if sample_pos != samples.len() {
+        return Err(JournalError::SegmentCorrupt(format!(
+            "segment {id} sparse index references {} non-frame offsets",
+            samples.len() - sample_pos
+        )));
     }
 
     Ok(Some(SealedSegment {

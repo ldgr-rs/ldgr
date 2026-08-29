@@ -32,6 +32,8 @@ pub enum CborError {
     UnknownTag(u64),
     /// Declared array, map, byte, or text length exceeds the remaining input.
     LengthOverflow,
+    /// One canonical entry exceeds [`crate::limits::MAX_ENTRY_BYTES`].
+    EntryTooLarge(usize),
     DepthLimitExceeded,
     UnsupportedType(u8),
     TrailingBytes,
@@ -65,6 +67,9 @@ impl fmt::Display for CborError {
             Self::InvalidUtf8 => f.write_str("invalid UTF-8 sequence in text string"),
             Self::UnknownTag(t) => write!(f, "unknown or disallowed CBOR tag: {t}"),
             Self::LengthOverflow => f.write_str("declared length exceeds remaining input"),
+            Self::EntryTooLarge(size) => {
+                write!(f, "canonical entry exceeds the {size}-byte limit")
+            }
             Self::DepthLimitExceeded => f.write_str("CBOR nesting depth exceeds the limit"),
             Self::UnsupportedType(t) => write!(f, "unsupported CBOR major type or value: {t:#x}"),
             Self::TrailingBytes => f.write_str("trailing unparsed bytes in CBOR buffer"),
