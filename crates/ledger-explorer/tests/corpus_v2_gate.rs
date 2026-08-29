@@ -261,6 +261,7 @@ fn ldfi_finds_every_v2_bug_with_valid_minimal_certificate() {
             "corpus-v2-ldfi",
             Vec::new(),
             [9u8; 32],
+            None,
         )
         .unwrap();
         cert_for_verify.solver_data = Some(cert.clone());

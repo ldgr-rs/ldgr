@@ -579,6 +579,7 @@ fn sample_manifest_bytes() -> Vec<u8> {
         journal_root: [9u8; 32],
         entry_count: 42,
         actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
+        execution_identity: None,
         extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(1))]),
     }
     .to_canonical_bytes()
@@ -760,6 +761,7 @@ fn manifest_version_migration() {
         journal_root: [9u8; 32],
         entry_count: 1234,
         actor_heads: BTreeMap::from([(1u32, [1u8; 32]), (2u32, [2u8; 32])]),
+        execution_identity: None,
         extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(99))]),
     };
     assert!(ManifestVersion::CURRENT.is_supported());

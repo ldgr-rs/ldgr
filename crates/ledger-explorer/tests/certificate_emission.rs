@@ -27,7 +27,7 @@ fn certificate_write_and_verify_roundtrip() {
     let builder = "test-builder-certificate-emission";
     let path = temp_cert_path("roundtrip");
     report
-        .write_certificate(&path, digest, builder)
+        .write_certificate(&path, digest, builder, None)
         .expect("write_certificate must succeed");
     let json = std::fs::read_to_string(&path).expect("certificate file must be readable");
     assert!(
@@ -65,12 +65,22 @@ fn from_campaign_is_deterministic() {
     .unwrap();
     let digest = [7u8; 32];
     let builder = "helper-builder";
-    let cert_a =
-        ledger_explorer::CampaignCertificate::from_campaign(&report, builder, Vec::new(), digest)
-            .unwrap();
-    let cert_b =
-        ledger_explorer::CampaignCertificate::from_campaign(&report, builder, Vec::new(), digest)
-            .unwrap();
+    let cert_a = ledger_explorer::CampaignCertificate::from_campaign(
+        &report,
+        builder,
+        Vec::new(),
+        digest,
+        None,
+    )
+    .unwrap();
+    let cert_b = ledger_explorer::CampaignCertificate::from_campaign(
+        &report,
+        builder,
+        Vec::new(),
+        digest,
+        None,
+    )
+    .unwrap();
     assert_eq!(cert_a.builder_id, cert_b.builder_id);
     assert_eq!(
         cert_a.external_parameters_digest,
@@ -113,6 +123,7 @@ fn recorded_solver_data_from_real_cut_verifies() {
         "test-builder-solver-data",
         Vec::new(),
         [2u8; 32],
+        None,
     )
     .unwrap();
     certificate.solver_data = Some(extension.clone());

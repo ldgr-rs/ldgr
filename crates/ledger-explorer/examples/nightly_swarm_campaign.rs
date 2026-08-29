@@ -167,6 +167,7 @@ fn build_manifest(finding: &Finding) -> RunManifest {
         journal_root: finding.run.journal.root_hash(),
         entry_count: finding.run.journal.len() as u64,
         actor_heads,
+        execution_identity: None,
         extensions: BTreeMap::new(),
     }
 }
@@ -330,7 +331,7 @@ fn drive(args: &Args) -> Result<(), String> {
         let digest = run_config_digest(&base)?;
         let builder_id = builder_id();
         report
-            .write_certificate(&cert_path, digest, &builder_id)
+            .write_certificate(&cert_path, digest, &builder_id, None)
             .map_err(|error| format!("certificate emit: {error}"))?;
         println!("certificate written to {}", cert_path.display());
     }

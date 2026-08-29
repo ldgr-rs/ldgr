@@ -19,6 +19,7 @@ extern crate std;
 pub mod archive;
 pub mod clock;
 pub mod dag;
+pub mod identity;
 pub mod monitor;
 #[cfg(feature = "std")]
 pub mod persistent;
@@ -32,6 +33,9 @@ pub mod snapshot_store;
 
 pub use clock::VectorClock;
 pub use dag::{BatchEntry, Entry, EntryFrame, Journal, JournalError};
+pub use identity::{
+    CRASH_SEMANTICS_VERSION, ExecutionIdentity, JOURNAL_FORMAT_VERSION, ResourceLimits,
+};
 pub use monitor::{JournalCorrectnessMonitor, MonitorIssue, VerificationReport};
 #[cfg(feature = "std")]
 pub use persistent::PersistentJournal;

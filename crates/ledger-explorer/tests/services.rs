@@ -217,8 +217,8 @@ fn minimize_decisions_reduces_a_monotone_predicate() {
 fn emit_parse_validate_round_trip() {
     let report: CampaignReport =
         run_campaign(&OutcomeWorkload(99), &final_is(7), config(7), 1).expect("campaign must run");
-    let certificate =
-        emit_statement(&report, "builder", Vec::new(), [1u8; 32]).expect("statement must emit");
+    let certificate = emit_statement(&report, "builder", Vec::new(), [1u8; 32], None)
+        .expect("statement must emit");
     let json = certificate.to_json().expect("serialize");
     let parsed = parse_statement(&json).expect("statement must parse");
     validate_statement(&parsed).expect("statement must validate");
@@ -242,7 +242,7 @@ fn emit_parse_validate_round_trip() {
         })
         .collect();
     let lineage_only = CampaignReport { findings, ..report };
-    let err = emit_statement(&lineage_only, "builder", Vec::new(), [1u8; 32])
+    let err = emit_statement(&lineage_only, "builder", Vec::new(), [1u8; 32], None)
         .expect_err("lineage-only journals must be rejected");
     assert!(
         matches!(err, ServiceError::Cert(CertError::Verification(_))),
@@ -260,8 +260,8 @@ fn emit_parse_validate_round_trip() {
 fn validate_cut_against_journal_rejects_zero_digest_binding() {
     let report: CampaignReport =
         run_campaign(&OutcomeWorkload(99), &final_is(99), config(8), 1).expect("campaign must run");
-    let mut certificate =
-        emit_statement(&report, "builder", Vec::new(), [1u8; 32]).expect("statement must emit");
+    let mut certificate = emit_statement(&report, "builder", Vec::new(), [1u8; 32], None)
+        .expect("statement must emit");
     // A zero subject digest never binds to any journal in journal mode.
     certificate.subject.digest = [0u8; 32];
     let journal = Journal::new();

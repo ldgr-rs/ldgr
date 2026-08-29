@@ -583,6 +583,7 @@ fn manifest_round_trip_and_version_reject() {
         journal_root: [9u8; 32],
         entry_count: 1234,
         actor_heads: BTreeMap::from([(1u32, [1u8; 32]), (2u32, [2u8; 32])]),
+        execution_identity: None,
         extensions: BTreeMap::new(),
     };
 

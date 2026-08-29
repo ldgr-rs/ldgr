@@ -117,6 +117,13 @@ pub struct CampaignCertificate {
     pub findings_count: usize,
     pub solver_data: Option<RecordedSolverData>,
     pub statistical: Option<StatisticalBound>,
+    /// Execution-identity digest of the run that produced this statement.
+    ///
+    /// `None` on certificates emitted without identity binding; the
+    /// identity-aware journal verification ([`Self::verify_with_journal_and_identity`])
+    /// treats a present-but-unmatched digest as a failure before any root
+    /// comparison.
+    pub execution_identity: Option<Hash>,
 }
 
 #[derive(Debug, Error)]
@@ -260,12 +267,14 @@ impl CampaignCertificate {
         builder_id: &str,
         deps: Vec<ResolvedDependency>,
         run_config_digest: Hash,
+        execution_identity: Option<Hash>,
     ) -> Result<Self, CertError> {
         Self::from_campaign_with(
             report,
             builder_id,
             deps,
             run_config_digest,
+            execution_identity,
             LineagePolicy::Strict,
         )
     }
@@ -276,6 +285,7 @@ impl CampaignCertificate {
         builder_id: &str,
         deps: Vec<ResolvedDependency>,
         run_config_digest: Hash,
+        execution_identity: Option<Hash>,
         policy: LineagePolicy,
     ) -> Result<Self, CertError> {
         if policy == LineagePolicy::Strict {
@@ -283,7 +293,13 @@ impl CampaignCertificate {
                 check_lineage_not_certifiable(&finding.run.journal)?;
             }
         }
-        Self::from_campaign_inner(report, builder_id, deps, run_config_digest)
+        Self::from_campaign_inner(
+            report,
+            builder_id,
+            deps,
+            run_config_digest,
+            execution_identity,
+        )
     }
 
     fn from_campaign_inner(
@@ -291,6 +307,7 @@ impl CampaignCertificate {
         builder_id: &str,
         deps: Vec<ResolvedDependency>,
         run_config_digest: Hash,
+        execution_identity: Option<Hash>,
     ) -> Result<Self, CertError> {
         let subject = if let Some(f) = report.findings.first() {
             Subject {
@@ -321,6 +338,7 @@ impl CampaignCertificate {
             findings_count: report.findings.len(),
             solver_data: None,
             statistical,
+            execution_identity,
         };
         certificate.verify()?;
         Ok(certificate)
@@ -381,6 +399,10 @@ impl CampaignCertificate {
             .map(|x| serde_json::json!({"name":x.name,"digest":{"blake3":hash_to_hex(&x.digest)}}))
             .collect();
         let mut p = serde_json::json!({"buildDefinition":{"buildType":self.build_type,"externalParameters":{"runConfigDigest":hash_to_hex(&self.external_parameters_digest)},"resolvedDependencies":deps_json},"runDetails":{"builder":{"id":self.builder_id},"metadata":{"runsExecuted":self.runs_executed,"findingsCount":self.findings_count}}});
+        if let Some(identity) = &self.execution_identity {
+            p["buildDefinition"]["externalParameters"]["executionIdentity"] =
+                serde_json::json!(hash_to_hex(identity));
+        }
         if let Some(data) = &self.solver_data {
             let mut solver_json = serde_json::json!({"cut":data.cut.iter().map(hash_to_hex).collect::<Vec<_>>(),"recordedLowerBound":data.recorded_lower_bound,"method":data.method});
             if let Some(horizon) = data.horizon {
@@ -454,10 +476,20 @@ impl CampaignCertificate {
             external_parameters,
             "externalParameters",
             &["runConfigDigest"],
-            &[],
+            &["executionIdentity"],
         )?;
         let run_digest = hex_to_hash(get_str(external_parameters, "runConfigDigest")?)
             .map_err(CertError::Schema)?;
+        let execution_identity = match external_parameters.get("executionIdentity") {
+            Some(value) => {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| CertError::Schema("executionIdentity".into()))?;
+                check_string_bytes(text, "executionIdentity")?;
+                Some(hex_to_hash(text).map_err(CertError::Schema)?)
+            }
+            None => None,
+        };
         let deps_arr = get_arr(bd, "resolvedDependencies")?;
         if deps_arr.len() > MAX_RESOLVED_DEPENDENCIES {
             return Err(CertError::Schema(format!(
@@ -571,6 +603,7 @@ impl CampaignCertificate {
             findings_count,
             solver_data,
             statistical,
+            execution_identity,
         })
     }
 
@@ -764,6 +797,41 @@ impl CampaignCertificate {
     pub fn verify_with_journal(&self, journal: &Journal) -> Result<(), CertError> {
         self.verify_with_journal_with(journal, LineagePolicy::Strict)
     }
+
+    /// Validate and bind the certificate to a journal, gated on execution
+    /// identity.
+    ///
+    /// The identity gate runs before any root comparison: a certificate that
+    /// carries an identity digest must match the expected digest of the run
+    /// that produced the journal, and a digest present on only one side is
+    /// treated as incomplete and rejected. When both sides carry no identity
+    /// the legacy comparison path is used.
+    pub fn verify_with_journal_and_identity(
+        &self,
+        journal: &Journal,
+        expected_identity: Option<Hash>,
+    ) -> Result<(), CertError> {
+        match (self.execution_identity, expected_identity) {
+            (Some(certificate), Some(expected)) if certificate == expected => {}
+            (Some(_), Some(_)) => {
+                return Err(CertError::Verification(
+                    "execution identity mismatch: certificate and run disagree".into(),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(CertError::Verification(
+                    "execution identity incomplete: run carries no identity".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(CertError::Verification(
+                    "execution identity incomplete: certificate carries no identity".into(),
+                ));
+            }
+            (None, None) => {}
+        }
+        self.verify_with_journal(journal)
+    }
 }
 
 impl CampaignReport {
@@ -783,6 +851,7 @@ impl CampaignReport {
         path: &Path,
         run_config_digest: Hash,
         builder_id: &str,
+        execution_identity: Option<Hash>,
     ) -> Result<(), CertError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -793,8 +862,13 @@ impl CampaignReport {
                 source,
             })?;
         }
-        let cert =
-            CampaignCertificate::from_campaign(self, builder_id, Vec::new(), run_config_digest)?;
+        let cert = CampaignCertificate::from_campaign(
+            self,
+            builder_id,
+            Vec::new(),
+            run_config_digest,
+            execution_identity,
+        )?;
         let json = cert.to_json()?;
         check_cert_bytes(json.len())?;
         std::fs::write(path, json).map_err(|source| CertError::Io {
@@ -876,7 +950,7 @@ mod tests {
                 digest: [1u8; 32],
             },
         ];
-        let c = CampaignCertificate::from_campaign(&r, "builder-1", deps, [9u8; 32]).unwrap();
+        let c = CampaignCertificate::from_campaign(&r, "builder-1", deps, [9u8; 32], None).unwrap();
         let j = c.to_json().unwrap();
         let b = CampaignCertificate::from_json(&j).unwrap();
         assert_eq!(c.subject, b.subject);
@@ -886,8 +960,9 @@ mod tests {
 
     #[test]
     fn emitted_json_limit_preserves_round_trip_boundary() {
-        let base = CampaignCertificate::from_campaign(&empty(10), "builder", Vec::new(), [9u8; 32])
-            .expect("base certificate must be valid");
+        let base =
+            CampaignCertificate::from_campaign(&empty(10), "builder", Vec::new(), [9u8; 32], None)
+                .expect("base certificate must be valid");
         let with_dependency_name_size = |name_bytes: usize| {
             let mut certificate = base.clone();
             certificate.resolved_dependencies = (0..MAX_RESOLVED_DEPENDENCIES)
@@ -954,7 +1029,7 @@ mod tests {
         // Writing onto an existing directory fails deterministically on
         // unix with IsADirectory: the write arm keeps the io source.
         let err = empty(1)
-            .write_certificate(&dir, [0u8; 32], "builder")
+            .write_certificate(&dir, [0u8; 32], "builder", None)
             .unwrap_err();
         match &err {
             CertError::Io {
@@ -989,7 +1064,7 @@ mod tests {
         std::fs::write(&blocker, b"x").expect("write blocker file");
         let cert_path = blocker.join("cert.json");
         let err = empty(1)
-            .write_certificate(&cert_path, [0u8; 32], "builder")
+            .write_certificate(&cert_path, [0u8; 32], "builder", None)
             .unwrap_err();
         match &err {
             CertError::Io {
@@ -1026,7 +1101,7 @@ mod tests {
         let cert_path = dir.join("cert.json");
         let builder = "x".repeat(CERT_MAX_BYTES + 1);
         let error = empty(1)
-            .write_certificate(&cert_path, [9u8; 32], &builder)
+            .write_certificate(&cert_path, [9u8; 32], &builder, None)
             .expect_err("oversized certificate input must fail");
         assert!(
             matches!(error, CertError::Schema(_) | CertError::Serialization(_)),
@@ -1043,7 +1118,7 @@ mod tests {
         let dir = unique_cert_dir("rt");
         let cert_path = dir.join("cert.json");
         with_finding()
-            .write_certificate(&cert_path, [9u8; 32], "builder")
+            .write_certificate(&cert_path, [9u8; 32], "builder", None)
             .expect("write certificate");
         let bytes = std::fs::read(&cert_path).expect("read certificate");
         let text = String::from_utf8(bytes).expect("certificate must be utf8");
@@ -1055,7 +1130,8 @@ mod tests {
     #[test]
     fn verify_rejects_wrong_predicate_type() {
         let mut c =
-            CampaignCertificate::from_campaign(&empty(10), "b", Vec::new(), [1u8; 32]).unwrap();
+            CampaignCertificate::from_campaign(&empty(10), "b", Vec::new(), [1u8; 32], None)
+                .unwrap();
         c.predicate_type = format!(
             "{}/attestations/wrong/v1",
             crate::attest_uri::attestation_base()
@@ -1072,20 +1148,140 @@ mod tests {
 
     #[test]
     fn verify_rejects_zero_subject_with_findings() {
-        let mut c = CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32])
-            .expect("valid campaign must create a certificate");
+        let mut c =
+            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
+                .expect("valid campaign must create a certificate");
         c.subject.digest = [0u8; 32];
         assert!(matches!(c.verify(), Err(CertError::Verification(_))));
     }
 
     #[test]
+    fn identity_gate_rejects_disagreeing_statement_and_run() {
+        // Statement and run disagree: the gate fails before any root
+        // comparison.
+        let certificate = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            [1u8; 32],
+            Some([0xaa; 32]),
+        )
+        .expect("certificate with identity must build");
+        let journal = &with_finding().findings[0].run.journal;
+        let error = certificate
+            .verify_with_journal_and_identity(journal, Some([0xbb; 32]))
+            .expect_err("disagreeing identity must fail");
+        assert!(matches!(error, CertError::Verification(_)));
+    }
+
+    #[test]
+    fn identity_gate_rejects_incomplete_sides() {
+        let certificate = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            [1u8; 32],
+            Some([0xaa; 32]),
+        )
+        .expect("certificate with identity must build");
+        let journal = &with_finding().findings[0].run.journal;
+        // Certificate carries identity, run carries none: incomplete.
+        let error = certificate
+            .verify_with_journal_and_identity(journal, None)
+            .expect_err("run without identity must fail");
+        assert!(matches!(error, CertError::Verification(_)));
+
+        // Run carries identity, certificate carries none: incomplete.
+        let legacy =
+            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
+                .expect("legacy certificate must build");
+        let error = legacy
+            .verify_with_journal_and_identity(journal, Some([0xaa; 32]))
+            .expect_err("certificate without identity must fail");
+        assert!(matches!(error, CertError::Verification(_)));
+    }
+
+    #[test]
+    fn identity_gate_passes_when_both_sides_match_or_are_absent() {
+        let certificate = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            [1u8; 32],
+            Some([0xaa; 32]),
+        )
+        .expect("certificate with identity must build");
+        let journal = &with_finding().findings[0].run.journal;
+        // Matching identity proceeds to the normal journal binding (subject
+        // digest equals the journal root from with_finding).
+        assert!(
+            certificate
+                .verify_with_journal_and_identity(journal, Some([0xaa; 32]))
+                .is_ok()
+        );
+        // Both sides absent: the legacy comparison path is unchanged.
+        let legacy =
+            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
+                .expect("legacy certificate must build");
+        assert!(
+            legacy
+                .verify_with_journal_and_identity(journal, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn identity_json_round_trips() {
+        let certificate = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            [1u8; 32],
+            Some([0xaa; 32]),
+        )
+        .expect("certificate with identity must build");
+        let json = certificate.to_json().expect("certificate serializes");
+        assert!(json.contains("executionIdentity"));
+        let decoded = CampaignCertificate::from_json(&json).expect("certificate parses");
+        assert_eq!(decoded.execution_identity, Some([0xaa; 32]));
+        // Legacy JSON without the field parses to None. The identity field
+        // lives under externalParameters; removing the serialized value must
+        // leave a valid legacy statement.
+        let value: serde_json::Value = serde_json::from_str(&json).expect("json parses");
+        let mut params = value["predicate"]["buildDefinition"]["externalParameters"]
+            .as_object()
+            .expect("externalParameters is an object")
+            .clone();
+        params.remove("executionIdentity");
+        let legacy_json = serde_json::to_string(&serde_json::json!({
+            "_type": value["_type"],
+            "subject": value["subject"],
+            "predicateType": value["predicateType"],
+            "predicate": {
+                "buildDefinition": {
+                    "buildType": value["predicate"]["buildDefinition"]["buildType"],
+                    "externalParameters": params,
+                    "resolvedDependencies": value["predicate"]["buildDefinition"]
+                        ["resolvedDependencies"],
+                },
+                "runDetails": value["predicate"]["runDetails"],
+            },
+        }))
+        .expect("legacy json builds");
+        let legacy = CampaignCertificate::from_json(&legacy_json).expect("legacy statement parses");
+        assert_eq!(legacy.execution_identity, None);
+    }
+
+    #[test]
     fn verify_rejects_absent_or_malformed_subject() {
-        let mut c = CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32])
-            .expect("valid campaign must create a certificate");
+        let mut c =
+            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
+                .expect("valid campaign must create a certificate");
         c.subject.name = "  ".into();
         assert!(matches!(c.verify(), Err(CertError::Verification(_))));
         let mut c =
-            CampaignCertificate::from_campaign(&empty(10), "b", Vec::new(), [1u8; 32]).unwrap();
+            CampaignCertificate::from_campaign(&empty(10), "b", Vec::new(), [1u8; 32], None)
+                .unwrap();
         c.subject.digest = [7u8; 32];
         assert!(
             matches!(c.verify(), Err(CertError::Verification(_))),
@@ -1095,9 +1291,14 @@ mod tests {
 
     #[test]
     fn statement_validation_rejects_empty_solver_data_cut() {
-        let mut certificate =
-            CampaignCertificate::from_campaign(&with_finding(), "builder", Vec::new(), [1u8; 32])
-                .expect("valid campaign must create a certificate");
+        let mut certificate = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "builder",
+            Vec::new(),
+            [1u8; 32],
+            None,
+        )
+        .expect("valid campaign must create a certificate");
         certificate.solver_data = Some(RecordedSolverData {
             cut: Vec::new(),
             recorded_lower_bound: 0,
@@ -1124,7 +1325,7 @@ mod tests {
     #[test]
     fn from_json_rejects_wrong_type_and_multiple_subjects() {
         let certificate =
-            CampaignCertificate::from_campaign(&empty(10), "builder", Vec::new(), [1u8; 32])
+            CampaignCertificate::from_campaign(&empty(10), "builder", Vec::new(), [1u8; 32], None)
                 .expect("valid campaign must create a certificate");
         let mut value: serde_json::Value =
             serde_json::from_str(&certificate.to_json().expect("certificate must serialize"))
@@ -1146,9 +1347,14 @@ mod tests {
 
     #[test]
     fn from_json_rejects_empty_cut_duplicate_cut_and_invalid_horizon() {
-        let certificate =
-            CampaignCertificate::from_campaign(&with_finding(), "builder", Vec::new(), [1u8; 32])
-                .expect("valid campaign must create a certificate");
+        let certificate = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "builder",
+            Vec::new(),
+            [1u8; 32],
+            None,
+        )
+        .expect("valid campaign must create a certificate");
         let mut value: serde_json::Value =
             serde_json::from_str(&certificate.to_json().expect("certificate must serialize"))
                 .expect("certificate JSON must parse");
@@ -1207,7 +1413,7 @@ mod tests {
             memo_hits: 0,
         };
         let mut certificate =
-            CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32])
+            CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32], None)
                 .expect("valid campaign must create a certificate");
         certificate.solver_data = Some(RecordedSolverData {
             recorded_lower_bound: u64::try_from(cut.len()).expect("test cut length must fit"),

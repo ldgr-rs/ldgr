@@ -2,11 +2,21 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::cbor::{self, CborError, CborValue};
 use crate::entry::{ActorId, Hash};
+
+/// Extension-map key carrying the execution-identity digest in the manifest.
+///
+/// The digest is a 32-byte BLAKE3 hash of the canonical
+/// `ledger_journal::identity::ExecutionIdentity` bytes. `ledger-format`
+/// cannot depend on `ledger-journal`, so the key is a documented string
+/// constant rather than a typed re-export; both sides agree on the key name
+/// and the 32-byte payload shape.
+const EXECUTION_IDENTITY_EXTENSION: &str = "execution_identity";
 
 /// Current manifest format version. Version 1 is the only supported version.
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -47,6 +57,13 @@ pub struct RunManifest {
     pub actor_heads: BTreeMap<ActorId, Hash>,
     /// Reserved extension fields for append-only format evolution.
     pub extensions: BTreeMap<String, CborValue>,
+    /// Execution-identity digest of the run that produced this manifest.
+    ///
+    /// Encoded inside [`Self::extensions`] under `execution_identity`, so the
+    /// canonical wire form (array of 7 items) is unchanged. `None` means the
+    /// run did not bind an identity; a root comparison involving this
+    /// manifest must treat the identity as incomplete.
+    pub execution_identity: Option<Hash>,
 }
 
 impl RunManifest {
@@ -118,8 +135,14 @@ impl RunManifest {
             .collect();
         CborValue::Map(heads).try_encode(&mut out)?;
 
-        let extensions: Vec<(CborValue, CborValue)> = self
-            .extensions
+        let mut extensions = self.extensions.clone();
+        if let Some(identity) = &self.execution_identity {
+            extensions.insert(
+                EXECUTION_IDENTITY_EXTENSION.to_string(),
+                CborValue::Bytes(identity.to_vec()),
+            );
+        }
+        let extensions: Vec<(CborValue, CborValue)> = extensions
             .iter()
             .map(|(key, val)| (CborValue::Text(key.clone()), val.clone()))
             .collect();
@@ -238,6 +261,22 @@ impl RunManifest {
             _ => return Err(CborError::MalformedManifest("extensions must be a map")),
         };
 
+        let execution_identity = match extensions.get(EXECUTION_IDENTITY_EXTENSION) {
+            Some(CborValue::Bytes(b)) => {
+                Some(<[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
+                    CborError::MalformedManifest(
+                        "execution_identity extension must be a 32-byte hash",
+                    )
+                })?)
+            }
+            Some(_) => {
+                return Err(CborError::MalformedManifest(
+                    "execution_identity extension must be a byte string",
+                ));
+            }
+            None => None,
+        };
+
         Ok(RunManifest {
             format_version,
             root_seed,
@@ -246,6 +285,80 @@ impl RunManifest {
             entry_count,
             actor_heads,
             extensions,
+            execution_identity,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    fn sample_manifest() -> RunManifest {
+        RunManifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            root_seed: [0x01; 32],
+            policy_tag: "random".to_string(),
+            journal_root: [0x02; 32],
+            entry_count: 7,
+            actor_heads: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+            execution_identity: None,
+        }
+    }
+
+    #[test]
+    fn identity_extension_round_trips() {
+        let mut manifest = sample_manifest();
+        manifest.execution_identity = Some([0xab; 32]);
+        let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
+        let decoded = RunManifest::from_canonical_bytes(&bytes).expect("manifest decodes");
+        assert_eq!(decoded.execution_identity, Some([0xab; 32]));
+        assert_eq!(decoded.to_canonical_bytes().expect("re-encode"), bytes);
+    }
+
+    #[test]
+    fn identity_absent_stays_absent() {
+        // A legacy manifest without the extension key decodes with no
+        // identity; root comparison treats that as incomplete.
+        let manifest = sample_manifest();
+        let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
+        let decoded = RunManifest::from_canonical_bytes(&bytes).expect("manifest decodes");
+        assert_eq!(decoded.execution_identity, None);
+    }
+
+    #[test]
+    fn identity_presence_changes_canonical_bytes() {
+        let plain = sample_manifest();
+        let mut bound = sample_manifest();
+        bound.execution_identity = Some([0xab; 32]);
+        assert_ne!(
+            plain.to_canonical_bytes().expect("plain encodes"),
+            bound.to_canonical_bytes().expect("bound encodes")
+        );
+    }
+
+    #[test]
+    fn identity_extension_rejects_wrong_shape() {
+        let mut manifest = sample_manifest();
+        manifest.extensions.insert(
+            EXECUTION_IDENTITY_EXTENSION.to_string(),
+            CborValue::Bytes(vec![1, 2, 3]),
+        );
+        let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
+        let error = RunManifest::from_canonical_bytes(&bytes)
+            .expect_err("wrong-length identity must be rejected");
+        assert!(matches!(error, CborError::MalformedManifest(_)));
+
+        let mut manifest = sample_manifest();
+        manifest.extensions.insert(
+            EXECUTION_IDENTITY_EXTENSION.to_string(),
+            CborValue::Unsigned(7),
+        );
+        let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
+        let error = RunManifest::from_canonical_bytes(&bytes)
+            .expect_err("non-byte identity must be rejected");
+        assert!(matches!(error, CborError::MalformedManifest(_)));
     }
 }

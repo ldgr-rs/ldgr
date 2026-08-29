@@ -31,8 +31,9 @@ fn write_cert(path: &PathBuf, json: &str) {
 #[test]
 fn cert_verify_human_valid() {
     let report = make_report(10);
-    let cert = CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32])
-        .expect("valid report must create a certificate");
+    let cert =
+        CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32], None)
+            .expect("valid report must create a certificate");
     let json = cert.to_json().unwrap();
     let path = temp_path("valid-human");
     write_cert(&path, &json);
@@ -75,8 +76,9 @@ fn cert_verify_json_valid() {
         name: "dep-a".into(),
         digest: [2u8; 32],
     }];
-    let mut cert = CampaignCertificate::from_campaign(&report, "builder-json", deps, [9u8; 32])
-        .expect("valid report must create a certificate");
+    let mut cert =
+        CampaignCertificate::from_campaign(&report, "builder-json", deps, [9u8; 32], None)
+            .expect("valid report must create a certificate");
     cert.solver_data = Some(RecordedSolverData {
         cut: vec![[3u8; 32], [4u8; 32]],
         recorded_lower_bound: 1,
@@ -124,8 +126,9 @@ fn cert_verify_json_valid() {
 #[test]
 fn cert_verify_tampered_predicate_fails() {
     let report = make_report(10);
-    let cert = CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32])
-        .expect("valid report must create a certificate");
+    let cert =
+        CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32], None)
+            .expect("valid report must create a certificate");
     let mut json = cert.to_json().unwrap();
     // tamper predicateType
     let tampered = format!(
@@ -147,8 +150,9 @@ fn cert_verify_tampered_predicate_fails() {
 #[test]
 fn cert_verify_preserves_journal_open_error_source() {
     let report = make_report(10);
-    let cert = CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32])
-        .expect("valid report must create a certificate");
+    let cert =
+        CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32], None)
+            .expect("valid report must create a certificate");
     let cert_path = temp_path("journal-source-cert");
     write_cert(
         &cert_path,
