@@ -8,6 +8,7 @@
 //! instance cache is the primary store; a global [`OnceLock`] store is
 //! provided for cross-solver memoization.
 
+use crate::solver::SolverConfig;
 use ledger_format::Hash;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -129,51 +130,39 @@ impl ClauseCache {
     /// Compute the content-addressed key for a solver invocation.
     ///
     /// `closure_hash` is `BLAKE3(sorted event ids in the causal closure)`.
-    /// `max_horizon` is the optional derivation depth bound.
-    /// `oracle_version` is the predicate version from `predicate_version`,
-    /// with an explicit presence byte so `None` and `Some(0)` never collapse
-    /// into one key.
-    /// `input_class` partitions the cache per PBT generator stream.
-    /// `max_faults` is the cardinality bound consumed by hazard encodings.
     /// `engine_tag` separates entries per solver engine
     /// ([`engine_tag::BUILTIN`] / [`engine_tag::CADICAL`]); an entry derived
     /// by one engine must never satisfy another.
-    /// `run_config_hash` is the canonical `RunConfig` hash of the encoding's
-    /// simulation context; entries derived under different run configs must
-    /// never satisfy each other.
-    pub fn compute_key(
-        closure_hash: Hash,
-        max_horizon: Option<usize>,
-        oracle_version: Option<u64>,
-        input_class: Option<u64>,
-        max_faults: Option<usize>,
-        engine_tag: u8,
-        run_config_hash: Option<Hash>,
-    ) -> Hash {
+    /// `config` carries the remaining cache dimensions: horizon,
+    /// oracle version, input class, max faults, run-config hash, and the
+    /// support-provider version and digest. Entries derived under different
+    /// values of any dimension must never satisfy each other, and each
+    /// presence byte keeps `None` apart from `Some(0)`.
+    pub fn compute_key(closure_hash: Hash, engine_tag: u8, config: &SolverConfig) -> Hash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&closure_hash);
         hasher.update(&[0xfe]);
-        if let Some(h) = max_horizon {
+        if let Some(h) = config.max_horizon {
             hasher.update(&(h as u64).to_le_bytes());
         } else {
             hasher.update(&[0xff, 0xff]);
         }
         hasher.update(&[0xfd]);
-        if let Some(version) = oracle_version {
+        if let Some(version) = config.oracle_version {
             hasher.update(&[0x01]);
             hasher.update(&version.to_le_bytes());
         } else {
             hasher.update(&[0x00]);
         }
         hasher.update(&[0xfc]);
-        if let Some(class) = input_class {
+        if let Some(class) = config.input_class {
             hasher.update(&[0x01]);
             hasher.update(&class.to_le_bytes());
         } else {
             hasher.update(&[0x00]);
         }
         hasher.update(&[0xfb]);
-        if let Some(faults) = max_faults {
+        if let Some(faults) = config.max_faults {
             hasher.update(&[0x01]);
             hasher.update(&(faults as u64).to_le_bytes());
         } else {
@@ -182,9 +171,23 @@ impl ClauseCache {
         hasher.update(&[0xfa]);
         hasher.update(&[engine_tag]);
         hasher.update(&[0xf9]);
-        if let Some(hash) = run_config_hash {
+        if let Some(hash) = config.run_config_hash {
             hasher.update(&[0x01]);
             hasher.update(&hash);
+        } else {
+            hasher.update(&[0x00]);
+        }
+        hasher.update(&[0xf8]);
+        if let Some(version) = config.support_version {
+            hasher.update(&[0x01]);
+            hasher.update(&version.to_le_bytes());
+        } else {
+            hasher.update(&[0x00]);
+        }
+        hasher.update(&[0xf7]);
+        if let Some(digest) = config.support_digest {
+            hasher.update(&[0x01]);
+            hasher.update(&digest);
         } else {
             hasher.update(&[0x00]);
         }
@@ -265,24 +268,15 @@ mod tests {
         let closure = hash_of(7);
         let k1 = ClauseCache::compute_key(
             closure,
-            Some(10),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(10),
         );
         let k2 = ClauseCache::compute_key(
             closure,
-            Some(100),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(100),
         );
-        let k3 =
-            ClauseCache::compute_key(closure, None, None, None, None, engine_tag::BUILTIN, None);
+        let k3 = ClauseCache::compute_key(closure, engine_tag::BUILTIN, &SolverConfig::default());
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
     }
@@ -292,21 +286,13 @@ mod tests {
         let closure = hash_of(9);
         let k1 = ClauseCache::compute_key(
             closure,
-            None,
-            Some(1),
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_oracle_version(1),
         );
         let k2 = ClauseCache::compute_key(
             closure,
-            None,
-            Some(2),
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_oracle_version(2),
         );
         assert_ne!(k1, k2);
     }
@@ -317,28 +303,64 @@ mod tests {
         // configurations: the presence byte must keep them apart, mirroring
         // the state fingerprint's None-vs-Some(0) behavior.
         let closure = hash_of(9);
-        let none =
-            ClauseCache::compute_key(closure, None, None, None, None, engine_tag::BUILTIN, None);
+        let none = ClauseCache::compute_key(closure, engine_tag::BUILTIN, &SolverConfig::default());
         let zero = ClauseCache::compute_key(
             closure,
-            None,
-            Some(0),
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_oracle_version(0),
         );
         assert_ne!(none, zero);
         let again = ClauseCache::compute_key(
             closure,
-            None,
-            Some(0),
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_oracle_version(0),
         );
         assert_eq!(zero, again);
+    }
+
+    #[test]
+    fn compute_key_differs_on_support_version() {
+        // A provider version change must isolate the cache: same closure,
+        // horizon, oracle, and run config, different support version.
+        let closure = hash_of(11);
+        let digest = hash_of(3);
+        let v1 = ClauseCache::compute_key(
+            closure,
+            engine_tag::BUILTIN,
+            &SolverConfig::default()
+                .with_support_version(1)
+                .with_support_digest(digest),
+        );
+        let v2 = ClauseCache::compute_key(
+            closure,
+            engine_tag::BUILTIN,
+            &SolverConfig::default()
+                .with_support_version(2)
+                .with_support_digest(digest),
+        );
+        assert_ne!(v1, v2);
+    }
+
+    #[test]
+    fn compute_key_differs_on_support_digest() {
+        // A provider model change must isolate the cache even when the
+        // version is unchanged: different digest, all else equal.
+        let closure = hash_of(13);
+        let a = ClauseCache::compute_key(
+            closure,
+            engine_tag::BUILTIN,
+            &SolverConfig::default()
+                .with_support_version(1)
+                .with_support_digest(hash_of(1)),
+        );
+        let b = ClauseCache::compute_key(
+            closure,
+            engine_tag::BUILTIN,
+            &SolverConfig::default()
+                .with_support_version(1)
+                .with_support_digest(hash_of(2)),
+        );
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -346,30 +368,18 @@ mod tests {
         let closure = hash_of(7);
         let k_none = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64),
         );
         let k_a = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            Some(1),
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64).with_input_class(1),
         );
         let k_b = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            Some(2),
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64).with_input_class(2),
         );
         assert_ne!(k_none, k_a);
         assert_ne!(k_a, k_b);
@@ -380,21 +390,13 @@ mod tests {
         let closure = hash_of(7);
         let k1 = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64),
         );
         let k2 = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64),
         );
         assert_eq!(k1, k2);
     }
@@ -406,21 +408,13 @@ mod tests {
         let closure = hash_of(7);
         let builtin = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64),
         );
         let cadical = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::CADICAL,
-            None,
+            &SolverConfig::default().with_horizon(64),
         );
         assert_ne!(builtin, cadical);
     }
@@ -430,30 +424,18 @@ mod tests {
         let closure = hash_of(7);
         let none = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64),
         );
         let bounded = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            Some(2),
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64).with_max_faults(2),
         );
         let bounded_more = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            Some(3),
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64).with_max_faults(3),
         );
         assert_ne!(none, bounded);
         assert_ne!(bounded, bounded_more);
@@ -466,30 +448,22 @@ mod tests {
         let closure = hash_of(7);
         let none = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            None,
+            &SolverConfig::default().with_horizon(64),
         );
         let run_a = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            Some(hash_of(1)),
+            &SolverConfig::default()
+                .with_horizon(64)
+                .with_run_config_hash(hash_of(1)),
         );
         let run_b = ClauseCache::compute_key(
             closure,
-            Some(64),
-            None,
-            None,
-            None,
             engine_tag::BUILTIN,
-            Some(hash_of(2)),
+            &SolverConfig::default()
+                .with_horizon(64)
+                .with_run_config_hash(hash_of(2)),
         );
         assert_ne!(none, run_a);
         assert_ne!(run_a, run_b);

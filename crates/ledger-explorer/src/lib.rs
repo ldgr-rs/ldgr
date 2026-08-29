@@ -24,6 +24,7 @@ pub mod search;
 pub mod solver;
 pub mod solver_cache;
 pub mod solver_state;
+pub mod support;
 pub mod workloads;
 
 pub use attest_uri::{
@@ -69,4 +70,8 @@ pub use solver_cache::{ClauseCache, WeightedClause};
 pub use solver_state::{
     COST_MODEL_VERSION, PersistedClosure, PersistedHypothesis, SolverStateArtifact,
     SolverStateError, fingerprint, load as load_solver_state, save as save_solver_state,
+};
+pub use support::{
+    StaticSupportProvider, SupportError, SupportExpr, SupportOutcome, SupportProvider, all_of_ids,
+    entry_ids_by,
 };

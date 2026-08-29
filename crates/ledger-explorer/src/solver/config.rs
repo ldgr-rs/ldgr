@@ -67,6 +67,11 @@ pub fn cutoff() -> usize {
 /// cache keys and the solver-state fingerprint so artifacts from different
 /// run configs never satisfy each other. `None` keeps callers that do not
 /// run a simulation on the historical key space.
+///
+/// `support_version` and `support_digest` pin the support-provider
+/// semantics (see [`crate::support`]). A provider change must never reuse
+/// clauses or hypotheses derived under an older model, so both values join
+/// the cache keys and the solver-state fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SolverConfig {
     pub max_horizon: Option<usize>,
@@ -75,6 +80,8 @@ pub struct SolverConfig {
     pub max_faults: Option<usize>,
     pub engine: SolverEngine,
     pub run_config_hash: Option<Hash>,
+    pub support_version: Option<u64>,
+    pub support_digest: Option<Hash>,
 }
 
 impl SolverConfig {
@@ -109,6 +116,18 @@ impl SolverConfig {
 
     pub fn with_run_config_hash(mut self, hash: Hash) -> Self {
         self.run_config_hash = Some(hash);
+        self
+    }
+
+    /// Pin the support-provider version on this config.
+    pub fn with_support_version(mut self, version: u64) -> Self {
+        self.support_version = Some(version);
+        self
+    }
+
+    /// Pin the support-provider digest on this config.
+    pub fn with_support_digest(mut self, digest: Hash) -> Self {
+        self.support_digest = Some(digest);
         self
     }
 }

@@ -101,15 +101,7 @@ impl HittingSetSolver {
     /// canonical run-config hash and the max-faults bound, so every encoding
     /// input the solver consumes separates the cache namespace.
     pub(crate) fn incremental_key_with_tag(&self, closure_hash: Hash, engine_tag: u8) -> Hash {
-        ClauseCache::compute_key(
-            closure_hash,
-            self.config.max_horizon,
-            self.config.oracle_version,
-            self.config.input_class,
-            self.config.max_faults,
-            engine_tag,
-            self.config.run_config_hash,
-        )
+        ClauseCache::compute_key(closure_hash, engine_tag, &self.config)
     }
 
     pub(crate) fn clause_cache(&self) -> &ClauseCache {

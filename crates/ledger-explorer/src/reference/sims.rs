@@ -665,3 +665,169 @@ pub fn mini_raft() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     ];
     (builders, single_leader_per_term_oracle())
 }
+
+// ---------------------------------------------------------------------------
+// Explicit support models for the corpus fixtures
+//
+// Each model names the entry roles that jointly support the planted
+// violation, using the semantic role described in the fixture doc comment.
+// A model whose mechanism is a pure timing interaction with no clean entry
+// set is declared Opaque: unknown semantics produce heuristic output only.
+// ---------------------------------------------------------------------------
+
+/// mini-zab: the leader's two proposals are jointly required for the split.
+pub fn mini_zab_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        0,
+    ))
+}
+
+/// mini-hdfs: the NameNode's two grants are jointly required.
+pub fn mini_hdfs_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        0,
+    ))
+}
+
+/// mini-cassandra: the primary's gossip send plus the stale reader's recv
+/// jointly support the anti-entropy staleness.
+pub fn mini_cassandra_support(journal: &Journal) -> crate::support::SupportExpr {
+    let mut ids = crate::support::entry_ids_by(journal, ledger_format::EntryKind::Send, 0);
+    ids.extend(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Recv,
+        2,
+    ));
+    crate::support::all_of_ids(ids)
+}
+
+/// mini-2pc: the coordinator's PREPARE and COMMIT sends are jointly required
+/// for the crash-after-commit violation.
+pub fn mini_2pc_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        0,
+    ))
+}
+
+/// mini-leader-stepdown: both leaders' replication streams jointly support
+/// the stale read after the leadership change.
+pub fn mini_leader_stepdown_support(journal: &Journal) -> crate::support::SupportExpr {
+    let mut ids = crate::support::entry_ids_by(journal, ledger_format::EntryKind::Send, 0);
+    ids.extend(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        2,
+    ));
+    crate::support::all_of_ids(ids)
+}
+
+/// mini-membership-churn: the leader's replication sends are jointly
+/// required for the commit-index stall.
+pub fn mini_membership_churn_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        0,
+    ))
+}
+
+/// mini-hdfs-lease-expiry: the NameNode grant and the stale writer's sends
+/// jointly support the post-expiry write.
+pub fn mini_hdfs_lease_expiry_support(journal: &Journal) -> crate::support::SupportExpr {
+    let mut ids = crate::support::entry_ids_by(journal, ledger_format::EntryKind::Send, 0);
+    ids.extend(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        1,
+    ));
+    crate::support::all_of_ids(ids)
+}
+
+/// mini-reorder-lost-update: both writers' sends are jointly required for
+/// the reordered lost update.
+pub fn mini_reorder_lost_update_support(journal: &Journal) -> crate::support::SupportExpr {
+    let mut ids = crate::support::entry_ids_by(journal, ledger_format::EntryKind::Send, 1);
+    ids.extend(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        2,
+    ));
+    crate::support::all_of_ids(ids)
+}
+
+/// mini-lease-timer-race: a pure timing interaction; no clean entry set.
+pub fn mini_lease_timer_race_support(_journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::SupportExpr::Opaque
+}
+
+/// mini-restart-dup-append: the appender's sends to the durable log are
+/// jointly required for the duplicate append.
+pub fn mini_restart_dup_append_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        1,
+    ))
+}
+
+/// mini-partition-retry-dup: the client's request sends are jointly required
+/// for the duplicate delivery under the partition.
+pub fn mini_partition_retry_dup_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        0,
+    ))
+}
+
+/// mini-cloud-az-double-assign: the scheduler's two assignments are jointly
+/// required for the missing AZ fence.
+pub fn mini_cloud_az_double_assign_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        0,
+    ))
+}
+
+/// mini-cloud-instance-flap: the autoscaler's forwarded registration is
+/// required for the duplicate registration.
+pub fn mini_cloud_instance_flap_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        1,
+    ))
+}
+
+/// mini-cloud-config-drift: the coordinator's pushes are jointly required
+/// for the staged-rollout divergence.
+pub fn mini_cloud_config_drift_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        0,
+    ))
+}
+
+/// mini-cloud-quota-retry-storm: the quota service's apply sends are
+/// required for the backpressure duplicate apply.
+pub fn mini_cloud_quota_retry_storm_support(journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::all_of_ids(crate::support::entry_ids_by(
+        journal,
+        ledger_format::EntryKind::Send,
+        1,
+    ))
+}
+
+/// mini-kv-stale-read: schedule-dependent stale read with no clean entry
+/// set in the shared Mini-Kv workload; declared Opaque.
+pub fn mini_kv_stale_read_support(_journal: &Journal) -> crate::support::SupportExpr {
+    crate::support::SupportExpr::Opaque
+}
