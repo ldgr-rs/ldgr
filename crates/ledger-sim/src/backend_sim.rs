@@ -7,7 +7,7 @@ use crate::seedtree::SeedTree;
 use crate::simfs::SimFs;
 use crate::time::{Clock, VirtualTime};
 use core::convert::Infallible;
-use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, MessageId, StreamId};
+use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, StreamId};
 use ledger_journal::{Journal, JournalError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{Rng, TryRng};
@@ -302,11 +302,10 @@ impl Net for SimBackend {
             EntryKind::Recv,
             [message.send_id],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                // CONSUMER DEBT (lane 2): real message identity.
-                message_id: MessageId::new(message.from as ActorId, message.payload),
+                message_id: message.message_id,
                 from: message.from as ActorId,
                 to: task as ActorId,
-                observed_content: message.payload.to_le_bytes().to_vec(),
+                observed_content: message.content.clone(),
             }),
         );
         // Clone the origin out before re-locking: the guard from `get` lives
@@ -331,11 +330,10 @@ impl SimBackend {
             EntryKind::Send,
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                // CONSUMER DEBT (lane 2): real message identity.
-                message_id: MessageId::new(message.from as ActorId, message.payload),
+                message_id: message.message_id,
                 from: message.from as ActorId,
                 to: message.to as ActorId,
-                original_content: message.payload.to_le_bytes().to_vec(),
+                original_content: message.content.clone(),
             }),
         ) else {
             return (false, None);
@@ -439,7 +437,8 @@ mod tests {
         let _ = effects.net().send(Message {
             from: 1,
             to: 2,
-            payload: 42,
+            content: 42u64.to_le_bytes().to_vec(),
+            message_id: ledger_format::MessageId::new(1, 0),
             send_id: [0; 32],
             deliver_at: now,
         });

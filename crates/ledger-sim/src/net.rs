@@ -1,8 +1,9 @@
-//! Deterministic simulated network with timed delivery queues and partitions.
+//! Deterministic simulated network with timed delivery queues, partitions,
+//! and a bounded reorder window.
 //! Version 0.2: DnsTable exposes sorted `iter()` for deterministic RunConfig hashing.
 
 use crate::config::Probability;
-use ledger_format::{FaultSpec, Hash};
+use ledger_format::{FaultSpec, Hash, MessageId};
 use rand_core::Rng;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -14,12 +15,25 @@ pub struct Message {
     pub from: usize,
     /// Receiving actor/task ID.
     pub to: usize,
-    /// Numerical or encoded payload.
-    pub payload: u64,
+    /// Content bytes; a scalar caller encodes its value explicitly at the
+    /// API boundary.
+    pub content: Vec<u8>,
     /// Journal entry ID of the corresponding Send event.
     pub send_id: Hash,
+    /// Message identity copied from the Send entry.
+    pub message_id: MessageId,
     /// Virtual timestamp at which this message becomes deliverable.
     pub deliver_at: u64,
+}
+
+impl Message {
+    /// Decode the first 8 little-endian bytes as a scalar payload.
+    pub fn payload(&self) -> u64 {
+        let mut buf = [0u8; 8];
+        let n = self.content.len().min(8);
+        buf[..n].copy_from_slice(&self.content[..n]);
+        u64::from_le_bytes(buf)
+    }
 }
 
 /// Per-link transport configuration.
@@ -287,9 +301,18 @@ impl SimNet {
         self.send(Message {
             from,
             to,
-            payload,
+            content: payload.to_le_bytes().to_vec(),
+            message_id: MessageId::new(from as ledger_format::ActorId, 0),
             send_id,
             deliver_at: now.saturating_add(delay),
+        })
+    }
+
+    /// Send a message with an explicit identity and content bytes.
+    pub fn send_at_with_identity(&mut self, message: Message, now: u64, delay: u64) -> bool {
+        self.send(Message {
+            deliver_at: now.saturating_add(delay),
+            ..message
         })
     }
 
@@ -313,22 +336,58 @@ impl SimNet {
     /// Take the first deliverable message for `task` available at `now`.
     ///
     /// With a nonzero effective reorder window (per-link override or global),
-    /// the most recently queued deliverable message wins (UDP-style unordered
-    /// delivery); otherwise delivery is strict FIFO.
+    /// the eligible set is the bounded suffix of the ready queue: the last
+    /// `window` ready messages. The newest of that suffix wins. Window zero
+    /// preserves queue order (strict FIFO).
     pub fn recv_at(&mut self, task: usize, now: u64) -> Option<Message> {
-        let mut first = None;
-        let mut last = None;
-        for (index, message) in self.queue.iter().enumerate() {
-            if message.to == task && message.deliver_at <= now {
-                if first.is_none() {
-                    first = Some(index);
-                }
-                last = Some(index);
-            }
-        }
-        let first = first?;
+        let ready: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.to == task && message.deliver_at <= now)
+            .map(|(index, _)| index)
+            .collect();
+        let first = *ready.first()?;
         let window = self.effective_reorder_window(self.queue[first].from, task);
-        let index = if window > 0 { last? } else { first };
+        let index = if window == 0 {
+            first
+        } else {
+            // The exact bounded candidate window: the last `window` ready
+            // messages, newest-first within it.
+            let start = ready.len().saturating_sub(window);
+            ready[ready.len() - 1].max(ready[start])
+        };
+        self.queue.remove(index)
+    }
+
+    /// Take one ready message for `task`, drawing a seeded pick inside the
+    /// exact bounded candidate window.
+    ///
+    /// Window zero draws nothing and serves the queue head (FIFO). A nonzero
+    /// window limits the candidate set to the last `window` ready messages
+    /// and serves `candidate[draw(candidate.len())]`.
+    pub fn recv_at_drawn(
+        &mut self,
+        task: usize,
+        now: u64,
+        mut draw: impl FnMut(u64) -> u64,
+    ) -> Option<Message> {
+        let ready: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.to == task && message.deliver_at <= now)
+            .map(|(index, _)| index)
+            .collect();
+        let first = *ready.first()?;
+        let window = self.effective_reorder_window(self.queue[first].from, task);
+        let index = if window == 0 {
+            first
+        } else {
+            let start = ready.len().saturating_sub(window);
+            let suffix = &ready[start..];
+            suffix[(draw(suffix.len() as u64) % suffix.len() as u64) as usize]
+        };
         self.queue.remove(index)
     }
 
@@ -363,7 +422,8 @@ mod tests {
             Message {
                 from: 0,
                 to: 1,
-                payload: 7,
+                content: 7u64.to_le_bytes().to_vec(),
+                message_id: ledger_format::MessageId::new(0, 0),
                 send_id: send_id(1),
                 deliver_at: 100,
             },
@@ -374,7 +434,7 @@ mod tests {
         assert!(delivered);
         let msg = net.recv_at(1, 110).unwrap();
         assert_eq!(msg.deliver_at, 110);
-        assert_eq!(msg.payload, 7);
+        assert_eq!(msg.payload(), 7);
     }
 
     #[test]
@@ -386,7 +446,8 @@ mod tests {
             Message {
                 from: 0,
                 to: 1,
-                payload: 1,
+                content: 1u64.to_le_bytes().to_vec(),
+                message_id: ledger_format::MessageId::new(0, 0),
                 send_id: send_id(1),
                 deliver_at: 0
             },
@@ -412,7 +473,8 @@ mod tests {
             Message {
                 from: 0,
                 to: 1,
-                payload: 2,
+                content: 2u64.to_le_bytes().to_vec(),
+                message_id: ledger_format::MessageId::new(0, 0),
                 send_id: send_id(2),
                 deliver_at: 100
             },
@@ -443,7 +505,8 @@ mod tests {
             Message {
                 from: 0,
                 to: 1,
-                payload: 1,
+                content: 1u64.to_le_bytes().to_vec(),
+                message_id: ledger_format::MessageId::new(0, 0),
                 send_id: send_id(1),
                 deliver_at: 0
             },
@@ -464,7 +527,8 @@ mod tests {
             Message {
                 from: 0,
                 to: 1,
-                payload: 2,
+                content: 2u64.to_le_bytes().to_vec(),
+                message_id: ledger_format::MessageId::new(0, 0),
                 send_id: send_id(2),
                 deliver_at: 0
             },
@@ -486,7 +550,143 @@ mod tests {
         let _ = net.send_at(0, 1, 10, send_id(1), now, 0);
         let _ = net.send_at(0, 1, 20, send_id(2), now, 0);
         // Newest-first: second message wins.
-        assert_eq!(net.recv_at(1, now).unwrap().payload, 20);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 20);
+    }
+
+    #[test]
+    fn reorder_window_zero_preserves_queue_order() {
+        let mut net = SimNet::new();
+        let now = 10;
+        for value in [10u64, 20, 30] {
+            let _ = net.send_at(0, 1, value, send_id(value as u8), now, 0);
+        }
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 10);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 20);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 30);
+    }
+
+    #[test]
+    fn reorder_window_bounds_the_candidate_suffix() {
+        // Five ready messages with window 2: the eligible set is the last
+        // two, and the newest of the suffix wins.
+        let mut net = SimNet::new();
+        net.set_reorder_window(2);
+        let now = 10;
+        for value in [10u64, 20, 30, 40, 50] {
+            let _ = net.send_at(0, 1, value, send_id(value as u8), now, 0);
+        }
+        // Newest-first within the bounded window: 50, then 40, then 30.
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 50);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 40);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 30);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 20);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 10);
+    }
+
+    #[test]
+    fn reorder_window_larger_than_queue_clamps_to_ready_count() {
+        let mut net = SimNet::new();
+        net.set_reorder_window(100);
+        let now = 10;
+        for value in [10u64, 20, 30] {
+            let _ = net.send_at(0, 1, value, send_id(value as u8), now, 0);
+        }
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 30);
+    }
+
+    #[test]
+    fn drawn_window_serves_within_the_bounded_suffix() {
+        let mut net = SimNet::new();
+        net.set_reorder_window(2);
+        let now = 10;
+        for value in [10u64, 20, 30, 40, 50] {
+            let _ = net.send_at(0, 1, value, send_id(value as u8), now, 0);
+        }
+        // draw(2) == 0 serves the older member of the last-two suffix.
+        let first = net.recv_at_drawn(1, now, |_| 0).unwrap();
+        assert_eq!(first.payload(), 40);
+        // draw(2) == 1 serves the newest member.
+        let second = net.recv_at_drawn(1, now, |bound| bound - 1).unwrap();
+        assert_eq!(second.payload(), 50);
+    }
+
+    #[test]
+    fn message_identity_survives_delay_and_reorder() {
+        let mut net = SimNet::new();
+        net.set_reorder_window(1);
+        let now = 10;
+        let _ = net.send(Message {
+            from: 0,
+            to: 1,
+            content: 7u64.to_le_bytes().to_vec(),
+            message_id: ledger_format::MessageId::new(0, 3),
+            send_id: send_id(1),
+            deliver_at: now + 5,
+        });
+        let _ = net.send(Message {
+            from: 0,
+            to: 1,
+            content: 8u64.to_le_bytes().to_vec(),
+            message_id: ledger_format::MessageId::new(0, 4),
+            send_id: send_id(2),
+            deliver_at: now,
+        });
+        let msg = net.recv_at(1, now + 10).unwrap();
+        // Stable identity through delay: the earlier send arrives with its
+        // own message identity even after a later send was queued.
+        assert_eq!(msg.message_id, ledger_format::MessageId::new(0, 4));
+        assert_eq!(msg.payload(), 8);
+    }
+
+    #[test]
+    fn empty_and_maximum_size_messages_deliver() {
+        let mut net = SimNet::new();
+        let now = 10;
+        // Empty message: zero content bytes, still deliverable.
+        let _ = net.send(Message {
+            from: 0,
+            to: 1,
+            content: Vec::new(),
+            message_id: ledger_format::MessageId::new(0, 0),
+            send_id: send_id(1),
+            deliver_at: now,
+        });
+        // Maximum-size message: exactly the format cap.
+        let max = vec![0xABu8; ledger_format::limits::MAX_MESSAGE_BYTES];
+        let _ = net.send(Message {
+            from: 0,
+            to: 1,
+            content: max.clone(),
+            message_id: ledger_format::MessageId::new(0, 1),
+            send_id: send_id(2),
+            deliver_at: now,
+        });
+        let empty = net.recv_at(1, now).unwrap();
+        assert!(empty.content.is_empty());
+        let full = net.recv_at(1, now).unwrap();
+        assert_eq!(full.content.len(), ledger_format::limits::MAX_MESSAGE_BYTES);
+        assert_eq!(full.content, max);
+    }
+
+    #[test]
+    fn send_and_recv_frames_carry_equal_content_and_endpoints() {
+        let mut net = SimNet::new();
+        let now = 10;
+        let content = vec![1, 2, 3, 4];
+        let id = ledger_format::MessageId::new(2, 7);
+        let _ = net.send(Message {
+            from: 2,
+            to: 3,
+            content: content.clone(),
+            message_id: id,
+            send_id: send_id(1),
+            deliver_at: now,
+        });
+        let msg = net.recv_at(3, now).unwrap();
+        assert_eq!(msg.from, 2);
+        assert_eq!(msg.to, 3);
+        assert_eq!(msg.message_id, id);
+        assert_eq!(msg.content, content, "recv carries the original content");
     }
 
     #[test]

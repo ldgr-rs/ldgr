@@ -6,7 +6,6 @@
 //! sleeping/receiving futures live here; the orchestration loop, the task
 //! table, and the shared state stay in the module root.
 use crate::origin::OriginSource;
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -125,15 +124,13 @@ impl Boundary {
     /// With the default zero-probability swarm this consumes no draws and
     /// returns [`SwarmAction::Deliver`] unchanged, keeping journals
     /// byte-identical to the pre-swarm path.
-    fn swarm_send_policy(&self, send_id: Hash) -> SwarmAction {
+    fn swarm_send_policy(&self, send_id: Hash, message_id: MessageId) -> SwarmAction {
         let swarm = &self.shared.swarm;
         if swarm.drop_probability.get() > 0.0 && self.net_draw() < swarm.drop_probability.get() {
             if let Err(error) = self.append(
                 EntryKind::Fault,
                 [send_id],
-                EntryPayload::Fault(FaultPayload::DropMessage {
-                    message_id: MessageId::new(self.task as ActorId, 0),
-                }),
+                EntryPayload::Fault(FaultPayload::DropMessage { message_id }),
             ) {
                 self.shared.record_journal_error(error);
             }
@@ -174,7 +171,7 @@ impl Boundary {
     fn maybe_crash_on_write(
         &self,
         path: &str,
-        value: u64,
+        write_id: ledger_format::Hash,
     ) -> Result<(), ledger_journal::JournalError> {
         let swarm = &self.shared.swarm;
         if swarm.crash_probability.get() <= 0.0 {
@@ -188,31 +185,29 @@ impl Boundary {
         let mut offset = self.shared.fs_offset.borrow_mut();
         let choice = self.shared.seed_tree.draw_u64("fs", *offset);
         *offset += 1;
-        let operator = match choice % 4 {
-            0 => crate::simfs::CrashOperator::DropAllUnsynced,
-            1 => {
-                // ledger-lint:allow:HashSet (single-element set; the crash
-                // operator sorts before iterating)
-                let mut dropped = HashSet::new();
-                dropped.insert(path.to_owned());
-                crate::simfs::CrashOperator::DropSubset(dropped)
-            }
-            2 => crate::simfs::CrashOperator::TornWrite {
-                path: path.to_owned(),
-                partial_value: value.saturating_div(2),
+        // Canonical v2 operators targeting the just-journaled write entry;
+        // the journaled operation is the one applied.
+        let operation = match choice % 4 {
+            0 => ledger_format::CrashOperation::DropAllUnsynced,
+            1 => ledger_format::CrashOperation::DropPaths {
+                paths: vec![crate::simfs::path_ref(path)],
             },
-            _ => crate::simfs::CrashOperator::BitFlipCorruption {
-                path: path.to_owned(),
-                xor_mask: 1,
+            2 => ledger_format::CrashOperation::TornWrite {
+                write_entry: write_id,
+                persisted_prefix: 4,
+            },
+            _ => ledger_format::CrashOperation::BitFlip {
+                write_entry: write_id,
+                offset: 0,
+                bit: 0,
             },
         };
-        let state_index = match operator {
-            crate::simfs::CrashOperator::DropAllUnsynced => 0,
-            crate::simfs::CrashOperator::DropSubset(_) => 1,
-            crate::simfs::CrashOperator::TornWrite { .. } => 2,
-            crate::simfs::CrashOperator::BitFlipCorruption { .. } => 3,
-            crate::simfs::CrashOperator::TornWriteSectors { .. } => 4,
-            crate::simfs::CrashOperator::CorruptRange { .. } => 5,
+        let state_index = match operation {
+            ledger_format::CrashOperation::DropAllUnsynced => 0,
+            ledger_format::CrashOperation::DropPaths { .. } => 1,
+            ledger_format::CrashOperation::TornWrite { .. } => 2,
+            ledger_format::CrashOperation::CorruptRange { .. } => 3,
+            ledger_format::CrashOperation::BitFlip { .. } => 4,
         };
         let mut fault_classes = self.shared.fault_classes_used.borrow_mut();
         if fault_classes.len() >= swarm.fault_classes_per_run.max(1) {
@@ -220,13 +215,25 @@ impl Boundary {
         }
         fault_classes.insert(state_index);
         drop(fault_classes);
-        self.shared.fs.borrow_mut().apply_crash_operator(&operator);
+        if let Err(error) = self
+            .shared
+            .fs
+            .borrow_mut()
+            .apply_crash_operation(&operation)
+        {
+            // A crash that cannot resolve its target must fail closed.
+            self.shared
+                .record_journal_error(ledger_journal::JournalError::InvalidPayload(format!(
+                    "swarm crash operator rejected: {error}"
+                )));
+            return Ok(());
+        }
         self.append(
             EntryKind::Fault,
             [],
             EntryPayload::Fault(FaultPayload::CrashActor {
                 actor: self.task as ActorId,
-                crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+                crash_operation: operation,
             }),
         )?;
         Ok(())
@@ -398,17 +405,40 @@ impl Boundary {
         base_delay: u64,
         at: Option<OriginSource>,
     ) -> bool {
+        self.send_bytes_inner(to, payload.to_le_bytes().to_vec(), base_delay, at)
+    }
+
+    /// Single byte-send path: journals `Send` with the authoritative sender
+    /// sequence identity, applies the fault and swarm policies, then delivers
+    /// through the configured link or the direct queue.
+    fn send_bytes_inner(
+        &self,
+        to: usize,
+        content: Vec<u8>,
+        base_delay: u64,
+        at: Option<OriginSource>,
+    ) -> bool {
         let now = self.shared.time.borrow().now();
+        let message_id = self.next_message_id();
+        if content.len() as u64 > ledger_format::limits::MAX_MESSAGE_BYTES as u64 {
+            // Fail closed: an oversized message never reaches the queue or
+            // the journal.
+            self.shared
+                .record_journal_error(ledger_journal::JournalError::InvalidPayload(format!(
+                    "message of {} bytes exceeds the {} byte limit",
+                    content.len(),
+                    ledger_format::limits::MAX_MESSAGE_BYTES
+                )));
+            return false;
+        }
         let id = match self.append(
             EntryKind::Send,
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                // CONSUMER DEBT (lane 2): real message identity replaces the
-                // deterministic transitional sequence below.
-                message_id: MessageId::new(self.task as ActorId, payload),
+                message_id,
                 from: self.task as ActorId,
                 to: to as ActorId,
-                original_content: payload.to_le_bytes().to_vec(),
+                original_content: content.clone(),
             }),
         ) {
             Ok(id) => id,
@@ -424,20 +454,18 @@ impl Boundary {
             if let Err(error) = self.append(
                 EntryKind::Fault,
                 [id],
-                EntryPayload::Fault(FaultPayload::DropMessage {
-                    message_id: MessageId::new(self.task as ActorId, 0),
-                }),
+                EntryPayload::Fault(FaultPayload::DropMessage { message_id }),
             ) {
                 self.shared.record_journal_error(error);
             }
             return true;
         }
-        let injected_delay = match self.inject_send_fault(id) {
+        let injected_delay = match self.inject_send_fault(id, message_id) {
             Some(None) => return true,
             Some(Some(ticks)) => ticks,
             None => 0,
         };
-        let total_delay = match self.swarm_send_policy(id) {
+        let total_delay = match self.swarm_send_policy(id, message_id) {
             SwarmAction::Drop => return true,
             SwarmAction::Delay(extra) => base_delay
                 .saturating_add(extra)
@@ -445,22 +473,41 @@ impl Boundary {
             SwarmAction::Deliver => base_delay.saturating_add(injected_delay),
         };
         let delivered = if self.shared.net.borrow().link_configured(self.task, to) {
-            self.send_via_link(self.task, to, payload, id, now, total_delay)
+            self.send_via_link(
+                Message {
+                    from: self.task,
+                    to,
+                    content,
+                    message_id,
+                    send_id: id,
+                    deliver_at: now,
+                },
+                now,
+                total_delay,
+            )
         } else {
-            self.shared
-                .net
-                .borrow_mut()
-                .send_at(self.task, to, payload, id, now, total_delay)
+            self.shared.net.borrow_mut().send_at_with_identity(
+                Message {
+                    from: self.task,
+                    to,
+                    content,
+                    message_id,
+                    send_id: id,
+                    deliver_at: now,
+                },
+                now,
+                total_delay,
+            )
         };
         if !delivered {
-            self.journal_net_loss(id, to);
+            self.journal_net_loss(id, to, message_id);
         }
         delivered
     }
 
     /// Journal the fault class for a message the network refused: a partition
     /// when the link is partitioned, otherwise a loss drop.
-    fn journal_net_loss(&self, send_id: Hash, to: usize) {
+    fn journal_net_loss(&self, send_id: Hash, to: usize, message_id: MessageId) {
         let partitioned = self.shared.net.borrow().is_partitioned(self.task, to);
         let fault = if partitioned {
             FaultSpec::Partition {
@@ -476,9 +523,7 @@ impl Boundary {
                 dst,
                 enabled: true,
             },
-            _ => FaultPayload::DropMessage {
-                message_id: MessageId::new(self.task as ActorId, 0),
-            },
+            _ => FaultPayload::DropMessage { message_id },
         });
         if let Err(error) = self.append(EntryKind::Fault, [send_id], fault_payload) {
             self.shared.record_journal_error(error);
@@ -487,32 +532,16 @@ impl Boundary {
 
     /// Send a message through a configured link, drawing jitter and loss from
     /// the shared `net` seed stream offset.
-    fn send_via_link(
-        &self,
-        from: usize,
-        to: usize,
-        payload: u64,
-        send_id: Hash,
-        now: u64,
-        base_delay: u64,
-    ) -> bool {
-        self.shared.net.borrow_mut().send_via_link(
-            Message {
-                from,
-                to,
-                payload,
-                send_id,
-                deliver_at: now,
-            },
-            now,
-            base_delay,
-            |bound| {
+    fn send_via_link(&self, message: Message, now: u64, base_delay: u64) -> bool {
+        self.shared
+            .net
+            .borrow_mut()
+            .send_via_link(message, now, base_delay, |bound| {
                 let mut offset = self.shared.net_offset.borrow_mut();
                 let value = self.shared.seed_tree.draw_u64("net", *offset);
                 *offset += 1;
                 value % bound.max(1)
-            },
-        )
+            })
     }
 
     /// Return the scheduled fault injection targeting `id`, if any.
@@ -543,16 +572,14 @@ impl Boundary {
     ///
     /// Returns `None` when the fault drops the message or when no fault
     /// targets it.
-    fn inject_send_fault(&self, send_id: Hash) -> Option<Option<u64>> {
+    fn inject_send_fault(&self, send_id: Hash, message_id: MessageId) -> Option<Option<u64>> {
         match self.schedule_injection_for(send_id) {
             Some(SimFault::Drop(_)) => {
                 self.mark_fault_applied(send_id);
                 if let Err(error) = self.append(
                     EntryKind::Fault,
                     [send_id],
-                    EntryPayload::Fault(FaultPayload::DropMessage {
-                        message_id: MessageId::new(self.task as ActorId, 0),
-                    }),
+                    EntryPayload::Fault(FaultPayload::DropMessage { message_id }),
                 ) {
                     self.shared.record_journal_error(error);
                 }
@@ -587,41 +614,60 @@ impl Boundary {
             }
             Some(SimFault::Corrupt { write, xor_mask }) => {
                 self.mark_fault_applied(*write);
-                let operator = crate::simfs::CrashOperator::BitFlipCorruption {
-                    path: path.to_owned(),
-                    xor_mask: *xor_mask,
+                let operation = ledger_format::CrashOperation::CorruptRange {
+                    write_entry: *write,
+                    offset: 0,
+                    xor_bytes: xor_mask.to_le_bytes().to_vec(),
                 };
-                self.shared.fs.borrow_mut().apply_crash_operator(&operator);
+                if let Err(error) = self
+                    .shared
+                    .fs
+                    .borrow_mut()
+                    .apply_crash_operation(&operation)
+                {
+                    // A scheduled corruption that cannot resolve its target
+                    // fails closed without fallback.
+                    return Err(ledger_journal::JournalError::InvalidPayload(format!(
+                        "scheduled corrupt rejected: {error}"
+                    )));
+                }
                 self.append(
                     EntryKind::Fault,
                     [],
                     EntryPayload::Fault(FaultPayload::CrashActor {
                         actor: self.task as ActorId,
-                        crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+                        crash_operation: operation,
                     }),
                 )?;
             }
             Some(SimFault::CrashState { write, state }) => {
                 self.mark_fault_applied(*write);
-                let operator =
-                    match *state {
-                        0 => crate::simfs::CrashOperator::DropAllUnsynced,
-                        1 => crate::simfs::CrashOperator::DropSubset(
-                            std::collections::HashSet::from([path.to_owned()]),
-                        ),
-                        2 => crate::simfs::CrashOperator::TornWrite {
-                            path: path.to_owned(),
-                            partial_value: 0,
-                        },
-                        _ => crate::simfs::CrashOperator::DropAllUnsynced,
-                    };
-                self.shared.fs.borrow_mut().apply_crash_operator(&operator);
+                let operation = match *state {
+                    0 => ledger_format::CrashOperation::DropAllUnsynced,
+                    1 => ledger_format::CrashOperation::DropPaths {
+                        paths: vec![crate::simfs::path_ref(path)],
+                    },
+                    _ => ledger_format::CrashOperation::TornWrite {
+                        write_entry: *write,
+                        persisted_prefix: 0,
+                    },
+                };
+                if let Err(error) = self
+                    .shared
+                    .fs
+                    .borrow_mut()
+                    .apply_crash_operation(&operation)
+                {
+                    return Err(ledger_journal::JournalError::InvalidPayload(format!(
+                        "scheduled crash-state rejected: {error}"
+                    )));
+                }
                 self.append(
                     EntryKind::Fault,
                     [],
                     EntryPayload::Fault(FaultPayload::CrashActor {
                         actor: self.task as ActorId,
-                        crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+                        crash_operation: operation,
                     }),
                 )?;
             }
@@ -686,32 +732,45 @@ impl Boundary {
         Ok(now)
     }
 
-    /// Take the first deliverable message for this task, journaling a `Recv`
-    /// entry, and return its payload.
-    pub(crate) fn recv_now(&self) -> Option<u64> {
-        let now = self.shared.time.borrow().now();
-        let message = self.shared.net.borrow_mut().recv_at(self.task, now)?;
-        let recv_id = match self.append(
+    /// Take the next message identity for this task's send sequence.
+    fn next_message_id(&self) -> MessageId {
+        let mut seqs = self.shared.send_seq.borrow_mut();
+        if self.task >= seqs.len() {
+            seqs.resize(self.task + 1, 0);
+        }
+        let sequence = seqs[self.task];
+        seqs[self.task] = sequence + 1;
+        MessageId::new(self.task as ActorId, sequence)
+    }
+
+    /// Journal a `Recv` frame for `message` and return its entry id.
+    fn journal_recv(&self, message: &Message) -> Option<Hash> {
+        match self.append(
             EntryKind::Recv,
             [message.send_id],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                // CONSUMER DEBT (lane 2): real message identity.
-                message_id: MessageId::new(message.from as ActorId, message.payload),
+                message_id: message.message_id,
                 from: message.from as ActorId,
                 to: self.task as ActorId,
-                observed_content: message.payload.to_le_bytes().to_vec(),
+                observed_content: message.content.clone(),
             }),
         ) {
             Ok(id) => Some(id),
             Err(error) => {
-                // The message is already consumed; surface the failed append
-                // instead of losing it on the return-None path.
                 self.shared.record_journal_error(error);
                 None
             }
-        };
+        }
+    }
+
+    /// Take the first deliverable message for this task, journaling a `Recv`
+    /// entry, and return its scalar payload.
+    pub(crate) fn recv_now(&self) -> Option<u64> {
+        let now = self.shared.time.borrow().now();
+        let message = self.shared.net.borrow_mut().recv_at(self.task, now)?;
+        let recv_id = self.journal_recv(&message);
         self.inherit_recv_origin(recv_id, message.send_id);
-        Some(message.payload)
+        Some(message.payload())
     }
 
     /// Journal an `InputStep` entry carrying a generator identity, a replay
@@ -924,28 +983,12 @@ impl Effects for Boundary {
 
 impl Net for Boundary {
     fn send(&self, message: Message) -> bool {
-        self.send_core(message.to, message.payload, 0, None)
+        self.send_bytes_inner(message.to, message.content, 0, None)
     }
 
     fn recv(&self, task: usize, now: u64) -> Option<Message> {
         let message = self.shared.net.borrow_mut().recv_at(task, now)?;
-        let recv_id = match self.append(
-            EntryKind::Recv,
-            [message.send_id],
-            EntryPayload::Recv(ledger_format::RecvFrame {
-                // CONSUMER DEBT (lane 2): real message identity.
-                message_id: MessageId::new(message.from as ActorId, message.payload),
-                from: message.from as ActorId,
-                to: self.task as ActorId,
-                observed_content: message.payload.to_le_bytes().to_vec(),
-            }),
-        ) {
-            Ok(id) => Some(id),
-            Err(error) => {
-                self.shared.record_journal_error(error);
-                None
-            }
-        };
+        let recv_id = self.journal_recv(&message);
         self.inherit_recv_origin(recv_id, message.send_id);
         Some(message)
     }
@@ -981,7 +1024,7 @@ impl Fs for Boundary {
             Some(id),
         );
         self.inject_write_fault(id, path)?;
-        self.maybe_crash_on_write(path, value)?;
+        self.maybe_crash_on_write(path, id)?;
         Ok(id)
     }
 
@@ -1097,11 +1140,10 @@ impl Future for RecvFuture {
                 EntryKind::Recv,
                 [message.send_id],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    // CONSUMER DEBT (lane 2): real message identity.
-                    message_id: MessageId::new(message.from as ActorId, message.payload),
+                    message_id: message.message_id,
                     from: message.from as ActorId,
                     to: self.task as ActorId,
-                    observed_content: message.payload.to_le_bytes().to_vec(),
+                    observed_content: message.content.clone(),
                 }),
             ) {
                 Ok(id) => {
@@ -1118,7 +1160,7 @@ impl Future for RecvFuture {
                 }
                 Err(error) => self.shared.record_journal_error(error),
             }
-            Poll::Ready(message.payload)
+            Poll::Ready(message.payload())
         } else {
             // Record a failed Block append; the park still proceeds.
             match self.shared.journal_append(

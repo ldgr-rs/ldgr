@@ -249,14 +249,15 @@ fn native_pingpong() -> (Vec<u8>, Journal) {
     let sent = backend.net().send(Message {
         from: 0,
         to: 0,
-        payload: PING_PAYLOAD,
+        content: PING_PAYLOAD.to_le_bytes().to_vec(),
+        message_id: ledger_format::MessageId::new(0, 0),
         send_id: [0; 32],
         deliver_at: now,
     });
     let received_payload = backend
         .net()
         .recv(0, backend.clock().now())
-        .map(|message| message.payload);
+        .map(|message| message.payload());
     let mut output = format!("sent={sent} received={received_payload:?}\n").into_bytes();
     if sent && received_payload == Some(PING_PAYLOAD) {
         output.extend_from_slice(b"PINGPONG_OK\n");

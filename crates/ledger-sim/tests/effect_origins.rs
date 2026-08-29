@@ -11,7 +11,8 @@ fn message(to: usize) -> ledger_sim::Message {
     ledger_sim::Message {
         from: 1,
         to,
-        payload: 42,
+        content: 42u64.to_le_bytes().to_vec(),
+        message_id: ledger_format::MessageId::new(1, 0),
         send_id: [0; 32],
         deliver_at: 0,
     }
