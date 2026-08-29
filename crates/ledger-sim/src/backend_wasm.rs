@@ -797,9 +797,9 @@ impl WasmBackend {
              path_ptr: u32,
              path_len: u32,
              _oflags: u32,
-             _fs_rights_base: u64,
+             fs_rights_base: u64,
              _fs_rights_inh: u64,
-             _fdflags: u32,
+             fdflags: u32,
              opened_fd_ptr: u32|
              -> Result<u32, Error> {
                 let memory = caller
@@ -819,12 +819,25 @@ impl WasmBackend {
                     .map_err(|_| Error::msg("path_open path not utf8"))?;
                 let key = path.trim_start_matches('/').to_owned();
                 let key = if key.is_empty() { path.clone() } else { key };
+                // Preview1 rights bits the u64-cell store can honor.
+                const RIGHT_FD_READ: u64 = 1 << 1;
+                const RIGHT_FD_SEEK: u64 = 1 << 3;
+                const RIGHT_FD_WRITE: u64 = 1 << 6;
+                const FDFLAGS_APPEND: u32 = 0x0001;
+                let rights = crate::wasi_fs::FdRights {
+                    read: fs_rights_base & RIGHT_FD_READ != 0,
+                    write: fs_rights_base & RIGHT_FD_WRITE != 0,
+                    seek: fs_rights_base & RIGHT_FD_SEEK != 0,
+                };
+                let flags = crate::wasi_fs::FdFlags {
+                    append: fdflags & FDFLAGS_APPEND != 0,
+                };
                 let opened = caller
                     .data()
                     .wasi_fs
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .open(&key);
+                    .open_with_flags(&key, rights, flags);
                 let fd_to_write = match opened {
                     Ok(fd) => fd,
                     Err(_) => return Ok(24), // EBADF: table full or invalid.
@@ -885,13 +898,19 @@ impl WasmBackend {
                     mem[dst..dst + 4].copy_from_slice(&total.to_le_bytes());
                     return Ok(0);
                 }
-                let path_opt = caller
-                    .data()
-                    .wasi_fs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(fd)
-                    .map(|description| description.path.clone());
+                let path_opt = {
+                    let table = caller
+                        .data()
+                        .wasi_fs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    // Closed or non-granted handles fail before any path is
+                    // resolved, so a revoked capability cannot reach the store.
+                    match table.check_io(fd, true) {
+                        Ok(()) => table.get(fd).map(|description| description.path.clone()),
+                        Err(_) => None,
+                    }
+                };
                 let path = match path_opt {
                     Some(path) => path,
                     None => return Ok(8),
@@ -929,13 +948,18 @@ impl WasmBackend {
                     .get_export("memory")
                     .and_then(|export| export.into_memory())
                     .ok_or_else(|| Error::msg("guest has no exported memory"))?;
-                let path_opt = caller
-                    .data()
-                    .wasi_fs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(fd)
-                    .map(|description| description.path.clone());
+                let path_opt = {
+                    let table = caller
+                        .data()
+                        .wasi_fs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    // A read requires the read right on an open handle.
+                    match table.check_io(fd, false) {
+                        Ok(()) => table.get(fd).map(|description| description.path.clone()),
+                        Err(_) => None,
+                    }
+                };
                 let path = match path_opt {
                     Some(path) => path,
                     None => return Ok(8),
@@ -1272,7 +1296,19 @@ mod fd_write_boundary_tests {
                 .expect("open_test export")
                 .call(
                     &mut *store,
-                    (3, 0, path_ptr, path_len, 0, 0, 0, 0, opened_fd_ptr),
+                    // dirfd, dirflags, path, len, oflags, rights_base
+                    // (read+write granted), rights_inheriting, fdflags, out.
+                    (
+                        3,
+                        0,
+                        path_ptr,
+                        path_len,
+                        0,
+                        (1 << 1) | (1 << 6),
+                        0,
+                        0,
+                        opened_fd_ptr,
+                    ),
                 )
                 .expect("open_test call")
         };
@@ -1357,5 +1393,44 @@ mod fd_write_boundary_tests {
             kinds.iter().any(|kind| matches!(kind, EntryKind::FsWrite)),
             "journal must contain FsWrite on the valid path, got {kinds:?}"
         );
+
+        // A read-only open (read right only) must fail fd_write with EBADF
+        // before any path is resolved or journaled.
+        {
+            let mem = memory.data_mut(&mut backend.store);
+            mem[path_ptr..path_ptr + 3].copy_from_slice(b"/rd");
+        }
+        let open_errno = instance
+            .get_typed_func::<(u32, u32, u32, u32, u32, u64, u64, u32, u32), u32>(
+                &mut backend.store,
+                "open_test",
+            )
+            .expect("open_test export")
+            .call(
+                &mut backend.store,
+                (
+                    3,
+                    0,
+                    path_ptr as u32,
+                    3,
+                    0,
+                    1 << 1,
+                    0,
+                    0,
+                    opened_fd_ptr as u32,
+                ),
+            )
+            .expect("open_test call");
+        assert_eq!(open_errno, 0);
+        let rd_fd = {
+            let mem = memory.data(&backend.store);
+            u32::from_le_bytes(
+                mem[opened_fd_ptr..opened_fd_ptr + 4]
+                    .try_into()
+                    .expect("opened fd bytes"),
+            )
+        };
+        let errno = write_via_guest(&mut backend.store, rd_fd, iovs as u32, 1, nwritten as u32);
+        assert_eq!(errno, 8, "a write on a read-only handle must fail closed");
     }
 }
