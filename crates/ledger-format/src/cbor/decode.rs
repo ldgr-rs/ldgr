@@ -18,7 +18,7 @@ impl CborValue {
     }
 }
 
-fn decode_header(input: &[u8], cursor: &mut usize) -> Result<(u8, u64), CborError> {
+pub(crate) fn decode_header(input: &[u8], cursor: &mut usize) -> Result<(u8, u64), CborError> {
     if *cursor >= input.len() {
         return Err(CborError::UnexpectedEof);
     }

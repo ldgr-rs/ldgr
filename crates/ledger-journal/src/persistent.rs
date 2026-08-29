@@ -25,7 +25,7 @@ use crate::retention::RetentionClass;
 use crate::segment::{SealedSegment, SegmentStore};
 use crate::snapshot::{DEFAULT_SNAPSHOT_INTERVAL, Snapshot, SnapshotManager};
 use crate::snapshot_store::SnapshotStore;
-use ledger_format::{ActorId, EntryKind, Hash, Payload};
+use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
 
 /// A journal that is both in-memory and durably persisted.
 ///
@@ -189,7 +189,7 @@ impl PersistentJournal {
         kind: EntryKind,
         actor: ActorId,
         observed_parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Result<Hash, JournalError> {
         let id = self
             .journal
@@ -337,6 +337,13 @@ mod tests {
     use std::vec;
     use std::vec::Vec;
 
+    fn outcome(value: u64) -> EntryPayload {
+        EntryPayload::Outcome(ledger_format::OutcomePayload {
+            schema: [0x00; 32],
+            value: ledger_format::CanonicalValue::Unsigned(value),
+        })
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("ldgr-persistent-{name}-{}", std::process::id()));
@@ -347,12 +354,13 @@ mod tests {
     fn raw_entry(actor: ActorId, sequence: u64, parents: Vec<Hash>, clock: VectorClock) -> Entry {
         Entry::new(
             EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
                 actor,
                 parents,
                 vector_clock: Vec::new(),
                 sequence,
-                payload: Payload::Number(sequence),
+                payload: outcome(sequence),
             },
             clock,
         )
@@ -389,12 +397,13 @@ mod tests {
             let mut store = SegmentStore::new(&dir).unwrap();
             let entry = Entry::new(
                 EntryData {
+                    format_version: ledger_format::FORMAT_VERSION,
                     kind: EntryKind::Outcome,
                     actor: 1,
                     parents: Vec::new(),
                     vector_clock: Vec::new(),
                     sequence: 0,
-                    payload: Payload::Number(0),
+                    payload: outcome(0),
                 },
                 VectorClock::from_map([(1, 7)]),
             )
@@ -413,7 +422,7 @@ mod tests {
     struct Step {
         kind: EntryKind,
         actor: ActorId,
-        payload: Payload,
+        payload: EntryPayload,
         /// Observe the id produced `back` steps earlier (0 = none).
         observed_backs: Vec<usize>,
         /// Chain to the immediately preceding step of the same group.
@@ -429,38 +438,53 @@ mod tests {
             steps.push(Step {
                 kind: EntryKind::TimerSet,
                 actor: 1,
-                payload: Payload::Number(round as u64),
+                payload: EntryPayload::TimerSet {
+                    timer_id: round as u64,
+                    deadline_ticks: round as u64,
+                },
                 observed_backs: Vec::new(),
                 chain: false,
             });
             steps.push(Step {
                 kind: EntryKind::TimerFire,
                 actor: 1,
-                payload: Payload::Empty,
+                payload: EntryPayload::TimerFire {
+                    timer_id: round as u64,
+                    deadline_ticks: round as u64,
+                },
                 observed_backs: Vec::new(),
                 chain: true,
             });
             steps.push(Step {
                 kind: EntryKind::Wake,
                 actor: 1,
-                payload: Payload::Empty,
+                payload: EntryPayload::Wake(ledger_format::WakePayload::TimerReady {
+                    timer_id: round as u64,
+                }),
                 observed_backs: Vec::new(),
                 chain: true,
             });
             steps.push(Step {
                 kind: EntryKind::Send,
                 actor: 2,
-                payload: Payload::Pair {
-                    left: 1,
-                    right: round as u64,
-                },
+                payload: EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, round as u64),
+                    from: 2,
+                    to: 1,
+                    original_content: (round as u64).to_le_bytes().to_vec(),
+                }),
                 observed_backs: vec![3],
                 chain: false,
             });
             steps.push(Step {
                 kind: EntryKind::Recv,
                 actor: 2,
-                payload: Payload::Number(round as u64),
+                payload: EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(2, round as u64),
+                    from: 2,
+                    to: 1,
+                    observed_content: (round as u64).to_le_bytes().to_vec(),
+                }),
                 observed_backs: vec![1],
                 chain: false,
             });

@@ -293,7 +293,7 @@ pub fn all_of_ids(ids: impl IntoIterator<Item = Hash>) -> SupportExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::Payload;
+    use ledger_format::EntryPayload;
 
     fn journal_with_ids(count: usize) -> (Journal, Vec<Hash>) {
         let mut journal = Journal::new();
@@ -304,7 +304,12 @@ mod tests {
                     EntryKind::Send,
                     (i % 3) as ActorId,
                     [],
-                    Payload::Number(i as u64),
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new((i % 3) as ActorId, 0),
+                        from: (i % 3) as ActorId,
+                        to: 1,
+                        original_content: (i as u64).to_le_bytes().to_vec(),
+                    }),
                 )
                 .expect("append must succeed");
             recorded.push(hash);
@@ -478,10 +483,30 @@ mod tests {
     fn entry_ids_by_filters_kind_and_actor() {
         let mut journal = Journal::new();
         let send = journal
-            .append(EntryKind::Send, 0, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                0,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(0, 0),
+                    from: 0,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("send");
         journal
-            .append(EntryKind::Recv, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Recv,
+                1,
+                [],
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    observed_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("recv");
         let ids = entry_ids_by(&journal, EntryKind::Send, 0);
         assert_eq!(ids.len(), 1);

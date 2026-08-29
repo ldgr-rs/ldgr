@@ -2,7 +2,7 @@
 
 use crate::oracle::Verdict;
 use crate::solver::{FaultSolver, SolverError};
-use ledger_format::{ActorId, EntryKind, Hash, Payload};
+use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
 use ledger_journal::Journal;
 use ledger_sim::SimFault;
 use std::collections::HashSet;
@@ -75,13 +75,14 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<S
                         ticks: 1,
                     },
                 );
-                if let Payload::Pair { left, .. } = &entry.data.payload {
+                if let EntryPayload::Send(ledger_format::SendFrame { to, .. }) = &entry.data.payload
+                {
                     push(
                         &mut schedule,
                         &mut seen_classes,
                         SimFault::Partition {
                             src: entry.data.actor,
-                            dst: *left as ActorId,
+                            dst: *to as ActorId,
                         },
                     );
                 }
@@ -208,8 +209,7 @@ fn fs_write_parent(parents: &[Hash], journal: &Journal) -> Option<Hash> {
 mod tests {
     use super::*;
     use crate::solver::HittingSetSolver;
-    use ledger_format::Payload;
-
+    use ledger_format::CanonicalValue;
     #[test]
     fn fallback_cut_is_a_proper_subset_of_faultable_events() {
         // Faultable Sends on actor 1 and a witness outcome on actor 2 with no
@@ -225,16 +225,26 @@ mod tests {
                         EntryKind::Send,
                         1,
                         [],
-                        Payload::Pair {
-                            left: 2,
-                            right: value,
-                        },
+                        EntryPayload::Send(ledger_format::SendFrame {
+                            message_id: ledger_format::MessageId::new(1, 0),
+                            from: 1,
+                            to: 2,
+                            original_content: value.to_le_bytes().to_vec(),
+                        }),
                     )
                     .expect("append must succeed"),
             );
         }
         let outcome = journal
-            .append(EntryKind::Outcome, 2, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("append must succeed");
 
         let verdict = Verdict::fail(vec![outcome], "planted");
@@ -262,10 +272,28 @@ mod tests {
     fn solve_with_trait_object_matches_concrete_solver() {
         let mut journal = Journal::new();
         let send = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("append must succeed");
         let outcome = journal
-            .append(EntryKind::Outcome, 1, [send], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [send],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("append must succeed");
         let verdict = Verdict::fail(vec![outcome], "trait check");
 

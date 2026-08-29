@@ -439,13 +439,17 @@ mod tests {
     fn from_campaign_preserves_counts() {
         use crate::oracle::Verdict;
         use crate::search::{CampaignReport, Finding};
+        use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
         let mut journal = Journal::new();
         journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 0,
                 [],
-                ledger_format::Payload::Number(1),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
             )
             .unwrap();
         let run = RunResult {

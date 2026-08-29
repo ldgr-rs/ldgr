@@ -396,17 +396,17 @@ fn kind_name(kind: EntryKind) -> &'static str {
         EntryKind::FsWrite => "FsWrite",
         EntryKind::FsFsync => "FsFsync",
         EntryKind::FsRead => "FsRead",
-        EntryKind::RngDraw { .. } => "RngDraw",
+        EntryKind::RngDraw => "RngDraw",
         EntryKind::Outcome => "Outcome",
         EntryKind::Assert => "Assert",
         EntryKind::Snapshot => "Snapshot",
         EntryKind::Epoch => "Epoch",
-        EntryKind::InputStep { .. } => "InputStep",
+        EntryKind::InputStep => "InputStep",
         EntryKind::CapRequest => "CapRequest",
         EntryKind::CapGrant => "CapGrant",
         EntryKind::CapInvoke => "CapInvoke",
         EntryKind::CapRevoke => "CapRevoke",
-        EntryKind::Fault { .. } => "Fault",
+        EntryKind::Fault => "Fault",
         EntryKind::StepBegin => "StepBegin",
         EntryKind::StepEnd => "StepEnd",
     }
@@ -456,25 +456,80 @@ mod tests {
     use super::*;
     use crate::clock::VectorClock;
     use crate::dag::{Entry, JournalState};
-    use ledger_format::{EntryData, Payload};
+    use ledger_format::{EntryData, EntryPayload};
     use std::sync::Arc;
+
+    /// Builds a valid v2 typed payload for the kind in tests that only need
+    /// a well-formed entry, not domain semantics.
+    fn scalar_payload(kind: EntryKind, value: u64) -> EntryPayload {
+        use ledger_format::*;
+        match kind {
+            EntryKind::Outcome => EntryPayload::Outcome(OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(value),
+            }),
+            EntryKind::Send => EntryPayload::Send(SendFrame {
+                message_id: MessageId::new(1, value),
+                from: 1,
+                to: value as u32,
+                original_content: value.to_le_bytes().to_vec(),
+            }),
+            EntryKind::Recv => EntryPayload::Recv(RecvFrame {
+                message_id: MessageId::new(1, value),
+                from: 1,
+                to: value as u32,
+                observed_content: value.to_le_bytes().to_vec(),
+            }),
+            EntryKind::FsWrite => EntryPayload::FsWrite(FsWritePayload::Allocate {
+                path_ref: PathRef {
+                    path_hash: [0xcc; 32],
+                    canonical_path: format!("/d/{value}").into_bytes(),
+                },
+            }),
+            EntryKind::FsRead => EntryPayload::FsRead(FsReadPayload {
+                path_ref: PathRef {
+                    path_hash: [0xcc; 32],
+                    canonical_path: format!("/d/{value}").into_bytes(),
+                },
+                offset: 0,
+                requested_len: 1,
+                observed: ObservedRead::Missing,
+            }),
+            EntryKind::TimerFire => EntryPayload::TimerFire {
+                timer_id: value,
+                deadline_ticks: value,
+            },
+            EntryKind::Wake => EntryPayload::Wake(WakePayload::TimerReady { timer_id: value }),
+            EntryKind::InputStep => EntryPayload::InputStep(InputStepPayload {
+                generator: 0,
+                replay: 0,
+                value: CanonicalValue::Unsigned(value),
+            }),
+            _other => EntryPayload::Outcome(OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(value),
+            }),
+        }
+    }
 
     #[test]
     fn verify_accepts_valid_journal() {
         let mut journal = Journal::new();
         journal
             .append(
-                EntryKind::InputStep {
-                    generator: 0,
-                    replay: 0,
-                },
+                EntryKind::InputStep,
                 1,
                 [],
-                Payload::Number(1),
+                scalar_payload(EntryKind::InputStep, 1),
             )
             .unwrap();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 2),
+            )
             .unwrap();
         let report = JournalCorrectnessMonitor::verify(&journal).unwrap();
         assert_eq!(report.entries_audited, 2);
@@ -486,22 +541,47 @@ mod tests {
     fn valid_observed_value_parents_pass_fidelity() {
         let mut journal = Journal::new();
         let send = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(EntryKind::Send, 1, [], scalar_payload(EntryKind::Send, 1))
             .unwrap();
         journal
-            .append(EntryKind::Recv, 2, [send], Payload::Number(2))
+            .append(
+                EntryKind::Recv,
+                2,
+                [send],
+                scalar_payload(EntryKind::Recv, 2),
+            )
             .unwrap();
         let fs_write = journal
-            .append(EntryKind::FsWrite, 1, [], Payload::Number(3))
+            .append(
+                EntryKind::FsWrite,
+                1,
+                [],
+                scalar_payload(EntryKind::FsWrite, 3),
+            )
             .unwrap();
         journal
-            .append(EntryKind::FsRead, 2, [fs_write], Payload::Number(4))
+            .append(
+                EntryKind::FsRead,
+                2,
+                [fs_write],
+                scalar_payload(EntryKind::FsRead, 4),
+            )
             .unwrap();
         let timer_fire = journal
-            .append(EntryKind::TimerFire, 1, [], Payload::Number(5))
+            .append(
+                EntryKind::TimerFire,
+                1,
+                [],
+                scalar_payload(EntryKind::TimerFire, 5),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Wake, 2, [timer_fire], Payload::Number(6))
+            .append(
+                EntryKind::Wake,
+                2,
+                [timer_fire],
+                scalar_payload(EntryKind::Wake, 6),
+            )
             .unwrap();
         assert!(JournalCorrectnessMonitor::audit(&journal).is_empty());
     }
@@ -510,10 +590,20 @@ mod tests {
     fn recv_without_send_parent_reports_kind_mismatch() {
         let mut journal = Journal::new();
         let outcome = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 1),
+            )
             .unwrap();
         let recv = journal
-            .append(EntryKind::Recv, 2, [outcome], Payload::Number(2))
+            .append(
+                EntryKind::Recv,
+                2,
+                [outcome],
+                scalar_payload(EntryKind::Recv, 2),
+            )
             .unwrap();
         let issues = JournalCorrectnessMonitor::audit(&journal);
         assert_eq!(issues.len(), 1);
@@ -531,10 +621,20 @@ mod tests {
     fn fsread_without_fswrite_parent_reports_kind_mismatch() {
         let mut journal = Journal::new();
         let outcome = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 1),
+            )
             .unwrap();
         let fs_read = journal
-            .append(EntryKind::FsRead, 1, [outcome], Payload::Number(2))
+            .append(
+                EntryKind::FsRead,
+                1,
+                [outcome],
+                scalar_payload(EntryKind::FsRead, 2),
+            )
             .unwrap();
         let issues = JournalCorrectnessMonitor::audit(&journal);
         assert_eq!(issues.len(), 1);
@@ -552,20 +652,31 @@ mod tests {
     fn rewritten_parent_reports_missing_parent() {
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 1),
+            )
             .unwrap();
         let second = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 2),
+            )
             .unwrap();
         // Rewrite the second entry's parent link to a hash that does not exist.
         let tampered = Entry::new(
             EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
                 actor: 1,
                 parents: vec![Hash::default()],
                 vector_clock: Vec::new(),
                 sequence: 1,
-                payload: Payload::Number(2),
+                payload: scalar_payload(EntryKind::Outcome, 2),
             },
             journal.get(&second).unwrap().vector_clock.clone(),
         )
@@ -594,12 +705,13 @@ mod tests {
     fn broken_vector_clock_reports_mismatch() {
         let entry = Entry::new(
             EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
                 actor: 1,
                 parents: Vec::new(),
                 vector_clock: Vec::new(),
                 sequence: 0,
-                payload: Payload::Number(1),
+                payload: scalar_payload(EntryKind::Outcome, 1),
             },
             VectorClock::new(),
         )
@@ -640,10 +752,20 @@ mod tests {
     fn replay_fidelity_accepts_identical_and_rejects_divergent() {
         let mut original = Journal::new();
         original
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 1),
+            )
             .unwrap();
         original
-            .append(EntryKind::Outcome, 2, [], Payload::Number(2))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [],
+                scalar_payload(EntryKind::Outcome, 2),
+            )
             .unwrap();
 
         let identical = original.fork();
@@ -651,7 +773,7 @@ mod tests {
 
         let mut divergent = original.fork();
         divergent
-            .append(EntryKind::Send, 3, [], Payload::Number(3))
+            .append(EntryKind::Send, 3, [], scalar_payload(EntryKind::Send, 3))
             .unwrap();
         assert!(matches!(
             JournalCorrectnessMonitor::verify_replay_fidelity(&original, &divergent),
@@ -666,13 +788,28 @@ mod tests {
     fn coverage_mismatch_reports_shortfall_and_surplus() {
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 1),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                scalar_payload(EntryKind::Outcome, 2),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Outcome, 2, [], Payload::Number(3))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [],
+                scalar_payload(EntryKind::Outcome, 3),
+            )
             .unwrap();
 
         // Exact counts must pass.
@@ -719,13 +856,23 @@ mod tests {
         for actor in 1..=5u32 {
             for _ in 0..2 {
                 journal
-                    .append(EntryKind::Outcome, actor, [], Payload::Number(actor as u64))
+                    .append(
+                        EntryKind::Outcome,
+                        actor,
+                        [],
+                        scalar_payload(EntryKind::Outcome, actor as u64),
+                    )
                     .unwrap();
             }
         }
         // Actor 6 is journaled but never reported by the boundary.
         journal
-            .append(EntryKind::Outcome, 6, [], Payload::Number(7))
+            .append(
+                EntryKind::Outcome,
+                6,
+                [],
+                scalar_payload(EntryKind::Outcome, 7),
+            )
             .unwrap();
 
         // Every reported count disagrees with the journal, so all six actors
@@ -782,24 +929,26 @@ mod tests {
         // before MissingParent. The sorted output must flip that order.
         let broken = Entry::new(
             EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
                 actor: 1,
                 parents: vec![Hash::default()],
                 vector_clock: Vec::new(),
                 sequence: 0,
-                payload: Payload::Number(1),
+                payload: scalar_payload(EntryKind::Outcome, 1),
             },
             VectorClock::new(),
         )
         .unwrap();
         let recv = Entry::new(
             EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Recv,
                 actor: 2,
                 parents: vec![broken.id],
                 vector_clock: Vec::new(),
                 sequence: 0,
-                payload: Payload::Number(2),
+                payload: scalar_payload(EntryKind::Outcome, 2),
             },
             VectorClock::new().incremented(2),
         )

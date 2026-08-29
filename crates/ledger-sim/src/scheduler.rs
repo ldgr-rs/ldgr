@@ -69,11 +69,11 @@ impl NoveltyModel {
                 reward += 0.5;
             }
             // Fault-witness adjacency: reward entries adjacent to a fault.
-            if matches!(last_kind, EntryKind::Fault { .. }) {
+            if matches!(last_kind, EntryKind::Fault) {
                 reward += 1.0;
             }
         }
-        if matches!(kind, EntryKind::Fault { .. }) {
+        if matches!(kind, EntryKind::Fault) {
             reward += 1.0;
         }
         if let Some(signature) = vc_signature
@@ -631,21 +631,12 @@ mod tests {
 
     #[test]
     fn bandit_rewards_fault_adjacency() {
-        use ledger_format::FaultSpec;
-
         let mut model = NoveltyModel::new();
         // Seed the (Send, Send) transition and (3, 3) actor pair.
         model.record_emission(3, EntryKind::Send, 3, None);
         model.record_emission(3, EntryKind::Send, 3, None);
         // A Fault-kind entry earns the transition reward plus the fault reward.
-        let fault = model.record_emission(
-            3,
-            EntryKind::Fault {
-                fault: FaultSpec::Drop,
-            },
-            3,
-            None,
-        );
+        let fault = model.record_emission(3, EntryKind::Fault, 3, None);
         assert_eq!(fault, 2.0, "a fault entry earns transition + fault novelty");
         // The emission after a fault earns adjacency novelty on top of its own
         // new (Fault, Send) transition.

@@ -289,7 +289,7 @@ mod tests {
     use super::*;
     use crate::dag::Journal;
     use alloc::vec;
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{EntryKind, EntryPayload};
 
     #[test]
     fn snapshot_hash_detects_corruption() {
@@ -308,7 +308,15 @@ mod tests {
     fn load_validates_state_and_entry() {
         let mut journal = Journal::new();
         let entry_id = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
+            )
             .unwrap();
         let mut manager = SnapshotManager::new(1);
         manager.record_snapshot(Snapshot::new(

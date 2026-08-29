@@ -56,6 +56,7 @@ use ledger_explorer::Verdict;
 use ledger_explorer::reference::ReferenceReplayError;
 use ledger_explorer::reference::{CorpusScenario, corpus_scenarios};
 use ledger_explorer::search::Workload;
+use ledger_format::{CanonicalValue, EntryPayload};
 use ledger_sim::{Instruction, RunConfig, RunResult, SeedTree, SimFault, Simulation};
 use rand_core::Rng;
 
@@ -596,7 +597,10 @@ fn outcome_value(journal: &ledger_journal::Journal) -> Option<u64> {
         .entries()
         .filter(|entry| entry.data.kind == ledger_format::EntryKind::Outcome)
         .find_map(|entry| match &entry.data.payload {
-            ledger_format::Payload::Number(value) => Some(*value),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                value: CanonicalValue::Unsigned(value),
+                ..
+            }) => Some(*value),
             _ => None,
         })
 }

@@ -253,12 +253,9 @@ impl InterchangeEnvelope {
 fn mapping_to_json(m: &EntryMapping) -> JsonMapping {
     let kind = m.kind.0;
     let tag = kind.tag();
-    let (stream, generator, replay, fault) = match kind {
-        EntryKind::RngDraw { stream } => (Some(stream), None, None, None),
-        EntryKind::InputStep { generator, replay } => (None, Some(generator), Some(replay), None),
-        EntryKind::Fault { fault } => (None, None, None, Some(FaultSpecSerde::from(fault))),
-        _ => (None, None, None, None),
-    };
+    // v2 kinds are plain tags; structured data lives in typed payloads, so
+    // the envelope carries no kind-embedded fields.
+    let (stream, generator, replay, fault) = (None, None, None, None);
     JsonMapping {
         kind_tag: tag,
         external_type: m.external_type.clone(),
@@ -284,38 +281,17 @@ fn json_to_kind(jm: &JsonMapping) -> Result<EntryKind, AdapterError> {
         8 => Ok(EntryKind::FsWrite),
         9 => Ok(EntryKind::FsFsync),
         10 => Ok(EntryKind::FsRead),
-        11 => {
-            let stream = jm
-                .stream
-                .ok_or(AdapterError::InvalidMapping("missing stream for RngDraw"))?;
-            Ok(EntryKind::RngDraw { stream })
-        }
+        11 => Ok(EntryKind::RngDraw),
         12 => Ok(EntryKind::Outcome),
         13 => Ok(EntryKind::Assert),
         14 => Ok(EntryKind::Snapshot),
         15 => Ok(EntryKind::Epoch),
-        16 => {
-            let generator = jm.generator.ok_or(AdapterError::InvalidMapping(
-                "missing generator for InputStep",
-            ))?;
-            let replay = jm
-                .replay
-                .ok_or(AdapterError::InvalidMapping("missing replay for InputStep"))?;
-            Ok(EntryKind::InputStep { generator, replay })
-        }
+        16 => Ok(EntryKind::InputStep),
         17 => Ok(EntryKind::CapRequest),
         18 => Ok(EntryKind::CapGrant),
         19 => Ok(EntryKind::CapInvoke),
         20 => Ok(EntryKind::CapRevoke),
-        21 => {
-            let fault = jm
-                .fault
-                .clone()
-                .ok_or(AdapterError::InvalidMapping("missing fault for Fault"))?;
-            Ok(EntryKind::Fault {
-                fault: FaultSpec::from(fault),
-            })
-        }
+        21 => Ok(EntryKind::Fault),
         22 => Ok(EntryKind::StepBegin),
         23 => Ok(EntryKind::StepEnd),
         _ => Err(AdapterError::InvalidHeader),
@@ -339,43 +315,17 @@ mod tests {
             EntryKind::FsWrite,
             EntryKind::FsFsync,
             EntryKind::FsRead,
-            EntryKind::RngDraw { stream: 5 },
-            EntryKind::RngDraw { stream: 0 },
-            EntryKind::RngDraw { stream: u32::MAX },
+            EntryKind::RngDraw,
             EntryKind::Outcome,
             EntryKind::Assert,
             EntryKind::Snapshot,
             EntryKind::Epoch,
-            EntryKind::InputStep {
-                generator: 7,
-                replay: 42,
-            },
-            EntryKind::InputStep {
-                generator: 0,
-                replay: 0,
-            },
+            EntryKind::InputStep,
             EntryKind::CapRequest,
             EntryKind::CapGrant,
             EntryKind::CapInvoke,
             EntryKind::CapRevoke,
-            EntryKind::Fault {
-                fault: FaultSpec::Drop,
-            },
-            EntryKind::Fault {
-                fault: FaultSpec::Delay { ticks: 99 },
-            },
-            EntryKind::Fault {
-                fault: FaultSpec::Partition { src: 1, dst: 2 },
-            },
-            EntryKind::Fault {
-                fault: FaultSpec::Crash,
-            },
-            EntryKind::Fault {
-                fault: FaultSpec::Corrupt,
-            },
-            EntryKind::Fault {
-                fault: FaultSpec::CrashState(7),
-            },
+            EntryKind::Fault,
             EntryKind::StepBegin,
             EntryKind::StepEnd,
         ]
@@ -412,11 +362,11 @@ mod tests {
         let h1 = env.envelope_hash().unwrap();
         let h2 = env.envelope_hash().unwrap();
         assert_eq!(h1, h2);
-        // Different stream yields different hash.
+        // Different kind yields a different hash.
         let env2 = InterchangeEnvelope::new(
             EnvelopeHeader::new("t".into(), "e".into()),
             vec![EntryMapping {
-                kind: EntryKind::RngDraw { stream: 5 }.into(),
+                kind: EntryKind::Send.into(),
                 external_type: "x".into(),
                 fidelity: Fidelity::BitExact,
             }],
@@ -425,13 +375,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_structured_field_errors() {
-        // Manually craft JSON with missing stream for RngDraw.
+    fn unknown_kind_tag_errors() {
+        // An unknown kind tag fails closed instead of mapping to a kind.
         let je = JsonEnvelope {
             media_type: "t".into(),
             emitter: "e".into(),
             body: vec![JsonMapping {
-                kind_tag: 11,
+                kind_tag: 99,
                 external_type: "x".into(),
                 fidelity: 0,
                 stream: None,
@@ -446,6 +396,6 @@ mod tests {
         bytes.extend_from_slice(&ENVELOPE_VERSION.to_be_bytes());
         bytes.extend_from_slice(&json);
         let err = InterchangeEnvelope::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, AdapterError::InvalidMapping(_)));
+        assert!(matches!(err, AdapterError::InvalidHeader));
     }
 }

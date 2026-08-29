@@ -28,7 +28,7 @@ use ledger_explorer::FaultSolver;
 use ledger_explorer::maxsat::{HazardEncoding, encode_hazard};
 use ledger_explorer::oracle::Verdict;
 use ledger_explorer::solver::{MaxSatSolver, SolverConfig, SolverEngine, event_fault_cost};
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
 use ledger_journal::Journal;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{Rng, SeedableRng};
@@ -72,11 +72,22 @@ fn build_case(rng: &mut ChaCha8Rng) -> EncodingCase {
             }
         }
         let payload = match kind {
-            EntryKind::Send => Payload::Pair {
-                left: (rng.next_u32() % 3 + 1) as u64,
-                right: (rng.next_u32() % 1000) as u64,
-            },
-            _ => Payload::Number((rng.next_u32() % 1000) as u64),
+            EntryKind::Send => EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(actor, 0),
+                from: actor,
+                to: (rng.next_u32() % 3 + 1),
+                original_content: (rng.next_u32() % 1000).to_le_bytes().to_vec(),
+            }),
+            EntryKind::Recv => EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(actor, 0),
+                from: 1,
+                to: actor,
+                observed_content: (rng.next_u32() % 1000).to_le_bytes().to_vec(),
+            }),
+            _ => EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned((rng.next_u32() % 1000) as u64),
+            }),
         };
         let id = journal
             .append(kind, actor, parents, payload)
@@ -95,7 +106,10 @@ fn build_case(rng: &mut ChaCha8Rng) -> EncodingCase {
             EntryKind::Outcome,
             4,
             witness_parents,
-            Payload::Number(rng.next_u32() as u64 % 1000),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned((rng.next_u32() % 1000) as u64),
+            }),
         )
         .expect("witness append must succeed");
     let verdict = Verdict::fail(vec![witness], "cross-engine randomized case");

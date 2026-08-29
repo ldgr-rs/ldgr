@@ -96,13 +96,33 @@ fn motif_label(motif: (EntryKind, EntryKind)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::Payload;
+    use ledger_format::{CanonicalValue, EntryPayload};
 
-    fn chain_journal(entries: &[(EntryKind, Payload)]) -> Journal {
+    fn chain_journal(entries: &[(EntryKind, u64)]) -> Journal {
         let mut journal = Journal::new();
-        for (kind, payload) in entries {
+        for (kind, value) in entries {
+            let payload = match kind {
+                EntryKind::Send => EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: value.to_le_bytes().to_vec(),
+                }),
+                EntryKind::Recv => EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    observed_content: value.to_le_bytes().to_vec(),
+                }),
+                EntryKind::Assert => EntryPayload::Assert(ledger_format::AssertPayload {
+                    predicate: [0x00; 32],
+                    passed: *value != 0,
+                    detail: CanonicalValue::Unsigned(*value),
+                }),
+                _ => unreachable!("fixture kinds"),
+            };
             journal
-                .append(*kind, 1, [], payload.clone())
+                .append(*kind, 1, [], payload)
                 .expect("append must succeed");
         }
         journal
@@ -127,18 +147,12 @@ mod tests {
     #[test]
     fn rank_motifs_puts_failing_motif_first() {
         let failing = run(chain_journal(&[
-            (EntryKind::Send, Payload::Number(1)),
-            (EntryKind::Recv, Payload::Number(1)),
-            (EntryKind::Assert, Payload::Number(0)),
+            (EntryKind::Send, 1),
+            (EntryKind::Recv, 1),
+            (EntryKind::Assert, 0),
         ]));
-        let passing_recv = run(chain_journal(&[
-            (EntryKind::Send, Payload::Number(2)),
-            (EntryKind::Recv, Payload::Number(2)),
-        ]));
-        let passing_send = run(chain_journal(&[
-            (EntryKind::Send, Payload::Number(3)),
-            (EntryKind::Send, Payload::Number(4)),
-        ]));
+        let passing_recv = run(chain_journal(&[(EntryKind::Send, 2), (EntryKind::Recv, 2)]));
+        let passing_send = run(chain_journal(&[(EntryKind::Send, 3), (EntryKind::Send, 4)]));
 
         let labeled = vec![
             (failing.clone(), true),
@@ -169,13 +183,10 @@ mod tests {
     #[test]
     fn min_occurrences_excludes_rare_motifs() {
         let failing = run(chain_journal(&[
-            (EntryKind::Send, Payload::Number(1)),
-            (EntryKind::Assert, Payload::Number(0)),
+            (EntryKind::Send, 1),
+            (EntryKind::Assert, 0),
         ]));
-        let passing = run(chain_journal(&[
-            (EntryKind::Send, Payload::Number(2)),
-            (EntryKind::Recv, Payload::Number(2)),
-        ]));
+        let passing = run(chain_journal(&[(EntryKind::Send, 2), (EntryKind::Recv, 2)]));
         let labeled = vec![(failing, true), (passing.clone(), false), (passing, false)];
         let ranked = rank_motifs_by_lift(&labeled, 2);
         assert!(
@@ -186,7 +197,7 @@ mod tests {
 
     #[test]
     fn all_passing_runs_yield_no_lifts() {
-        let passing = run(chain_journal(&[(EntryKind::Send, Payload::Number(1))]));
+        let passing = run(chain_journal(&[(EntryKind::Send, 1)]));
         let labeled = vec![(passing.clone(), false), (passing, false)];
         assert!(rank_motifs_by_lift(&labeled, 1).is_empty());
     }

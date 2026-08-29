@@ -68,7 +68,7 @@ fn wasm_fs_crash_drops_unsynced() {
         "journal must contain FsRead, got {kinds:?}"
     );
     assert!(
-        kinds.iter().any(|k| matches!(k, EntryKind::Fault { .. })),
+        kinds.iter().any(|k| matches!(k, EntryKind::Fault)),
         "journal must contain Fault(CrashState) after crash, got {kinds:?}"
     );
     // Determinism: second run same seed yields same sentinel.

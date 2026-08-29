@@ -243,23 +243,35 @@ fn check_ci_parity(root: &Path) -> CheckOutcome {
     }
 }
 
-/// Verifies a canonical payload round-trips through the canonical decoder.
+/// Verifies a typed entry payload round-trips through the canonical codec.
 fn check_format_conformance() -> CheckOutcome {
     const NAME: &str = "format conformance";
-    use ledger_format::{CborValue, Payload};
-    let payload = Payload::Pair {
-        left: 42,
-        right: 100,
+    use ledger_format::{EntryData, EntryKind, EntryPayload, FsWritePayload, PathRef};
+    let path = b"/tmp/f".to_vec();
+    let entry = EntryData {
+        format_version: ledger_format::limits::FORMAT_VERSION,
+        kind: EntryKind::FsWrite,
+        actor: 1,
+        parents: vec![],
+        vector_clock: vec![0],
+        sequence: 0,
+        payload: EntryPayload::FsWrite(FsWritePayload::Write {
+            path_ref: PathRef::new([0u8; 32], path),
+            offset: 42,
+            content: vec![100],
+        }),
     };
-    let mut encoded = Vec::new();
-    if let Err(error) = payload.try_encode(&mut encoded) {
-        return CheckOutcome {
-            name: NAME,
-            ok: false,
-            detail: format!("cannot encode sample payload: {error}"),
-        };
-    }
-    let decoded = match CborValue::from_canonical_bytes(&encoded) {
+    let encoded = match entry.try_canonical_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return CheckOutcome {
+                name: NAME,
+                ok: false,
+                detail: format!("cannot encode sample payload: {error}"),
+            };
+        }
+    };
+    let decoded = match EntryData::from_canonical_bytes(&encoded) {
         Ok(value) => value,
         Err(error) => {
             return CheckOutcome {
@@ -269,17 +281,12 @@ fn check_format_conformance() -> CheckOutcome {
             };
         }
     };
-    let expected = CborValue::Array(vec![
-        CborValue::Unsigned(3),
-        CborValue::Unsigned(42),
-        CborValue::Unsigned(100),
-    ]);
-    let roundtrip_ok = decoded == expected && decoded.to_canonical_bytes() == encoded;
+    let roundtrip_ok = decoded == entry && decoded.try_canonical_bytes() == Ok(encoded);
     CheckOutcome {
         name: NAME,
         ok: roundtrip_ok,
         detail: if roundtrip_ok {
-            "Payload::Pair round-trips through canonical CBOR".into()
+            "typed entry payload round-trips through canonical CBOR".into()
         } else {
             "canonical round-trip produced different bytes".into()
         },

@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::attest_uri::{build_type_campaign_v1, predicate_type_campaign_v1};
 use crate::search::CampaignReport;
 use crate::solver::{event_fault_cost, is_faultable};
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash};
 use ledger_journal::Journal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,7 +12,10 @@ use thiserror::Error;
 fn is_lineage_only_journal(journal: &Journal) -> bool {
     journal.entries().any(|entry| {
         entry.data.kind == EntryKind::Epoch
-            && matches!(&entry.data.payload, Payload::Text(text) if text == "lineage-only")
+            && matches!(
+                &entry.data.payload,
+                EntryPayload::Epoch(ledger_format::EpochPayload { epoch: 0 })
+            )
     })
 }
 
@@ -1185,7 +1188,7 @@ mod tests {
     use super::*;
     use crate::oracle::Verdict;
     use crate::search::{CampaignReport, Finding};
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{CanonicalValue, EntryKind};
     use ledger_journal::Journal;
     use ledger_sim::RunResult;
     use std::error::Error as _;
@@ -1196,7 +1199,10 @@ mod tests {
             ledger_format::EntryKind::Outcome,
             1,
             [],
-            ledger_format::Payload::Number(1),
+            ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: ledger_format::CanonicalValue::Unsigned(1),
+            }),
         )
         .unwrap();
         let run = RunResult {
@@ -1743,7 +1749,17 @@ mod tests {
     fn journal_binding_rejects_zero_root_and_wrong_journal() {
         let mut journal = Journal::new();
         let member = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 7 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 7u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("journal append must succeed");
         let mut certificate = journal_certificate(&journal, vec![member]);
         certificate.subject.digest = [0u8; 32];
@@ -1756,7 +1772,17 @@ mod tests {
         let certificate = journal_certificate(&journal, vec![member]);
         let mut other = Journal::new();
         other
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 8 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 8u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("journal append must succeed");
         let error = certificate
             .verify_with_journal(&other)
@@ -1768,7 +1794,17 @@ mod tests {
     fn journal_binding_rejects_cut_larger_than_journal_before_duplicate_check() {
         let mut journal = Journal::new();
         let member = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 7 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 7u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("journal append must succeed");
         let certificate = journal_certificate(&journal, vec![member, member]);
         let error = certificate
@@ -1784,10 +1820,28 @@ mod tests {
     fn journal_binding_rejects_unknown_cut_member() {
         let mut journal = Journal::new();
         let member = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 7 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 7u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("journal append must succeed");
         journal
-            .append(EntryKind::Outcome, 2, [member], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [member],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("journal append must succeed");
         let certificate = journal_certificate(&journal, vec![[0xEE; 32]]);
         let error = certificate
@@ -1803,13 +1857,41 @@ mod tests {
     fn journal_binding_checks_members_without_parent_path_inference() {
         let mut journal = Journal::new();
         let recorded = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 7 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 7u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("journal append must succeed");
         let unrelated = journal
-            .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 8 })
+            .append(
+                EntryKind::Send,
+                2,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 2,
+                    to: 3,
+                    original_content: 8u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("journal append must succeed");
         journal
-            .append(EntryKind::Outcome, 3, [recorded], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                3,
+                [recorded],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("journal append must succeed");
 
         let certificate = journal_certificate(&journal, vec![unrelated]);
@@ -1830,10 +1912,12 @@ mod tests {
                     EntryKind::Send,
                     1,
                     parent.map_or(Vec::new(), |p: Hash| vec![p]),
-                    Payload::Pair {
-                        left: (i as u64).wrapping_add(1),
-                        right: (i as u64).wrapping_add(2),
-                    },
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: (i as u32).wrapping_add(1),
+                        original_content: (i as u64).wrapping_add(2).to_le_bytes().to_vec(),
+                    }),
                 )
                 .expect("append must succeed");
             if i == 0 {

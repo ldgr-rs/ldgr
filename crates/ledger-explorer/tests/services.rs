@@ -8,7 +8,7 @@ use ledger_explorer::services::{
 };
 use ledger_explorer::solver::SolverConfig;
 use ledger_explorer::{CampaignReport, CertError, Finding, Oracle, PropertyOracle, Workload};
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SimFault, Simulation};
 
@@ -17,7 +17,10 @@ fn outcome_value(journal: &Journal) -> Option<u64> {
         .entries()
         .filter(|entry| entry.data.kind == EntryKind::Outcome)
         .find_map(|entry| match &entry.data.payload {
-            Payload::Number(value) => Some(*value),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                value: CanonicalValue::Unsigned(value),
+                ..
+            }) => Some(*value),
             _ => None,
         })
 }
@@ -230,7 +233,7 @@ fn emit_parse_validate_round_trip() {
             EntryKind::Epoch,
             0,
             [],
-            Payload::Text("lineage-only".into()),
+            EntryPayload::Epoch(ledger_format::EpochPayload { epoch: 0 }),
         )
         .expect("append lineage marker");
     let findings: Vec<Finding> = report

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash};
 use ledger_journal::PersistentJournal;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -26,7 +26,15 @@ fn build(journal: &mut PersistentJournal, count: u64) -> Vec<Hash> {
     let mut ids = Vec::with_capacity(count as usize);
     for i in 0..count {
         let id = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(i))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(i),
+                }),
+            )
             .unwrap();
         ids.push(id);
     }

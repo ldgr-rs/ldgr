@@ -7,7 +7,7 @@ use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::{FaultReplayError, Workload, replay_with_faults, search};
 use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::{MiniKvWorkload, TwoPhaseCommitWorkload};
-use ledger_format::{EntryKind, FaultSpec, Payload};
+use ledger_format::{EntryKind, EntryPayload};
 use ledger_sim::{Policy, RunConfig, SimFault, Simulation};
 
 fn find_stale_read() -> ledger_explorer::search::Finding {
@@ -279,7 +279,10 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
         .find(|entry| {
             entry.data.actor == 0
                 && matches!(entry.data.kind, EntryKind::Send)
-                && matches!(&entry.data.payload, Payload::Pair { left: 1, .. })
+                && matches!(
+                    &entry.data.payload,
+                    EntryPayload::Send(ledger_format::SendFrame { to: 1, .. })
+                )
         })
         .map(|entry| entry.id)
         .expect("the coordinator sends Prepare to participant 1");
@@ -327,7 +330,7 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     // which is reachable because the cut link only blocks participant A.
     let send_entry = probe.journal.get(&send).expect("send entry must exist");
     let send_dst = match &send_entry.data.payload {
-        Payload::Pair { left, .. } => *left as u32,
+        EntryPayload::Send(ledger_format::SendFrame { to, .. }) => *to,
         _ => u32::MAX,
     };
     let replay_schedule: Vec<SimFault> = schedule
@@ -348,10 +351,12 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     );
     assert!(
         faulted.journal.entries().any(|entry| matches!(
-            &entry.data.kind,
-            EntryKind::Fault {
-                fault: FaultSpec::Partition { src: 0, dst }
-            } if *dst == send_dst
+            &entry.data.payload,
+            EntryPayload::Fault(ledger_format::FaultPayload::Partition {
+                src: 0,
+                dst,
+                ..
+            }) if *dst == send_dst
         )),
         "the partition must journal a Fault entry on the cut link"
     );
@@ -359,7 +364,7 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
         faulted
             .journal
             .entries()
-            .any(|entry| matches!(&entry.data.kind, EntryKind::Fault { .. })),
+            .any(|entry| matches!(&entry.data.kind, EntryKind::Fault)),
         "the write-side classes must journal Fault entries"
     );
     assert_ne!(

@@ -269,13 +269,21 @@ mod liveness_tests {
 
     #[test]
     fn monitor_halt_becomes_liveness_style_finding() {
-        use ledger_format::{EntryKind, Payload};
+        use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
         use ledger_journal::Journal;
         // Effective verdict must treat MonitorHalt as a liveness-style
         // violation with a journal-tail witness.
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
+            )
             .unwrap();
         let run = ledger_sim::RunResult {
             outcome: ledger_sim::RunOutcome::MonitorHalt("test halt".into()),
@@ -308,7 +316,7 @@ mod liveness_tests {
     #[test]
     fn monitored_campaign_halts_violating_runs_mid_step() {
         use crate::monitor::SafetyMonitor;
-        use ledger_format::{EntryKind, Payload};
+        use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
         use ledger_journal::Entry;
         struct ViolatingWorkload;
         impl Workload for ViolatingWorkload {
@@ -333,7 +341,13 @@ mod liveness_tests {
         let monitor = SafetyMonitor::new(
             |entry: &Entry| {
                 if entry.data.kind == EntryKind::Outcome {
-                    !matches!(&entry.data.payload, Payload::Number(99))
+                    !matches!(
+                        &entry.data.payload,
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            schema: _,
+                            value: CanonicalValue::Unsigned(99)
+                        })
+                    )
                 } else {
                     true
                 }

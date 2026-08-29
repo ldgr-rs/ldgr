@@ -161,14 +161,14 @@ fn build_manifest(finding: &Finding) -> RunManifest {
         actor_heads.insert(entry.data.actor, entry.id);
     }
     RunManifest {
-        format_version: 1,
+        format_version: ledger_format::FORMAT_VERSION,
+        crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
         root_seed: finding.seed,
         policy_tag: "swarm:random".into(),
         journal_root: finding.run.journal.root_hash(),
         entry_count: finding.run.journal.len() as u64,
         actor_heads,
         execution_identity: None,
-        extensions: BTreeMap::new(),
     }
 }
 

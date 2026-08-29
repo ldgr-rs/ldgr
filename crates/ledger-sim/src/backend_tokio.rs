@@ -5,7 +5,7 @@ use crate::effects::{Effects, Fs, Net};
 use crate::net::{Message, SimNet};
 use crate::simfs::SimFs;
 use crate::time::Clock;
-use ledger_format::{EntryKind, FaultSpec, Hash, Payload, StreamId};
+use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, MessageId, StreamId};
 use ledger_journal::{Journal, JournalError};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -252,7 +252,7 @@ impl TokioBackend {
         &self,
         kind: EntryKind,
         parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Option<Hash> {
         match self.journal.borrow_mut().append(kind, 0, parents, payload) {
             Ok(id) => Some(id),
@@ -347,10 +347,13 @@ impl Net for TokioBackend {
         let Some(id) = self.append(
             EntryKind::Send,
             [],
-            Payload::Pair {
-                left: message.to as u64,
-                right: message.payload,
-            },
+            EntryPayload::Send(ledger_format::SendFrame {
+                // CONSUMER DEBT (lane 2): real message identity.
+                message_id: MessageId::new(message.from as ActorId, message.payload),
+                from: message.from as ActorId,
+                to: message.to as ActorId,
+                original_content: message.payload.to_le_bytes().to_vec(),
+            }),
         ) else {
             return false;
         };
@@ -365,7 +368,13 @@ impl Net for TokioBackend {
         self.append(
             EntryKind::Recv,
             [message.send_id],
-            Payload::Number(message.payload),
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                // CONSUMER DEBT (lane 2): real message identity.
+                message_id: MessageId::new(message.from as ActorId, message.payload),
+                from: message.from as ActorId,
+                to: task as ActorId,
+                observed_content: message.payload.to_le_bytes().to_vec(),
+            }),
         );
         Some(message)
     }
@@ -396,11 +405,12 @@ impl Fs for TokioBackend {
 
     fn crash(&self) {
         self.append(
-            EntryKind::Fault {
-                fault: FaultSpec::CrashState(0),
-            },
+            EntryKind::Fault,
             [],
-            Payload::Empty,
+            EntryPayload::Fault(FaultPayload::CrashActor {
+                actor: 0,
+                crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+            }),
         );
         self.fs.borrow_mut().crash();
     }

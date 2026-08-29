@@ -339,7 +339,7 @@ impl OnlineMonitor for LivenessMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
     use ledger_journal::Journal;
     use ledger_sim::{Instruction, Policy, RunConfig, RunResult};
 
@@ -364,7 +364,15 @@ mod tests {
         let mut ids = Vec::new();
         for payload in payloads {
             let id = journal
-                .append(EntryKind::Outcome, 1, [], Payload::Number(*payload))
+                .append(
+                    EntryKind::Outcome,
+                    1,
+                    [],
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: CanonicalValue::Unsigned(*payload),
+                    }),
+                )
                 .unwrap();
             ids.push(id);
         }
@@ -377,7 +385,13 @@ mod tests {
         let monitor = SafetyMonitor::new(
             |entry: &Entry| {
                 if entry.data.kind == EntryKind::Outcome {
-                    !matches!(&entry.data.payload, Payload::Number(99))
+                    !matches!(
+                        &entry.data.payload,
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            schema: _,
+                            value: CanonicalValue::Unsigned(99)
+                        })
+                    )
                 } else {
                     true
                 }
@@ -400,7 +414,13 @@ mod tests {
         let monitor = SafetyMonitor::new(
             |entry: &Entry| {
                 if entry.data.kind == EntryKind::Outcome {
-                    !matches!(&entry.data.payload, Payload::Number(99))
+                    !matches!(
+                        &entry.data.payload,
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            schema: _,
+                            value: CanonicalValue::Unsigned(99)
+                        })
+                    )
                 } else {
                     true
                 }
@@ -421,13 +441,43 @@ mod tests {
         let mut journal = Journal::new();
         // Three non-Outcome entries.
         let id1 = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let id2 = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let id3 = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(3))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 3u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
 
         let e1 = journal.get(&id1).unwrap().clone();
@@ -452,7 +502,15 @@ mod tests {
         // Reset and verify that Occurrence resets gap.
         monitor.reset();
         let outcome_id = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let outcome_entry = journal.get(&outcome_id).unwrap().clone();
         assert_eq!(monitor.on_entry(&outcome_entry), MonitorAction::Continue);
@@ -465,10 +523,30 @@ mod tests {
         let monitor = LivenessMonitor::new(EntryKind::Outcome, 2);
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let run = empty_run_with_journal(journal);
         let oracle = MonitorOracle::new().with_monitor(Box::new(monitor));
@@ -502,10 +580,30 @@ mod tests {
         let monitor = LivenessMonitor::new(EntryKind::Outcome, 2);
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let oracle = MonitorOracle::new().with_monitor(Box::new(monitor));
         let _ = oracle.check(&empty_run_with_journal(journal));
@@ -514,7 +612,15 @@ mod tests {
         // A second run with no gap pressure replaces the stale warnings.
         let mut clean = Journal::new();
         clean
-            .append(EntryKind::Outcome, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let _ = oracle.check(&empty_run_with_journal(clean));
         assert!(
@@ -528,13 +634,43 @@ mod tests {
         let monitor = LivenessMonitor::new(EntryKind::Outcome, 2);
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(3))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 3u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let run = empty_run_with_journal(journal);
         let oracle = MonitorOracle::new().with_monitor(Box::new(monitor));
@@ -549,13 +685,41 @@ mod tests {
         let monitor = LivenessMonitor::new(EntryKind::Outcome, 1);
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         // Gap is 1 at bound -> Warn, not Halt, because Outcome reset gap.
         let run = empty_run_with_journal(journal);
@@ -567,22 +731,54 @@ mod tests {
     #[test]
     fn oracle_aggregates_multiple_halts() {
         let safety_a = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(10)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(10)
+                    })
+                )
+            },
             "payload 10 forbidden",
         )
         .with_name("monitor-a");
         let safety_b = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(20)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(20)
+                    })
+                )
+            },
             "payload 20 forbidden",
         )
         .with_name("monitor-b");
 
         let mut journal = Journal::new();
         let id_a = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(10))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(10),
+                }),
+            )
             .unwrap();
         let id_b = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(20))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(20),
+                }),
+            )
             .unwrap();
         let run = empty_run_with_journal(journal);
         let oracle = MonitorOracle::new()
@@ -606,7 +802,15 @@ mod tests {
         let safety_b = SafetyMonitor::new(|_: &Entry| false, "always halt b").with_name("b");
         let mut journal = Journal::new();
         let id = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
+            )
             .unwrap();
         let run = empty_run_with_journal(journal);
         let oracle = MonitorOracle::new()
@@ -629,13 +833,41 @@ mod tests {
         );
         let mut journal = Journal::new();
         let id1 = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let id2 = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let id3 = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(2))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let run = empty_run_with_journal(journal);
         let oracle = MonitorOracle::new().with_monitor(Box::new(monitor));
@@ -717,7 +949,13 @@ mod tests {
         let oracle = MonitorOracle::new().with_monitor(Box::new(SafetyMonitor::new(
             |entry: &Entry| {
                 if entry.data.kind == EntryKind::Outcome {
-                    !matches!(&entry.data.payload, Payload::Number(99))
+                    !matches!(
+                        &entry.data.payload,
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            schema: _,
+                            value: CanonicalValue::Unsigned(99)
+                        })
+                    )
                 } else {
                     true
                 }
@@ -749,7 +987,11 @@ mod tests {
         }
         impl OnlineMonitor for OrderMonitor {
             fn on_entry(&mut self, entry: &Entry) -> MonitorAction {
-                if let Payload::Number(v) = entry.data.payload {
+                if let EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: _,
+                    value: CanonicalValue::Unsigned(v),
+                }) = entry.data.payload
+                {
                     self.seen.borrow_mut().push(v);
                 }
                 MonitorAction::Continue
@@ -767,7 +1009,15 @@ mod tests {
         let mut journal = Journal::new();
         for v in [10, 20, 30] {
             journal
-                .append(EntryKind::Outcome, 1, [], Payload::Number(v))
+                .append(
+                    EntryKind::Outcome,
+                    1,
+                    [],
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: CanonicalValue::Unsigned(v),
+                    }),
+                )
                 .unwrap();
         }
         let run = empty_run_with_journal(journal);
@@ -776,18 +1026,50 @@ mod tests {
         // The monitor's seen Vec was moved into oracle; we cannot inspect directly.
         // Instead test via a monitor that halts and check witnesses order matches append order.
         let halt_on_20 = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(20)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(20)
+                    })
+                )
+            },
             "halt on 20",
         );
         let mut journal2 = Journal::new();
         let _id10 = journal2
-            .append(EntryKind::Outcome, 1, [], Payload::Number(10))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(10),
+                }),
+            )
             .unwrap();
         let id20 = journal2
-            .append(EntryKind::Outcome, 1, [], Payload::Number(20))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(20),
+                }),
+            )
             .unwrap();
         let _id30 = journal2
-            .append(EntryKind::Outcome, 1, [], Payload::Number(30))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(30),
+                }),
+            )
             .unwrap();
         let run2 = empty_run_with_journal(journal2);
         let oracle2 = MonitorOracle::new().with_monitor(Box::new(halt_on_20));
@@ -802,17 +1084,45 @@ mod tests {
         let oracle = MonitorOracle::new().with_monitor(Box::new(monitor));
 
         let mut j1 = Journal::new();
-        j1.append(EntryKind::Send, 1, [], Payload::Number(1))
-            .unwrap();
-        j1.append(EntryKind::Send, 1, [], Payload::Number(2))
-            .unwrap(); // gap 2 >1 => halt
+        j1.append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 1,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
+        .unwrap();
+        j1.append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 1,
+                original_content: 2u64.to_le_bytes().to_vec(),
+            }),
+        )
+        .unwrap(); // gap 2 >1 => halt
         let run1 = empty_run_with_journal(j1);
         let v1 = oracle.check(&run1);
         assert!(v1.violated, "first run should halt");
 
         let mut j2 = Journal::new();
-        j2.append(EntryKind::Outcome, 1, [], Payload::Number(0))
-            .unwrap(); // resets gap
+        j2.append(
+            EntryKind::Outcome,
+            1,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
+        .unwrap(); // resets gap
         let run2 = empty_run_with_journal(j2);
         let v2 = oracle.check(&run2);
         assert!(
@@ -836,7 +1146,15 @@ mod tests {
         // Two identical journals must produce identical verdicts.
         let mk_oracle = || {
             MonitorOracle::new().with_monitor(Box::new(SafetyMonitor::new(
-                |e: &Entry| !matches!(&e.data.payload, Payload::Number(42)),
+                |e: &Entry| {
+                    !matches!(
+                        &e.data.payload,
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            value: CanonicalValue::Unsigned(42),
+                            ..
+                        })
+                    )
+                },
                 "no 42",
             )))
         };
@@ -854,19 +1172,43 @@ mod tests {
     fn monitors_to_step_monitor_feeds_delta_in_order_first_halt_wins() {
         // Two monitors: first halts on payload 10, second on payload 20.
         let m1 = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(10)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(10)
+                    })
+                )
+            },
             "payload 10 forbidden",
         )
         .with_name("m1");
         let m2 = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(20)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(20)
+                    })
+                )
+            },
             "payload 20 forbidden",
         )
         .with_name("m2");
         let mut step_monitor = monitors_to_step_monitor(vec![Box::new(m1), Box::new(m2)]);
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
+            )
             .unwrap();
         // First delta [0,1): no halt.
         assert_eq!(
@@ -875,7 +1217,15 @@ mod tests {
         );
         // Append an entry that halts m1.
         let _id10 = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(10))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(10),
+                }),
+            )
             .unwrap();
         // Delta from 1 must halt with m1's reason, not m2's.
         let action = step_monitor(&journal, 1);
@@ -886,27 +1236,67 @@ mod tests {
         // Even if later entries would halt m2, first halt wins and later
         // entries are not inspected beyond the halting entry.
         let _id20 = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(20))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(20),
+                }),
+            )
             .unwrap();
         // Reset with fresh monitors to verify order across entries: when delta
         // contains 10 then 20, the monitor that sees 10 first halts.
         let m1b = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(10)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(10)
+                    })
+                )
+            },
             "payload 10 forbidden",
         )
         .with_name("m1");
         let m2b = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(20)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(20)
+                    })
+                )
+            },
             "payload 20 forbidden",
         )
         .with_name("m2");
         let mut step_monitor2 = monitors_to_step_monitor(vec![Box::new(m1b), Box::new(m2b)]);
         let mut journal2 = Journal::new();
         journal2
-            .append(EntryKind::Outcome, 1, [], Payload::Number(10))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(10),
+                }),
+            )
             .unwrap();
         journal2
-            .append(EntryKind::Outcome, 1, [], Payload::Number(20))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(20),
+                }),
+            )
             .unwrap();
         let action2 = step_monitor2(&journal2, 0);
         assert!(
@@ -921,21 +1311,45 @@ mod tests {
     #[test]
     fn step_monitor_sharing_via_oracle_is_deterministic() {
         let monitor = SafetyMonitor::new(
-            |entry: &Entry| !matches!(&entry.data.payload, Payload::Number(99)),
+            |entry: &Entry| {
+                !matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(99)
+                    })
+                )
+            },
             "no 99",
         );
         let oracle = MonitorOracle::new().with_monitor(Box::new(monitor));
         let mut step_monitor = oracle.to_step_monitor();
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
+            )
             .unwrap();
         assert_eq!(
             step_monitor(&journal, 0),
             ledger_sim::OnlineAction::Continue
         );
         let _id = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(99))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(99),
+                }),
+            )
             .unwrap();
         let action = step_monitor(&journal, 1);
         assert!(matches!(action, ledger_sim::OnlineAction::Halt { .. }));

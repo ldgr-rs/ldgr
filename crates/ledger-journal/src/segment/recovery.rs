@@ -24,9 +24,9 @@ use crate::retention::RetentionClass;
 use ledger_format::Hash;
 
 use super::{
-    ArchivedSegment, HEADER_LEN, INDEX_ENTRY_LEN, MANIFEST_FILE, MIN_FRAME_PAYLOAD, SEGMENT_MAGIC,
-    SealedSegment, SegmentStore, TRAILER_LEN, WAL_FILE, decode_frame_payload, next_frame,
-    read_u32_be_at, read_u64_be_at, read_u64_le_at, segment_file_name, segment_io,
+    ArchivedSegment, INDEX_ENTRY_LEN, MANIFEST_FILE, MIN_FRAME_PAYLOAD, SealedSegment,
+    SegmentStore, TRAILER_LEN, WAL_FILE, decode_frame_payload, next_frame, read_u32_be_at,
+    read_u64_be_at, read_u64_le_at, segment_file_name, segment_io,
 };
 
 impl SegmentStore {
@@ -174,6 +174,17 @@ impl SegmentStore {
                 .map_err(segment_io)?;
         }
 
+        // Validate the outer v2 prefix before walking frames; frames start
+        // after the 16-byte prefix.
+        let prefix = ledger_format::frame::parse_prefix(&bytes, ledger_format::frame::MAGIC_WAL)
+            .map_err(|err| JournalError::SegmentCorrupt(format!("WAL prefix invalid: {err:?}")))?;
+        if prefix.header_len != 0 {
+            return Err(JournalError::SegmentCorrupt(
+                "WAL header_len must be 0".to_string(),
+            ));
+        }
+        let wal_prefix = ledger_format::frame::FRAME_PREFIX_LEN;
+
         // Sealed ids are content hashes, so membership is definitive.
         // Collect them before replaying the WAL so a crash window that
         // left both a sealed segment and its WAL prefix does not double
@@ -185,7 +196,7 @@ impl SegmentStore {
             .collect();
 
         let mut recovered = Vec::new();
-        let mut offset = 0usize;
+        let mut offset = wal_prefix;
         while offset < truncate_to as usize {
             let (next, payload) = next_frame(&bytes, offset)?
                 .ok_or_else(|| JournalError::SegmentCorrupt("WAL frame walk failed".to_string()))?;
@@ -219,8 +230,14 @@ impl SegmentStore {
 /// prefix near `u64::MAX`) ends the run like any truncated tail; the walk
 /// never panics on hostile input.
 pub(crate) fn last_complete_frame_end(bytes: &[u8]) -> Result<u64, JournalError> {
-    let mut offset = 0usize;
-    let mut last_complete = 0usize;
+    // Frames start after the 16-byte outer prefix. A WAL with no complete
+    // frame truncates to the prefix itself.
+    let prefix = ledger_format::frame::FRAME_PREFIX_LEN;
+    if bytes.len() < prefix {
+        return Ok(0);
+    }
+    let mut offset = prefix;
+    let mut last_complete = prefix as u64;
     while offset + 8 <= bytes.len() {
         let len = read_u64_le_at(bytes, offset);
         if len < MIN_FRAME_PAYLOAD as u64 {
@@ -238,10 +255,10 @@ pub(crate) fn last_complete_frame_end(bytes: &[u8]) -> Result<u64, JournalError>
         }
         // Safe: end <= bytes.len(), so the usize conversion is lossless.
         let end = end as usize;
-        last_complete = end;
+        last_complete = end as u64;
         offset = end;
     }
-    Ok(last_complete as u64)
+    Ok(last_complete)
 }
 
 /// Read segment metadata and sparse index from a loose file.
@@ -267,14 +284,63 @@ pub(crate) fn parse_segment_bytes(
     id: u64,
 ) -> Result<Option<SealedSegment>, JournalError> {
     let file_len = bytes.len() as u64;
-    if file_len < (HEADER_LEN + TRAILER_LEN) as u64 {
+    if file_len < (ledger_format::frame::FRAME_PREFIX_LEN + TRAILER_LEN) as u64 {
         return Ok(None);
     }
 
     let trailer = &bytes[file_len as usize - TRAILER_LEN..];
     let index_len = read_u32_be_at(trailer, 0) as usize;
-    let sample_interval = read_u32_be_at(trailer, 4);
+    let _sample_interval = read_u32_be_at(trailer, 4);
     let compressed_len = read_u64_be_at(trailer, 8);
+
+    // Validate the outer frame prefix first: any version other than 2 fails
+    // closed before any header field is trusted.
+    let prefix =
+        match ledger_format::frame::parse_prefix(bytes, ledger_format::frame::MAGIC_SEGMENT) {
+            Ok(prefix) => prefix,
+            Err(ledger_format::FrameError::WrongMagic)
+            | Err(ledger_format::FrameError::TruncatedFrame) => {
+                return Ok(None);
+            }
+            Err(ledger_format::FrameError::UnsupportedVersion(v)) => {
+                return Err(JournalError::SegmentCorrupt(format!(
+                    "unsupported segment version {v}, expected 2"
+                )));
+            }
+            Err(ledger_format::FrameError::HeaderTooLarge(_))
+            | Err(ledger_format::FrameError::ReservedFlags(_)) => {
+                return Ok(None);
+            }
+        };
+    let header_len = prefix.header_len as usize;
+    let header_end = ledger_format::frame::FRAME_PREFIX_LEN + header_len;
+    if header_end as u64 + TRAILER_LEN as u64 > file_len {
+        return Ok(None);
+    }
+    let header_bytes = &bytes[ledger_format::frame::FRAME_PREFIX_LEN..header_end];
+    let header = match ledger_format::CborValue::from_canonical_bytes(header_bytes) {
+        Ok(ledger_format::CborValue::Array(items)) if items.len() == 4 => items,
+        _ => return Ok(None),
+    };
+    let entry_count = match &header[0] {
+        ledger_format::CborValue::Unsigned(v) => *v,
+        _ => return Ok(None),
+    };
+    let uncompressed_len = match &header[1] {
+        ledger_format::CborValue::Unsigned(v) => *v,
+        _ => return Ok(None),
+    };
+    let mut root_hash = Hash::default();
+    match &header[2] {
+        ledger_format::CborValue::Bytes(b) if b.len() == 32 => {
+            root_hash.copy_from_slice(b);
+        }
+        _ => return Ok(None),
+    }
+    let header_sample_interval = match &header[3] {
+        ledger_format::CborValue::Unsigned(v) if *v <= u32::MAX as u64 => *v as u32,
+        _ => return Ok(None),
+    };
 
     // Belt-and-braces length arithmetic: `index_len * INDEX_ENTRY_LEN` could
     // overflow usize on a 32-bit build for a hostile trailer, so the product
@@ -285,29 +351,17 @@ pub(crate) fn parse_segment_bytes(
         Some(product) => product as u64,
         None => return Ok(None),
     };
-    let expected_len = (HEADER_LEN as u64)
+    let data_offset = header_end as u64;
+    let expected_len = data_offset
         .checked_add(compressed_len)
         .and_then(|v| v.checked_add(index_bytes))
         .and_then(|v| v.checked_add(TRAILER_LEN as u64));
     if expected_len != Some(file_len) {
         return Ok(None);
     }
-    if &bytes[0..4] != SEGMENT_MAGIC {
-        return Ok(None);
-    }
-    let version = read_u32_be_at(bytes, 4);
-    if version != 1 {
-        return Err(JournalError::SegmentCorrupt(format!(
-            "unsupported segment version {version}, expected 1"
-        )));
-    }
-    let entry_count = read_u64_be_at(bytes, 8);
-    let uncompressed_len = read_u64_be_at(bytes, 16);
-    let mut root_hash = Hash::default();
-    root_hash.copy_from_slice(&bytes[24..56]);
 
     let mut samples = Vec::with_capacity(index_len);
-    let index_start = HEADER_LEN + compressed_len as usize;
+    let index_start = data_offset as usize + compressed_len as usize;
     for i in 0..index_len {
         let base = index_start + i * INDEX_ENTRY_LEN;
         let entry = &bytes[base..base + INDEX_ENTRY_LEN];
@@ -322,8 +376,9 @@ pub(crate) fn parse_segment_bytes(
         uncompressed_len,
         compressed_len,
         root_hash,
-        sample_interval,
+        sample_interval: header_sample_interval,
         contains_fault_relevant: false,
+        data_offset,
         samples,
     }))
 }

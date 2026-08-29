@@ -1,6 +1,6 @@
 //! Composable history, assertion, invariant, and differential oracles over journal runs.
 
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash};
 use ledger_journal::Journal;
 use ledger_sim::RunResult;
 use std::cell::{Cell, RefCell};
@@ -78,13 +78,19 @@ impl Oracle for ExactlyOnceValueOracle {
         // journals an Outcome with a text payload that must not shadow it.
         let mut last_numeric_outcome: Option<Hash> = None;
         for (index, entry) in run.journal.entries().enumerate() {
-            if matches!(entry.data.kind, EntryKind::InputStep { .. }) {
-                if let Payload::Number(value) = &entry.data.payload {
-                    input_values.entry(*value).or_default().push(index);
-                    last_input = Some((*value, index));
+            if let EntryPayload::InputStep(step) = &entry.data.payload {
+                if let ledger_format::CanonicalValue::Unsigned(value) = step.value {
+                    input_values.entry(value).or_default().push(index);
+                    last_input = Some((value, index));
                 }
             } else if entry.data.kind == EntryKind::Outcome
-                && matches!(&entry.data.payload, Payload::Number(_))
+                && matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: ledger_format::CanonicalValue::Unsigned(_),
+                        ..
+                    })
+                )
             {
                 last_numeric_outcome = Some(entry.id);
             }
@@ -109,7 +115,10 @@ impl Oracle for ExactlyOnceValueOracle {
         }
         if let (Some((last_value, _)), Some(id)) = (last_input, last_numeric_outcome)
             && let Some(entry) = run.journal.get(&id)
-            && let Payload::Number(outcome_value) = &entry.data.payload
+            && let EntryPayload::Outcome(ledger_format::OutcomePayload {
+                value: ledger_format::CanonicalValue::Unsigned(outcome_value),
+                ..
+            }) = &entry.data.payload
             && *outcome_value != last_value
         {
             return Verdict::fail(
@@ -480,13 +489,18 @@ impl Oracle for AssertionOracle {
         for entry in run.journal.entries() {
             if entry.data.kind == EntryKind::Assert {
                 match &entry.data.payload {
-                    Payload::Number(0) => {
+                    EntryPayload::Assert(ledger_format::AssertPayload {
+                        passed: false, ..
+                    }) => {
                         return Verdict::fail(
                             vec![entry.id],
                             format!("assertion failed at actor {}", entry.data.actor),
                         );
                     }
-                    Payload::Text(msg) if msg.starts_with("fail") => {
+                    EntryPayload::Assert(ledger_format::AssertPayload {
+                        detail: ledger_format::CanonicalValue::Text(msg),
+                        ..
+                    }) if msg.starts_with("fail") => {
                         return Verdict::fail(vec![entry.id], format!("assertion failed: {msg}"));
                     }
                     _ => {}
@@ -504,7 +518,10 @@ fn observable_outputs(run: &RunResult) -> Vec<(u32, u64)> {
         .entries()
         .filter(|entry| entry.data.kind == EntryKind::Outcome)
         .filter_map(|entry| match &entry.data.payload {
-            Payload::Number(value) => Some((entry.data.actor, *value)),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                value: ledger_format::CanonicalValue::Unsigned(value),
+                ..
+            }) => Some((entry.data.actor, *value)),
             _ => None,
         })
         .collect()
@@ -766,9 +783,15 @@ mod tests {
         let oracle = CachedPropertyOracle::new(
             |journal: &Journal| {
                 calls.set(calls.get() + 1);
-                !journal
-                    .entries()
-                    .any(|entry| matches!(&entry.data.payload, Payload::Number(1)))
+                !journal.entries().any(|entry| {
+                    matches!(
+                        &entry.data.payload,
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            value: ledger_format::CanonicalValue::Unsigned(1),
+                            ..
+                        })
+                    )
+                })
             },
             "no set of value 1",
         );
@@ -797,10 +820,28 @@ mod tests {
     fn linearizable_point_journal() -> (Journal, Vec<LinOperation>) {
         let mut journal = Journal::new();
         let write = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 1),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("append must succeed");
         let read = journal
-            .append(EntryKind::Outcome, 2, [write], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [write],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
+            )
             .expect("append must succeed");
         let operations = vec![
             LinOperation {
@@ -837,10 +878,28 @@ mod tests {
     fn linearizability_rejects_a_real_time_stale_read() {
         let mut journal = Journal::new();
         let write = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 1),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("append must succeed");
         let read = journal
-            .append(EntryKind::Outcome, 2, [write], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [write],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("append must succeed");
         let operations = vec![
             LinOperation {
@@ -883,16 +942,52 @@ mod tests {
     fn linearizability_accepts_concurrent_overlapping_operations() {
         let mut journal = Journal::new();
         let w_invoke = journal
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 1),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("append must succeed");
         let w_response = journal
-            .append(EntryKind::Recv, 1, [w_invoke], Payload::Number(0))
+            .append(
+                EntryKind::Recv,
+                1,
+                [w_invoke],
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    observed_content: 0u64.to_le_bytes().to_vec(),
+                }),
+            )
             .expect("append must succeed");
         let r_invoke = journal
-            .append(EntryKind::Outcome, 2, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("append must succeed");
         let r_response = journal
-            .append(EntryKind::Outcome, 2, [r_invoke], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [r_invoke],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("append must succeed");
         let operations = vec![
             LinOperation {
@@ -942,19 +1037,28 @@ mod tests {
         for value in values {
             journal
                 .append(
-                    EntryKind::InputStep {
-                        generator: 0,
-                        replay: 0,
-                    },
+                    EntryKind::InputStep,
                     1,
                     [],
-                    Payload::Number(*value),
+                    EntryPayload::InputStep(ledger_format::InputStepPayload {
+                        generator: 0,
+                        replay: 0,
+                        value: ledger_format::CanonicalValue::Unsigned(*value),
+                    }),
                 )
                 .expect("append must succeed");
         }
         if let Some(outcome) = outcome {
             journal
-                .append(EntryKind::Outcome, 1, [], Payload::Number(outcome))
+                .append(
+                    EntryKind::Outcome,
+                    1,
+                    [],
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: ledger_format::CanonicalValue::Unsigned(outcome),
+                    }),
+                )
                 .expect("append must succeed");
         }
         run_for_value_oracle(journal)

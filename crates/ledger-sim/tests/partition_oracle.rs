@@ -6,7 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use ledger_format::{EntryKind, FaultSpec, Hash, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, FaultPayload, Hash, OutcomePayload};
 use ledger_sim::{Boundary, Effects, Policy, RunConfig, Simulation, TaskBuilder};
 
 fn boxed(
@@ -64,7 +64,13 @@ fn partition_fault_mid_run_flips_link_and_restores_delivery() {
         .journal
         .entries()
         .find_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-            (EntryKind::Outcome, Payload::Number(value)) => Some(*value),
+            (
+                EntryKind::Outcome,
+                EntryPayload::Outcome(OutcomePayload {
+                    value: CanonicalValue::Unsigned(value),
+                    ..
+                }),
+            ) => Some(*value),
             _ => None,
         })
         .expect("the sender must journal an outcome");
@@ -79,10 +85,10 @@ fn partition_fault_mid_run_flips_link_and_restores_delivery() {
     let partition_faults = run
         .journal
         .entries()
-        .filter_map(|entry| match entry.data.kind {
-            EntryKind::Fault {
-                fault: FaultSpec::Partition { src: 0, dst: 1 },
-            } => Some(entry.data.parents.clone()),
+        .filter_map(|entry| match &entry.data.payload {
+            EntryPayload::Fault(FaultPayload::Partition { src: 0, dst: 1, .. }) => {
+                Some(entry.data.parents.clone())
+            }
             _ => None,
         })
         .collect::<Vec<_>>();

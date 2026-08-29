@@ -14,7 +14,7 @@
 
 mod common;
 
-use ledger_format::{EntryKind, StreamId};
+use ledger_format::{EntryKind, EntryPayload, StreamId};
 use ledger_journal::{Journal, JournalCorrectnessMonitor};
 use ledger_sim::{Effects, SeedTree, SimBackend, WasmBackend};
 use rand_core::Rng;
@@ -214,12 +214,15 @@ fn wasi_random_and_clock_journal_entries() {
         .map(|entry| entry.data.kind)
         .collect::<Vec<_>>();
     assert!(
-        kinds.iter().any(|kind| matches!(
-            kind,
-            EntryKind::RngDraw {
-                stream: ledger_sim::WASI_RANDOM_STREAM
-            }
-        )),
+        journal.entries().any(|entry| {
+            matches!(
+                &entry.data.payload,
+                EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                    stream: ledger_sim::WASI_RANDOM_STREAM,
+                    ..
+                })
+            )
+        }),
         "random_get must journal one RngDraw on the WASI stream; got {kinds:?}"
     );
     assert!(

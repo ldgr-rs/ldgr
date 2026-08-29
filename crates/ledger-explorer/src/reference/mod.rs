@@ -77,11 +77,11 @@ fn task(body: impl Future<Output = ()> + 'static) -> Pin<Box<dyn Future<Output =
 fn outcome_values(journal: &Journal) -> Vec<u64> {
     journal
         .entries()
-        .filter_map(|entry| match entry.data.kind {
-            ledger_format::EntryKind::Outcome => match &entry.data.payload {
-                ledger_format::Payload::Number(value) => Some(*value),
-                _ => None,
-            },
+        .filter_map(|entry| match &entry.data.payload {
+            ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
+                value: ledger_format::CanonicalValue::Unsigned(value),
+                ..
+            }) if entry.data.kind == ledger_format::EntryKind::Outcome => Some(*value),
             _ => None,
         })
         .collect()
@@ -94,7 +94,10 @@ fn outcome_by_actor(journal: &Journal, actor: u32) -> Vec<u64> {
         .filter_map(|entry| {
             if entry.data.actor == actor && entry.data.kind == ledger_format::EntryKind::Outcome {
                 match &entry.data.payload {
-                    ledger_format::Payload::Number(value) => Some(*value),
+                    ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: ledger_format::CanonicalValue::Unsigned(value),
+                        ..
+                    }) => Some(*value),
                     _ => None,
                 }
             } else {

@@ -86,12 +86,13 @@ impl SimFsHost {
         {
             let mut journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
             if let Err(error) = journal.append(
-                ledger_format::EntryKind::Fault {
-                    fault: ledger_format::FaultSpec::CrashState(0),
-                },
+                ledger_format::EntryKind::Fault,
                 self.actor,
                 [],
-                ledger_format::Payload::Empty,
+                ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::CrashActor {
+                    actor: self.actor,
+                    crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+                }),
             ) {
                 record_first_journal_error(&self.journal_error, &error);
             }

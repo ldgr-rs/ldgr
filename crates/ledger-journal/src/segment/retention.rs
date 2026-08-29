@@ -151,6 +151,15 @@ impl SegmentStore {
         let tmp_path = self.dir.join(format!("{MANIFEST_FILE}.tmp"));
         {
             let mut file = BufWriter::new(File::create(&tmp_path).map_err(segment_io)?);
+            // v2 outer frame prefix (LDGM, version 2); the record stream that
+            // follows is the container payload.
+            let mut prefix = Vec::new();
+            ledger_format::frame::encode_prefix(
+                &mut prefix,
+                ledger_format::frame::MAGIC_STORE_MANIFEST,
+                0,
+            );
+            file.write_all(&prefix).map_err(segment_io)?;
             file.write_all(&2u32.to_be_bytes()).map_err(segment_io)?;
             file.write_all(&[self.retention.to_u8()])
                 .map_err(segment_io)?;
@@ -186,6 +195,16 @@ impl SegmentStore {
         path: &Path,
     ) -> Result<(RetentionClass, Vec<ManifestEntry>), JournalError> {
         let mut file = File::open(path).map_err(segment_io)?;
+        // Validate the outer v2 prefix before trusting any record bytes.
+        let mut prefix_bytes = [0u8; ledger_format::frame::FRAME_PREFIX_LEN];
+        file.read_exact(&mut prefix_bytes).map_err(segment_io)?;
+        ledger_format::frame::parse_prefix(
+            &prefix_bytes,
+            ledger_format::frame::MAGIC_STORE_MANIFEST,
+        )
+        .map_err(|err| {
+            JournalError::SegmentCorrupt(format!("store manifest prefix invalid: {err:?}"))
+        })?;
         let mut version = [0u8; 4];
         file.read_exact(&mut version).map_err(segment_io)?;
         let version = u32::from_be_bytes(version);

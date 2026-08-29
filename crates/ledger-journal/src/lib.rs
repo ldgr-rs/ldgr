@@ -50,24 +50,32 @@ pub use snapshot_store::SnapshotStore;
 mod tests {
     use super::*;
     use alloc::vec;
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{EntryKind, EntryPayload};
+
+    fn outcome(value: u64) -> EntryPayload {
+        EntryPayload::Outcome(ledger_format::OutcomePayload {
+            schema: [0x00; 32],
+            value: ledger_format::CanonicalValue::Unsigned(value),
+        })
+    }
 
     #[test]
     fn append_adds_local_parent_and_increments_clock() {
         let mut journal = Journal::new();
         let first = journal
             .append(
-                EntryKind::InputStep {
-                    generator: 0,
-                    replay: 0,
-                },
+                EntryKind::InputStep,
                 1,
                 [],
-                Payload::Number(1),
+                EntryPayload::InputStep(ledger_format::InputStepPayload {
+                    generator: 0,
+                    replay: 0,
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
             )
             .unwrap();
         let second = journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(2))
+            .append(EntryKind::Outcome, 1, [], outcome(2))
             .unwrap();
         let entry = journal.get(&second).unwrap();
         assert_eq!(entry.data.parents, vec![first]);
@@ -79,17 +87,18 @@ mod tests {
         let mut journal = Journal::new();
         journal
             .append(
-                EntryKind::InputStep {
-                    generator: 0,
-                    replay: 0,
-                },
+                EntryKind::InputStep,
                 1,
                 [],
-                Payload::Number(1),
+                EntryPayload::InputStep(ledger_format::InputStepPayload {
+                    generator: 0,
+                    replay: 0,
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
             )
             .unwrap();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(2))
+            .append(EntryKind::Outcome, 1, [], outcome(2))
             .unwrap();
 
         let report = JournalCorrectnessMonitor::verify(&journal).unwrap();
@@ -103,7 +112,7 @@ mod tests {
         let mut original = Journal::new();
         for i in 0..10 {
             original
-                .append(EntryKind::Outcome, 1, [], Payload::Number(i))
+                .append(EntryKind::Outcome, 1, [], outcome(i))
                 .unwrap();
         }
         let fork = original.fork();

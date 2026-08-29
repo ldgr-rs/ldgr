@@ -3,7 +3,7 @@
 use crate::oracle::HistoryOperation;
 use crate::pbt::gen_id;
 use crate::search::Workload;
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{EntryKind, EntryPayload};
 use ledger_sim::{Instruction, RunResult};
 
 /// Mini-KV workload with client write and asynchronous node replication race.
@@ -44,19 +44,30 @@ impl Workload for MiniKvWorkload {
         run.journal
             .entries()
             .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-                (EntryKind::Send, Payload::Pair { left: 1, right: 42 })
-                    if entry.data.actor == 0 =>
-                {
-                    Some(HistoryOperation::Write {
-                        key: "k".into(),
-                        value: 42,
-                        witness: entry.id,
-                    })
+                (EntryKind::Send, EntryPayload::Send(frame)) if frame.to == 1 => {
+                    let value = u64::from_le_bytes(
+                        frame.original_content[..8]
+                            .try_into()
+                            .expect("8-byte payload"),
+                    );
+                    if entry.data.actor == 0 && value == 42 {
+                        Some(HistoryOperation::Write {
+                            key: "k".into(),
+                            value: 42,
+                            witness: entry.id,
+                        })
+                    } else {
+                        None
+                    }
                 }
-                (EntryKind::Outcome, Payload::Number(value)) if entry.data.actor == 2 => {
+                (EntryKind::Outcome, EntryPayload::Outcome(outcome)) if entry.data.actor == 2 => {
+                    let value = match outcome.value {
+                        ledger_format::CanonicalValue::Unsigned(v) => v,
+                        _ => return None,
+                    };
                     Some(HistoryOperation::Read {
                         key: "k".into(),
-                        value: *value,
+                        value,
                         witness: entry.id,
                     })
                 }
@@ -101,7 +112,6 @@ impl Workload for MiniKvWorkload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::EntryKind;
     use ledger_sim::{Policy, RunConfig, Simulation};
 
     #[test]
@@ -116,18 +126,30 @@ mod tests {
         let inputs = run
             .journal
             .entries()
-            .filter_map(|entry| match entry.data.kind {
-                EntryKind::InputStep { generator, replay } => {
-                    Some((generator, replay, entry.data.payload.clone()))
+            .filter_map(|entry| match &entry.data.payload {
+                EntryPayload::InputStep(step) => {
+                    Some((step.generator, step.replay, step.value.clone()))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
         let expected_generator = gen_id(MINI_KV_GENERATOR);
         let expected = vec![
-            (expected_generator, 0u64, ledger_format::Payload::Number(7)),
-            (expected_generator, 1u64, ledger_format::Payload::Number(8)),
-            (expected_generator, 2u64, ledger_format::Payload::Number(9)),
+            (
+                expected_generator,
+                0u64,
+                ledger_format::CanonicalValue::Unsigned(7),
+            ),
+            (
+                expected_generator,
+                1u64,
+                ledger_format::CanonicalValue::Unsigned(8),
+            ),
+            (
+                expected_generator,
+                2u64,
+                ledger_format::CanonicalValue::Unsigned(9),
+            ),
         ];
         assert_eq!(inputs, expected);
         assert!(run.monitor_issues.is_empty());

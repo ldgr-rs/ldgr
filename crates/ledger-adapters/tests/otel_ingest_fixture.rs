@@ -3,7 +3,7 @@
 
 use ledger_adapters::envelope::Fidelity;
 use ledger_adapters::otel::{OtelEvent, OtelIngestConfig, OtelSpan, ingest_otel_dedup};
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, OutcomePayload};
 use ledger_journal::{Journal, PersistentJournal};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -131,7 +131,10 @@ fn map_outcomes(journal: &Journal) -> HashMap<String, ledger_format::Hash> {
     let mut out = HashMap::new();
     for entry in journal.entries() {
         if entry.data.kind == EntryKind::Outcome
-            && let Payload::Text(name) = &entry.data.payload
+            && let EntryPayload::Outcome(OutcomePayload {
+                value: CanonicalValue::Text(name),
+                ..
+            }) = &entry.data.payload
         {
             out.insert(name.clone(), entry.id);
         }

@@ -26,7 +26,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ledger_explorer::{FaultSolver, HittingSetSolver, MaxSatSolver, Verdict};
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use std::hint::black_box;
 
@@ -48,15 +48,34 @@ fn build_scaling_journal(n: usize) -> (Journal, Verdict) {
 
     let chain_len = n - 1;
     for i in 0..chain_len {
-        let payload = Payload::Number(i as u64);
         let id = if i != 0 && i % RECV_PERIOD == 0 {
             let observed = last_send.expect("Recv needs a prior Send");
             journal
-                .append(EntryKind::Recv, 1, [observed], payload)
+                .append(
+                    EntryKind::Recv,
+                    1,
+                    [observed],
+                    EntryPayload::Recv(ledger_format::RecvFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: 1,
+                        observed_content: (i as u64).to_le_bytes().to_vec(),
+                    }),
+                )
                 .expect("Recv append must succeed")
         } else {
             let id = journal
-                .append(EntryKind::Send, 1, [], payload)
+                .append(
+                    EntryKind::Send,
+                    1,
+                    [],
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: 1,
+                        original_content: (i as u64).to_le_bytes().to_vec(),
+                    }),
+                )
                 .expect("Send append must succeed");
             last_send = Some(id);
             id
@@ -71,14 +90,33 @@ fn build_scaling_journal(n: usize) -> (Journal, Verdict) {
                 EntryKind::Outcome,
                 1,
                 [last, prev],
-                Payload::Number(u64::MAX),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(u64::MAX),
+                }),
             )
             .expect("Outcome append must succeed"),
         (Some(last), _) => journal
-            .append(EntryKind::Outcome, 1, [last], Payload::Number(u64::MAX))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [last],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(u64::MAX),
+                }),
+            )
             .expect("Outcome append must succeed"),
         (None, _) => journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(u64::MAX))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(u64::MAX),
+                }),
+            )
             .expect("Outcome append must succeed"),
     };
     let verdict = Verdict::fail(vec![outcome], format!("synthetic scaling verdict N={n}"));

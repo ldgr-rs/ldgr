@@ -8,7 +8,7 @@ use core::fmt;
 use hashbrown::HashMap;
 
 use crate::clock::VectorClock;
-use ledger_format::{ActorId, EntryData, EntryKind, Hash, Payload};
+use ledger_format::{ActorId, EntryData, EntryKind, EntryPayload, Hash};
 
 /// Entries added to the overlay before it is frozen back into the base.
 ///
@@ -219,12 +219,12 @@ pub struct BatchEntry {
     /// first in its call.
     pub chain_previous: bool,
     /// Payload covered by the content hash.
-    pub payload: Payload,
+    pub payload: EntryPayload,
 }
 
 impl BatchEntry {
     /// A batch entry with no observed parents.
-    pub fn new(kind: EntryKind, actor: ActorId, payload: Payload) -> Self {
+    pub fn new(kind: EntryKind, actor: ActorId, payload: EntryPayload) -> Self {
         Self {
             kind,
             actor,
@@ -268,7 +268,7 @@ pub struct EntryFrame {
 pub(crate) fn kind_is_fault_relevant(kind: &EntryKind) -> bool {
     matches!(
         kind,
-        EntryKind::Fault { .. } | EntryKind::Outcome | EntryKind::Assert
+        EntryKind::Fault | EntryKind::Outcome | EntryKind::Assert
     )
 }
 
@@ -340,7 +340,7 @@ impl Journal {
         kind: EntryKind,
         actor: ActorId,
         observed_parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Result<Hash, JournalError> {
         let previous_head = self.state.heads.get(&actor).copied();
         let mut parents = Vec::new();
@@ -386,6 +386,7 @@ impl Journal {
         clock = clock.incremented(actor);
 
         let data = EntryData {
+            format_version: ledger_format::FORMAT_VERSION,
             kind,
             actor,
             parents,
@@ -524,6 +525,7 @@ impl Journal {
             clock = clock.incremented(spec.actor);
 
             let data = EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: spec.kind,
                 actor: spec.actor,
                 parents,
@@ -629,13 +631,15 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::boxed::Box;
-    use ledger_format::{CborValue, Payload};
+    use ledger_format::EntryPayload;
 
     #[test]
     fn append_rejects_non_canonical_payload_without_hashing() {
         let mut journal = Journal::new();
-        let bad_payload = Payload::Value(CborValue::Float(f64::NAN));
+        let bad_payload = EntryPayload::Outcome(ledger_format::OutcomePayload {
+            schema: [0x00; 32],
+            value: ledger_format::CanonicalValue::Float(f64::NAN),
+        });
         let result = journal.append(EntryKind::Outcome, 1, [], bad_payload);
         assert!(matches!(result, Err(JournalError::InvalidPayload(_))));
         assert!(journal.is_empty());
@@ -644,7 +648,11 @@ mod tests {
     #[test]
     fn append_rejects_disallowed_tag_without_hashing() {
         let mut journal = Journal::new();
-        let bad_payload = Payload::Value(CborValue::Tag(99, Box::new(CborValue::Unsigned(1))));
+        // NaN is rejected by CanonicalValue before hashing.
+        let bad_payload = EntryPayload::Outcome(ledger_format::OutcomePayload {
+            schema: [0x00; 32],
+            value: ledger_format::CanonicalValue::Float(f64::NAN),
+        });
         let result = journal.append(EntryKind::Outcome, 1, [], bad_payload);
         assert!(matches!(result, Err(JournalError::InvalidPayload(_))));
         assert!(journal.is_empty());
@@ -658,13 +666,14 @@ mod tests {
             pre_fork.push(
                 journal
                     .append(
-                        EntryKind::InputStep {
-                            generator: 0,
-                            replay: 0,
-                        },
+                        EntryKind::InputStep,
                         1,
                         [],
-                        Payload::Number(i),
+                        EntryPayload::InputStep(ledger_format::InputStepPayload {
+                            generator: 0,
+                            replay: 0,
+                            value: ledger_format::CanonicalValue::Unsigned(i),
+                        }),
                     )
                     .unwrap(),
             );
@@ -677,7 +686,15 @@ mod tests {
         for i in 0..1000 {
             a_ids.push(
                 fork_a
-                    .append(EntryKind::Outcome, 1, [], Payload::Number(i))
+                    .append(
+                        EntryKind::Outcome,
+                        1,
+                        [],
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            schema: [0x00; 32],
+                            value: ledger_format::CanonicalValue::Unsigned(i),
+                        }),
+                    )
                     .unwrap(),
             );
         }
@@ -685,7 +702,15 @@ mod tests {
         for i in 0..1000 {
             b_ids.push(
                 fork_b
-                    .append(EntryKind::Outcome, 1, [], Payload::Number(i + 1000))
+                    .append(
+                        EntryKind::Outcome,
+                        1,
+                        [],
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            schema: [0x00; 32],
+                            value: ledger_format::CanonicalValue::Unsigned(i + 1000),
+                        }),
+                    )
                     .unwrap(),
             );
         }
@@ -726,8 +751,16 @@ mod tests {
         drop(journal);
         let extra = OVERLAY_THRESHOLD * 2 + 10;
         for i in 0..extra {
-            fork.append(EntryKind::Outcome, 1, [], Payload::Number(i as u64))
-                .unwrap();
+            fork.append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(i as u64),
+                }),
+            )
+            .unwrap();
         }
         assert_eq!(fork.len(), extra);
         let last = fork.entries().last().unwrap();
@@ -746,8 +779,16 @@ mod tests {
         let mut fork = journal.fork();
         let extra = OVERLAY_THRESHOLD * 2 + 10;
         for i in 0..extra {
-            fork.append(EntryKind::Outcome, 1, [], Payload::Number(i as u64))
-                .unwrap();
+            fork.append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(i as u64),
+                }),
+            )
+            .unwrap();
         }
         assert_eq!(fork.len(), extra);
         assert_eq!(
@@ -766,11 +807,27 @@ mod tests {
     fn sequence_resumes_across_actor_heads_after_fork() {
         let mut journal = Journal::new();
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let mut fork = journal.fork();
         let id = fork
-            .append(EntryKind::Outcome, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
+            )
             .unwrap();
         let entry = fork.get(&id).unwrap();
         assert_eq!(entry.data.sequence, 1);

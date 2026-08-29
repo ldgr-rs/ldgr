@@ -368,7 +368,7 @@ impl Simulation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::EntryKind;
+    use ledger_format::{EntryKind, EntryPayload};
 
     /// A run whose journal-error slot is populated is rejected end to end:
     /// no [`RunResult`] (and therefore no finding, certificate, or minimized
@@ -518,17 +518,19 @@ mod tests {
         let inputs = run
             .journal
             .entries()
-            .filter_map(|entry| match entry.data.kind {
-                EntryKind::InputStep { generator, replay } => {
-                    Some((generator, replay, entry.data.payload.clone()))
-                }
+            .filter_map(|entry| match &entry.data.payload {
+                EntryPayload::InputStep(ledger_format::InputStepPayload {
+                    generator,
+                    replay,
+                    value,
+                }) => Some((*generator, *replay, value.clone())),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].0, 7);
         assert_eq!(inputs[0].1, 3);
-        assert_eq!(inputs[0].2, ledger_format::Payload::Number(99));
+        assert_eq!(inputs[0].2, ledger_format::CanonicalValue::Unsigned(99));
         assert!(run.monitor_issues.is_empty());
     }
 
@@ -544,17 +546,19 @@ mod tests {
         let inputs = run
             .journal
             .entries()
-            .filter_map(|entry| match entry.data.kind {
-                EntryKind::InputStep { generator, replay } => {
-                    Some((generator, replay, entry.data.payload.clone()))
-                }
+            .filter_map(|entry| match &entry.data.payload {
+                EntryPayload::InputStep(ledger_format::InputStepPayload {
+                    generator,
+                    replay,
+                    value,
+                }) => Some((*generator, *replay, value.clone())),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].0, 0);
         assert_eq!(inputs[0].1, 0);
-        assert_eq!(inputs[0].2, ledger_format::Payload::Number(42));
+        assert_eq!(inputs[0].2, ledger_format::CanonicalValue::Unsigned(42));
         assert!(run.monitor_issues.is_empty());
     }
 
@@ -614,7 +618,13 @@ mod tests {
         let halt_on_99 = |journal: &ledger_journal::Journal, start: usize| {
             for entry in journal.entries().skip(start) {
                 if entry.data.kind == ledger_format::EntryKind::Outcome
-                    && matches!(&entry.data.payload, ledger_format::Payload::Number(99))
+                    && matches!(
+                        &entry.data.payload,
+                        ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            value: ledger_format::CanonicalValue::Unsigned(99),
+                            ..
+                        })
+                    )
                 {
                     return crate::runtime::OnlineAction::Halt {
                         reason: HaltReason::from("outcome 99 forbidden"),
@@ -683,7 +693,13 @@ mod tests {
         .with_step_monitor(Box::new(|journal, start| {
             for entry in journal.entries().skip(start) {
                 if entry.data.kind == ledger_format::EntryKind::Outcome
-                    && matches!(&entry.data.payload, ledger_format::Payload::Number(99))
+                    && matches!(
+                        &entry.data.payload,
+                        ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            value: ledger_format::CanonicalValue::Unsigned(99),
+                            ..
+                        })
+                    )
                 {
                     return crate::runtime::OnlineAction::Halt {
                         reason: HaltReason::from("outcome 99 forbidden"),

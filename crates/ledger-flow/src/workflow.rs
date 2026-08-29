@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ledger_format::{ActorId, EntryKind, Hash, Payload};
+use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
 use ledger_journal::{Journal, JournalError};
 use thiserror::Error;
 
@@ -133,7 +133,11 @@ impl WorkflowExecution {
             EntryKind::StepBegin,
             self.actor,
             [],
-            Payload::Text(step_name.to_string()),
+            EntryPayload::StepBegin(ledger_format::StepBeginPayload {
+                step_id: self.step_counter,
+                name: step_name.as_bytes().to_vec(),
+                idempotency_key: None,
+            }),
         )?;
         self.step_counter += 1;
         Ok(hash)
@@ -151,7 +155,10 @@ impl WorkflowExecution {
             EntryKind::StepEnd,
             self.actor,
             [begin_hash],
-            Payload::Number(result_value),
+            EntryPayload::StepEnd(ledger_format::StepEndPayload::Completed {
+                step_id: self.step_counter,
+                result: ledger_format::CanonicalValue::Unsigned(result_value),
+            }),
         )?;
         // Push only after the append succeeded: a failed append must not
         // leave a completed step that the journal does not contain.
@@ -173,7 +180,10 @@ impl WorkflowExecution {
                 continue;
             }
             if entry.data.kind == EntryKind::StepEnd
-                && let Payload::Number(val) = entry.data.payload
+                && let EntryPayload::StepEnd(ledger_format::StepEndPayload::Completed {
+                    result: ledger_format::CanonicalValue::Unsigned(val),
+                    ..
+                }) = entry.data.payload
                 && let Some(parent) = entry.data.parents.first().copied()
                 && let Some(name) = evidence.begin_names.get(&parent)
             {
@@ -307,13 +317,17 @@ fn scan_step_evidence(journal: &Journal, actor: ActorId) -> StepEvidence {
         }
         match entry.data.kind {
             EntryKind::StepBegin => {
-                if let Payload::Text(name) = &entry.data.payload {
+                if let EntryPayload::StepBegin(begin) = &entry.data.payload {
+                    let name = String::from_utf8_lossy(&begin.name).to_string();
                     evidence.begins.insert(name.clone(), entry.id);
                     evidence.begin_names.insert(entry.id, name.clone());
                 }
             }
             EntryKind::StepEnd => {
-                if let Payload::Number(value) = entry.data.payload
+                if let EntryPayload::StepEnd(ledger_format::StepEndPayload::Completed {
+                    result: ledger_format::CanonicalValue::Unsigned(value),
+                    ..
+                }) = entry.data.payload
                     && let Some(parent) = entry.data.parents.first().copied()
                 {
                     evidence.ends.insert(parent, value);

@@ -7,7 +7,7 @@
 //! [`ExecutorShared::journal_error`] and surfaces through
 //! [`crate::runtime::RunResult::journal_error`] at run end.
 use super::ExecutorShared;
-use ledger_format::{ActorId, EntryKind, Hash, Payload};
+use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
 use ledger_journal::BatchEntry;
 
 impl ExecutorShared {
@@ -17,7 +17,7 @@ impl ExecutorShared {
         actor: ActorId,
         kind: EntryKind,
         parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Result<Hash, ledger_journal::JournalError> {
         let id = self
             .journal

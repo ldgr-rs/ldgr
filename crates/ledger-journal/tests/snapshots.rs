@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{EntryKind, EntryPayload};
 use ledger_journal::{JournalError, PersistentJournal, Snapshot};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -21,7 +21,15 @@ fn temp_dir(name: &str) -> PathBuf {
 fn build(journal: &mut PersistentJournal, count: u64) {
     for i in 0..count {
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(i))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(i),
+                }),
+            )
             .unwrap();
     }
 }

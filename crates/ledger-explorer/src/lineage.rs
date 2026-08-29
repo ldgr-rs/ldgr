@@ -241,7 +241,7 @@ impl LineageIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::Payload;
+    use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
     use ledger_journal::Journal;
 
     fn test_config_bounded() -> SolverConfig {
@@ -256,14 +256,27 @@ mod tests {
     fn build_then_refresh_no_growth_returns_false() {
         let mut journal = Journal::new();
         let send = journal
-            .append(ledger_format::EntryKind::Send, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 0u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let witness = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 1,
                 [send],
-                Payload::Number(1),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
             )
             .unwrap();
         let config = test_config_bounded();
@@ -282,18 +295,26 @@ mod tests {
         let mut journal = Journal::new();
         let send_a = journal
             .append(
-                ledger_format::EntryKind::Send,
+                EntryKind::Send,
                 1,
                 [],
-                Payload::Pair { left: 1, right: 1 },
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
             )
             .unwrap();
         let witness_a = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 1,
                 [send_a],
-                Payload::Number(0),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
             )
             .unwrap();
         let config = test_config_bounded();
@@ -302,18 +323,26 @@ mod tests {
         // Append new faultable and new witness that depends on it and old.
         let send_b = journal
             .append(
-                ledger_format::EntryKind::Send,
+                EntryKind::Send,
                 2,
                 [],
-                Payload::Pair { left: 2, right: 2 },
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 2,
+                    to: 2,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
             )
             .unwrap();
         let witness_b = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 2,
                 [send_b, witness_a],
-                Payload::Number(1),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
             )
             .unwrap();
         // Refresh with witnesses including new witness
@@ -332,26 +361,39 @@ mod tests {
         let mut journal = Journal::new();
         let send_a = journal
             .append(
-                ledger_format::EntryKind::Send,
+                EntryKind::Send,
                 1,
                 [],
-                Payload::Pair { left: 1, right: 1 },
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
             )
             .unwrap();
         let recv_a = journal
             .append(
-                ledger_format::EntryKind::Recv,
+                EntryKind::Recv,
                 1,
                 [send_a],
-                Payload::Number(0),
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    observed_content: 0u64.to_le_bytes().to_vec(),
+                }),
             )
             .unwrap();
         let witness = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 1,
                 [recv_a],
-                Payload::Number(0),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
             )
             .unwrap();
         let config = test_config_bounded();
@@ -359,19 +401,27 @@ mod tests {
         // Grow journal with irrelevant and relevant entries
         let send_b = journal
             .append(
-                ledger_format::EntryKind::Send,
+                EntryKind::Send,
                 2,
                 [],
-                Payload::Pair { left: 2, right: 2 },
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 2,
+                    to: 2,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
             )
             .unwrap();
         // New witness branching
         let witness2 = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 2,
                 [send_b, recv_a],
-                Payload::Number(1),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
             )
             .unwrap();
         let witnesses = vec![witness, witness2];
@@ -392,14 +442,27 @@ mod tests {
     fn fingerprint_mismatch_forces_rebuild() {
         let mut journal = Journal::new();
         let send = journal
-            .append(ledger_format::EntryKind::Send, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: 0u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let witness = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 1,
                 [send],
-                Payload::Number(1),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(1),
+                }),
             )
             .unwrap();
         let config_a = SolverConfig::default().with_horizon(1);

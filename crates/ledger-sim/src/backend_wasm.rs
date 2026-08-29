@@ -48,7 +48,7 @@ use crate::seedtree::SeedTree;
 use crate::time::Clock;
 use crate::wasi_fs::{WasiFdTable, bytes_to_u64, deterministic_fd};
 use futures::executor::block_on;
-use ledger_format::{ActorId, EntryKind, Hash, Payload, StreamId};
+use ledger_format::{ActorId, EntryKind, EntryPayload, Hash, StreamId};
 use ledger_journal::{Journal, JournalError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::Rng;
@@ -196,7 +196,12 @@ struct WasiJournal {
 
 impl WasiJournal {
     /// Append one entry through the shared journaling path.
-    fn append(&self, kind: EntryKind, parents: impl IntoIterator<Item = Hash>, payload: Payload) {
+    fn append(
+        &self,
+        kind: EntryKind,
+        parents: impl IntoIterator<Item = Hash>,
+        payload: EntryPayload,
+    ) {
         let mut journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         match journal.append(kind, self.actor, parents, payload) {
             Ok(_) => {}
@@ -227,7 +232,7 @@ impl wasmtime_wasi::HostWallClock for VirtualWallClock {
     fn now(&self) -> std::time::Duration {
         let ticks = *self.ticks.lock().unwrap_or_else(|e| e.into_inner());
         self.journal
-            .append(EntryKind::ClockRead, [], Payload::Number(ticks));
+            .append(EntryKind::ClockRead, [], EntryPayload::ClockRead { ticks });
         std::time::Duration::from_nanos(ticks * NS_PER_TICK)
     }
 }
@@ -250,7 +255,7 @@ impl wasmtime_wasi::HostMonotonicClock for VirtualMonotonicClock {
     fn now(&self) -> u64 {
         let ticks = *self.ticks.lock().unwrap_or_else(|e| e.into_inner());
         self.journal
-            .append(EntryKind::ClockRead, [], Payload::Number(ticks));
+            .append(EntryKind::ClockRead, [], EntryPayload::ClockRead { ticks });
         ticks * NS_PER_TICK
     }
 }
@@ -747,11 +752,13 @@ impl WasmBackend {
             "random_get",
             |mut caller: Caller<'_, WasmStoreData>, buf: u32, len: u32| -> Result<u32, Error> {
                 caller.data_mut().effects.journal_append(
-                    EntryKind::RngDraw {
-                        stream: WASI_RANDOM_STREAM,
-                    },
+                    EntryKind::RngDraw,
                     [],
-                    Payload::Number(len as u64),
+                    EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                        stream: WASI_RANDOM_STREAM,
+                        draw_index: 0,
+                        content: (len as u64).to_le_bytes().to_vec(),
+                    }),
                 );
                 // One u32 word per byte, matching the per-byte sampling the
                 // built-in preview1 handler applied, so the guest-visible bytes

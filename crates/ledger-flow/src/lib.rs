@@ -35,7 +35,7 @@ pub use workflow::{FlowError, ResumeStatus, StepOutcome, WorkflowExecution, Work
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{EntryKind, EntryPayload};
     use ledger_journal::Journal;
 
     #[test]
@@ -195,7 +195,12 @@ mod tests {
             .filter(|entry| {
                 entry.data.actor == 1
                     && entry.data.kind == EntryKind::StepBegin
-                    && matches!(&entry.data.payload, Payload::Text(name) if name == "s2")
+                    && matches!(
+                        &entry.data.payload,
+                        EntryPayload::StepBegin(ledger_format::StepBeginPayload {
+                            name, ..
+                        }) if name == b"s2"
+                    )
             })
             .count();
         assert_eq!(s2_begins, 1);
@@ -235,7 +240,12 @@ mod tests {
             .filter(|entry| {
                 entry.data.actor == 1
                     && entry.data.kind == EntryKind::StepBegin
-                    && matches!(&entry.data.payload, Payload::Text(text) if text == name)
+                    && matches!(
+                        &entry.data.payload,
+                        EntryPayload::StepBegin(ledger_format::StepBeginPayload {
+                            name: text, ..
+                        }) if text == name.as_bytes()
+                    )
             })
             .count()
     }
@@ -288,7 +298,12 @@ mod tests {
             .find(|entry| {
                 entry.data.actor == 1
                     && entry.data.kind == EntryKind::StepBegin
-                    && matches!(&entry.data.payload, Payload::Text(text) if text == "s1")
+                    && matches!(
+                        &entry.data.payload,
+                        EntryPayload::StepBegin(ledger_format::StepBeginPayload {
+                            name: text, ..
+                        }) if text == b"s1"
+                    )
             })
             .expect("s1 begin must exist")
             .id;
@@ -297,7 +312,12 @@ mod tests {
             .find(|entry| {
                 entry.data.actor == 1
                     && entry.data.kind == EntryKind::StepBegin
-                    && matches!(&entry.data.payload, Payload::Text(text) if text == "boom")
+                    && matches!(
+                        &entry.data.payload,
+                        EntryPayload::StepBegin(ledger_format::StepBeginPayload {
+                            name: text, ..
+                        }) if text == b"boom"
+                    )
             })
             .expect("boom begin must exist")
             .id;
@@ -372,33 +392,76 @@ mod tests {
     }
 
     #[test]
-    fn recovery_ignores_non_text_begin_and_unpaired_end() {
+    fn recovery_records_typed_begin_and_ignores_orphan_end() {
         let mut journal = Journal::new();
-        // Non-text begin must not produce a "step" fallback entry.
-        let non_text_begin = journal
-            .append(EntryKind::StepBegin, 1, [], Payload::Number(99))
+        // A typed StepBegin with an empty name is still a begin: the typed
+        // payload carries the step identity, so recovery records it and its
+        // paired end regardless of name content.
+        let typed_begin = journal
+            .append(
+                EntryKind::StepBegin,
+                1,
+                [],
+                EntryPayload::StepBegin(ledger_format::StepBeginPayload {
+                    step_id: 99,
+                    name: Vec::new(),
+                    idempotency_key: None,
+                }),
+            )
             .unwrap();
         let _paired_end = journal
-            .append(EntryKind::StepEnd, 1, [non_text_begin], Payload::Number(1))
+            .append(
+                EntryKind::StepEnd,
+                1,
+                [typed_begin],
+                EntryPayload::StepEnd(ledger_format::StepEndPayload::Completed {
+                    step_id: 1,
+                    result: ledger_format::CanonicalValue::Unsigned(1),
+                }),
+            )
             .unwrap();
         // Orphan end with a parent that exists but is not a recognized begin
         // must be ignored. The parent is a real journal entry (journal append
         // rejects fabricated hashes), it simply is not a step begin.
         let real_non_begin = journal
-            .append(EntryKind::Send, 1, [], Payload::Text("marker".into()))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: b"marker".to_vec(),
+                }),
+            )
             .unwrap();
         let _orphan_end = journal
-            .append(EntryKind::StepEnd, 1, [real_non_begin], Payload::Number(2))
+            .append(
+                EntryKind::StepEnd,
+                1,
+                [real_non_begin],
+                EntryPayload::StepEnd(ledger_format::StepEndPayload::Completed {
+                    step_id: 2,
+                    result: ledger_format::CanonicalValue::Unsigned(2),
+                }),
+            )
             .unwrap();
         let recovered = WorkflowExecution::recover_from_journal(1, &journal);
-        assert_eq!(recovered.step_counter, 0);
-        assert!(recovered.completed_steps.is_empty());
-        // Valid text begin is still recovered.
+        // The typed begin above pairs with its end into one completed step;
+        // the orphan end (parent is a Send, not a begin) is ignored.
+        assert_eq!(recovered.step_counter, 1);
+        assert_eq!(recovered.completed_steps, vec![("".to_string(), 1)]);
+        // Valid text begin is still recovered alongside the earlier typed
+        // begin: recovery sees both in the same journal.
         let mut wf = WorkflowExecution::new(1);
         let begin = wf.step_begin(&mut journal, "ok").unwrap();
         wf.step_end(&mut journal, "ok", begin, 5).unwrap();
         let recovered2 = WorkflowExecution::recover_from_journal(1, &journal);
-        assert_eq!(recovered2.completed_steps, vec![("ok".to_string(), 5)]);
-        assert_eq!(recovered2.step_counter, 1);
+        assert_eq!(
+            recovered2.completed_steps,
+            vec![("".to_string(), 1), ("ok".to_string(), 5)]
+        );
+        assert_eq!(recovered2.step_counter, 2);
     }
 }

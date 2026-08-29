@@ -6,7 +6,7 @@
 //! `DropAllUnsynced` operator byte-identical to the historical path.
 #![cfg(feature = "sim-fs-journaling")]
 
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, OutcomePayload};
 use ledger_sim::{Instruction, JournalingMode, Policy, RunConfig, Simulation};
 
 /// Run a write (optionally fsynced), crash, then read the value back into the
@@ -41,7 +41,13 @@ fn post_crash_value(
     run.journal
         .entries()
         .find_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-            (EntryKind::Outcome, Payload::Number(value)) => Some(*value),
+            (
+                EntryKind::Outcome,
+                EntryPayload::Outcome(OutcomePayload {
+                    value: CanonicalValue::Unsigned(value),
+                    ..
+                }),
+            ) => Some(*value),
             _ => None,
         })
 }

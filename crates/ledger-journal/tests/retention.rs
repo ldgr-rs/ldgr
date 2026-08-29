@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use ledger_format::{EntryKind, FaultSpec, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash};
 use ledger_journal::{Journal, JournalError, PersistentJournal, RetentionClass, SegmentStore};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -39,17 +39,40 @@ fn loose_segment_files(dir: &Path) -> Vec<String> {
 fn append_mixed_stream(journal: &mut PersistentJournal) {
     for seg in 0..3u64 {
         for i in 0..40 {
-            let kind = match (seg, i) {
-                (1, 0) => EntryKind::Outcome,
-                (1, 5) => EntryKind::Fault {
-                    fault: FaultSpec::Drop,
-                },
-                (2, 10) => EntryKind::Assert,
-                _ => EntryKind::Send,
+            let value = seg * 40 + i;
+            let (kind, payload) = match (seg, i) {
+                (1, 0) => (
+                    EntryKind::Outcome,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: ledger_format::CanonicalValue::Unsigned(value),
+                    }),
+                ),
+                (1, 5) => (
+                    EntryKind::Fault,
+                    EntryPayload::Fault(ledger_format::FaultPayload::DropMessage {
+                        message_id: ledger_format::MessageId::new(1, value),
+                    }),
+                ),
+                (2, 10) => (
+                    EntryKind::Assert,
+                    EntryPayload::Assert(ledger_format::AssertPayload {
+                        predicate: [0x00; 32],
+                        passed: true,
+                        detail: ledger_format::CanonicalValue::Unsigned(value),
+                    }),
+                ),
+                _ => (
+                    EntryKind::Send,
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(1, value),
+                        from: 1,
+                        to: 2,
+                        original_content: value.to_le_bytes().to_vec(),
+                    }),
+                ),
             };
-            journal
-                .append(kind, 1, [], Payload::Number(seg * 40 + i))
-                .unwrap();
+            journal.append(kind, 1, [], payload).unwrap();
         }
         journal.force_seal().unwrap();
     }
@@ -62,22 +85,60 @@ fn append_mixed_stream(journal: &mut PersistentJournal) {
 fn append_warm_stream(journal: &mut PersistentJournal) {
     for i in 0..40 {
         journal
-            .append(EntryKind::Send, 1, [], Payload::Number(i))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, i),
+                    from: 1,
+                    to: 2,
+                    original_content: i.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
     }
     journal.force_seal().unwrap();
     journal
-        .append(EntryKind::Outcome, 1, [], Payload::Number(1000))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: ledger_format::CanonicalValue::Unsigned(1000),
+            }),
+        )
         .unwrap();
     for i in 0..39 {
         journal
-            .append(EntryKind::FsWrite, 1, [], Payload::Number(i))
+            .append(
+                EntryKind::FsWrite,
+                1,
+                [],
+                EntryPayload::FsWrite(ledger_format::FsWritePayload::Allocate {
+                    path_ref: ledger_format::PathRef {
+                        path_hash: [0xcc; 32],
+                        canonical_path: format!("/d/{i}").into_bytes(),
+                    },
+                }),
+            )
             .unwrap();
     }
     journal.force_seal().unwrap();
     for i in 0..40 {
         journal
-            .append(EntryKind::Recv, 1, [], Payload::Number(i))
+            .append(
+                EntryKind::Recv,
+                1,
+                [],
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(1, i),
+                    from: 1,
+                    to: 2,
+                    observed_content: i.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
     }
     journal.force_seal().unwrap();
@@ -187,7 +248,17 @@ fn raising_retention_reextracts() {
     let mut entries = Vec::new();
     for i in 0..240 {
         let id = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(i))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, i),
+                    from: 1,
+                    to: 2,
+                    original_content: i.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         entries.push(journal.get(&id).unwrap().clone());
     }

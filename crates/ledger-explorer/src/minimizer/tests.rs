@@ -1,6 +1,7 @@
 use super::*;
 use crate::oracle::{AssertionOracle, HistoryOperation, Oracle, PropertyOracle};
 use crate::search::{Finding, Workload};
+use ledger_format::{CanonicalValue, EntryPayload};
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, Simulation};
 use std::error::Error as _;
 
@@ -38,8 +39,8 @@ impl Workload for InputJournalWorkload {
 
 fn input_value_present(run: &RunResult, target: u64) -> bool {
     run.journal.entries().any(|entry| {
-        matches!(entry.data.kind, EntryKind::InputStep { .. })
-            && matches!(&entry.data.payload, Payload::Number(value) if *value == target)
+        matches!(entry.data.kind, EntryKind::InputStep)
+            && matches!(&entry.data.payload, EntryPayload::InputStep(ledger_format::InputStepPayload { generator: _, replay: _, value: CanonicalValue::Unsigned(value) }) if *value == target)
     })
 }
 
@@ -47,8 +48,15 @@ fn no_input_equals_42() -> PropertyOracle<impl Fn(&Journal) -> bool> {
     PropertyOracle {
         property: |journal: &Journal| {
             !journal.entries().any(|entry| {
-                matches!(entry.data.kind, EntryKind::InputStep { .. })
-                    && matches!(&entry.data.payload, Payload::Number(42))
+                matches!(entry.data.kind, EntryKind::InputStep)
+                    && matches!(
+                        &entry.data.payload,
+                        EntryPayload::InputStep(ledger_format::InputStepPayload {
+                            generator: _,
+                            replay: _,
+                            value: CanonicalValue::Unsigned(42)
+                        })
+                    )
             })
         },
         name: "no input value equals 42".into(),
@@ -138,7 +146,15 @@ fn chain_journal(values: &[u64]) -> Journal {
     let mut journal = Journal::new();
     for value in values {
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(*value))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(*value),
+                }),
+            )
             .expect("append must succeed");
     }
     journal
@@ -358,11 +374,27 @@ fn memoized_replay_fast_forwards_repeated_batches() {
 fn candidate_journal_fast_forwards_source_prefix_runs() {
     let mut source = Journal::new();
     source
-        .append(EntryKind::Outcome, 1, [], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
     for value in 1..20u64 {
         source
-            .append(EntryKind::Outcome, 2, [], Payload::Number(value))
+            .append(
+                EntryKind::Outcome,
+                2,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(value),
+                }),
+            )
             .expect("append must succeed");
     }
     let ids = source
@@ -396,13 +428,42 @@ fn candidate_journal_fast_forwards_source_prefix_runs() {
 fn minimize_slice_forward_closure_preserves_violation() {
     let mut journal = Journal::new();
     let boundary = journal
-        .append(EntryKind::Send, 1, [], Payload::Number(1))
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 1,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let witness = journal
-        .append(EntryKind::Assert, 1, [], Payload::Number(0))
+        .append(
+            EntryKind::Assert,
+            1,
+            [],
+            EntryPayload::Assert(ledger_format::AssertPayload {
+                predicate: [0x00; 32],
+                passed: 0 != 0,
+                detail: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
     let consumer = journal
-        .append(EntryKind::Recv, 2, [boundary], Payload::Number(1))
+        .append(
+            EntryKind::Recv,
+            2,
+            [boundary],
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(2, 0),
+                from: 1,
+                to: 2,
+                observed_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
 
     let backward = causal_slice(&journal, witness).expect("backward slice must succeed");
@@ -493,8 +554,8 @@ fn no_high_band_inputs() -> PropertyOracle<impl Fn(&Journal) -> bool> {
     PropertyOracle {
         property: |journal: &Journal| {
             !journal.entries().any(|entry| {
-                matches!(entry.data.kind, EntryKind::InputStep { .. })
-                    && matches!(&entry.data.payload, Payload::Number(value) if *value >= 80)
+                matches!(entry.data.kind, EntryKind::InputStep)
+                    && matches!(&entry.data.payload, EntryPayload::InputStep(ledger_format::InputStepPayload { generator: _, replay: _, value: CanonicalValue::Unsigned(value) }) if *value >= 80)
             })
         },
         name: "no input value in the high band".into(),
