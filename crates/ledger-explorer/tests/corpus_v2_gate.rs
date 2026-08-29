@@ -207,13 +207,13 @@ fn ldfi_finds_every_v2_bug_with_valid_minimal_certificate() {
         );
         let upper = (cert.cut.len() as u64).saturating_mul(MAX_EVENT_COST);
         assert!(
-            cert.recorded_lower_bound <= upper,
-            "{name}: recorded solver bound {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
-            cert.recorded_lower_bound
+            cert.cost <= upper,
+            "{name}: recorded cut cost {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
+            cert.cost
         );
         let hyp = ledger_explorer::ldfi::FaultHypothesis {
             events: cert.cut.clone(),
-            total_cost: cert.recorded_lower_bound,
+            total_cost: cert.cost,
             explanation: "mcs cut".to_string(),
         };
         let schedule = hypothesis_to_schedule(&hyp, &run.journal);

@@ -181,9 +181,13 @@ impl MaxSatSolver {
         } else {
             Some(crate::certs::RecordedSolverData {
                 cut: solution.cut,
-                recorded_lower_bound: solution.lower_bound_proof.unsat_core_cost,
+                cost: solution.total_cost,
                 method: solution.lower_bound_proof.method.to_string(),
                 horizon: self.inner.config.max_horizon,
+                support_provider_version: self.inner.config.support_version,
+                witnesses: verdict.witnesses.clone(),
+                reproduced: false,
+                baseline_passed: false,
             })
         };
         Ok((hypotheses, solver_data))

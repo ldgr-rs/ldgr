@@ -68,13 +68,13 @@ fn mcs_certificates_on_bug_corpus_v1() {
         // faultable kind, bounded by the shared cost-model maximum.
         let upper = (cert.cut.len() as u64).saturating_mul(MAX_EVENT_COST);
         assert!(
-            cert.recorded_lower_bound <= upper,
-            "{name}: recorded solver bound {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
-            cert.recorded_lower_bound
+            cert.cost <= upper,
+            "{name}: recorded cut cost {} must be <= cut.len()*{MAX_EVENT_COST} ({upper})",
+            cert.cost
         );
-        assert!(
-            cert.recorded_lower_bound <= hyps[0].total_cost,
-            "{name}: recorded solver bound must not exceed total_cost"
+        assert_eq!(
+            cert.cost, hyps[0].total_cost,
+            "{name}: recorded cut cost must equal the hypothesis cost"
         );
 
         // Map cut to executable fault schedule and verify replay reproduces
@@ -82,7 +82,7 @@ fn mcs_certificates_on_bug_corpus_v1() {
         // full schedule over-blocks progress.
         let hyp = ledger_explorer::ldfi::FaultHypothesis {
             events: cert.cut.clone(),
-            total_cost: cert.recorded_lower_bound,
+            total_cost: cert.cost,
             explanation: "mcs cut".to_string(),
         };
         let schedule = hypothesis_to_schedule(&hyp, &run.journal);
@@ -108,10 +108,10 @@ fn mcs_certificates_on_bug_corpus_v1() {
 
         let mut violated = holds(&schedule);
         println!(
-            "{name} full schedule violated={} cut_len={} lb={} schedule_len={}",
+            "{name} full schedule violated={} cut_len={} cost={} schedule_len={}",
             violated,
             cert.cut.len(),
-            cert.recorded_lower_bound,
+            cert.cost,
             schedule.len()
         );
         if !violated {
@@ -149,7 +149,7 @@ fn mcs_certificates_on_bug_corpus_v1() {
             "{name}: fault-injected replay must reproduce the violation"
         );
 
-        table.push((name.clone(), cert.cut.len(), cert.recorded_lower_bound));
+        table.push((name.clone(), cert.cut.len(), cert.cost));
         checked += 1;
     }
 

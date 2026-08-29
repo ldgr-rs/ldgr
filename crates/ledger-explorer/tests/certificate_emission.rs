@@ -113,9 +113,9 @@ fn recorded_solver_data_from_real_cut_verifies() {
         .expect("weighted MaxSAT solve must succeed");
     let extension = extension.expect("non-empty solve must return recorded solver data");
     assert!(!extension.cut.is_empty(), "the real cut must be non-empty");
-    assert!(
-        extension.recorded_lower_bound <= hypotheses[0].total_cost,
-        "the recorded bound must not exceed the solved cut cost"
+    assert_eq!(
+        extension.cost, hypotheses[0].total_cost,
+        "the recorded cost must equal the solved cut cost"
     );
 
     let mut certificate = CampaignCertificate::from_campaign(
@@ -154,8 +154,8 @@ fn recorded_solver_data_from_real_cut_verifies() {
         "the recorded solver horizon must survive the roundtrip"
     );
 
-    // A recorded bound above the maximum cut cost must fail validation.
-    let tampered_bound = certificate
+    // A recorded cost above the maximum cut cost must fail validation.
+    let tampered_cost = certificate
         .solver_data
         .as_ref()
         .map(|data| data.cut.len() as u64 * MAX_EVENT_COST + 1)
@@ -163,12 +163,16 @@ fn recorded_solver_data_from_real_cut_verifies() {
     let mut tampered = certificate.clone();
     tampered.solver_data = Some(ledger_explorer::RecordedSolverData {
         cut: certificate.solver_data.as_ref().unwrap().cut.clone(),
-        recorded_lower_bound: tampered_bound,
+        cost: tampered_cost,
         method: extension.method.clone(),
         horizon: extension.horizon,
+        support_provider_version: extension.support_provider_version,
+        witnesses: extension.witnesses.clone(),
+        reproduced: extension.reproduced,
+        baseline_passed: extension.baseline_passed,
     });
     assert!(
         tampered.verify().is_err(),
-        "verify must reject recorded bound {tampered_bound} above the cut cost"
+        "verify must reject recorded cost {tampered_cost} above the cut cost"
     );
 }

@@ -5,7 +5,7 @@
 //! certificate surfaces. Callers outside the explorer crate route through
 //! them instead of reaching into implementation modules.
 
-use crate::certs::{CampaignCertificate, CertError, ResolvedDependency};
+use crate::certs::{CampaignCertificate, CertError, LineagePolicy, ResolvedDependency};
 use crate::ldfi::{self, FaultHypothesis};
 use crate::maxsat;
 use crate::minimizer::{self, MinimizationReport, MinimizeError, MinimizedRepro};
@@ -166,5 +166,37 @@ pub fn validate_cut_against_journal(
     journal: &Journal,
 ) -> Result<(), ServiceError> {
     certificate.verify_with_journal(journal)?;
+    Ok(())
+}
+
+/// Bind a statement to a journal and verify the recorded cut is
+/// inclusion-minimal under the strict lineage policy.
+///
+/// Refuses statements whose cut is not reproduced or whose no-fault baseline
+/// violates: those are campaign statements, not fault-causation evidence.
+pub fn validate_inclusion_minimal_cut(
+    certificate: &CampaignCertificate,
+    journal: &Journal,
+) -> Result<(), ServiceError> {
+    certificate.verify_inclusion_minimal(journal)?;
+    Ok(())
+}
+
+/// Inclusion-minimal validation bound to the support provider that derived
+/// the recorded cut.
+///
+/// The recorded support-provider version must match the provider actually
+/// used; a disagreement fails before traversal, so an altered support binding
+/// can never certify a cut.
+pub fn validate_inclusion_minimal_cut_with_support(
+    certificate: &CampaignCertificate,
+    journal: &Journal,
+    support_version: u64,
+) -> Result<(), ServiceError> {
+    certificate.verify_inclusion_minimal_with_support(
+        journal,
+        LineagePolicy::Strict,
+        Some(support_version),
+    )?;
     Ok(())
 }

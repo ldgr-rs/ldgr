@@ -4,7 +4,7 @@
 use ledger_explorer::services::{
     ServiceError, emit_statement, ldfi_solve, minimize_decisions, parse_statement, replay_faults,
     replay_prefix, replay_strict, run_campaign, schedule_from_hypothesis, search_first,
-    validate_cut_against_journal, validate_statement,
+    validate_cut_against_journal, validate_inclusion_minimal_cut, validate_statement,
 };
 use ledger_explorer::solver::SolverConfig;
 use ledger_explorer::{CampaignReport, CertError, Finding, Oracle, PropertyOracle, Workload};
@@ -270,5 +270,27 @@ fn validate_cut_against_journal_rejects_zero_digest_binding() {
     assert!(
         matches!(err, ServiceError::Cert(CertError::Verification(_))),
         "typed binding error: {err:?}"
+    );
+}
+
+#[test]
+fn validate_inclusion_minimal_cut_refuses_campaign_statements() {
+    let report: CampaignReport =
+        run_campaign(&OutcomeWorkload(99), &final_is(7), config(8), 1).expect("campaign must run");
+    assert!(
+        !report.findings.is_empty(),
+        "the mismatched oracle must produce a finding"
+    );
+    let certificate = emit_statement(&report, "builder", Vec::new(), [1u8; 32], None)
+        .expect("statement must emit");
+    let journal = report.findings[0].run.journal.clone();
+    // The operation names the third distinct check: inclusion-minimal
+    // fault-cut validation. A campaign statement without a recorded cut is
+    // not fault-causation evidence and must fail closed.
+    let err = validate_inclusion_minimal_cut(&certificate, &journal)
+        .expect_err("campaign statements carry no fault cut");
+    assert!(
+        matches!(err, ServiceError::Cert(CertError::Verification(_))),
+        "typed minimality error: {err:?}"
     );
 }

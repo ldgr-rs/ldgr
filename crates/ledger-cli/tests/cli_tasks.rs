@@ -881,16 +881,26 @@ fn cert_verify_journal_mode_valid() {
     let cert_path = dir.join("cert.json");
     std::fs::write(&cert_path, cert.to_json().unwrap()).unwrap();
     // Journal binding should succeed.
-    let out = ledger_cli::cert_cmd::run_verify(&cert_path, Some(&journal_dir), false)
-        .expect("valid cert");
+    let out = ledger_cli::cert_cmd::run_verify(
+        &cert_path,
+        Some(&journal_dir),
+        ledger_cli::CertVerifyOp::Journal,
+        false,
+    )
+    .expect("valid cert");
     assert!(out.contains("certificate valid"), "{out}");
     assert!(
         out.contains("mode: journal-bound"),
         "mode label missing: {out}"
     );
     // JSON reports the exact journal-bound mode label.
-    let out_json =
-        ledger_cli::cert_cmd::run_verify(&cert_path, Some(&journal_dir), true).expect("json");
+    let out_json = ledger_cli::cert_cmd::run_verify(
+        &cert_path,
+        Some(&journal_dir),
+        ledger_cli::CertVerifyOp::Journal,
+        true,
+    )
+    .expect("json");
     let parsed: serde_json::Value = serde_json::from_str(&out_json).expect("json parse");
     assert_eq!(parsed["valid"], true);
     assert_eq!(parsed["mode"], "journal-bound");
@@ -955,8 +965,13 @@ fn cert_verify_journal_mode_wrong_root() {
         .expect("valid report must create a certificate");
     let cert_path = dir.join("cert.json");
     std::fs::write(&cert_path, cert.to_json().unwrap()).unwrap();
-    let err =
-        ledger_cli::cert_cmd::run_verify(&cert_path, Some(&journal_dir_b), false).unwrap_err();
+    let err = ledger_cli::cert_cmd::run_verify(
+        &cert_path,
+        Some(&journal_dir_b),
+        ledger_cli::CertVerifyOp::Journal,
+        false,
+    )
+    .unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("subject digest mismatch") || msg.contains("mismatch"),
@@ -981,26 +996,34 @@ fn cert_verify_human_recorded_solver_data_label() {
             .expect("valid report must create a certificate");
     cert.solver_data = Some(RecordedSolverData {
         cut: vec![[3u8; 32]],
-        recorded_lower_bound: 2,
+        cost: 2,
         method: "m".into(),
         horizon: Some(64),
+        support_provider_version: None,
+        witnesses: Vec::new(),
+        reproduced: false,
+        baseline_passed: false,
     });
     let dir = temp_dir("cert-recorded-bound");
     let path = dir.join("cert.json");
     std::fs::write(&path, cert.to_json().unwrap()).unwrap();
-    let out = ledger_cli::cert_cmd::run_verify(&path, None, false).unwrap();
+    let out =
+        ledger_cli::cert_cmd::run_verify(&path, None, ledger_cli::CertVerifyOp::Statement, false)
+            .unwrap();
     assert!(
-        out.contains("recorded_lower_bound"),
+        out.contains("cost="),
         "human must identify recorded solver data: {out}"
     );
     assert!(
         !out.contains("proven"),
         "human output must not claim proof: {out}"
     );
-    let out_json = ledger_cli::cert_cmd::run_verify(&path, None, true).unwrap();
+    let out_json =
+        ledger_cli::cert_cmd::run_verify(&path, None, ledger_cli::CertVerifyOp::Statement, true)
+            .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&out_json).unwrap();
     let solver_data = &parsed["solver_data"];
-    assert_eq!(solver_data["recorded_lower_bound"], 2);
+    assert_eq!(solver_data["cost"], 2);
 }
 
 #[test]
@@ -1010,7 +1033,9 @@ fn cert_verify_rejects_oversized_file() {
     // The bounded reader rejects 1 MiB plus one byte before JSON parsing.
     let oversized = vec![b'a'; 1024 * 1024 + 1];
     std::fs::write(&path, &oversized).unwrap();
-    let err = ledger_cli::cert_cmd::run_verify(&path, None, false).unwrap_err();
+    let err =
+        ledger_cli::cert_cmd::run_verify(&path, None, ledger_cli::CertVerifyOp::Statement, false)
+            .unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("too large") || msg.contains("limit"),
@@ -1059,7 +1084,12 @@ fn cert_verify_rejects_oversized_via_bounded_reader() {
     let path_ok = dir.join("ok.json");
     std::fs::write(&path_ok, &json).unwrap();
     // Small cert verifies.
-    let ok = ledger_cli::cert_cmd::run_verify(&path_ok, None, false);
+    let ok = ledger_cli::cert_cmd::run_verify(
+        &path_ok,
+        None,
+        ledger_cli::CertVerifyOp::Statement,
+        false,
+    );
     assert!(ok.is_ok(), "small cert must verify: {ok:?}");
     // The bounded reader consumes at most the limit plus one byte.
     let path_big = dir.join("big.json");
@@ -1067,7 +1097,13 @@ fn cert_verify_rejects_oversized_via_bounded_reader() {
     big.push_str(&" ".repeat(1024 * 1024));
     assert!(big.len() > 1024 * 1024);
     std::fs::write(&path_big, &big).unwrap();
-    let err = ledger_cli::cert_cmd::run_verify(&path_big, None, false).unwrap_err();
+    let err = ledger_cli::cert_cmd::run_verify(
+        &path_big,
+        None,
+        ledger_cli::CertVerifyOp::Statement,
+        false,
+    )
+    .unwrap_err();
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("too large") || msg.contains("limit"),

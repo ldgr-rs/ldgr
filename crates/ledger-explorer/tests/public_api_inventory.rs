@@ -18,7 +18,9 @@
 use ledger_explorer::services::{
     ServiceError, emit_statement, ldfi_solve, minimize_decisions, minimize_finding,
     parse_statement, replay_faults, replay_prefix, replay_strict, run_campaign,
-    schedule_from_hypothesis, search_first, validate_cut_against_journal, validate_statement,
+    schedule_from_hypothesis, search_first, validate_cut_against_journal,
+    validate_inclusion_minimal_cut, validate_inclusion_minimal_cut_with_support,
+    validate_statement,
 };
 use ledger_explorer::{
     AssertionOracle, CampaignCertificate, CampaignReport, CertError, ClauseCache, CoverageBuilder,

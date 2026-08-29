@@ -90,12 +90,39 @@ pub struct ResolvedDependency {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedSolverData {
     pub cut: Vec<Hash>,
-    /// Value recorded by the solver when it emitted this data.
-    pub recorded_lower_bound: u64,
+    /// Exact cut cost recomputed from the journal fault model at emission.
+    pub cost: u64,
     pub method: String,
     /// Solver horizon recorded at emission time. `None` records an unbounded
-    /// solver configuration. Wave 1 does not use this value for traversal.
+    /// solver configuration. Inclusion-minimal validation refuses an
+    /// unbounded configuration because it cannot bound the walk.
     pub horizon: Option<usize>,
+    /// Support-provider version pinned at emission. Tampering with this value
+    /// after the fact is rejected by support-aware validation.
+    pub support_provider_version: Option<u64>,
+    /// Violation witnesses the cut was derived against.
+    pub witnesses: Vec<Hash>,
+    /// Strict replay with the recorded cut applied reproduced the violation.
+    pub reproduced: bool,
+    /// The no-fault baseline rerun passed.
+    pub baseline_passed: bool,
+}
+
+/// Journal-anchored validation result recorded in a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JournalValidation {
+    /// The statement bound to a journal: root matched and every cut member
+    /// existed in that journal and was faultable.
+    Bound,
+}
+
+/// Inclusion-minimal fault-cut validation result recorded when checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InclusionMinimal {
+    /// No cut member is redundant: dropping any member loses hazard coverage.
+    Minimal,
+    /// At least one cut member is redundant.
+    NotMinimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +144,10 @@ pub struct CampaignCertificate {
     pub findings_count: usize,
     pub solver_data: Option<RecordedSolverData>,
     pub statistical: Option<StatisticalBound>,
+    /// Result of journal-anchored validation when it has been run.
+    pub journal_validation: Option<JournalValidation>,
+    /// Result of bounded inclusion-minimal fault-cut validation when checked.
+    pub inclusion_minimal: Option<InclusionMinimal>,
     /// Execution-identity digest of the run that produced this statement.
     ///
     /// `None` on certificates emitted without identity binding; the
@@ -338,6 +369,8 @@ impl CampaignCertificate {
             findings_count: report.findings.len(),
             solver_data: None,
             statistical,
+            journal_validation: None,
+            inclusion_minimal: None,
             execution_identity,
         };
         certificate.verify()?;
@@ -404,11 +437,31 @@ impl CampaignCertificate {
                 serde_json::json!(hash_to_hex(identity));
         }
         if let Some(data) = &self.solver_data {
-            let mut solver_json = serde_json::json!({"cut":data.cut.iter().map(hash_to_hex).collect::<Vec<_>>(),"recordedLowerBound":data.recorded_lower_bound,"method":data.method});
+            let mut solver_json = serde_json::json!({"cut":data.cut.iter().map(hash_to_hex).collect::<Vec<_>>(),"cost":data.cost,"method":data.method,"reproduced":data.reproduced,"baselinePassed":data.baseline_passed});
             if let Some(horizon) = data.horizon {
                 solver_json["horizon"] = serde_json::json!(horizon);
             }
+            if let Some(version) = data.support_provider_version {
+                solver_json["supportProviderVersion"] = serde_json::json!(version);
+            }
+            if !data.witnesses.is_empty() {
+                solver_json["witnesses"] =
+                    serde_json::json!(data.witnesses.iter().map(hash_to_hex).collect::<Vec<_>>());
+            }
             p["solverData"] = solver_json;
+        }
+        if let Some(validation) = &self.journal_validation {
+            let label = match validation {
+                JournalValidation::Bound => "bound",
+            };
+            p["journalValidation"] = serde_json::json!(label);
+        }
+        if let Some(minimal) = &self.inclusion_minimal {
+            let label = match minimal {
+                InclusionMinimal::Minimal => true,
+                InclusionMinimal::NotMinimal => false,
+            };
+            p["inclusionMinimal"] = serde_json::json!(label);
         }
         if let Some(s) = &self.statistical {
             p["statistical"] =
@@ -461,7 +514,12 @@ impl CampaignCertificate {
             pred,
             "predicate",
             &["buildDefinition", "runDetails"],
-            &["solverData", "statistical"],
+            &[
+                "solverData",
+                "statistical",
+                "journalValidation",
+                "inclusionMinimal",
+            ],
         )?;
         let bd = get_obj(pred, "buildDefinition")?;
         check_object_fields(
@@ -528,8 +586,8 @@ impl CampaignCertificate {
             check_object_fields(
                 data,
                 "solverData",
-                &["cut", "recordedLowerBound", "method"],
-                &["horizon"],
+                &["cut", "cost", "method", "reproduced", "baselinePassed"],
+                &["horizon", "supportProviderVersion", "witnesses"],
             )?;
             let cut_arr = get_arr(data, "cut")?;
             if cut_arr.is_empty() {
@@ -548,11 +606,49 @@ impl CampaignCertificate {
                 check_string_bytes(text, "cut member")?;
                 cut.push(hex_to_hash(text).map_err(CertError::Schema)?);
             }
-            let recorded_lower_bound = data
-                .get("recordedLowerBound")
+            let cost = data
+                .get("cost")
                 .and_then(|value| value.as_u64())
-                .ok_or_else(|| CertError::Schema("recordedLowerBound".into()))?;
+                .ok_or_else(|| CertError::Schema("cost".into()))?;
             let method = get_str(data, "method")?.to_string();
+            let reproduced = data
+                .get("reproduced")
+                .and_then(|value| value.as_bool())
+                .ok_or_else(|| CertError::Schema("reproduced".into()))?;
+            let baseline_passed = data
+                .get("baselinePassed")
+                .and_then(|value| value.as_bool())
+                .ok_or_else(|| CertError::Schema("baselinePassed".into()))?;
+            let witnesses = if let Some(arr) = data.get("witnesses").and_then(|x| x.as_array()) {
+                if arr.len() > MAX_RESOLVED_DEPENDENCIES {
+                    return Err(CertError::Schema(format!(
+                        "witnesses exceeds {MAX_RESOLVED_DEPENDENCIES}"
+                    )));
+                }
+                let mut out = Vec::with_capacity(arr.len());
+                for value in arr {
+                    let text = value
+                        .as_str()
+                        .ok_or_else(|| CertError::Schema("witness".into()))?;
+                    check_string_bytes(text, "witness")?;
+                    out.push(hex_to_hash(text).map_err(CertError::Schema)?);
+                }
+                out
+            } else {
+                Vec::new()
+            };
+            let support_provider_version = if let Some(value) = data.get("supportProviderVersion") {
+                let raw = value
+                    .as_u64()
+                    .ok_or_else(|| CertError::Schema("supportProviderVersion".into()))?;
+                let converted = u64_to_usize_checked(raw, "supportProviderVersion")?;
+                Some(
+                    u64::try_from(converted)
+                        .map_err(|_| CertError::Schema("supportProviderVersion overflow".into()))?,
+                )
+            } else {
+                None
+            };
             let horizon = if let Some(value) = data.get("horizon") {
                 let raw = value
                     .as_u64()
@@ -569,9 +665,13 @@ impl CampaignCertificate {
             };
             Some(RecordedSolverData {
                 cut,
-                recorded_lower_bound,
+                cost,
                 method,
                 horizon,
+                support_provider_version,
+                witnesses,
+                reproduced,
+                baseline_passed,
             })
         } else {
             None
@@ -592,6 +692,27 @@ impl CampaignCertificate {
         } else {
             None
         };
+        let journal_validation = match pred.get("journalValidation").and_then(|x| x.as_str()) {
+            Some("bound") => Some(JournalValidation::Bound),
+            Some(other) => {
+                return Err(CertError::Schema(format!(
+                    "journalValidation must be `bound`, got {other:?}"
+                )));
+            }
+            None => None,
+        };
+        let inclusion_minimal = match pred.get("inclusionMinimal") {
+            Some(value) => match value.as_bool() {
+                Some(true) => Some(InclusionMinimal::Minimal),
+                Some(false) => Some(InclusionMinimal::NotMinimal),
+                None => {
+                    return Err(CertError::Schema(
+                        "inclusionMinimal must be a boolean".into(),
+                    ));
+                }
+            },
+            None => None,
+        };
         Ok(Self {
             subject,
             predicate_type: pt,
@@ -603,6 +724,8 @@ impl CampaignCertificate {
             findings_count,
             solver_data,
             statistical,
+            journal_validation,
+            inclusion_minimal,
             execution_identity,
         })
     }
@@ -690,12 +813,25 @@ impl CampaignCertificate {
             let maximum_cost = cut_count.checked_mul(MAX_EVENT_COST).ok_or_else(|| {
                 CertError::Verification("maximum recorded cut cost overflow".into())
             })?;
-            if data.recorded_lower_bound > maximum_cost {
+            if data.cost > maximum_cost {
                 return Err(CertError::Verification(format!(
-                    "recorded solver bound {} exceeds maximum cut cost {maximum_cost}",
-                    data.recorded_lower_bound
+                    "recorded cut cost {} exceeds maximum cut cost {maximum_cost}",
+                    data.cost
                 )));
             }
+        }
+        if self.inclusion_minimal.is_some() && self.solver_data.is_none() {
+            return Err(CertError::Verification(
+                "inclusionMinimal requires a recorded cut".into(),
+            ));
+        }
+        if self.journal_validation.is_some() && self.findings_count == 0 {
+            // A bound result records journal-anchored validation, which only
+            // runs on findings-bearing statements; a campaign statement that
+            // never bound to a journal must not claim the result.
+            return Err(CertError::Verification(
+                "journalValidation requires findings to validate against a journal".into(),
+            ));
         }
         if let Some(statistical) = &self.statistical {
             check_string_bytes(&statistical.method, "statistical.method")?;
@@ -746,6 +882,16 @@ impl CampaignCertificate {
                 "journal mode requires concrete subject digest; zero digest never binds".into(),
             ));
         }
+        if let Some(data) = &self.solver_data {
+            for witness in &data.witnesses {
+                if journal.get(witness).is_none() {
+                    return Err(CertError::Verification(format!(
+                        "forged witness: references unknown journal entry {:02x?}",
+                        &witness[..4]
+                    )));
+                }
+            }
+        }
         let subject_root = journal.root_hash();
         if subject_root != self.subject.digest {
             return Err(CertError::Verification(format!(
@@ -780,10 +926,10 @@ impl CampaignCertificate {
                 .checked_add(event_fault_cost(journal, id))
                 .ok_or_else(|| CertError::Verification("recomputed cut cost overflow".into()))
         })?;
-        if data.recorded_lower_bound > exact_cost {
+        if data.cost != exact_cost {
             return Err(CertError::Verification(format!(
-                "recorded solver bound {} exceeds recomputed cut cost {exact_cost}",
-                data.recorded_lower_bound
+                "recorded cut cost {} disagrees with recomputed cut cost {exact_cost}",
+                data.cost
             )));
         }
         Ok(())
@@ -832,6 +978,160 @@ impl CampaignCertificate {
         }
         self.verify_with_journal(journal)
     }
+
+    /// Bound the statement to a journal and verify the recorded cut is
+    /// inclusion-minimal: every member is essential, so no proper subset of
+    /// the cut still covers every witness derivation path.
+    ///
+    /// Requires a non-empty reproduced cut and a passing no-fault baseline;
+    /// a baseline violation may still produce a campaign statement, but it is
+    /// not fault-causation evidence and this operation refuses it.
+    pub fn verify_inclusion_minimal_with(
+        &self,
+        journal: &Journal,
+        policy: LineagePolicy,
+    ) -> Result<(), CertError> {
+        self.verify_inclusion_minimal_with_support(journal, policy, None)
+    }
+
+    /// Inclusion-minimal validation bound to an expected support-provider
+    /// version.
+    ///
+    /// When the statement records a support-provider version and an expected
+    /// version is supplied, the two must agree; a disagreement fails before
+    /// any traversal, so an altered support binding can never certify a cut.
+    pub fn verify_inclusion_minimal_with_support(
+        &self,
+        journal: &Journal,
+        policy: LineagePolicy,
+        expected_support_version: Option<u64>,
+    ) -> Result<(), CertError> {
+        self.verify_with_journal_with(journal, policy)?;
+        let Some(data) = &self.solver_data else {
+            return Err(CertError::Verification(
+                "inclusion-minimal validation requires a recorded cut".into(),
+            ));
+        };
+        if let (Some(recorded), Some(expected)) =
+            (data.support_provider_version, expected_support_version)
+            && recorded != expected
+        {
+            return Err(CertError::Verification(format!(
+                "support-provider version mismatch: statement records {recorded}, \
+                 expected {expected}"
+            )));
+        }
+        if !data.reproduced || !data.baseline_passed {
+            return Err(CertError::Verification(
+                "fault-cut extension requires a reproduced cut and a passing \
+                 no-fault baseline; a baseline violation is a campaign \
+                 statement, not fault-causation evidence"
+                    .into(),
+            ));
+        }
+        let Some(horizon) = data.horizon else {
+            return Err(CertError::Verification(
+                "inclusion-minimal validation requires a recorded solver \
+                 horizon to bound the traversal"
+                    .into(),
+            ));
+        };
+        if data.witnesses.is_empty() {
+            return Err(CertError::Verification(
+                "inclusion-minimal validation requires recorded witnesses".into(),
+            ));
+        }
+        let paths = collect_fault_paths_iterative(journal, &data.witnesses, horizon)?;
+        let cut: std::collections::BTreeSet<Hash> = data.cut.iter().copied().collect();
+        for path in &paths {
+            if path.iter().all(|id| !cut.contains(id)) {
+                return Err(CertError::Verification(
+                    "recorded cut misses a witness derivation path".into(),
+                ));
+            }
+        }
+        for member in &data.cut {
+            let essential = paths.iter().any(|path| {
+                path.contains(member) && path.iter().filter(|id| cut.contains(*id)).count() == 1
+            });
+            if !essential {
+                return Err(CertError::Verification(format!(
+                    "cut member {:02x?} is redundant: the recorded cut is not \
+                     inclusion-minimal",
+                    &member[..4]
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Journal-bound inclusion-minimal validation under the strict lineage
+    /// policy. See [`Self::verify_inclusion_minimal_with`].
+    pub fn verify_inclusion_minimal(&self, journal: &Journal) -> Result<(), CertError> {
+        self.verify_inclusion_minimal_with(journal, LineagePolicy::Strict)
+    }
+}
+
+/// Maximum derivation paths a bounded inclusion-minimal check will walk
+/// before failing closed: a cut whose witness closure is wider than this
+/// cannot be certified with the recorded horizon.
+const MAX_INCLUSION_PATHS: usize = 65536;
+
+/// Iteratively collect faultable derivation paths from `witnesses`, bounded
+/// by `horizon`.
+///
+/// The explicit stack keeps journal-derived graph depth off the call stack,
+/// and the per-walk visited set bounds re-expansion of shared ancestors, so
+/// a deep or wide graph cannot overflow or explode the walk. Returns an
+/// error when the path budget is exceeded, which fails the check closed.
+fn collect_fault_paths_iterative(
+    journal: &Journal,
+    witnesses: &[Hash],
+    horizon: usize,
+) -> Result<Vec<Vec<Hash>>, CertError> {
+    let mut paths = Vec::new();
+    for witness in witnesses {
+        let mut visited: std::collections::HashSet<(Hash, usize)> =
+            std::collections::HashSet::new();
+        let mut stack = vec![(*witness, 0usize, Vec::new())];
+        while let Some((current, depth, mut path)) = stack.pop() {
+            if depth > horizon {
+                if !path.is_empty() {
+                    paths.push(path);
+                    if paths.len() > MAX_INCLUSION_PATHS {
+                        return Err(CertError::Verification(format!(
+                            "inclusion-minimal check exceeds {MAX_INCLUSION_PATHS} paths"
+                        )));
+                    }
+                }
+                continue;
+            }
+            if !visited.insert((current, depth)) {
+                continue;
+            }
+            let Some(entry) = journal.get(&current) else {
+                continue;
+            };
+            if is_faultable(entry.data.kind) {
+                path.push(current);
+            }
+            if entry.data.parents.is_empty() {
+                if !path.is_empty() {
+                    paths.push(path);
+                    if paths.len() > MAX_INCLUSION_PATHS {
+                        return Err(CertError::Verification(format!(
+                            "inclusion-minimal check exceeds {MAX_INCLUSION_PATHS} paths"
+                        )));
+                    }
+                }
+            } else {
+                for parent in &entry.data.parents {
+                    stack.push((*parent, depth + 1, path.clone()));
+                }
+            }
+        }
+    }
+    Ok(paths)
 }
 
 impl CampaignReport {
@@ -1301,9 +1601,13 @@ mod tests {
         .expect("valid campaign must create a certificate");
         certificate.solver_data = Some(RecordedSolverData {
             cut: Vec::new(),
-            recorded_lower_bound: 0,
+            cost: 0,
             method: "solver-v1".into(),
             horizon: Some(64),
+            support_provider_version: None,
+            witnesses: Vec::new(),
+            reproduced: false,
+            baseline_passed: false,
         });
         let error = certificate.verify().expect_err("empty cut must fail");
         assert!(error.to_string().contains("non-empty cut"), "{error}");
@@ -1360,8 +1664,10 @@ mod tests {
                 .expect("certificate JSON must parse");
         value["predicate"]["solverData"] = serde_json::json!({
             "cut": [],
-            "recordedLowerBound": 0,
+            "cost": 0,
             "method": "solver-v1",
+            "reproduced": true,
+            "baselinePassed": true,
             "horizon": 64
         });
         let empty_cut = serde_json::to_string(&value).expect("JSON must serialize");
@@ -1370,8 +1676,10 @@ mod tests {
         let member = "01".repeat(32);
         value["predicate"]["solverData"] = serde_json::json!({
             "cut": [member.clone(), member],
-            "recordedLowerBound": 1,
+            "cost": 1,
             "method": "solver-v1",
+            "reproduced": true,
+            "baselinePassed": true,
             "horizon": 64
         });
         let duplicate = serde_json::to_string(&value).expect("JSON must serialize");
@@ -1415,11 +1723,18 @@ mod tests {
         let mut certificate =
             CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32], None)
                 .expect("valid campaign must create a certificate");
+        let exact_cost = cut.iter().fold(0u64, |total, id| {
+            total.saturating_add(event_fault_cost(journal, id))
+        });
         certificate.solver_data = Some(RecordedSolverData {
-            recorded_lower_bound: u64::try_from(cut.len()).expect("test cut length must fit"),
+            cost: exact_cost,
             cut,
             method: "solver-v1".into(),
             horizon: Some(64),
+            support_provider_version: None,
+            witnesses: Vec::new(),
+            reproduced: true,
+            baseline_passed: true,
         });
         certificate
     }
@@ -1504,6 +1819,225 @@ mod tests {
         );
     }
 
+    fn deep_chain_journal(depth: usize) -> (Journal, Hash, Hash) {
+        let mut journal = Journal::new();
+        let mut parent = None;
+        let mut head = [0u8; 32];
+        let mut witness = [0u8; 32];
+        for i in 0..depth {
+            let id = journal
+                .append(
+                    EntryKind::Send,
+                    1,
+                    parent.map_or(Vec::new(), |p: Hash| vec![p]),
+                    Payload::Pair {
+                        left: (i as u64).wrapping_add(1),
+                        right: (i as u64).wrapping_add(2),
+                    },
+                )
+                .expect("append must succeed");
+            if i == 0 {
+                head = id;
+            }
+            parent = Some(id);
+            witness = id;
+        }
+        (journal, head, witness)
+    }
+
+    #[test]
+    fn inclusion_minimal_accepts_chain_cut_without_stack_overflow() {
+        // A 20k-deep single-parent chain behind a shallow statement horizon:
+        // the recorded horizon bounds the walk, and the iterative traversal
+        // never puts journal depth on the call stack.
+        let (journal, head, witness) = deep_chain_journal(20_000);
+        // The cut must sit inside the recorded horizon (64) of the witness;
+        // the head of a 20k chain is far beyond it.
+        let mut cut = Vec::new();
+        let mut current = Some(witness);
+        for _ in 0..16 {
+            current = current
+                .and_then(|id| journal.get(&id))
+                .and_then(|e| e.data.parents.first().copied());
+        }
+        let within_horizon = current.expect("chain must extend 16 levels");
+        cut.push(within_horizon);
+        let mut certificate = journal_certificate(&journal, cut);
+        certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .witnesses = vec![witness];
+        certificate
+            .verify_inclusion_minimal(&journal)
+            .expect("the within-horizon chain cut must be inclusion-minimal");
+        assert_ne!(
+            head, within_horizon,
+            "the deep head stays outside the horizon"
+        );
+    }
+
+    #[test]
+    fn iterative_traversal_handles_deep_chain_without_recursion() {
+        // The traversal itself must survive graph depth far beyond any
+        // reasonable call-stack budget: 100k levels with no recursion.
+        let (journal, _, witness) = deep_chain_journal(100_000);
+        let paths = collect_fault_paths_iterative(&journal, &[witness], 100_000)
+            .expect("deep walk must complete within the path budget");
+        assert_eq!(paths.len(), 1, "a chain has exactly one witness path");
+        assert_eq!(
+            paths[0].len(),
+            100_000,
+            "every faultable chain level lands on the path"
+        );
+    }
+
+    #[test]
+    fn inclusion_minimal_rejects_redundant_cut_member() {
+        let (journal, head, witness) = deep_chain_journal(32);
+        // Cut with both the head and the witness: the witness is redundant
+        // because every path through the witness also passes the head.
+        let mut certificate = journal_certificate(&journal, vec![head, witness]);
+        certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .witnesses = vec![witness];
+        let error = certificate
+            .verify_inclusion_minimal(&journal)
+            .expect_err("redundant member must fail");
+        assert!(
+            error.to_string().contains("redundant"),
+            "error must name the redundancy: {error}"
+        );
+    }
+
+    #[test]
+    fn inclusion_minimal_requires_reproduction_and_baseline() {
+        let (journal, head, witness) = deep_chain_journal(8);
+        let mut certificate = journal_certificate(&journal, vec![head]);
+        certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .witnesses = vec![witness];
+        let data = certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present");
+        data.reproduced = false;
+        let error = certificate
+            .verify_inclusion_minimal(&journal)
+            .expect_err("an unreproduced cut is campaign data, not fault evidence");
+        assert!(
+            error.to_string().contains("reproduced"),
+            "error must name the missing reproduction: {error}"
+        );
+
+        let mut certificate = journal_certificate(&journal, vec![head]);
+        certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .witnesses = vec![witness];
+        certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .baseline_passed = false;
+        let error = certificate
+            .verify_inclusion_minimal(&journal)
+            .expect_err("a violating baseline is a campaign statement, not causation");
+        assert!(
+            error.to_string().contains("baseline"),
+            "error must name the baseline: {error}"
+        );
+    }
+
+    #[test]
+    fn altered_support_version_fails_statement_validation() {
+        // A real chain journal so cut membership and exact-cost checks pass
+        // before the support-version gate is exercised.
+        let (journal, head, witness) = deep_chain_journal(8);
+        let mut certificate = journal_certificate(&journal, vec![head]);
+        certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .witnesses = vec![witness];
+        certificate
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .support_provider_version = Some(1);
+        // The statement records which support-provider version derived its
+        // cut; tampering with that binding is a schema-level integrity break.
+        let json = certificate.to_json().expect("certificate serializes");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("certificate JSON must parse");
+        value["predicate"]["solverData"]["supportProviderVersion"] = serde_json::json!(2);
+        let tampered = serde_json::to_string(&value).expect("JSON must serialize");
+        let decoded = CampaignCertificate::from_json(&tampered).expect("schema must decode");
+        assert_eq!(
+            decoded
+                .solver_data
+                .as_ref()
+                .expect("solver data present")
+                .support_provider_version,
+            Some(2),
+            "the altered version must parse"
+        );
+        // Support binding is checked by the support-aware journal operation:
+        // a statement claiming one version while carrying another fails closed
+        // before any traversal.
+        let mut consistent = decoded.clone();
+        consistent
+            .solver_data
+            .as_mut()
+            .expect("solver data present")
+            .support_provider_version = Some(1);
+        assert!(
+            consistent
+                .verify_inclusion_minimal_with_support(&journal, LineagePolicy::Strict, Some(1))
+                .is_ok(),
+            "a statement matching the expected provider version must pass"
+        );
+        let error = decoded
+            .verify_inclusion_minimal_with_support(&journal, LineagePolicy::Strict, Some(1))
+            .expect_err("altered support version must fail support-bound validation");
+        assert!(
+            error
+                .to_string()
+                .contains("support-provider version mismatch"),
+            "error must name the support binding: {error}"
+        );
+    }
+
+    #[test]
+    fn statement_round_trips_journal_validation_and_minimality_results() {
+        let report = with_finding();
+        let mut certificate =
+            CampaignCertificate::from_campaign(&report, "b", Vec::new(), [1u8; 32], None)
+                .expect("valid campaign must create a certificate");
+        certificate.journal_validation = Some(JournalValidation::Bound);
+        certificate.inclusion_minimal = Some(InclusionMinimal::Minimal);
+        let json = certificate.to_json().expect("certificate serializes");
+        assert!(json.contains("journalValidation"), "{json}");
+        assert!(json.contains("inclusionMinimal"), "{json}");
+        let decoded = CampaignCertificate::from_json(&json).expect("certificate parses");
+        assert_eq!(decoded.journal_validation, Some(JournalValidation::Bound));
+        assert_eq!(decoded.inclusion_minimal, Some(InclusionMinimal::Minimal));
+        // Unknown values fail closed.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("certificate JSON must parse");
+        value["predicate"]["journalValidation"] = serde_json::json!("unbound");
+        let bad = serde_json::to_string(&value).expect("JSON must serialize");
+        assert!(
+            CampaignCertificate::from_json(&bad).is_err(),
+            "unknown journalValidation label must fail"
+        );
+    }
+
     #[test]
     fn certificate_surfaces_contain_no_future_claim_wording() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1512,10 +2046,16 @@ mod tests {
             manifest.join("../ledger-cli/src/cert_cmd.rs"),
             manifest.join("../../README.md"),
         ];
+        // Stage 2 statements are unsigned. Public text must not claim
+        // trust guarantees the format does not provide, and the unverified
+        // solver bound wording is gone with the field. Every phrase is
+        // concatenated so this test never matches its own source.
         let forbidden = [
-            ["inclusion", "-minimal"].concat(),
-            ["support", " path"].concat(),
-            ["support", "-path"].concat(),
+            ["authent", "ic"].concat(),
+            ["non-", "repudiation"].concat(),
+            ["complete", "ness"].concat(),
+            ["global", " optimum"].concat(),
+            ["tamper", "-proof"].concat(),
             ["proven", " lower bound"].concat(),
             ["optimal", "ity"].concat(),
         ];
@@ -1525,7 +2065,7 @@ mod tests {
             for phrase in &forbidden {
                 assert!(
                     !lower.contains(phrase),
-                    "{} contains future claim wording `{phrase}`",
+                    "{} contains forbidden claim wording `{phrase}`",
                     file.display()
                 );
             }

@@ -327,7 +327,22 @@ pub enum CertCommand {
         /// Directory of the persisted journal for journal-anchored validation.
         #[arg(long)]
         journal: Option<PathBuf>,
+        /// Selected operation: statement, journal, or inclusion-minimal.
+        /// Journal and inclusion-minimal require --journal.
+        #[arg(long, value_enum, default_value_t = CertVerifyOp::Statement)]
+        op: CertVerifyOp,
     },
+}
+
+/// The three distinct certificate operations the CLI names explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CertVerifyOp {
+    /// Bounded statement validation without a journal.
+    Statement,
+    /// Journal-anchored observation and cut validation.
+    Journal,
+    /// Bounded inclusion-minimal fault-cut validation.
+    InclusionMinimal,
 }
 
 #[derive(Debug, Subcommand)]

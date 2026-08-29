@@ -1,6 +1,8 @@
 use std::error::Error as _;
 use std::path::PathBuf;
 
+use ledger_cli::CertVerifyOp;
+use ledger_cli::cert_cmd::run_verify;
 use ledger_explorer::search::CampaignReport;
 use ledger_explorer::{
     CampaignCertificate, RecordedSolverData, ResolvedDependency, StatisticalBound,
@@ -38,7 +40,7 @@ fn cert_verify_human_valid() {
     let path = temp_path("valid-human");
     write_cert(&path, &json);
 
-    let out = ledger_cli::cert_cmd::run_verify(&path, None, false).unwrap();
+    let out = run_verify(&path, None, CertVerifyOp::Statement, false).unwrap();
     assert!(
         out.contains("certificate valid"),
         "output missing valid marker: {out}"
@@ -81,9 +83,13 @@ fn cert_verify_json_valid() {
             .expect("valid report must create a certificate");
     cert.solver_data = Some(RecordedSolverData {
         cut: vec![[3u8; 32], [4u8; 32]],
-        recorded_lower_bound: 1,
+        cost: 2,
         method: "test-method".into(),
         horizon: Some(64),
+        support_provider_version: None,
+        witnesses: Vec::new(),
+        reproduced: false,
+        baseline_passed: false,
     });
     cert.statistical = Some(StatisticalBound {
         upper_p: 0.01,
@@ -94,7 +100,7 @@ fn cert_verify_json_valid() {
     let path = temp_path("valid-json");
     write_cert(&path, &json);
 
-    let out = ledger_cli::cert_cmd::run_verify(&path, None, true).unwrap();
+    let out = run_verify(&path, None, CertVerifyOp::Statement, true).unwrap();
     assert!(out.contains("\"valid\":true"), "json missing valid: {out}");
     assert!(
         out.contains(&predicate_type_campaign_v1()),
@@ -139,7 +145,7 @@ fn cert_verify_tampered_predicate_fails() {
     let path = temp_path("tampered-predicate");
     write_cert(&path, &json);
 
-    let err = ledger_cli::cert_cmd::run_verify(&path, None, false).unwrap_err();
+    let err = run_verify(&path, None, CertVerifyOp::Statement, false).unwrap_err();
     let lower = err.to_string().to_lowercase();
     assert!(
         lower.contains("predicate") || lower.contains("verification") || lower.contains("schema"),
@@ -161,8 +167,13 @@ fn cert_verify_preserves_journal_open_error_source() {
     let journal_path = temp_path("journal-source-invalid");
     write_cert(&journal_path, "not a journal directory");
 
-    let error = ledger_cli::cert_cmd::run_verify(&cert_path, Some(&journal_path), false)
-        .expect_err("invalid journal path must fail");
+    let error = run_verify(
+        &cert_path,
+        Some(&journal_path),
+        CertVerifyOp::Journal,
+        false,
+    )
+    .expect_err("invalid journal path must fail");
     assert!(
         matches!(error, ledger_cli::cert_cmd::CertVerifyError::JournalOpen(_)),
         "journal open must keep its dedicated error variant: {error:?}"
@@ -180,10 +191,60 @@ fn cert_verify_preserves_journal_open_error_source() {
 fn cert_verify_invalid_json_schema_error() {
     let path = temp_path("invalid-json");
     write_cert(&path, r#"{"not": "a certificate"}"#);
-    let err = ledger_cli::cert_cmd::run_verify(&path, None, false).unwrap_err();
+    let err = run_verify(&path, None, CertVerifyOp::Statement, false).unwrap_err();
     let lower = err.to_string().to_lowercase();
     assert!(
         lower.contains("schema"),
         "invalid json should be schema error, got: {err}"
+    );
+}
+
+#[test]
+fn journal_mode_requires_explicit_journal() {
+    let report = make_report(10);
+    let cert =
+        CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32], None)
+            .expect("valid report must create a certificate");
+    let path = temp_path("journal-required");
+    write_cert(&path, &cert.to_json().unwrap());
+    // Journal mode without --journal names its requirement explicitly.
+    let err = run_verify(&path, None, CertVerifyOp::Journal, false).unwrap_err();
+    assert!(
+        err.to_string().contains("requires --journal"),
+        "journal mode must require the journal: {err}"
+    );
+    let err = run_verify(&path, None, CertVerifyOp::InclusionMinimal, false).unwrap_err();
+    assert!(
+        err.to_string().contains("requires --journal"),
+        "inclusion-minimal mode must require the journal: {err}"
+    );
+}
+
+#[test]
+fn inclusion_minimal_mode_names_the_operation_and_refuses_campaign_statements() {
+    let report = make_report(10);
+    let cert =
+        CampaignCertificate::from_campaign(&report, "builder-test", Vec::new(), [1u8; 32], None)
+            .expect("valid report must create a certificate");
+    let cert_path = temp_path("minimal-campaign");
+    write_cert(&cert_path, &cert.to_json().unwrap());
+    // A journal directory is required and must open, but a campaign
+    // statement without a recorded fault cut is not causation evidence.
+    let journal_path = temp_path("minimal-campaign-journal");
+    std::fs::create_dir_all(&journal_path).unwrap();
+    let err = run_verify(
+        &cert_path,
+        Some(&journal_path),
+        CertVerifyOp::InclusionMinimal,
+        false,
+    )
+    .unwrap_err();
+    // The empty directory opens as an empty journal, and the campaign
+    // statement (no findings, zero digest) must fail closed: the concrete
+    // subject digest requirement binds before any cut check.
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("zero digest") || msg.contains("recorded cut"),
+        "inclusion-minimal mode must fail closed on a campaign statement: {err}"
     );
 }
