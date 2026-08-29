@@ -28,7 +28,8 @@ use crate::scheduler::Scheduler;
 use crate::seedtree::SeedTree;
 use crate::simfs::SimFs;
 use crate::time::VirtualTime;
-use ledger_format::{ActorId, EntryKind, Hash, Payload};
+use ledger_format::MessageId;
+use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
 use ledger_journal::{BatchEntry, Journal, JournalCorrectnessMonitor};
 use rand_chacha::ChaCha20Rng;
 
@@ -478,8 +479,14 @@ impl Executor {
     fn journal_spawns(&self) -> Result<(), RuntimeError> {
         let tasks = self.shared.tasks.borrow();
         for (task_id, _) in tasks.iter().enumerate() {
-            self.shared
-                .journal_append(task_id as ActorId, EntryKind::Spawn, [], Payload::Empty)?;
+            self.shared.journal_append(
+                task_id as ActorId,
+                EntryKind::Spawn,
+                [],
+                EntryPayload::Spawn {
+                    child_actor: task_id as ActorId,
+                },
+            )?;
         }
         Ok(())
     }
@@ -488,11 +495,13 @@ impl Executor {
     fn journal_rng_draw(&self, choice: usize) -> Result<(), RuntimeError> {
         self.shared.journal_append(
             SCHED_ACTOR,
-            EntryKind::RngDraw {
-                stream: SCHED_STREAM,
-            },
+            EntryKind::RngDraw,
             [],
-            Payload::Number(choice as u64),
+            EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                stream: SCHED_STREAM,
+                draw_index: 0,
+                content: (choice as u64).to_le_bytes().to_vec(),
+            }),
         )?;
         Ok(())
     }
@@ -520,7 +529,9 @@ impl Executor {
                 task_id as ActorId,
                 EntryKind::Wake,
                 send_id.into_iter().collect::<Vec<_>>(),
-                Payload::Empty,
+                EntryPayload::Wake(ledger_format::WakePayload::MessageReady {
+                    message_id: MessageId::new(task_id as ActorId, 0),
+                }),
             )?;
             self.shared
                 .notify_entry(task_id as ActorId, EntryKind::Wake, task_id, Some(wake_id));
@@ -545,13 +556,23 @@ impl Executor {
         if !fired.is_empty() {
             let mut batch = Vec::with_capacity(fired.len() * 2);
             for timer in &fired {
-                let mut timer_entry =
-                    BatchEntry::new(EntryKind::TimerFire, timer.task as ActorId, Payload::Empty);
+                let mut timer_entry = BatchEntry::new(
+                    EntryKind::TimerFire,
+                    timer.task as ActorId,
+                    EntryPayload::TimerFire {
+                        timer_id: 0,
+                        deadline_ticks: 0,
+                    },
+                );
                 timer_entry.observed_parents.extend(timer.enabler);
                 batch.push(timer_entry);
                 batch.push(
-                    BatchEntry::new(EntryKind::Wake, timer.task as ActorId, Payload::Empty)
-                        .chained(),
+                    BatchEntry::new(
+                        EntryKind::Wake,
+                        timer.task as ActorId,
+                        EntryPayload::Wake(ledger_format::WakePayload::TimerReady { timer_id: 0 }),
+                    )
+                    .chained(),
                 );
             }
             let ids = self.shared.journal_append_batch(batch)?;
@@ -1036,8 +1057,14 @@ mod tests {
         let extract_stream_one = |run: &RunResult| -> Vec<u64> {
             run.journal
                 .entries()
-                .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-                    (EntryKind::RngDraw { stream: 1 }, Payload::Number(value)) => Some(*value),
+                .filter_map(|entry| match &entry.data.payload {
+                    EntryPayload::RngDraw(draw)
+                        if entry.data.kind == EntryKind::RngDraw && draw.stream == 1 =>
+                    {
+                        Some(u64::from_le_bytes(
+                            draw.content[..8].try_into().expect("8-byte content"),
+                        ))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -1187,7 +1214,15 @@ mod coverage_tests {
                 leak_shared
                     .journal
                     .borrow_mut()
-                    .append(EntryKind::Outcome, 0, [], Payload::Number(99))
+                    .append(
+                        EntryKind::Outcome,
+                        0,
+                        [],
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            schema: [0x00; 32],
+                            value: ledger_format::CanonicalValue::Unsigned(99),
+                        }),
+                    )
                     .unwrap();
             });
             shared.tasks.borrow_mut().push(make_task_entry(root));
@@ -1217,7 +1252,7 @@ mod swarm_tests {
     use super::*;
     use crate::config::SwarmConfig;
     use crate::runtime::Simulation;
-    use ledger_format::FaultSpec;
+    use ledger_format::{EntryPayload, FaultPayload};
 
     fn base_config(seed: u8) -> RunConfig {
         RunConfig {
@@ -1247,22 +1282,21 @@ mod swarm_tests {
             ..SwarmConfig::default()
         });
         let run = Simulation::new(config, two_task_programs()).run().unwrap();
-        let kinds = run
+        let drops = run
             .journal
             .entries()
-            .map(|entry| entry.data.kind)
-            .collect::<Vec<_>>();
+            .filter(|entry| {
+                matches!(
+                    &entry.data.payload,
+                    EntryPayload::Fault(FaultPayload::DropMessage { .. })
+                )
+            })
+            .count();
+        assert!(drops >= 1, "a Drop fault must be journaled");
         assert!(
-            kinds.iter().any(|kind| matches!(
-                kind,
-                EntryKind::Fault {
-                    fault: FaultSpec::Drop
-                }
-            )),
-            "a Drop fault must be journaled"
-        );
-        assert!(
-            !kinds.iter().any(|kind| matches!(kind, EntryKind::Recv)),
+            !run.journal
+                .entries()
+                .any(|entry| entry.data.kind == EntryKind::Recv),
             "a dropped message must never be received"
         );
         assert!(run.monitor_issues.is_empty());
@@ -1299,16 +1333,15 @@ mod swarm_tests {
         let crash_states = run
             .journal
             .entries()
-            .filter_map(|entry| match entry.data.kind {
-                EntryKind::Fault {
-                    fault: FaultSpec::CrashState(index),
-                } => Some(index),
-                _ => None,
+            .filter(|entry| {
+                matches!(
+                    &entry.data.payload,
+                    EntryPayload::Fault(FaultPayload::CrashActor { .. })
+                )
             })
-            .collect::<Vec<_>>();
+            .count();
         assert_eq!(
-            crash_states.len(),
-            1,
+            crash_states, 1,
             "a budget of 1 must journal exactly one CrashState fault"
         );
         assert!(run.monitor_issues.is_empty());
@@ -1346,18 +1379,24 @@ mod swarm_tests {
             .unwrap();
         let b = Simulation::new(config, programs).run().unwrap();
         assert_eq!(a.journal.root_hash(), b.journal.root_hash());
-        let distinct = a
+        let distinct_ops = a
             .journal
             .entries()
-            .filter_map(|entry| match entry.data.kind {
-                EntryKind::Fault {
-                    fault: FaultSpec::CrashState(index),
-                } => Some(index),
+            .filter_map(|entry| match &entry.data.payload {
+                EntryPayload::Fault(FaultPayload::CrashActor {
+                    crash_operation, ..
+                }) => Some(crash_operation.clone()),
                 _ => None,
             })
-            .collect::<HashSet<_>>();
+            .collect::<Vec<_>>();
+        let mut seen: Vec<ledger_format::CrashOperation> = Vec::new();
+        for op in &distinct_ops {
+            if !seen.contains(op) {
+                seen.push(op.clone());
+            }
+        }
         assert!(
-            distinct.len() <= 2,
+            seen.len() <= 2,
             "a budget of 2 must keep distinct crash classes at most 2"
         );
         assert!(a.monitor_issues.is_empty());
@@ -1465,18 +1504,13 @@ mod swarm_tests {
             Instruction::Done,
         ]];
         let run = Simulation::new(config, programs).run().unwrap();
-        let kinds = run
-            .journal
-            .entries()
-            .map(|entry| entry.data.kind)
-            .collect::<Vec<_>>();
         assert!(
-            kinds.iter().any(|kind| matches!(
-                kind,
-                EntryKind::Fault {
-                    fault: FaultSpec::CrashState(_)
-                }
-            )),
+            run.journal.entries().any(|entry| {
+                matches!(
+                    &entry.data.payload,
+                    EntryPayload::Fault(FaultPayload::CrashActor { .. })
+                )
+            }),
             "a CrashState fault must be journaled after a sampled crash"
         );
         assert!(run.monitor_issues.is_empty());

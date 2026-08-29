@@ -1,31 +1,39 @@
 //! Manifest schemas and format version identifiers.
+//!
+//! Version 2 manifest layout (canonical CBOR array of exactly 8 items):
+//!
+//! ```text
+//! Manifest = [
+//!   format_version,
+//!   crash_semantics_version,
+//!   execution_identity_digest,
+//!   root_seed,
+//!   policy,
+//!   journal_root,
+//!   entry_count,
+//!   actor_heads
+//! ]
+//! ```
+//!
+//! The execution-identity digest moved from the version-1 extensions slot
+//! into a first-class array element; the extensions map is gone. The outer
+//! 16-byte frame prefix (see [`crate::frame`]) precedes the manifest bytes
+//! on disk.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::string::ToString;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::cbor::{self, CborError, CborValue};
 use crate::entry::{ActorId, Hash};
+use crate::limits::{CRASH_SEMANTICS_VERSION, FORMAT_VERSION};
 
-/// Extension-map key carrying the execution-identity digest in the manifest.
-///
-/// The digest is a 32-byte BLAKE3 hash of the canonical
-/// `ledger_journal::identity::ExecutionIdentity` bytes. `ledger-format`
-/// cannot depend on `ledger-journal`, so the key is a documented string
-/// constant rather than a typed re-export; both sides agree on the key name
-/// and the 32-byte payload shape.
-const EXECUTION_IDENTITY_EXTENSION: &str = "execution_identity";
-
-/// Current manifest format version. Version 1 is the only supported version.
-pub const MANIFEST_FORMAT_VERSION: u32 = 1;
+/// Current manifest format version. Version 2 is the only supported version.
+pub const MANIFEST_FORMAT_VERSION: u32 = FORMAT_VERSION;
 
 /// A manifest format version identifier.
 ///
-/// A reader rejects any version other than [`ManifestVersion::CURRENT`]. A
-/// breaking format change bumps the version and is a breaking release of
-/// `ledger-format`.
+/// A reader rejects any version other than [`ManifestVersion::CURRENT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManifestVersion(pub u32);
 
@@ -38,14 +46,16 @@ impl ManifestVersion {
 }
 
 /// A reproducible run manifest describing a simulation trial.
-///
-/// The canonical wire form is an array of 7 items in this order:
-/// `format_version`, `root_seed`, `policy_tag`, `journal_root`, `entry_count`,
-/// `actor_heads` (a map), and `extensions` (a map). The extensions map is the
-/// append-only forward-compatibility slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunManifest {
     pub format_version: u32,
+    /// Crash-semantics version bound by the manifest and `ExecutionIdentity`.
+    pub crash_semantics_version: u32,
+    /// Execution-identity digest of the run that produced this manifest.
+    ///
+    /// `None` means the run did not bind an identity; a root comparison
+    /// involving this manifest must treat the identity as incomplete.
+    pub execution_identity: Option<Hash>,
     pub root_seed: Hash,
     /// Scheduling policy name or parameters.
     pub policy_tag: String,
@@ -55,69 +65,18 @@ pub struct RunManifest {
     pub entry_count: u64,
     /// Actor sequence heads at end of run.
     pub actor_heads: BTreeMap<ActorId, Hash>,
-    /// Reserved extension fields for append-only format evolution.
-    pub extensions: BTreeMap<String, CborValue>,
-    /// Execution-identity digest of the run that produced this manifest.
-    ///
-    /// Encoded inside [`Self::extensions`] under `execution_identity`, so the
-    /// canonical wire form (array of 7 items) is unchanged. `None` means the
-    /// run did not bind an identity; a root comparison involving this
-    /// manifest must treat the identity as incomplete.
-    pub execution_identity: Option<Hash>,
 }
 
 impl RunManifest {
-    /// Serializes manifest to a structured CBOR map.
-    ///
-    /// This is the tolerant in-memory representation, not the canonical wire
-    /// form. Use [`Self::to_canonical_bytes`] for serialization.
-    pub fn to_cbor(&self) -> CborValue {
-        let heads = self
-            .actor_heads
-            .iter()
-            .map(|(k, v)| (CborValue::Unsigned(*k as u64), CborValue::Bytes(v.to_vec())))
-            .collect();
-        let extensions = self
-            .extensions
-            .iter()
-            .map(|(k, v)| (CborValue::Text(k.clone()), v.clone()))
-            .collect();
-
-        let map = vec![
-            (
-                CborValue::Text("format_version".into()),
-                CborValue::Unsigned(self.format_version as u64),
-            ),
-            (
-                CborValue::Text("root_seed".into()),
-                CborValue::Bytes(self.root_seed.to_vec()),
-            ),
-            (
-                CborValue::Text("policy".into()),
-                CborValue::Text(self.policy_tag.clone()),
-            ),
-            (
-                CborValue::Text("journal_root".into()),
-                CborValue::Bytes(self.journal_root.to_vec()),
-            ),
-            (
-                CborValue::Text("entry_count".into()),
-                CborValue::Unsigned(self.entry_count),
-            ),
-            (CborValue::Text("actor_heads".into()), CborValue::Map(heads)),
-            (
-                CborValue::Text("extensions".into()),
-                CborValue::Map(extensions),
-            ),
-        ];
-
-        CborValue::Map(map)
-    }
-
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
         let mut out = Vec::new();
-        cbor::array(&mut out, 7);
+        cbor::array(&mut out, 8);
         cbor::unsigned(&mut out, self.format_version as u64);
+        cbor::unsigned(&mut out, self.crash_semantics_version as u64);
+        match &self.execution_identity {
+            Some(digest) => cbor::bytes(&mut out, digest),
+            None => cbor::null(&mut out),
+        }
         cbor::bytes(&mut out, &self.root_seed);
         cbor::text(&mut out, &self.policy_tag);
         cbor::bytes(&mut out, &self.journal_root);
@@ -134,27 +93,13 @@ impl RunManifest {
             })
             .collect();
         CborValue::Map(heads).try_encode(&mut out)?;
-
-        let mut extensions = self.extensions.clone();
-        if let Some(identity) = &self.execution_identity {
-            extensions.insert(
-                EXECUTION_IDENTITY_EXTENSION.to_string(),
-                CborValue::Bytes(identity.to_vec()),
-            );
-        }
-        let extensions: Vec<(CborValue, CborValue)> = extensions
-            .iter()
-            .map(|(key, val)| (CborValue::Text(key.clone()), val.clone()))
-            .collect();
-        CborValue::Map(extensions).try_encode(&mut out)?;
-
         Ok(out)
     }
 
     /// Deserializes a manifest from canonical CBOR bytes.
     ///
-    /// Version 1 is an array of exactly 7 canonical items in the same order as
-    /// [`Self::to_canonical_bytes`]. Any other version is rejected.
+    /// Version 2 is an array of exactly 8 canonical items in the order above.
+    /// Any other version is rejected.
     pub fn from_canonical_bytes(input: &[u8]) -> Result<Self, CborError> {
         let value = CborValue::from_canonical_bytes(input)?;
         let CborValue::Array(items) = value else {
@@ -162,9 +107,9 @@ impl RunManifest {
                 "top-level item must be an array",
             ));
         };
-        if items.len() != 7 {
+        if items.len() != 8 {
             return Err(CborError::MalformedManifest(
-                "array must hold exactly 7 items",
+                "array must hold exactly 8 items",
             ));
         }
 
@@ -180,7 +125,31 @@ impl RunManifest {
             return Err(CborError::UnsupportedVersion(format_version));
         }
 
-        let root_seed = match &items[1] {
+        let crash_semantics_version = match &items[1] {
+            CborValue::Unsigned(v) if *v <= u32::MAX as u64 => *v as u32,
+            _ => {
+                return Err(CborError::MalformedManifest(
+                    "item 1 must be the crash-semantics version",
+                ));
+            }
+        };
+        if crash_semantics_version != CRASH_SEMANTICS_VERSION {
+            return Err(CborError::UnsupportedVersion(crash_semantics_version));
+        }
+
+        let execution_identity = match &items[2] {
+            CborValue::Null => None,
+            CborValue::Bytes(b) => Some(<[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
+                CborError::MalformedManifest("execution_identity digest must be a 32-byte hash")
+            })?),
+            _ => {
+                return Err(CborError::MalformedManifest(
+                    "execution_identity must be null or a 32-byte hash",
+                ));
+            }
+        };
+
+        let root_seed = match &items[3] {
             CborValue::Bytes(b) => <[u8; 32]>::try_from(b.as_slice())
                 .map_err(|_| CborError::MalformedManifest("root_seed must be 32 bytes"))?,
             _ => {
@@ -189,11 +158,11 @@ impl RunManifest {
                 ));
             }
         };
-        let policy_tag = match &items[2] {
+        let policy_tag = match &items[4] {
             CborValue::Text(s) => s.clone(),
             _ => return Err(CborError::MalformedManifest("policy must be a text string")),
         };
-        let journal_root = match &items[3] {
+        let journal_root = match &items[5] {
             CborValue::Bytes(b) => <[u8; 32]>::try_from(b.as_slice())
                 .map_err(|_| CborError::MalformedManifest("journal_root must be 32 bytes"))?,
             _ => {
@@ -202,7 +171,7 @@ impl RunManifest {
                 ));
             }
         };
-        let entry_count = match &items[4] {
+        let entry_count = match &items[6] {
             CborValue::Unsigned(v) => *v,
             _ => {
                 return Err(CborError::MalformedManifest(
@@ -211,7 +180,7 @@ impl RunManifest {
             }
         };
 
-        let actor_heads = match &items[5] {
+        let actor_heads = match &items[7] {
             CborValue::Map(entries) => {
                 let mut map = BTreeMap::new();
                 for (key, val) in entries {
@@ -242,50 +211,15 @@ impl RunManifest {
             _ => return Err(CborError::MalformedManifest("actor_heads must be a map")),
         };
 
-        let extensions = match &items[6] {
-            CborValue::Map(entries) => {
-                let mut map = BTreeMap::new();
-                for (key, val) in entries {
-                    let name = match key {
-                        CborValue::Text(s) => s.clone(),
-                        _ => {
-                            return Err(CborError::MalformedManifest(
-                                "extension name must be a text string",
-                            ));
-                        }
-                    };
-                    map.insert(name, val.clone());
-                }
-                map
-            }
-            _ => return Err(CborError::MalformedManifest("extensions must be a map")),
-        };
-
-        let execution_identity = match extensions.get(EXECUTION_IDENTITY_EXTENSION) {
-            Some(CborValue::Bytes(b)) => {
-                Some(<[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
-                    CborError::MalformedManifest(
-                        "execution_identity extension must be a 32-byte hash",
-                    )
-                })?)
-            }
-            Some(_) => {
-                return Err(CborError::MalformedManifest(
-                    "execution_identity extension must be a byte string",
-                ));
-            }
-            None => None,
-        };
-
         Ok(RunManifest {
             format_version,
+            crash_semantics_version,
+            execution_identity,
             root_seed,
             policy_tag,
             journal_root,
             entry_count,
             actor_heads,
-            extensions,
-            execution_identity,
         })
     }
 }
@@ -298,18 +232,18 @@ mod tests {
     fn sample_manifest() -> RunManifest {
         RunManifest {
             format_version: MANIFEST_FORMAT_VERSION,
+            crash_semantics_version: CRASH_SEMANTICS_VERSION,
+            execution_identity: None,
             root_seed: [0x01; 32],
             policy_tag: "random".to_string(),
             journal_root: [0x02; 32],
             entry_count: 7,
             actor_heads: BTreeMap::new(),
-            extensions: BTreeMap::new(),
-            execution_identity: None,
         }
     }
 
     #[test]
-    fn identity_extension_round_trips() {
+    fn identity_digest_round_trips() {
         let mut manifest = sample_manifest();
         manifest.execution_identity = Some([0xab; 32]);
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
@@ -320,8 +254,6 @@ mod tests {
 
     #[test]
     fn identity_absent_stays_absent() {
-        // A legacy manifest without the extension key decodes with no
-        // identity; root comparison treats that as incomplete.
         let manifest = sample_manifest();
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
         let decoded = RunManifest::from_canonical_bytes(&bytes).expect("manifest decodes");
@@ -340,25 +272,46 @@ mod tests {
     }
 
     #[test]
-    fn identity_extension_rejects_wrong_shape() {
+    fn wrong_version_is_rejected() {
         let mut manifest = sample_manifest();
-        manifest.extensions.insert(
-            EXECUTION_IDENTITY_EXTENSION.to_string(),
-            CborValue::Bytes(vec![1, 2, 3]),
-        );
+        manifest.format_version = 1;
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
-        let error = RunManifest::from_canonical_bytes(&bytes)
-            .expect_err("wrong-length identity must be rejected");
-        assert!(matches!(error, CborError::MalformedManifest(_)));
+        assert!(matches!(
+            RunManifest::from_canonical_bytes(&bytes),
+            Err(CborError::UnsupportedVersion(1))
+        ));
+    }
 
+    #[test]
+    fn wrong_crash_semantics_is_rejected() {
         let mut manifest = sample_manifest();
-        manifest.extensions.insert(
-            EXECUTION_IDENTITY_EXTENSION.to_string(),
-            CborValue::Unsigned(7),
-        );
+        manifest.crash_semantics_version = CRASH_SEMANTICS_VERSION + 1;
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
-        let error = RunManifest::from_canonical_bytes(&bytes)
-            .expect_err("non-byte identity must be rejected");
-        assert!(matches!(error, CborError::MalformedManifest(_)));
+        assert!(matches!(
+            RunManifest::from_canonical_bytes(&bytes),
+            Err(CborError::UnsupportedVersion(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_identity_shape_is_rejected() {
+        // Craft a manifest whose identity element is a 16-byte byte string;
+        // the typed field cannot express that, so build the raw array.
+        let mut bytes = Vec::new();
+        cbor::array(&mut bytes, 8);
+        cbor::unsigned(&mut bytes, MANIFEST_FORMAT_VERSION as u64);
+        cbor::unsigned(&mut bytes, CRASH_SEMANTICS_VERSION as u64);
+        cbor::bytes(&mut bytes, &[0xaa; 16]);
+        cbor::bytes(&mut bytes, &[0x01; 32]);
+        cbor::text(&mut bytes, "random");
+        cbor::bytes(&mut bytes, &[0x02; 32]);
+        cbor::unsigned(&mut bytes, 7);
+        CborValue::Map(Vec::new())
+            .try_encode(&mut bytes)
+            .expect("actor heads encode");
+        assert!(matches!(
+            RunManifest::from_canonical_bytes(&bytes),
+            Err(CborError::MalformedManifest(_))
+        ));
     }
 }

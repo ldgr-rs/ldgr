@@ -28,7 +28,7 @@ use ledger_explorer::oracle::{
     DifferentialOracle, HistoryOperation, HistoryOracle, KeyValueSpec, Oracle, Verdict,
 };
 use ledger_explorer::search::Workload;
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, Simulation};
 
 fn config(seed: [u8; 32]) -> RunConfig {
@@ -149,20 +149,29 @@ fn kv_history(run: &RunResult) -> Vec<HistoryOperation> {
     run.journal
         .entries()
         .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-            (EntryKind::Send, Payload::Pair { right: 42, .. }) if entry.data.actor == 0 => {
+            (
+                EntryKind::Send,
+                EntryPayload::Send(ledger_format::SendFrame {
+                    original_content, ..
+                }),
+            ) if entry.data.actor == 0 && original_content.as_slice() == 42u64.to_le_bytes() => {
                 Some(HistoryOperation::Write {
                     key: "k".into(),
                     value: 42,
                     witness: entry.id,
                 })
             }
-            (EntryKind::Outcome, Payload::Number(value)) if entry.data.actor == 2 => {
-                Some(HistoryOperation::Read {
-                    key: "k".into(),
-                    value: *value,
-                    witness: entry.id,
-                })
-            }
+            (
+                EntryKind::Outcome,
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    value: CanonicalValue::Unsigned(value),
+                    ..
+                }),
+            ) if entry.data.actor == 2 => Some(HistoryOperation::Read {
+                key: "k".into(),
+                value: *value,
+                witness: entry.id,
+            }),
             _ => None,
         })
         .collect()
@@ -174,7 +183,10 @@ fn outcome_value(run: &RunResult) -> Option<u64> {
         .entries()
         .filter(|entry| entry.data.kind == EntryKind::Outcome)
         .find_map(|entry| match &entry.data.payload {
-            Payload::Number(value) => Some(*value),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                value: CanonicalValue::Unsigned(value),
+                ..
+            }) => Some(*value),
             _ => None,
         })
 }

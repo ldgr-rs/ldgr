@@ -31,7 +31,7 @@ use ledger_explorer::ldfi::{hypothesis_to_schedule, solve_with};
 use ledger_explorer::oracle::{Oracle, PropertyOracle, Verdict};
 use ledger_explorer::search::{FaultReplayError, FaultReplayReport, Workload, replay_with_faults};
 use ledger_explorer::solver::HittingSetSolver;
-use ledger_format::Hash;
+use ledger_format::{CanonicalValue, EntryPayload, Hash};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SeedTree, SimFault, Simulation};
 use rand_core::Rng;
@@ -431,7 +431,10 @@ fn outcome_value(journal: &Journal) -> Option<u64> {
         .entries()
         .filter(|entry| entry.data.kind == ledger_format::EntryKind::Outcome)
         .find_map(|entry| match &entry.data.payload {
-            ledger_format::Payload::Number(value) => Some(*value),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                value: CanonicalValue::Unsigned(value),
+                ..
+            }) => Some(*value),
             _ => None,
         })
 }
@@ -1252,9 +1255,12 @@ fn dr0003_pbt_gate() {
         .run
         .journal
         .entries()
-        .filter(|entry| matches!(&entry.data.kind, ledger_format::EntryKind::InputStep { .. }))
+        .filter(|entry| matches!(&entry.data.kind, ledger_format::EntryKind::InputStep))
         .filter_map(|entry| match &entry.data.payload {
-            ledger_format::Payload::Number(value) => Some(*value),
+            EntryPayload::InputStep(ledger_format::InputStepPayload {
+                value: CanonicalValue::Unsigned(value),
+                ..
+            }) => Some(*value),
             _ => None,
         })
         .collect();

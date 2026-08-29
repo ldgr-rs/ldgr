@@ -5,7 +5,7 @@ use crate::oracle::{HistoryOperation, HistoryOracle, KeyValueSpec, PropertyOracl
 use crate::pbt::{EnergyDistribution, InputsWorkload};
 use crate::solver_state::load as load_solver_state;
 use crate::workloads::MiniKvWorkload;
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SeedTree, SimFault};
 
@@ -46,8 +46,8 @@ impl Workload for InputSensitiveWorkload {
 
 fn journal_contains_input_value(run: &RunResult, target: u64) -> bool {
     run.journal.entries().any(|entry| {
-        matches!(entry.data.kind, EntryKind::InputStep { .. })
-            && matches!(&entry.data.payload, Payload::Number(value) if *value == target)
+        matches!(entry.data.kind, EntryKind::InputStep)
+            && matches!(&entry.data.payload, EntryPayload::InputStep(ledger_format::InputStepPayload { generator: _, replay: _, value: CanonicalValue::Unsigned(value) }) if *value == target)
     })
 }
 
@@ -62,8 +62,15 @@ fn search_input_finds_violation_only_for_specific_input_sample() {
     let oracle = PropertyOracle {
         property: |journal: &Journal| {
             !journal.entries().any(|entry| {
-                matches!(entry.data.kind, EntryKind::InputStep { .. })
-                    && matches!(&entry.data.payload, Payload::Number(42))
+                matches!(entry.data.kind, EntryKind::InputStep)
+                    && matches!(
+                        &entry.data.payload,
+                        EntryPayload::InputStep(ledger_format::InputStepPayload {
+                            generator: _,
+                            replay: _,
+                            value: CanonicalValue::Unsigned(42)
+                        })
+                    )
             })
         },
         name: "no input value equals 42".into(),
@@ -343,7 +350,10 @@ fn kv_oracle(fw: u64) -> PropertyOracle<impl Fn(&Journal) -> bool> {
                 .entries()
                 .filter(|entry| entry.data.kind == EntryKind::Outcome)
                 .find_map(|entry| match &entry.data.payload {
-                    Payload::Number(value) => Some(*value),
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: _,
+                        value: CanonicalValue::Unsigned(value),
+                    }) => Some(*value),
                     _ => None,
                 });
             outcome == Some(fw)
@@ -535,7 +545,7 @@ fn outcome_halt_monitor(payload: u64) -> Box<dyn OnlineMonitor> {
     Box::new(SafetyMonitor::new(
         move |entry: &ledger_journal::Entry| {
             if entry.data.kind == EntryKind::Outcome {
-                !matches!(&entry.data.payload, Payload::Number(value) if *value == payload)
+                !matches!(&entry.data.payload, EntryPayload::Outcome(ledger_format::OutcomePayload { value: CanonicalValue::Unsigned(value), .. }) if *value == payload)
             } else {
                 true
             }
@@ -645,7 +655,15 @@ fn campaign_report_renders_ndjson_coverage_records() {
 
     let mut journal = Journal::new();
     journal
-        .append(EntryKind::Outcome, 1, [], Payload::Number(5))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(5),
+            }),
+        )
         .expect("append must succeed");
     let root_hex = hash_to_hex(&journal.root_hash());
     let run = RunResult {

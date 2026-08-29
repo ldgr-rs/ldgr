@@ -152,13 +152,13 @@ fn write_file(
 fn default_manifest() -> Result<Vec<u8>, ScaffoldError> {
     let manifest = RunManifest {
         format_version: MANIFEST_FORMAT_VERSION,
+        crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
         root_seed: [0u8; 32],
         policy_tag: "bandit".into(),
         journal_root: [0u8; 32],
         entry_count: 0,
         actor_heads: BTreeMap::new(),
         execution_identity: None,
-        extensions: BTreeMap::new(),
     };
     manifest
         .to_canonical_bytes()

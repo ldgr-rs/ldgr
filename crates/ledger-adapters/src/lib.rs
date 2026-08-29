@@ -22,7 +22,7 @@ pub use otel::{
     ingest_otel_file, ingest_otel_file_with_config, ingest_otel_with_fidelity, topo_order_spans,
 };
 
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{EntryKind, EntryPayload};
 use ledger_journal::{Journal, JournalError};
 
 /// Adapter translation errors.
@@ -165,7 +165,7 @@ pub(crate) fn mark_fidelity(journal: &mut Journal, fidelity: Fidelity) -> Result
                 EntryKind::Epoch,
                 0,
                 [],
-                Payload::Text("lineage-only".to_string()),
+                EntryPayload::Epoch(ledger_format::EpochPayload { epoch: 0 }),
             )
             .map_err(AdapterError::Journal)?;
     }

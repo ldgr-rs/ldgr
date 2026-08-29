@@ -7,7 +7,7 @@ use crate::seedtree::SeedTree;
 use crate::simfs::SimFs;
 use crate::time::{Clock, VirtualTime};
 use core::convert::Infallible;
-use ledger_format::{ActorId, EntryKind, FaultSpec, Hash, Payload, StreamId};
+use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, MessageId, StreamId};
 use ledger_journal::{Journal, JournalError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{Rng, TryRng};
@@ -51,12 +51,14 @@ impl SimStreamRng {
     /// Journal one `RngDraw` entry, recording the first failure if any.
     fn append_draw(&self, value: u64) {
         match lock(&self.journal).append(
-            EntryKind::RngDraw {
-                stream: self.stream,
-            },
+            EntryKind::RngDraw,
             self.actor,
             [],
-            Payload::Number(value),
+            EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                stream: self.stream,
+                draw_index: 0,
+                content: value.to_le_bytes().to_vec(),
+            }),
         ) {
             Ok(_) => {}
             Err(error) => {
@@ -188,7 +190,7 @@ impl SimBackend {
         &self,
         kind: EntryKind,
         parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Option<Hash> {
         self.append(kind, parents, payload)
     }
@@ -197,7 +199,7 @@ impl SimBackend {
         &self,
         kind: EntryKind,
         parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Option<Hash> {
         match lock(&self.journal).append(kind, self.actor, parents, payload) {
             Ok(id) => Some(id),
@@ -241,13 +243,31 @@ impl Effects for SimBackend {
 
     async fn sleep(&self, d: core::time::Duration) {
         let ticks = d.as_micros() as u64;
-        let timer_set = self.append(EntryKind::TimerSet, [], Payload::Number(ticks));
+        let timer_set = self.append(
+            EntryKind::TimerSet,
+            [],
+            EntryPayload::TimerSet {
+                timer_id: 0,
+                deadline_ticks: ticks,
+            },
+        );
         let mut time = lock(&self.time);
         time.set_with_enabler(ticks, self.actor as usize, timer_set);
         for fired in time.advance_with_enablers() {
             let parents = fired.enabler.into_iter().collect::<Vec<_>>();
-            if let Some(timer_fire) = self.append(EntryKind::TimerFire, parents, Payload::Empty) {
-                self.append(EntryKind::Wake, [timer_fire], Payload::Empty);
+            if let Some(timer_fire) = self.append(
+                EntryKind::TimerFire,
+                parents,
+                EntryPayload::TimerFire {
+                    timer_id: 0,
+                    deadline_ticks: 0,
+                },
+            ) {
+                self.append(
+                    EntryKind::Wake,
+                    [timer_fire],
+                    EntryPayload::Wake(ledger_format::WakePayload::TimerReady { timer_id: 0 }),
+                );
             }
         }
         drop(time);
@@ -281,7 +301,13 @@ impl Net for SimBackend {
         let id = self.append(
             EntryKind::Recv,
             [message.send_id],
-            Payload::Number(message.payload),
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                // CONSUMER DEBT (lane 2): real message identity.
+                message_id: MessageId::new(message.from as ActorId, message.payload),
+                from: message.from as ActorId,
+                to: task as ActorId,
+                observed_content: message.payload.to_le_bytes().to_vec(),
+            }),
         );
         // Clone the origin out before re-locking: the guard from `get` lives
         // to the end of the statement, and the mutex is not reentrant.
@@ -304,10 +330,13 @@ impl SimBackend {
         let Some(id) = self.append(
             EntryKind::Send,
             [],
-            Payload::Pair {
-                left: message.to as u64,
-                right: message.payload,
-            },
+            EntryPayload::Send(ledger_format::SendFrame {
+                // CONSUMER DEBT (lane 2): real message identity.
+                message_id: MessageId::new(message.from as ActorId, message.payload),
+                from: message.from as ActorId,
+                to: message.to as ActorId,
+                original_content: message.payload.to_le_bytes().to_vec(),
+            }),
         ) else {
             return (false, None);
         };
@@ -379,11 +408,12 @@ impl SimBackend {
     /// state. Returns the entry id when journaling worked.
     fn crash_impl(&self) -> Option<Hash> {
         let id = self.append(
-            EntryKind::Fault {
-                fault: FaultSpec::CrashState(0),
-            },
+            EntryKind::Fault,
             [],
-            Payload::Empty,
+            EntryPayload::Fault(FaultPayload::CrashActor {
+                actor: self.actor,
+                crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+            }),
         );
         lock(&*self.fs).crash();
         id
@@ -418,16 +448,20 @@ mod tests {
         futures::executor::block_on(effects.sleep(core::time::Duration::from_micros(10)));
 
         let journal = effects.journal_snapshot();
-        let kinds = journal.entries().map(|e| e.data.kind).collect::<Vec<_>>();
+        assert!(journal.entries().any(|e| {
+            matches!(
+                &e.data.payload,
+                EntryPayload::RngDraw(ledger_format::RngDrawPayload { stream: 0, .. })
+            )
+        }));
+        assert!(journal.entries().any(|e| e.data.kind == EntryKind::Send));
+        assert!(journal.entries().any(|e| e.data.kind == EntryKind::FsWrite));
+        assert!(journal.entries().any(|e| e.data.kind == EntryKind::FsFsync));
         assert!(
-            kinds
-                .iter()
-                .any(|k| matches!(k, EntryKind::RngDraw { stream: 0 }))
+            journal
+                .entries()
+                .any(|e| e.data.kind == EntryKind::TimerSet)
         );
-        assert!(kinds.iter().any(|k| matches!(k, EntryKind::Send)));
-        assert!(kinds.iter().any(|k| matches!(k, EntryKind::FsWrite)));
-        assert!(kinds.iter().any(|k| matches!(k, EntryKind::FsFsync)));
-        assert!(kinds.iter().any(|k| matches!(k, EntryKind::TimerSet)));
         assert!(journal.get(&write_id).is_some());
         assert!(
             JournalCorrectnessMonitor::audit(&journal).is_empty(),

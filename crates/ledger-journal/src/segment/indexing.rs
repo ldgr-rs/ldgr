@@ -15,8 +15,8 @@ use crate::dag::{Entry, JournalError};
 use ledger_format::Hash;
 
 use super::{
-    HEADER_LEN, SealedSegment, SegmentStore, decode_frame_payload, frame_payload_at, next_frame,
-    prefix_of, segment_file_name, segment_io,
+    SealedSegment, SegmentStore, decode_frame_payload, frame_payload_at, next_frame, prefix_of,
+    segment_file_name, segment_io,
 };
 
 impl SegmentStore {
@@ -73,7 +73,7 @@ impl SegmentStore {
             return Ok(Arc::clone(block));
         }
         let bytes = self.segment_bytes(segment.id)?;
-        let start = HEADER_LEN;
+        let start = segment.data_offset as usize;
         let end = start + segment.compressed_len as usize;
         if end > bytes.len() {
             return Err(JournalError::SegmentCorrupt(format!(

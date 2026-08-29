@@ -2,7 +2,7 @@ use super::*;
 use crate::ldfi::{FaultHypothesis, FaultableEvent};
 use crate::oracle::Verdict;
 use crate::solver_cache::{ClauseCache, WeightedClause};
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
 use ledger_journal::{Journal, JournalError};
 
 #[test]
@@ -20,13 +20,41 @@ fn empty_input_has_no_recorded_solver_data() {
 fn hitting_set_solver_detects_two_disjoint_supports() {
     let mut journal = Journal::new();
     let send_a = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let send_b = journal
-        .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 2 })
+        .append(
+            EntryKind::Send,
+            2,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(2, 0),
+                from: 2,
+                to: 3,
+                original_content: 2u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let witness = journal
-        .append(EntryKind::Outcome, 3, [send_a, send_b], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            3,
+            [send_a, send_b],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
 
     let verdict = Verdict::fail(vec![witness], "two supports");
@@ -53,20 +81,53 @@ fn hitting_set_solver_detects_two_disjoint_supports() {
 fn hitting_set_solver_picks_shared_root_over_two_branches() {
     let mut journal = Journal::new();
     let shared = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 99 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 99u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let branch_a = journal
-        .append(EntryKind::Recv, 2, [shared], Payload::Number(0))
+        .append(
+            EntryKind::Recv,
+            2,
+            [shared],
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(2, 0),
+                from: 1,
+                to: 2,
+                observed_content: 0u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let branch_b = journal
-        .append(EntryKind::Recv, 3, [shared], Payload::Number(0))
+        .append(
+            EntryKind::Recv,
+            3,
+            [shared],
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(3, 0),
+                from: 1,
+                to: 3,
+                observed_content: 0u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let witness = journal
         .append(
             EntryKind::Outcome,
             4,
             [branch_a, branch_b],
-            Payload::Number(0),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
         )
         .expect("append must succeed");
 
@@ -91,10 +152,28 @@ fn hitting_set_solver_picks_shared_root_over_two_branches() {
 fn solver_succeeds_on_small_journal() {
     let mut journal = Journal::new();
     let send = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let witness = journal
-        .append(EntryKind::Outcome, 1, [send], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [send],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
     let verdict = Verdict::fail(vec![witness], "small journal check");
     let mut solver = HittingSetSolver::new();
@@ -106,10 +185,28 @@ fn solver_succeeds_on_small_journal() {
 fn trait_object_dispatch_works() {
     let mut journal = Journal::new();
     let send = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let witness = journal
-        .append(EntryKind::Outcome, 1, [send], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [send],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
     let verdict = Verdict::fail(vec![witness], "trait object");
 
@@ -145,10 +242,28 @@ fn weighted_clause_helper() {
 fn maxsat_solver_matches_hitting_set_optimum() {
     let mut journal = Journal::new();
     let send = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let witness = journal
-        .append(EntryKind::Outcome, 1, [send], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [send],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
     let verdict = Verdict::fail(vec![witness], "maxsat delegate");
 
@@ -211,10 +326,28 @@ fn maxsat_solver_matches_hitting_set_optimum() {
 fn cache_memoizes_across_identical_solves() {
     let mut journal = Journal::new();
     let send = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let witness = journal
-        .append(EntryKind::Outcome, 1, [send], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [send],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
     let verdict = Verdict::fail(vec![witness], "cache test");
     let mut solver = HittingSetSolver::new();
@@ -253,13 +386,41 @@ fn incremental_solve_uses_cache() {
 fn bounded_closure_limits_depth() {
     let mut journal = Journal::new();
     let root = journal
-        .append(EntryKind::Send, 1, [], Payload::Number(0))
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 1,
+                original_content: 0u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let mid = journal
-        .append(EntryKind::Recv, 2, [root], Payload::Number(1))
+        .append(
+            EntryKind::Recv,
+            2,
+            [root],
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(2, 0),
+                from: 1,
+                to: 2,
+                observed_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let leaf = journal
-        .append(EntryKind::Outcome, 3, [mid], Payload::Number(2))
+        .append(
+            EntryKind::Outcome,
+            3,
+            [mid],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(2),
+            }),
+        )
         .expect("append must succeed");
     // horizon 0: only leaf
     let h0 = causal_closure_with_horizon(&journal, &[leaf], 0).expect("h0");
@@ -278,13 +439,41 @@ fn bounded_closure_limits_depth() {
 fn solver_respects_horizon() {
     let mut journal = Journal::new();
     let root = journal
-        .append(EntryKind::Send, 1, [], Payload::Number(0))
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 1,
+                original_content: 0u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let mid = journal
-        .append(EntryKind::Recv, 2, [root], Payload::Number(1))
+        .append(
+            EntryKind::Recv,
+            2,
+            [root],
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(2, 0),
+                from: 1,
+                to: 2,
+                observed_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let leaf = journal
-        .append(EntryKind::Outcome, 3, [mid], Payload::Number(2))
+        .append(
+            EntryKind::Outcome,
+            3,
+            [mid],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(2),
+            }),
+        )
         .expect("append must succeed");
     let verdict = Verdict::fail(vec![leaf], "horizon");
     let mut unbounded = HittingSetSolver::unbounded();
@@ -305,14 +494,42 @@ fn samc_prune_coalesces_concurrent_swaps() {
     let mut journal = Journal::new();
     // Two concurrent sends on different actors, no causal relation.
     let send_a = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let send_b = journal
-        .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 2 })
+        .append(
+            EntryKind::Send,
+            2,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(2, 0),
+                from: 2,
+                to: 3,
+                original_content: 2u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     // Witness depends on both, but they are concurrent.
     let _witness = journal
-        .append(EntryKind::Outcome, 3, [send_a, send_b], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            3,
+            [send_a, send_b],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append must succeed");
     let entry_a = journal.get(&send_a).expect("a");
     let entry_b = journal.get(&send_b).expect("b");
@@ -340,10 +557,30 @@ fn samc_prune_coalesces_concurrent_swaps() {
 fn samc_prune_keeps_non_concurrent() {
     let mut journal = Journal::new();
     let root = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let child = journal
-        .append(EntryKind::Recv, 1, [root], Payload::Number(0))
+        .append(
+            EntryKind::Recv,
+            1,
+            [root],
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 1,
+                observed_content: 0u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append must succeed");
     let entry_r = journal.get(&root).expect("root");
     let entry_c = journal.get(&child).expect("child");
@@ -551,7 +788,7 @@ mod proptest_hitting_set {
                     let actor = (p as u32) + 10;
                     let parents = prev.into_iter().collect::<Vec<_>>();
                     let id = journal
-                        .append(EntryKind::Send, actor, parents.clone(), Payload::Pair { left: 2, right: 1 })
+                        .append(EntryKind::Send, actor, parents.clone(), EntryPayload::Send(ledger_format::SendFrame { message_id: ledger_format::MessageId::new(actor, 0), from: actor, to: 2, original_content: 1u64.to_le_bytes().to_vec() }))
                         .expect("append must succeed");
                     let cost = event_fault_cost(&journal, &id);
                     path_events.push(FaultableEvent { event: id, kind: EntryKind::Send, cost });
@@ -567,7 +804,7 @@ mod proptest_hitting_set {
             }
             // Witness outcome
             let witness = journal
-                .append(EntryKind::Outcome, 99, witness_parents.clone(), Payload::Number(0))
+                .append(EntryKind::Outcome, 99, witness_parents.clone(), EntryPayload::Outcome(ledger_format::OutcomePayload { schema: [0x00; 32], value: CanonicalValue::Unsigned(0) }))
                 .expect("append must succeed");
             let path_hashes: Vec<Vec<Hash>> = all_paths.iter().map(|p| p.iter().map(|e| e.event).collect()).collect();
             let hitting_sets = compute_minimal_hitting_sets(&all_paths);

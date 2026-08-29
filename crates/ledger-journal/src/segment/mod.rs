@@ -44,7 +44,7 @@ use std::vec::Vec;
 use crate::clock::VectorClock;
 use crate::dag::{Entry, JournalError};
 use crate::retention::RetentionClass;
-use ledger_format::{CborValue, EntryData, EntryKind, FaultSpec, Hash, Payload};
+use ledger_format::{CborValue, EntryData, Hash};
 
 mod indexing;
 mod recovery;
@@ -58,9 +58,6 @@ pub const SEGMENT_TARGET_SIZE: usize = 64 * 1024 * 1024;
 
 /// Sparse-index sampling interval in frames.
 const SAMPLE_INTERVAL: u32 = 32;
-
-/// Number of bytes in the segment file header.
-const HEADER_LEN: usize = 56;
 
 /// Number of bytes in the segment file trailer.
 const TRAILER_LEN: usize = 16;
@@ -78,7 +75,6 @@ const INDEX_ENTRY_LEN: usize = 12;
 /// Minimum payload size of a valid frame (id + data length + minimal data).
 const MIN_FRAME_PAYLOAD: usize = 40;
 
-const SEGMENT_MAGIC: &[u8; 4] = b"LDGR";
 const WAL_FILE: &str = "wal.bin";
 const MANIFEST_FILE: &str = "manifest.bin";
 
@@ -101,6 +97,9 @@ pub struct SealedSegment {
     ///
     /// The warm retention tier keeps such segments loose.
     pub contains_fault_relevant: bool,
+    /// Byte offset where the compressed frame block begins (after the outer
+    /// frame prefix and the canonical CBOR header).
+    pub data_offset: u64,
     /// Sparse index entries, sorted by offset.
     samples: Vec<(u64, u32)>,
 }
@@ -414,213 +413,23 @@ fn decode_vector_clock(bytes: &[u8]) -> Result<VectorClock, JournalError> {
 }
 
 fn decode_entry_data(bytes: &[u8]) -> Result<EntryData, JournalError> {
-    let value = CborValue::from_canonical_bytes(bytes)
-        .map_err(|err| JournalError::SegmentCorrupt(err.to_string()))?;
-    let items = match value {
-        CborValue::Array(items) => items,
-        _ => return corrupt("entry encoding is not an array"),
-    };
-    if items.len() != 6 {
-        return corrupt("entry encoding has wrong item count");
-    }
-    let kind = decode_kind(&items[0])?;
-    let actor = match &items[1] {
-        CborValue::Unsigned(actor) => u32::try_from(*actor)
-            .map_err(|_| JournalError::SegmentCorrupt("entry actor exceeds u32".to_string()))?,
-        _ => return corrupt("entry actor is not an unsigned integer"),
-    };
-    let parents = decode_parents(&items[2])?;
-    let vector_clock = decode_vc_vec(&items[3])?;
-    let sequence = match &items[4] {
-        CborValue::Unsigned(seq) => *seq,
-        _ => return corrupt("entry sequence is not an unsigned integer"),
-    };
-    let payload = decode_payload(&items[5])?;
-    Ok(EntryData {
-        kind,
-        actor,
-        parents,
-        vector_clock,
-        sequence,
-        payload,
-    })
-}
-
-fn decode_parents(value: &CborValue) -> Result<Vec<Hash>, JournalError> {
-    let items = match value {
-        CborValue::Array(items) => items,
-        _ => return corrupt("parents is not an array"),
-    };
-    let mut parents = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            CborValue::Bytes(bytes) if bytes.len() == 32 => {
-                let mut hash = Hash::default();
-                hash.copy_from_slice(bytes);
-                parents.push(hash);
-            }
-            _ => return corrupt("parent is not a 32-byte hash"),
-        }
-    }
-    Ok(parents)
-}
-
-fn decode_vc_vec(value: &CborValue) -> Result<Vec<u64>, JournalError> {
-    let items = match value {
-        CborValue::Array(items) => items,
-        _ => return corrupt("entry vector clock is not an array"),
-    };
-    let mut clock = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            CborValue::Unsigned(value) => clock.push(*value),
-            _ => return corrupt("entry vector clock component is not unsigned"),
-        }
-    }
-    Ok(clock)
-}
-
-fn decode_kind(value: &CborValue) -> Result<EntryKind, JournalError> {
-    let (tag, fields): (u64, &[CborValue]) = match value {
-        CborValue::Unsigned(tag) => (*tag, &[]),
-        CborValue::Array(items) => {
-            let tag = match items.first() {
-                Some(CborValue::Unsigned(tag)) => *tag,
-                _ => return corrupt("structured kind tag is not unsigned"),
-            };
-            (tag, &items[1..])
-        }
-        _ => return corrupt("kind is neither tag nor array"),
-    };
-    let kind = match tag {
-        0 => EntryKind::Spawn,
-        1 => EntryKind::Block,
-        2 => EntryKind::Wake,
-        3 => EntryKind::TimerSet,
-        4 => EntryKind::TimerFire,
-        5 => EntryKind::ClockRead,
-        6 => EntryKind::Send,
-        7 => EntryKind::Recv,
-        8 => EntryKind::FsWrite,
-        9 => EntryKind::FsFsync,
-        10 => EntryKind::FsRead,
-        11 => {
-            let stream = unsigned_field(fields, 0)?;
-            EntryKind::RngDraw {
-                stream: u32::try_from(stream).map_err(|_| {
-                    JournalError::SegmentCorrupt("rng draw stream exceeds u32".to_string())
-                })?,
-            }
-        }
-        12 => EntryKind::Outcome,
-        13 => EntryKind::Assert,
-        14 => EntryKind::Snapshot,
-        15 => EntryKind::Epoch,
-        16 => {
-            let generator = unsigned_field(fields, 0)?;
-            let replay = unsigned_field(fields, 1)?;
-            EntryKind::InputStep { generator, replay }
-        }
-        17 => EntryKind::CapRequest,
-        18 => EntryKind::CapGrant,
-        19 => EntryKind::CapInvoke,
-        20 => EntryKind::CapRevoke,
-        21 => {
-            let fault = decode_fault(fields.first().ok_or_else(|| {
-                JournalError::SegmentCorrupt("Fault kind has no fields".to_string())
-            })?)?;
-            EntryKind::Fault { fault }
-        }
-        22 => EntryKind::StepBegin,
-        23 => EntryKind::StepEnd,
-        _ => return corrupt("unknown kind tag"),
-    };
-    Ok(kind)
-}
-
-fn unsigned_field(fields: &[CborValue], index: usize) -> Result<u64, JournalError> {
-    match fields.get(index) {
-        Some(CborValue::Unsigned(value)) => Ok(*value),
-        _ => corrupt("structured kind field is not unsigned"),
-    }
-}
-
-fn decode_fault(value: &CborValue) -> Result<FaultSpec, JournalError> {
-    let fault = match value {
-        CborValue::Unsigned(0) => FaultSpec::Drop,
-        CborValue::Unsigned(3) => FaultSpec::Crash,
-        CborValue::Unsigned(4) => FaultSpec::Corrupt,
-        CborValue::Array(items) => match (items.first(), items.get(1), items.get(2)) {
-            (Some(CborValue::Unsigned(1)), Some(CborValue::Unsigned(ticks)), None) => {
-                FaultSpec::Delay { ticks: *ticks }
-            }
-            (
-                Some(CborValue::Unsigned(2)),
-                Some(CborValue::Unsigned(src)),
-                Some(CborValue::Unsigned(dst)),
-            ) => FaultSpec::Partition {
-                src: u32::try_from(*src).map_err(|_| {
-                    JournalError::SegmentCorrupt("partition src exceeds u32".to_string())
-                })?,
-                dst: u32::try_from(*dst).map_err(|_| {
-                    JournalError::SegmentCorrupt("partition dst exceeds u32".to_string())
-                })?,
-            },
-            (Some(CborValue::Unsigned(5)), Some(CborValue::Unsigned(state)), None) => {
-                FaultSpec::CrashState(*state)
-            }
-            _ => return corrupt("unknown fault encoding"),
-        },
-        _ => return corrupt("unknown fault encoding"),
-    };
-    Ok(fault)
-}
-
-fn decode_payload(value: &CborValue) -> Result<Payload, JournalError> {
-    let items = match value {
-        CborValue::Array(items) => items,
-        _ => return corrupt("payload is not an array"),
-    };
-    let tag = match items.first() {
-        Some(CborValue::Unsigned(tag)) => *tag,
-        _ => return corrupt("payload tag is not unsigned"),
-    };
-    let payload = match (tag, items.as_slice()) {
-        (6, [_]) => Payload::Empty,
-        (0, [_, CborValue::Unsigned(value)]) => Payload::Number(*value),
-        (4, [_, value]) => match value {
-            CborValue::Unsigned(value) => Payload::Signed(i64::try_from(*value).map_err(|_| {
-                JournalError::SegmentCorrupt("signed payload exceeds i64".to_string())
-            })?),
-            CborValue::Negative(value) if *value <= i64::MAX as u64 => {
-                Payload::Signed(-(*value as i64) - 1)
-            }
-            _ => return corrupt("invalid signed payload"),
-        },
-        (1, [_, CborValue::Text(text)]) => Payload::Text(text.clone()),
-        (2, [_, CborValue::Bytes(bytes)]) => Payload::Bytes(bytes.clone()),
-        (3, [_, CborValue::Unsigned(left), CborValue::Unsigned(right)]) => Payload::Pair {
-            left: *left,
-            right: *right,
-        },
-        (5, [_, value]) => Payload::Value(value.clone()),
-        _ => return corrupt("unknown payload tag"),
-    };
-    Ok(payload)
-}
-
-fn corrupt<T>(message: &str) -> Result<T, JournalError> {
-    Err(JournalError::SegmentCorrupt(message.to_string()))
+    // v2 decoding is owned by ledger-format: the typed decoder validates the
+    // outer format version, kind tag, bounds, and payload shape before any
+    // content allocation. The journal only maps the error class.
+    EntryData::from_canonical_bytes(bytes)
+        .map_err(|err| JournalError::SegmentCorrupt(err.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::recovery::{last_complete_frame_end, parse_segment_bytes};
     use super::*;
+
+    /// Number of bytes in the segment file header.
+    const HEADER_LEN: usize = 56;
     use crate::clock::VectorClock;
     use crate::dag::{BatchEntry, Journal};
-    use ledger_format::ActorId;
-    use ledger_format::Hash;
+    use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
     use std::io::{Seek, SeekFrom, Write};
     use std::vec;
 
@@ -630,13 +439,14 @@ mod tests {
         for i in 0..count {
             let id = journal
                 .append(
-                    EntryKind::InputStep {
-                        generator: 0,
-                        replay: 0,
-                    },
+                    EntryKind::InputStep,
                     actor,
                     [],
-                    Payload::Number(base + i as u64),
+                    EntryPayload::InputStep(ledger_format::InputStepPayload {
+                        generator: 0,
+                        replay: 0,
+                        value: ledger_format::CanonicalValue::Unsigned(base + i as u64),
+                    }),
                 )
                 .unwrap();
             out.push(journal.get(&id).unwrap().clone());
@@ -697,12 +507,17 @@ mod tests {
         for (sequence, _) in (0..3).enumerate() {
             let entry = Entry::new(
                 EntryData {
+                    format_version: ledger_format::FORMAT_VERSION,
                     kind: EntryKind::Outcome,
                     actor: 1,
                     parents: Vec::new(),
                     vector_clock: Vec::new(),
                     sequence: sequence as u64,
-                    payload: Payload::Bytes(vec![0xab; 30 * 1024 * 1024]),
+                    payload: EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                        stream: 0,
+                        draw_index: 0,
+                        content: vec![0xab; 30 * 1024 * 1024],
+                    }),
                 },
                 VectorClock::new(),
             )
@@ -818,12 +633,16 @@ mod tests {
         // create a fresh WAL without any recovered-frame bookkeeping.
         let entry = Entry::new(
             EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
                 actor: 1,
                 parents: Vec::new(),
                 vector_clock: Vec::new(),
                 sequence: 0,
-                payload: Payload::Number(1),
+                payload: EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
             },
             VectorClock::default().incremented(1),
         )
@@ -1004,18 +823,39 @@ mod tests {
         let mut journal = Journal::new();
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
-            let kind = match i % 4 {
-                0 => EntryKind::Outcome,
-                1 => EntryKind::TimerSet,
-                2 => EntryKind::Send,
-                _ => EntryKind::Fault {
-                    fault: ledger_format::FaultSpec::Partition { src: 1, dst: 2 },
-                },
-            };
-            let payload = if i % 3 == 0 {
-                Payload::Text(format!("payload-{i:03}"))
-            } else {
-                Payload::Number(i as u64)
+            let value = i as u64;
+            let (kind, payload) = match i % 4 {
+                0 => (
+                    EntryKind::Outcome,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: ledger_format::CanonicalValue::Unsigned(value),
+                    }),
+                ),
+                1 => (
+                    EntryKind::TimerSet,
+                    EntryPayload::TimerSet {
+                        timer_id: value,
+                        deadline_ticks: value,
+                    },
+                ),
+                2 => (
+                    EntryKind::Send,
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(1, value),
+                        from: 1,
+                        to: 2,
+                        original_content: value.to_le_bytes().to_vec(),
+                    }),
+                ),
+                _ => (
+                    EntryKind::Fault,
+                    EntryPayload::Fault(ledger_format::FaultPayload::Partition {
+                        src: 1,
+                        dst: 2,
+                        enabled: true,
+                    }),
+                ),
             };
             let actor = (i % 2) as u32 + 1;
             let id = journal.append(kind, actor, [], payload).unwrap();
@@ -1167,9 +1007,18 @@ mod tests {
                 "prefix {prefix} must be rejected by frame_payload_at, not panic"
             );
             // last_complete_frame_end: a prefix that cannot fit ends the run
-            // like any truncated tail; never a panic and never a wrap.
-            let end = last_complete_frame_end(&block).unwrap();
-            assert_eq!(end, 0, "prefix {prefix} must end the complete run");
+            // like any truncated tail; never a panic and never a wrap. The
+            // WAL walk starts after the outer 16-byte prefix, so the hostile
+            // length occupies the first frame slot.
+            let mut wal = Vec::new();
+            ledger_format::frame::encode_prefix(&mut wal, ledger_format::frame::MAGIC_WAL, 0);
+            wal.extend_from_slice(&prefix.to_le_bytes());
+            let end = last_complete_frame_end(&wal).unwrap();
+            assert_eq!(
+                end,
+                ledger_format::frame::FRAME_PREFIX_LEN as u64,
+                "prefix {prefix} must end the complete run"
+            );
         }
     }
 
@@ -1210,7 +1059,10 @@ mod tests {
 
         assert_eq!(frame_payload_at(&block, 0).unwrap(), &payload_a[..]);
         assert_eq!(frame_payload_at(&block, 48).unwrap(), &payload_b[..]);
-        assert_eq!(last_complete_frame_end(&block).unwrap(), block.len() as u64);
+        let mut wal = Vec::new();
+        ledger_format::frame::encode_prefix(&mut wal, ledger_format::frame::MAGIC_WAL, 0);
+        wal.extend_from_slice(&block);
+        assert_eq!(last_complete_frame_end(&wal).unwrap(), wal.len() as u64);
     }
 
     /// A hostile prefix after valid frames ends the run at the last complete
@@ -1218,12 +1070,17 @@ mod tests {
     #[test]
     fn last_complete_run_stops_at_hostile_prefix() {
         let mut wal = Vec::new();
+        ledger_format::frame::encode_prefix(&mut wal, ledger_format::frame::MAGIC_WAL, 0);
         let payload = vec![0x11u8; 40];
         wal.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         wal.extend_from_slice(&payload);
         wal.extend_from_slice(&u64::MAX.to_le_bytes());
         let end = last_complete_frame_end(&wal).unwrap();
-        assert_eq!(end, 48, "run ends before the hostile prefix");
+        assert_eq!(
+            end,
+            (ledger_format::frame::FRAME_PREFIX_LEN + 48) as u64,
+            "run ends before the hostile prefix"
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@
 // ledger-lint:allow:fs:: (bench harness measures the host storage layer, which ambient fs writes by design; same as persistent.rs and segment/)
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, OutcomePayload};
 use ledger_journal::{BatchEntry, Journal, PersistentJournal, SegmentWriter};
 use std::hint::black_box;
 
@@ -67,7 +67,15 @@ fn bench_append_throughput(c: &mut Criterion) {
                     for i in 0..count {
                         black_box(
                             journal
-                                .append(EntryKind::Outcome, 1, [], Payload::Number(i))
+                                .append(
+                                    EntryKind::Outcome,
+                                    1,
+                                    [],
+                                    EntryPayload::Outcome(OutcomePayload {
+                                        schema: [0x00; 32],
+                                        value: CanonicalValue::Unsigned(i),
+                                    }),
+                                )
                                 .unwrap(),
                         );
                     }
@@ -85,7 +93,14 @@ fn build_chunked_batches(count: u64) -> Vec<Vec<BatchEntry>> {
     let mut batches: Vec<Vec<BatchEntry>> = Vec::with_capacity(count as usize / CHUNK + 1);
     let mut current: Vec<BatchEntry> = Vec::with_capacity(CHUNK);
     for i in 0..count {
-        current.push(BatchEntry::new(EntryKind::Outcome, 1, Payload::Number(i)));
+        current.push(BatchEntry::new(
+            EntryKind::Outcome,
+            1,
+            EntryPayload::Outcome(OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(i),
+            }),
+        ));
         if current.len() == CHUNK {
             batches.push(std::mem::replace(&mut current, Vec::with_capacity(CHUNK)));
         }
@@ -148,7 +163,15 @@ fn bench_append_durable(c: &mut Criterion) {
                     for i in 0..count {
                         black_box(
                             journal
-                                .append(EntryKind::Outcome, 1, [], Payload::Number(i))
+                                .append(
+                                    EntryKind::Outcome,
+                                    1,
+                                    [],
+                                    EntryPayload::Outcome(OutcomePayload {
+                                        schema: [0x00; 32],
+                                        value: CanonicalValue::Unsigned(i),
+                                    }),
+                                )
                                 .unwrap(),
                         );
                     }
@@ -189,7 +212,15 @@ fn build_journal(entries: u64) -> Journal {
     let mut journal = Journal::new();
     for i in 0..entries {
         journal
-            .append(EntryKind::Outcome, 1, [], Payload::Number(i))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(i),
+                }),
+            )
             .unwrap();
     }
     journal
@@ -206,8 +237,16 @@ fn bench_fork_cost(c: &mut Criterion) {
             |mut fork| {
                 for i in 0..1000u64 {
                     black_box(
-                        fork.append(EntryKind::Outcome, 1, [], Payload::Number(i))
-                            .unwrap(),
+                        fork.append(
+                            EntryKind::Outcome,
+                            1,
+                            [],
+                            EntryPayload::Outcome(OutcomePayload {
+                                schema: [0x00; 32],
+                                value: CanonicalValue::Unsigned(i),
+                            }),
+                        )
+                        .unwrap(),
                     );
                 }
                 black_box(fork.root_hash());

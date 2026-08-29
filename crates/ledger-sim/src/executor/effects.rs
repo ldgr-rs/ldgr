@@ -17,10 +17,19 @@ use crate::effects::{Effects, Fs, Net, TaskId};
 use crate::net::Message;
 use crate::time::Clock;
 use core::convert::Infallible;
-use ledger_format::{ActorId, EntryKind, FaultSpec, GenId, Hash, InputKey, Payload, StreamId};
+use ledger_format::{ActorId, EntryKind, EntryPayload, GenId, Hash, InputKey, StreamId};
+use ledger_format::{FaultPayload, FaultSpec, MessageId};
 use rand_core::{Rng, TryRng};
 
 use super::{BlockedOn, ExecutorShared, TaskEntry};
+
+/// Schema digest bound in `ExecutionIdentity` for scalar outcome values.
+/// CONSUMER DEBT (lane 2): the sim domain binds its real schema digest.
+const OUTCOME_SCHEMA: [u8; 32] = [0x00; 32];
+
+/// Predicate digest for scalar assertion values.
+/// CONSUMER DEBT (lane 2): the sim domain binds its real predicate digest.
+const ASSERT_SCHEMA: [u8; 32] = [0x00; 32];
 
 /// Outcome of a swarm network policy decision.
 enum SwarmAction {
@@ -71,7 +80,7 @@ impl Boundary {
         &self,
         kind: EntryKind,
         parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Result<Hash, ledger_journal::JournalError> {
         let id = self
             .shared
@@ -120,11 +129,11 @@ impl Boundary {
         let swarm = &self.shared.swarm;
         if swarm.drop_probability.get() > 0.0 && self.net_draw() < swarm.drop_probability.get() {
             if let Err(error) = self.append(
-                EntryKind::Fault {
-                    fault: FaultSpec::Drop,
-                },
+                EntryKind::Fault,
                 [send_id],
-                Payload::Empty,
+                EntryPayload::Fault(FaultPayload::DropMessage {
+                    message_id: MessageId::new(self.task as ActorId, 0),
+                }),
             ) {
                 self.shared.record_journal_error(error);
             }
@@ -213,11 +222,12 @@ impl Boundary {
         drop(fault_classes);
         self.shared.fs.borrow_mut().apply_crash_operator(&operator);
         self.append(
-            EntryKind::Fault {
-                fault: FaultSpec::CrashState(state_index),
-            },
+            EntryKind::Fault,
             [],
-            Payload::Empty,
+            EntryPayload::Fault(FaultPayload::CrashActor {
+                actor: self.task as ActorId,
+                crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+            }),
         )?;
         Ok(())
     }
@@ -243,7 +253,7 @@ impl Boundary {
         actor: ActorId,
         kind: EntryKind,
         parents: impl IntoIterator<Item = Hash>,
-        payload: Payload,
+        payload: EntryPayload,
     ) -> Result<Hash, ledger_journal::JournalError> {
         self.shared.journal_append(actor, kind, parents, payload)
     }
@@ -263,7 +273,14 @@ impl Boundary {
 
     /// Journal an `Outcome` entry carrying the task register (test helper).
     pub fn outcome(&self, value: u64) -> Result<Hash, ledger_journal::JournalError> {
-        self.append(EntryKind::Outcome, [], Payload::Number(value))
+        self.append(
+            EntryKind::Outcome,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: OUTCOME_SCHEMA,
+                value: ledger_format::CanonicalValue::Unsigned(value),
+            }),
+        )
     }
 
     /// Return whether a message is currently deliverable to this task.
@@ -334,7 +351,20 @@ impl Boundary {
             src: src as ActorId,
             dst: dst as ActorId,
         };
-        let id = self.append(EntryKind::Fault { fault }, [], Payload::Empty)?;
+        let id = self.append(
+            EntryKind::Fault,
+            [],
+            EntryPayload::Fault(match fault {
+                FaultSpec::Partition { src, dst } => FaultPayload::Partition {
+                    src,
+                    dst,
+                    enabled: true,
+                },
+                _ => FaultPayload::DropMessage {
+                    message_id: MessageId::new(self.task as ActorId, 0),
+                },
+            }),
+        )?;
         let applied = self
             .shared
             .net
@@ -372,10 +402,14 @@ impl Boundary {
         let id = match self.append(
             EntryKind::Send,
             [],
-            Payload::Pair {
-                left: to as u64,
-                right: payload,
-            },
+            EntryPayload::Send(ledger_format::SendFrame {
+                // CONSUMER DEBT (lane 2): real message identity replaces the
+                // deterministic transitional sequence below.
+                message_id: MessageId::new(self.task as ActorId, payload),
+                from: self.task as ActorId,
+                to: to as ActorId,
+                original_content: payload.to_le_bytes().to_vec(),
+            }),
         ) {
             Ok(id) => id,
             Err(error) => {
@@ -388,11 +422,11 @@ impl Boundary {
         }
         if self.shared.dropped_events.contains(&id) {
             if let Err(error) = self.append(
-                EntryKind::Fault {
-                    fault: FaultSpec::Drop,
-                },
+                EntryKind::Fault,
                 [id],
-                Payload::Empty,
+                EntryPayload::Fault(FaultPayload::DropMessage {
+                    message_id: MessageId::new(self.task as ActorId, 0),
+                }),
             ) {
                 self.shared.record_journal_error(error);
             }
@@ -436,7 +470,17 @@ impl Boundary {
         } else {
             FaultSpec::Drop
         };
-        if let Err(error) = self.append(EntryKind::Fault { fault }, [send_id], Payload::Empty) {
+        let fault_payload = EntryPayload::Fault(match fault {
+            FaultSpec::Partition { src, dst } => FaultPayload::Partition {
+                src,
+                dst,
+                enabled: true,
+            },
+            _ => FaultPayload::DropMessage {
+                message_id: MessageId::new(self.task as ActorId, 0),
+            },
+        });
+        if let Err(error) = self.append(EntryKind::Fault, [send_id], fault_payload) {
             self.shared.record_journal_error(error);
         }
     }
@@ -504,11 +548,11 @@ impl Boundary {
             Some(SimFault::Drop(_)) => {
                 self.mark_fault_applied(send_id);
                 if let Err(error) = self.append(
-                    EntryKind::Fault {
-                        fault: FaultSpec::Drop,
-                    },
+                    EntryKind::Fault,
                     [send_id],
-                    Payload::Empty,
+                    EntryPayload::Fault(FaultPayload::DropMessage {
+                        message_id: MessageId::new(self.task as ActorId, 0),
+                    }),
                 ) {
                     self.shared.record_journal_error(error);
                 }
@@ -533,11 +577,12 @@ impl Boundary {
                 self.mark_fault_applied(write_id);
                 self.fs_crash();
                 self.append(
-                    EntryKind::Fault {
-                        fault: FaultSpec::CrashState(0),
-                    },
+                    EntryKind::Fault,
                     [],
-                    Payload::Empty,
+                    EntryPayload::Fault(FaultPayload::CrashActor {
+                        actor: self.task as ActorId,
+                        crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+                    }),
                 )?;
             }
             Some(SimFault::Corrupt { write, xor_mask }) => {
@@ -548,11 +593,12 @@ impl Boundary {
                 };
                 self.shared.fs.borrow_mut().apply_crash_operator(&operator);
                 self.append(
-                    EntryKind::Fault {
-                        fault: FaultSpec::CrashState(3),
-                    },
+                    EntryKind::Fault,
                     [],
-                    Payload::Empty,
+                    EntryPayload::Fault(FaultPayload::CrashActor {
+                        actor: self.task as ActorId,
+                        crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+                    }),
                 )?;
             }
             Some(SimFault::CrashState { write, state }) => {
@@ -571,11 +617,12 @@ impl Boundary {
                     };
                 self.shared.fs.borrow_mut().apply_crash_operator(&operator);
                 self.append(
-                    EntryKind::Fault {
-                        fault: FaultSpec::CrashState(*state),
-                    },
+                    EntryKind::Fault,
                     [],
-                    Payload::Empty,
+                    EntryPayload::Fault(FaultPayload::CrashActor {
+                        actor: self.task as ActorId,
+                        crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+                    }),
                 )?;
             }
             _ => {}
@@ -589,7 +636,14 @@ impl Boundary {
     /// `TimerFire` journals with the correct parent. Any stale `timer_fired`
     /// flag from a prior sleep is cleared so a later park cannot short-circuit.
     pub(crate) fn park_sleep(&self, ticks: u64) -> Result<(), ledger_journal::JournalError> {
-        let timer_set = self.append(EntryKind::TimerSet, [], Payload::Number(ticks))?;
+        let timer_set = self.append(
+            EntryKind::TimerSet,
+            [],
+            EntryPayload::TimerSet {
+                timer_id: 0,
+                deadline_ticks: ticks,
+            },
+        )?;
         self.shared
             .time
             .borrow_mut()
@@ -602,21 +656,33 @@ impl Boundary {
 
     /// Park the task waiting for a message, journaling a `Block` entry.
     pub(crate) fn park_message(&self) -> Result<(), ledger_journal::JournalError> {
-        self.append(EntryKind::Block, [], Payload::Empty)?;
+        self.append(
+            EntryKind::Block,
+            [],
+            EntryPayload::Block(ledger_format::BlockPayload::Yield),
+        )?;
         self.shared.tasks.borrow_mut()[self.task].blocked_on = Some(BlockedOn::Message);
         Ok(())
     }
 
     /// Journal a `Block` entry for an explicit yield without parking.
     pub(crate) fn yield_block(&self) -> Result<(), ledger_journal::JournalError> {
-        self.append(EntryKind::Block, [], Payload::Empty)?;
+        self.append(
+            EntryKind::Block,
+            [],
+            EntryPayload::Block(ledger_format::BlockPayload::Yield),
+        )?;
         Ok(())
     }
 
     /// Journal a `ClockRead` entry carrying the current virtual time, returning it.
     pub(crate) fn read_clock(&self) -> Result<u64, ledger_journal::JournalError> {
         let now = self.shared.time.borrow().now();
-        self.append(EntryKind::ClockRead, [], Payload::Number(now))?;
+        self.append(
+            EntryKind::ClockRead,
+            [],
+            EntryPayload::ClockRead { ticks: now },
+        )?;
         Ok(now)
     }
 
@@ -628,7 +694,13 @@ impl Boundary {
         let recv_id = match self.append(
             EntryKind::Recv,
             [message.send_id],
-            Payload::Number(message.payload),
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                // CONSUMER DEBT (lane 2): real message identity.
+                message_id: MessageId::new(message.from as ActorId, message.payload),
+                from: message.from as ActorId,
+                to: self.task as ActorId,
+                observed_content: message.payload.to_le_bytes().to_vec(),
+            }),
         ) {
             Ok(id) => Some(id),
             Err(error) => {
@@ -651,22 +723,41 @@ impl Boundary {
         value: u64,
     ) -> Result<(), ledger_journal::JournalError> {
         self.append(
-            EntryKind::InputStep { generator, replay },
+            EntryKind::InputStep,
             [],
-            Payload::Number(value),
+            EntryPayload::InputStep(ledger_format::InputStepPayload {
+                generator,
+                replay,
+                value: ledger_format::CanonicalValue::Unsigned(value),
+            }),
         )?;
         Ok(())
     }
 
     /// Journal an `Assert` entry carrying a boolean as 1 or 0.
     pub(crate) fn assert_entry(&self, passed: bool) -> Result<(), ledger_journal::JournalError> {
-        self.append(EntryKind::Assert, [], Payload::Number(u64::from(passed)))?;
+        self.append(
+            EntryKind::Assert,
+            [],
+            EntryPayload::Assert(ledger_format::AssertPayload {
+                predicate: ASSERT_SCHEMA,
+                passed,
+                detail: ledger_format::CanonicalValue::Unsigned(u64::from(passed)),
+            }),
+        )?;
         Ok(())
     }
 
     /// Journal the terminal `Outcome` entry of a finished program.
     pub(crate) fn outcome_done(&self) -> Result<(), ledger_journal::JournalError> {
-        self.append(EntryKind::Outcome, [], Payload::Text("done".into()))?;
+        self.append(
+            EntryKind::Outcome,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: OUTCOME_SCHEMA,
+                value: ledger_format::CanonicalValue::Text("done".into()),
+            }),
+        )?;
         Ok(())
     }
 
@@ -700,9 +791,14 @@ impl Boundary {
             });
             (id, ())
         };
-        if let Err(error) =
-            self.append_for_actor(id as ActorId, EntryKind::Spawn, [], Payload::Empty)
-        {
+        if let Err(error) = self.append_for_actor(
+            id as ActorId,
+            EntryKind::Spawn,
+            [],
+            EntryPayload::Spawn {
+                child_actor: id as ActorId,
+            },
+        ) {
             self.shared.record_journal_error(error);
         }
         self.shared.ready.borrow_mut().push(id as usize);
@@ -745,13 +841,17 @@ impl TryRng for StreamRng {
                 .get_or_insert_with(|| self.shared.seed_tree.rng(&self.label));
             rng.next_u64()
         };
-        let kind = EntryKind::RngDraw {
-            stream: self.stream,
-        };
-        match self
-            .shared
-            .journal_append(self.task as ActorId, kind, [], Payload::Number(value))
-        {
+        let kind = EntryKind::RngDraw;
+        match self.shared.journal_append(
+            self.task as ActorId,
+            kind,
+            [],
+            EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                stream: self.stream,
+                draw_index: 0,
+                content: value.to_le_bytes().to_vec(),
+            }),
+        ) {
             Ok(id) => {
                 self.shared
                     .notify_entry(self.task as ActorId, kind, self.task, Some(id));
@@ -787,7 +887,14 @@ impl Effects for Boundary {
 
     async fn sleep(&self, d: core::time::Duration) {
         let ticks = d.as_micros() as u64;
-        let timer_set = match self.append(EntryKind::TimerSet, [], Payload::Number(ticks)) {
+        let timer_set = match self.append(
+            EntryKind::TimerSet,
+            [],
+            EntryPayload::TimerSet {
+                timer_id: 0,
+                deadline_ticks: ticks,
+            },
+        ) {
             Ok(id) => Some(id),
             Err(error) => {
                 self.shared.record_journal_error(error);
@@ -825,7 +932,13 @@ impl Net for Boundary {
         let recv_id = match self.append(
             EntryKind::Recv,
             [message.send_id],
-            Payload::Number(message.payload),
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                // CONSUMER DEBT (lane 2): real message identity.
+                message_id: MessageId::new(message.from as ActorId, message.payload),
+                from: message.from as ActorId,
+                to: self.task as ActorId,
+                observed_content: message.payload.to_le_bytes().to_vec(),
+            }),
         ) {
             Ok(id) => Some(id),
             Err(error) => {
@@ -928,11 +1041,12 @@ impl Boundary {
     /// state. Returns the entry id when journaling worked.
     fn crash_impl(&self) -> Option<Hash> {
         let id = match self.append(
-            EntryKind::Fault {
-                fault: FaultSpec::CrashState(0),
-            },
+            EntryKind::Fault,
             [],
-            Payload::Empty,
+            EntryPayload::Fault(FaultPayload::CrashActor {
+                actor: self.task as ActorId,
+                crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+            }),
         ) {
             Ok(id) => Some(id),
             Err(error) => {
@@ -982,7 +1096,13 @@ impl Future for RecvFuture {
                 self.task as ActorId,
                 EntryKind::Recv,
                 [message.send_id],
-                Payload::Number(message.payload),
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    // CONSUMER DEBT (lane 2): real message identity.
+                    message_id: MessageId::new(message.from as ActorId, message.payload),
+                    from: message.from as ActorId,
+                    to: self.task as ActorId,
+                    observed_content: message.payload.to_le_bytes().to_vec(),
+                }),
             ) {
                 Ok(id) => {
                     self.shared.notify_entry(
@@ -1005,7 +1125,7 @@ impl Future for RecvFuture {
                 self.task as ActorId,
                 EntryKind::Block,
                 [],
-                Payload::Empty,
+                EntryPayload::Block(ledger_format::BlockPayload::Yield),
             ) {
                 Ok(id) => {
                     self.shared.notify_entry(

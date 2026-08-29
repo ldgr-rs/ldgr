@@ -14,7 +14,7 @@ pub use memo::{MemoError, MemoizedReplay};
 pub use pipeline::{MinimizedRepro, minimize_full};
 
 use crate::pbt::gen_id;
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash};
 use ledger_journal::{Journal, JournalError};
 use thiserror::Error;
 
@@ -38,18 +38,16 @@ fn journal_inputs(journal: &Journal, generator: &str) -> Vec<u64> {
     let generator_id = gen_id(generator);
     journal
         .entries()
-        .filter_map(|entry| {
-            let entry_generator = match entry.data.kind {
-                EntryKind::InputStep { generator, .. } => generator,
-                _ => return None,
-            };
-            if entry_generator != generator_id {
-                return None;
+        .filter_map(|entry| match &entry.data.payload {
+            EntryPayload::InputStep(step)
+                if entry.data.kind == EntryKind::InputStep && step.generator == generator_id =>
+            {
+                match step.value {
+                    ledger_format::CanonicalValue::Unsigned(value) => Some(value),
+                    _ => None,
+                }
             }
-            match &entry.data.payload {
-                Payload::Number(value) => Some(*value),
-                _ => None,
-            }
+            _ => None,
         })
         .collect()
 }

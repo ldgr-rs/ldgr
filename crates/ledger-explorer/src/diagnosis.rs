@@ -44,14 +44,22 @@ pub fn first_divergence<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
     use ledger_sim::RunResult;
 
     fn journal_with(values: &[u64]) -> Journal {
         let mut journal = Journal::new();
         for value in values {
             journal
-                .append(EntryKind::Outcome, 1, [], Payload::Number(*value))
+                .append(
+                    EntryKind::Outcome,
+                    1,
+                    [],
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: CanonicalValue::Unsigned(*value),
+                    }),
+                )
                 .expect("append must succeed");
         }
         journal
@@ -93,7 +101,15 @@ mod tests {
         let mut journal = Journal::new();
         for (actor, value) in order {
             journal
-                .append(EntryKind::Outcome, *actor, [], Payload::Number(*value))
+                .append(
+                    EntryKind::Outcome,
+                    *actor,
+                    [],
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: CanonicalValue::Unsigned(*value),
+                    }),
+                )
                 .expect("append must succeed");
         }
         journal

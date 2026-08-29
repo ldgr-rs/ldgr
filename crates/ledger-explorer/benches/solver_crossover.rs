@@ -64,7 +64,7 @@ use ledger_explorer::{
     FaultSolver, HittingSetSolver, MaxSatSolver, SolverConfig, SolverEngine, Verdict,
     maxsat::{HazardEncoding, encode_hazard},
 };
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
 use ledger_journal::Journal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -99,7 +99,12 @@ fn build_disjoint_clauses_journal(n: usize) -> (Journal, Verdict) {
                 EntryKind::Send,
                 (i + 1) as u32,
                 [],
-                Payload::Number(i as u64),
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new((i + 1) as u32, 0),
+                    from: (i + 1) as u32,
+                    to: 1,
+                    original_content: (i as u64).to_le_bytes().to_vec(),
+                }),
             )
             .expect("root Send append must succeed");
         roots.push(id);
@@ -110,7 +115,10 @@ fn build_disjoint_clauses_journal(n: usize) -> (Journal, Verdict) {
             EntryKind::Outcome,
             u32::MAX,
             roots.clone(),
-            Payload::Number(u64::MAX),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(u64::MAX),
+            }),
         )
         .expect("witness Outcome append must succeed");
     let verdict = Verdict::fail(vec![witness], format!("crossover journal n_clauses={n}"));

@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use ledger_format::{EntryKind, GenId, Hash, InputKey, Payload};
+use ledger_format::{EntryKind, EntryPayload, GenId, Hash, InputKey};
 use ledger_journal::{Journal, PersistentJournal, VectorClock};
 
 const WAL_FILE: &str = "wal.bin";
@@ -33,26 +33,48 @@ fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<Hash> {
         let actor = (i % ACTORS) as u32 + 1;
         let kind = match i % 6 {
             0 => EntryKind::Outcome,
-            1 => EntryKind::InputStep {
-                generator: (i as GenId) % 3,
-                replay: i as InputKey,
-            },
-            2 => EntryKind::RngDraw {
-                stream: (i % 7) as u32,
-            },
+            1 => EntryKind::InputStep,
+            2 => EntryKind::RngDraw,
             3 => EntryKind::TimerSet,
             4 => EntryKind::Send,
             _ => EntryKind::Assert,
         };
-        let payload = match i % 5 {
-            0 => Payload::Number(i as u64),
-            1 => Payload::Text(format!("payload-{i:04}")),
-            2 => Payload::Bytes(vec![(i % 251) as u8; 8 + (i % 16)]),
-            3 => Payload::Pair {
-                left: i as u64,
-                right: (i as u64).wrapping_mul(3),
+        let value = i as u64;
+        // v2 payloads are kind-specific; the payload derives from the kind.
+        let payload = match kind {
+            EntryKind::Outcome => EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: if i % 3 == 0 {
+                    ledger_format::CanonicalValue::Unsigned(value)
+                } else {
+                    ledger_format::CanonicalValue::Text(format!("payload-{i:04}"))
+                },
+            }),
+            EntryKind::InputStep => EntryPayload::InputStep(ledger_format::InputStepPayload {
+                generator: (i as GenId) % 3,
+                replay: i as InputKey,
+                value: ledger_format::CanonicalValue::Unsigned(value),
+            }),
+            EntryKind::RngDraw => EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                stream: (i % 7) as u32,
+                draw_index: value,
+                content: vec![(i % 251) as u8; 8 + (i % 16)],
+            }),
+            EntryKind::TimerSet => EntryPayload::TimerSet {
+                timer_id: value,
+                deadline_ticks: value.wrapping_mul(3),
             },
-            _ => Payload::Signed(-(i as i64)),
+            EntryKind::Send => EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(actor, value),
+                from: actor,
+                to: (actor % 4) + 1,
+                original_content: value.to_le_bytes().to_vec(),
+            }),
+            _ => EntryPayload::Assert(ledger_format::AssertPayload {
+                predicate: [0x00; 32],
+                passed: i % 2 == 0,
+                detail: ledger_format::CanonicalValue::Unsigned(value),
+            }),
         };
         let mut observed = Vec::new();
         if let Some(hash) = last[actor as usize - 1] {
@@ -206,13 +228,29 @@ fn corrupt_sealed_tail_is_dropped_and_buffered_tail_reconstructs() {
         // reference the sealed segment that will be dropped.
         for i in 0..50 {
             journal
-                .append(EntryKind::Outcome, 7, [], Payload::Number(100 + i))
+                .append(
+                    EntryKind::Outcome,
+                    7,
+                    [],
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: ledger_format::CanonicalValue::Unsigned(100 + i),
+                    }),
+                )
                 .unwrap();
         }
         let mut reference = Journal::new();
         for i in 0..50 {
             reference
-                .append(EntryKind::Outcome, 7, [], Payload::Number(100 + i))
+                .append(
+                    EntryKind::Outcome,
+                    7,
+                    [],
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        schema: [0x00; 32],
+                        value: ledger_format::CanonicalValue::Unsigned(100 + i),
+                    }),
+                )
                 .unwrap();
         }
         let tail_root = reference.root_hash();

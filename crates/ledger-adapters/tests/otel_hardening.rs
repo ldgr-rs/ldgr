@@ -9,7 +9,7 @@ use ledger_adapters::otel::{
     OtelEvent, OtelIngestConfig, OtelSpan, ingest_otel_dedup, ingest_otel_enveloped,
     ingest_otel_file_with_config, ingest_otel_with_fidelity,
 };
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, OutcomePayload};
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -53,7 +53,15 @@ fn config(fidelity: Fidelity, dedup: bool) -> OtelIngestConfig {
 fn find_entry(journal: &ledger_journal::Journal, name: &str) -> ledger_journal::Entry {
     journal
         .entries()
-        .find(|e| e.data.payload == Payload::Text(name.into()))
+        .find(|e| {
+            matches!(
+                &e.data.payload,
+                EntryPayload::Outcome(OutcomePayload {
+                    value: CanonicalValue::Text(t),
+                    ..
+                }) if t == name
+            )
+        })
         .unwrap_or_else(|| panic!("missing entry {name}"))
         .clone()
 }
@@ -342,7 +350,7 @@ fn already_sorted_stays_identical() {
     // topo order for a sorted chain is the identity order, so journal bytes
     // are pinned against silent uniform drift.
     const PINNED_ROOT_HEX: &str =
-        "f4b306c1d5b21ecac9963e9f38aca058041006782e6b06a283103a2cadfcb6f0";
+        "f64bcc43e7f6edc77d49c5474b830e31449f78d4c486333b692b958fa925f7da";
     let s1 = make_span("t", "s1", None, "op1");
     let s2 = make_span("t", "s2", Some("s1"), "op2");
     let s3 = make_span("t", "s3", Some("s2"), "op3");

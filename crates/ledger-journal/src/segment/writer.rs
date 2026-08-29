@@ -18,8 +18,8 @@ use crate::retention::RetentionClass;
 use ledger_format::Hash;
 
 use super::{
-    SAMPLE_INTERVAL, SEGMENT_MAGIC, SEGMENT_TARGET_SIZE, SealedSegment, SegmentStore,
-    SegmentWriter, WAL_FILE, prefix_of, segment_file_name, segment_io,
+    SAMPLE_INTERVAL, SEGMENT_TARGET_SIZE, SealedSegment, SegmentStore, SegmentWriter, WAL_FILE,
+    prefix_of, segment_file_name, segment_io,
 };
 
 impl SegmentWriter {
@@ -117,6 +117,15 @@ impl SegmentWriter {
 
         let file_name = segment_file_name(segment_id);
         let tmp_path = dir.join(format!("{file_name}.tmp"));
+        let data_offset = {
+            let mut header = Vec::new();
+            ledger_format::cbor::array(&mut header, 4);
+            ledger_format::cbor::unsigned(&mut header, self.index.len() as u64);
+            ledger_format::cbor::unsigned(&mut header, self.buffer.len() as u64);
+            ledger_format::cbor::bytes(&mut header, &root_hash);
+            ledger_format::cbor::unsigned(&mut header, SAMPLE_INTERVAL as u64);
+            ledger_format::frame::FRAME_PREFIX_LEN + header.len()
+        };
         {
             let mut file = BufWriter::new(File::create(&tmp_path).map_err(segment_io)?);
             write_header(
@@ -124,6 +133,7 @@ impl SegmentWriter {
                 self.index.len() as u64,
                 self.buffer.len() as u64,
                 &root_hash,
+                SAMPLE_INTERVAL,
             )?;
             file.write_all(&compressed).map_err(segment_io)?;
             for &(offset, prefix) in &samples {
@@ -152,6 +162,7 @@ impl SegmentWriter {
             root_hash,
             sample_interval: SAMPLE_INTERVAL,
             contains_fault_relevant: self.fault_relevant,
+            data_offset: data_offset as u64,
             samples,
         })
     }
@@ -213,7 +224,12 @@ impl SegmentStore {
     fn ensure_wal(&mut self) -> Result<(), JournalError> {
         if self.wal.is_none() {
             let path = self.dir.join(WAL_FILE);
-            let file = File::create(&path).map_err(segment_io)?;
+            let mut file = File::create(&path).map_err(segment_io)?;
+            // v2 WAL opens with the outer frame prefix (LDGW, version 2,
+            // header_len 0, flags 0); frames follow the prefix.
+            let mut prefix = Vec::new();
+            ledger_format::frame::encode_prefix(&mut prefix, ledger_format::frame::MAGIC_WAL, 0);
+            file.write_all(&prefix).map_err(segment_io)?;
             self.wal = Some(BufWriter::new(file));
         }
         Ok(())
@@ -298,14 +314,26 @@ fn write_header(
     entry_count: u64,
     uncompressed_len: u64,
     root_hash: &Hash,
+    sample_interval: u32,
 ) -> Result<(), JournalError> {
-    file.write_all(SEGMENT_MAGIC).map_err(segment_io)?;
-    file.write_all(&1u32.to_be_bytes()).map_err(segment_io)?;
-    file.write_all(&entry_count.to_be_bytes())
-        .map_err(segment_io)?;
-    file.write_all(&uncompressed_len.to_be_bytes())
-        .map_err(segment_io)?;
-    file.write_all(root_hash).map_err(segment_io)?;
+    // v2 outer frame: 16-byte raw prefix (LDGS, version 2, header_len,
+    // flags) followed by the container-specific canonical CBOR header.
+    let mut header = Vec::new();
+    ledger_format::cbor::array(&mut header, 4);
+    ledger_format::cbor::unsigned(&mut header, entry_count);
+    ledger_format::cbor::unsigned(&mut header, uncompressed_len);
+    ledger_format::cbor::bytes(&mut header, root_hash);
+    ledger_format::cbor::unsigned(&mut header, sample_interval as u64);
+    let header_len = u32::try_from(header.len())
+        .map_err(|_| JournalError::SegmentCorrupt("segment header exceeds u32".to_string()))?;
+    let mut prefix = Vec::new();
+    ledger_format::frame::encode_prefix(
+        &mut prefix,
+        ledger_format::frame::MAGIC_SEGMENT,
+        header_len,
+    );
+    file.write_all(&prefix).map_err(segment_io)?;
+    file.write_all(&header).map_err(segment_io)?;
     Ok(())
 }
 

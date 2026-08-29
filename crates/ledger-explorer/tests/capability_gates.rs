@@ -26,7 +26,7 @@ use ledger_explorer::solver::{
 };
 use ledger_explorer::solver_cache::{ClauseCache, WeightedClause};
 use ledger_explorer::support::{StaticSupportProvider, SupportExpr, all_of_ids};
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
 use ledger_sim::{BeltStatus, RunOutcome, RunResult};
 
 // ---------------------------------------------------------------------------
@@ -45,10 +45,30 @@ fn chain_with_outcome(n: usize) -> (Journal, Hash) {
         };
         let id = match prev {
             Some(p) => journal
-                .append(kind, 1, [p], Payload::Number(i as u64))
+                .append(
+                    kind,
+                    1,
+                    [p],
+                    EntryPayload::Recv(ledger_format::RecvFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: 1,
+                        observed_content: (i as u64).to_le_bytes().to_vec(),
+                    }),
+                )
                 .expect("chain append must succeed"),
             None => journal
-                .append(kind, 1, [], Payload::Number(i as u64))
+                .append(
+                    kind,
+                    1,
+                    [],
+                    EntryPayload::Recv(ledger_format::RecvFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: 1,
+                        observed_content: (i as u64).to_le_bytes().to_vec(),
+                    }),
+                )
                 .expect("root append must succeed"),
         };
         prev = Some(id);
@@ -58,7 +78,10 @@ fn chain_with_outcome(n: usize) -> (Journal, Hash) {
             EntryKind::Outcome,
             1,
             prev.into_iter().collect::<Vec<_>>(),
-            Payload::Number(u64::MAX),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(u64::MAX),
+            }),
         )
         .expect("outcome append must succeed");
     (journal, witness)
@@ -239,7 +262,17 @@ fn differential_lineage_refresh_walks_only_new_witnesses() {
     // records the growth and reports no change with zero walks.
     for i in 2048..2050 {
         let id = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(i as u64))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 1,
+                    original_content: (i as u64).to_le_bytes().to_vec(),
+                }),
+            )
             .expect("growth append");
         let _ = id;
     }
@@ -260,7 +293,17 @@ fn differential_lineage_refresh_walks_only_new_witnesses() {
     let mut sub_prev: Option<Hash> = None;
     for i in 0..8 {
         let id = journal
-            .append(EntryKind::Send, 2, [], Payload::Number(3000 + i as u64))
+            .append(
+                EntryKind::Send,
+                2,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 2,
+                    to: 1,
+                    original_content: (3000 + i as u64).to_le_bytes().to_vec(),
+                }),
+            )
             .expect("sub-chain append");
         sub_prev = Some(id);
     }
@@ -269,7 +312,10 @@ fn differential_lineage_refresh_walks_only_new_witnesses() {
             EntryKind::Outcome,
             2,
             sub_prev.into_iter().collect::<Vec<_>>(),
-            Payload::Number(u64::MAX - 1),
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(u64::MAX - 1),
+            }),
         )
         .expect("new witness append");
     let fresh_clone = LineageIndex::build(&journal, &[tail, new_witness], &config, engine);
@@ -304,13 +350,41 @@ fn differential_lineage_refresh_walks_only_new_witnesses() {
 fn samc_prepruning_is_selective_and_deterministic() {
     let mut journal = Journal::new();
     let send_a = journal
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+        .append(
+            EntryKind::Send,
+            1,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 2,
+                original_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append a");
     let send_b = journal
-        .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 2 })
+        .append(
+            EntryKind::Send,
+            2,
+            [],
+            EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(2, 0),
+                from: 2,
+                to: 3,
+                original_content: 2u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append b");
     let witness = journal
-        .append(EntryKind::Outcome, 3, [send_a, send_b], Payload::Number(0))
+        .append(
+            EntryKind::Outcome,
+            3,
+            [send_a, send_b],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(0),
+            }),
+        )
         .expect("append witness");
     let entry_a = journal.get(&send_a).expect("entry a");
     let entry_b = journal.get(&send_b).expect("entry b");
@@ -341,7 +415,17 @@ fn samc_prepruning_is_selective_and_deterministic() {
     // Negative control: the prune must not be a blanket dedup. Hypotheses
     // over causally ordered events (no concurrent swap) both survive.
     let child = journal
-        .append(EntryKind::Recv, 1, [send_a], Payload::Number(1))
+        .append(
+            EntryKind::Recv,
+            1,
+            [send_a],
+            EntryPayload::Recv(ledger_format::RecvFrame {
+                message_id: ledger_format::MessageId::new(1, 0),
+                from: 1,
+                to: 1,
+                observed_content: 1u64.to_le_bytes().to_vec(),
+            }),
+        )
         .expect("append child");
     let hyp_child = FaultHypothesis {
         events: vec![child],

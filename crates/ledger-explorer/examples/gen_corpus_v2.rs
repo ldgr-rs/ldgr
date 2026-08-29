@@ -24,14 +24,14 @@ fn main() {
             actor_heads.insert(entry.data.actor, entry.id);
         }
         let manifest = RunManifest {
-            format_version: 1,
+            format_version: ledger_format::FORMAT_VERSION,
+            crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
             root_seed: finding.seed,
             policy_tag: "random".to_string(),
             journal_root: finding.run.journal.root_hash(),
             entry_count: finding.run.journal.len() as u64,
             actor_heads,
             execution_identity: None,
-            extensions: BTreeMap::new(),
         };
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
         let path = out_dir.join(format!("{}.ldgr", scenario.name));

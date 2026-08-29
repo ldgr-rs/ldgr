@@ -53,7 +53,7 @@
 
 use ledger_explorer::minimizer::{causal_slice_forward, ddmin};
 use ledger_explorer::oracle::{ExactlyOnceValueOracle, Oracle};
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, Simulation};
 
 /// Total noise inputs journaled on actor 0.
@@ -119,8 +119,12 @@ fn duplicate_pair_ids(journal: &ledger_journal::Journal) -> Vec<Hash> {
     journal
         .entries()
         .filter(|entry| {
-            matches!(entry.data.kind, EntryKind::InputStep { .. })
-                && matches!(&entry.data.payload, Payload::Number(value) if *value == DUP_VALUE)
+            matches!(entry.data.kind, EntryKind::InputStep)
+                && matches!(&entry.data.payload, EntryPayload::InputStep(ledger_format::InputStepPayload {
+            generator: _,
+            replay: _,
+            value: CanonicalValue::Unsigned(value),
+        }) if *value == DUP_VALUE)
         })
         .map(|entry| entry.id)
         .collect()
@@ -132,7 +136,13 @@ fn numeric_outcome_id(journal: &ledger_journal::Journal) -> Option<Hash> {
         .entries()
         .filter(|entry| {
             entry.data.kind == EntryKind::Outcome
-                && matches!(&entry.data.payload, Payload::Number(_))
+                && matches!(
+                    &entry.data.payload,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: CanonicalValue::Unsigned(_),
+                        ..
+                    })
+                )
         })
         .map(|entry| entry.id)
         .last()

@@ -40,6 +40,13 @@ pub enum CborError {
     MalformedManifest(&'static str),
 }
 
+impl CborError {
+    /// Converts into a canonical-value error, preserving the source.
+    pub fn into_value(self) -> crate::value::ValueError {
+        crate::value::ValueError::Cbor(self)
+    }
+}
+
 impl fmt::Display for CborError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -176,6 +183,9 @@ pub fn compare_canonical_keys(a: &[u8], b: &[u8]) -> Ordering {
 
 pub mod decode;
 pub mod encode;
+pub mod items;
+
+pub use items::{Item, ItemReader};
 
 pub use decode::parse_tolerant;
 pub use encode::{

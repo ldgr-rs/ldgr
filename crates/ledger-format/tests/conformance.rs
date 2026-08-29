@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use ledger_format::cbor::{self, CborError, CborValue};
-use ledger_format::{EntryData, EntryKind, FaultSpec, ManifestVersion, Payload, RunManifest};
+use ledger_format::{EntryData, EntryKind, ManifestVersion, RunManifest};
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -558,14 +558,16 @@ fn hostile_input_never_panics() {
 
 fn sample_entry_bytes() -> Vec<u8> {
     EntryData {
-        kind: EntryKind::Fault {
-            fault: FaultSpec::Delay { ticks: 100 },
-        },
+        format_version: ledger_format::FORMAT_VERSION,
+        kind: EntryKind::Fault,
         actor: 1,
         parents: vec![[1u8; 32], [2u8; 32]],
         vector_clock: vec![3, 4],
         sequence: 5,
-        payload: Payload::Text("payload".into()),
+        payload: ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::DelayMessage {
+            message_id: ledger_format::MessageId::new(1, 0),
+            ticks: 100,
+        }),
     }
     .try_canonical_bytes()
     .expect("sample entry encodes")
@@ -573,14 +575,14 @@ fn sample_entry_bytes() -> Vec<u8> {
 
 fn sample_manifest_bytes() -> Vec<u8> {
     RunManifest {
-        format_version: 1,
+        format_version: ledger_format::FORMAT_VERSION,
+        crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
+        execution_identity: None,
         root_seed: [7u8; 32],
         policy_tag: "pct".into(),
         journal_root: [9u8; 32],
         entry_count: 42,
         actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
-        execution_identity: None,
-        extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(1))]),
     }
     .to_canonical_bytes()
     .expect("sample manifest encodes")
@@ -685,7 +687,7 @@ fn tolerant_reader_matches_canonical_decoder_on_fixtures() {
 
 #[test]
 fn entry_round_trip_stability() {
-    let mut kinds: Vec<EntryKind> = vec![
+    let kinds: Vec<EntryKind> = vec![
         EntryKind::Spawn,
         EntryKind::Block,
         EntryKind::Wake,
@@ -697,47 +699,31 @@ fn entry_round_trip_stability() {
         EntryKind::FsWrite,
         EntryKind::FsFsync,
         EntryKind::FsRead,
-        EntryKind::RngDraw { stream: 11 },
+        EntryKind::RngDraw,
         EntryKind::Outcome,
         EntryKind::Assert,
         EntryKind::Snapshot,
         EntryKind::Epoch,
-        EntryKind::InputStep {
-            generator: 2,
-            replay: 3,
-        },
+        EntryKind::InputStep,
         EntryKind::CapRequest,
         EntryKind::CapGrant,
         EntryKind::CapInvoke,
         EntryKind::CapRevoke,
-        EntryKind::Fault {
-            fault: FaultSpec::Drop,
-        },
+        EntryKind::Fault,
         EntryKind::StepBegin,
         EntryKind::StepEnd,
     ];
     assert_eq!(kinds.len(), 24, "spec defines exactly 24 entry kinds");
 
-    let faults = [
-        FaultSpec::Drop,
-        FaultSpec::Delay { ticks: 100 },
-        FaultSpec::Partition { src: 1, dst: 2 },
-        FaultSpec::Crash,
-        FaultSpec::Corrupt,
-        FaultSpec::CrashState(3),
-    ];
-    for fault in faults {
-        kinds.push(EntryKind::Fault { fault });
-    }
-
     for kind in &kinds {
         let data = EntryData {
+            format_version: ledger_format::FORMAT_VERSION,
             kind: *kind,
             actor: 7,
             parents: vec![[0xaa; 32]],
             vector_clock: vec![1, 2, 3],
             sequence: 4,
-            payload: Payload::Pair { left: 5, right: 6 },
+            payload: default_payload(*kind),
         };
         let first = data.try_canonical_bytes().expect("entry encodes");
         let second = data.try_canonical_bytes().expect("entry encodes");
@@ -746,39 +732,147 @@ fn entry_round_trip_stability() {
             "encoding must be byte-identical for {kind:?}"
         );
         match CborValue::from_canonical_bytes(&first).expect("entry decodes as CBOR") {
-            CborValue::Array(items) => assert_eq!(items.len(), 6, "entry decodes as array of 6"),
+            CborValue::Array(items) => assert_eq!(items.len(), 7, "entry decodes as array of 7"),
             other => panic!("entry must decode as an array, got {other:?}"),
         }
+    }
+}
+
+/// Returns a v2 typed payload valid for every kind, so round-trip stability
+/// covers the full tag space.
+fn default_payload(kind: EntryKind) -> ledger_format::EntryPayload {
+    use ledger_format::*;
+    match kind {
+        EntryKind::Spawn => EntryPayload::Spawn { child_actor: 7 },
+        EntryKind::Block => EntryPayload::Block(BlockPayload::Yield),
+        EntryKind::Wake => EntryPayload::Wake(WakePayload::TimerReady { timer_id: 1 }),
+        EntryKind::TimerSet => EntryPayload::TimerSet {
+            timer_id: 1,
+            deadline_ticks: 2,
+        },
+        EntryKind::TimerFire => EntryPayload::TimerFire {
+            timer_id: 1,
+            deadline_ticks: 2,
+        },
+        EntryKind::ClockRead => EntryPayload::ClockRead { ticks: 9 },
+        EntryKind::Send => EntryPayload::Send(SendFrame {
+            message_id: MessageId::new(7, 4),
+            from: 7,
+            to: 1,
+            original_content: b"m".to_vec(),
+        }),
+        EntryKind::Recv => EntryPayload::Recv(RecvFrame {
+            message_id: MessageId::new(7, 4),
+            from: 7,
+            to: 1,
+            observed_content: b"m".to_vec(),
+        }),
+        EntryKind::FsWrite => EntryPayload::FsWrite(FsWritePayload::Allocate {
+            path_ref: PathRef {
+                path_hash: [0xcc; 32],
+                canonical_path: b"/d/f".to_vec(),
+            },
+        }),
+        EntryKind::FsFsync => EntryPayload::FsFsync(FsSyncPayload {
+            path_ref: PathRef {
+                path_hash: [0xcc; 32],
+                canonical_path: b"/d/f".to_vec(),
+            },
+        }),
+        EntryKind::FsRead => EntryPayload::FsRead(FsReadPayload {
+            path_ref: PathRef {
+                path_hash: [0xcc; 32],
+                canonical_path: b"/d/f".to_vec(),
+            },
+            offset: 0,
+            requested_len: 1,
+            observed: ObservedRead::Missing,
+        }),
+        EntryKind::RngDraw => EntryPayload::RngDraw(RngDrawPayload {
+            stream: 11,
+            draw_index: 0,
+            content: Vec::new(),
+        }),
+        EntryKind::Outcome => EntryPayload::Outcome(OutcomePayload {
+            schema: [0xdd; 32],
+            value: CanonicalValue::Unsigned(1),
+        }),
+        EntryKind::Assert => EntryPayload::Assert(AssertPayload {
+            predicate: [0xdd; 32],
+            passed: true,
+            detail: CanonicalValue::Unsigned(0),
+        }),
+        EntryKind::Snapshot => EntryPayload::Snapshot(SnapshotPayload {
+            snapshot_digest: [0xee; 32],
+        }),
+        EntryKind::Epoch => EntryPayload::Epoch(EpochPayload { epoch: 3 }),
+        EntryKind::InputStep => EntryPayload::InputStep(InputStepPayload {
+            generator: 2,
+            replay: 3,
+            value: CanonicalValue::Unsigned(1),
+        }),
+        EntryKind::CapRequest => EntryPayload::CapRequest(CapRequestPayload {
+            request: [0x11; 16],
+            subject: [0x22; 32],
+            capability: [0x33; 32],
+        }),
+        EntryKind::CapGrant => EntryPayload::CapGrant(CapGrantPayload {
+            request: [0x11; 16],
+            grant: [0x22; 16],
+            epoch: 1,
+        }),
+        EntryKind::CapInvoke => EntryPayload::CapInvoke(CapInvokePayload {
+            grant: [0x22; 16],
+            operation: [0x33; 32],
+        }),
+        EntryKind::CapRevoke => EntryPayload::CapRevoke(CapRevokePayload {
+            grant: [0x22; 16],
+            epoch: 1,
+        }),
+        EntryKind::Fault => EntryPayload::Fault(FaultPayload::Partition {
+            src: 1,
+            dst: 2,
+            enabled: true,
+        }),
+        EntryKind::StepBegin => EntryPayload::StepBegin(StepBeginPayload {
+            step_id: 1,
+            name: b"s".to_vec(),
+            idempotency_key: None,
+        }),
+        EntryKind::StepEnd => EntryPayload::StepEnd(StepEndPayload::Completed {
+            step_id: 1,
+            result: CanonicalValue::Unsigned(0),
+        }),
     }
 }
 
 #[test]
 fn manifest_version_migration() {
     let manifest = RunManifest {
-        format_version: 1,
+        format_version: ledger_format::FORMAT_VERSION,
+        crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
+        execution_identity: None,
         root_seed: [7u8; 32],
         policy_tag: "bandit".into(),
         journal_root: [9u8; 32],
         entry_count: 1234,
         actor_heads: BTreeMap::from([(1u32, [1u8; 32]), (2u32, [2u8; 32])]),
-        execution_identity: None,
-        extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(99))]),
     };
     assert!(ManifestVersion::CURRENT.is_supported());
-    assert!(ManifestVersion(1).is_supported());
-    assert!(!ManifestVersion(2).is_supported());
+    assert!(ManifestVersion(2).is_supported());
+    assert!(!ManifestVersion(1).is_supported());
 
     let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
-    assert_eq!(bytes[0], 0x87, "manifest is an array of 7");
-    let decoded = RunManifest::from_canonical_bytes(&bytes).expect("v1 manifest decodes");
+    assert_eq!(bytes[0], 0x88, "manifest is an array of 8");
+    let decoded = RunManifest::from_canonical_bytes(&bytes).expect("v2 manifest decodes");
     assert_eq!(decoded, manifest);
 
-    // A v2 manifest is rejected as unsupported.
-    let mut version_2 = bytes.clone();
-    version_2[1] = 0x02;
+    // A v1 manifest is rejected as unsupported.
+    let mut version_1 = bytes.clone();
+    version_1[1] = 0x01;
     assert_eq!(
-        RunManifest::from_canonical_bytes(&version_2),
-        Err(CborError::UnsupportedVersion(2))
+        RunManifest::from_canonical_bytes(&version_1),
+        Err(CborError::UnsupportedVersion(1))
     );
 
     // A v0 manifest is also rejected as unsupported.

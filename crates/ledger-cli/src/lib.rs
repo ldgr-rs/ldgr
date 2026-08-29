@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_verbosity_flag::{Verbosity, VerbosityFilter};
 
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash, SendFrame};
 use ledger_sim::{Instruction, Policy, Probability, RunResult};
 
 /// Default pct_mix 0.1 without unwrap or expect; 0.1 is known valid.
@@ -76,8 +76,15 @@ impl ledger_explorer::search::Workload for DefaultMiniKv {
         run.journal
             .entries()
             .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-                (EntryKind::Send, Payload::Pair { left: 1, right: 42 })
-                    if entry.data.actor == 0 =>
+                (
+                    EntryKind::Send,
+                    EntryPayload::Send(SendFrame {
+                        to: 1,
+                        original_content,
+                        ..
+                    }),
+                ) if entry.data.actor == 0
+                    && original_content.as_slice() == 42u64.to_le_bytes() =>
                 {
                     Some(ledger_explorer::HistoryOperation::Write {
                         key: "k".into(),
@@ -85,13 +92,17 @@ impl ledger_explorer::search::Workload for DefaultMiniKv {
                         witness: entry.id,
                     })
                 }
-                (EntryKind::Outcome, Payload::Number(value)) if entry.data.actor == 2 => {
-                    Some(ledger_explorer::HistoryOperation::Read {
-                        key: "k".into(),
-                        value: *value,
-                        witness: entry.id,
-                    })
-                }
+                (
+                    EntryKind::Outcome,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: ledger_format::CanonicalValue::Unsigned(value),
+                        ..
+                    }),
+                ) if entry.data.actor == 2 => Some(ledger_explorer::HistoryOperation::Read {
+                    key: "k".into(),
+                    value: *value,
+                    witness: entry.id,
+                }),
                 _ => None,
             })
             .collect()

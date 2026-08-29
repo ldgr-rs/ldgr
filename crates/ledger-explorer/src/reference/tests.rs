@@ -108,7 +108,10 @@ fn mini_raft_double_leader_fires_for_some_seed() {
         .entries()
         .filter_map(|e| match e.data.kind {
             ledger_format::EntryKind::Outcome => match &e.data.payload {
-                ledger_format::Payload::Number(v) => Some(*v),
+                ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: _,
+                    value: ledger_format::CanonicalValue::Unsigned(v),
+                }) => Some(*v),
                 _ => None,
             },
             _ => None,

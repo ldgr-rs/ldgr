@@ -15,7 +15,7 @@ use ledger_explorer::search::{
     run_swarm_campaign, search,
 };
 use ledger_explorer::workloads::{MiniKvWorkload, StorageCrashWorkload};
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SimFault, Simulation, SwarmConfig};
 
@@ -79,7 +79,13 @@ fn swarm_campaign_finds_violation() {
             journal
                 .entries()
                 .all(|entry| match (&entry.data.kind, &entry.data.payload) {
-                    (EntryKind::Outcome, Payload::Number(value)) => *value == 42,
+                    (
+                        EntryKind::Outcome,
+                        EntryPayload::Outcome(ledger_format::OutcomePayload {
+                            value: CanonicalValue::Unsigned(value),
+                            ..
+                        }),
+                    ) => *value == 42,
                     _ => true,
                 })
         },
@@ -234,20 +240,31 @@ impl Workload for ReorderStaleReadWorkload {
         run.journal
             .entries()
             .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-                (EntryKind::Send, Payload::Pair { right: 42, .. }) if entry.data.actor == 0 => {
+                (
+                    EntryKind::Send,
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        original_content, ..
+                    }),
+                ) if entry.data.actor == 0
+                    && original_content.as_slice() == 42u64.to_le_bytes() =>
+                {
                     Some(HistoryOperation::Write {
                         key: "k".into(),
                         value: 42,
                         witness: entry.id,
                     })
                 }
-                (EntryKind::Outcome, Payload::Number(value)) if entry.data.actor == 1 => {
-                    Some(HistoryOperation::Read {
-                        key: "k".into(),
-                        value: *value,
-                        witness: entry.id,
-                    })
-                }
+                (
+                    EntryKind::Outcome,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: CanonicalValue::Unsigned(value),
+                        ..
+                    }),
+                ) if entry.data.actor == 1 => Some(HistoryOperation::Read {
+                    key: "k".into(),
+                    value: *value,
+                    witness: entry.id,
+                }),
                 _ => None,
             })
             .collect()
@@ -371,7 +388,15 @@ fn quorum_axis_catches_the_planted_stale_read() {
                         && entry.data.kind == EntryKind::Send
                 })
                 .filter_map(|entry| match &entry.data.payload {
-                    Payload::Pair { right, .. } => Some(*right),
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        original_content, ..
+                    }) => {
+                        let bytes: [u8; 8] = original_content
+                            .as_slice()
+                            .try_into()
+                            .expect("8-byte send payload");
+                        Some(u64::from_le_bytes(bytes))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -380,7 +405,10 @@ fn quorum_axis_catches_the_planted_stale_read() {
                 .entries()
                 .filter(|entry| entry.data.actor == 4 && entry.data.kind == EntryKind::Outcome)
                 .find_map(|entry| match &entry.data.payload {
-                    Payload::Number(value) => Some(*value),
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: CanonicalValue::Unsigned(value),
+                        ..
+                    }) => Some(*value),
                     _ => None,
                 });
             // A stale read is only a quorum violation when a majority acked
@@ -413,7 +441,10 @@ fn quorum_axis_catches_the_planted_stale_read() {
                 .entries()
                 .filter(|entry| entry.data.kind == EntryKind::Outcome)
                 .find_map(|entry| match &entry.data.payload {
-                    Payload::Number(value) => Some(*value),
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: CanonicalValue::Unsigned(value),
+                        ..
+                    }) => Some(*value),
                     _ => None,
                 })
                 == Some(42)

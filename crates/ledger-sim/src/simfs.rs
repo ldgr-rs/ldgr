@@ -1,8 +1,22 @@
 //! Layered storage crash model with write provenance and corruption operators.
 
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash, PathRef};
 use ledger_journal::{Journal, JournalError};
 use std::collections::{BTreeMap, HashSet};
+
+/// Builds a canonical path reference for a string path.
+///
+/// CONSUMER DEBT (lane 2): the sim binds the canonical path hash through
+/// the journal's BLAKE3 helper once that lands; the deterministic zero hash
+/// keeps lane-1 journals byte-stable.
+fn path_ref(path: &str) -> PathRef {
+    let canonical =
+        ledger_format::canonicalize(path.as_bytes()).unwrap_or_else(|_| path.as_bytes().to_vec());
+    PathRef {
+        path_hash: [0x00; 32],
+        canonical_path: canonical,
+    }
+}
 
 /// Crash operators modeling failure modes in storage subsystems.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,10 +109,11 @@ impl SimFs {
             EntryKind::FsWrite,
             actor,
             [],
-            Payload::Pair {
-                left: path.len() as u64,
-                right: value,
-            },
+            EntryPayload::FsWrite(ledger_format::FsWritePayload::Write {
+                path_ref: path_ref(path),
+                offset: 0,
+                content: value.to_le_bytes().to_vec(),
+            }),
         )?;
         self.values
             .insert(path.to_owned(), (value, id, PageState::Dirty));
@@ -123,10 +138,9 @@ impl SimFs {
             EntryKind::FsWrite,
             actor,
             [],
-            Payload::Pair {
-                left: path.len() as u64,
-                right: 0,
-            },
+            EntryPayload::FsWrite(ledger_format::FsWritePayload::Allocate {
+                path_ref: path_ref(path),
+            }),
         )?;
         self.values
             .insert(path.to_owned(), (0, id, PageState::Allocated));
@@ -140,7 +154,16 @@ impl SimFs {
     /// Under journaling the journal replays first: committed records become
     /// durable, then pending renames commit, then dirty pages flush.
     pub fn fsync(&mut self, journal: &mut Journal, actor: u32) -> Result<Hash, JournalError> {
-        let id = journal.append(EntryKind::FsFsync, actor, [], Payload::Empty)?;
+        // The store-level barrier persists every dirty file; the root path is
+        // the canonical identity of that barrier.
+        let id = journal.append(
+            EntryKind::FsFsync,
+            actor,
+            [],
+            EntryPayload::FsFsync(ledger_format::FsSyncPayload {
+                path_ref: path_ref("/"),
+            }),
+        )?;
         #[cfg(feature = "sim-fs-journaling")]
         {
             for (path, (value, write_id)) in &self.journal {
@@ -177,15 +200,29 @@ impl SimFs {
                     EntryKind::FsRead,
                     actor,
                     [write_id],
-                    Payload::Pair {
-                        left: path.len() as u64,
-                        right: value,
-                    },
+                    EntryPayload::FsRead(ledger_format::FsReadPayload {
+                        path_ref: path_ref(path),
+                        offset: 0,
+                        requested_len: 1,
+                        observed: ledger_format::ObservedRead::Present {
+                            content: value.to_le_bytes().to_vec(),
+                        },
+                    }),
                 )?;
                 Ok(Some(value))
             }
             _ => {
-                journal.append(EntryKind::FsRead, actor, [], Payload::Text(path.to_owned()))?;
+                journal.append(
+                    EntryKind::FsRead,
+                    actor,
+                    [],
+                    EntryPayload::FsRead(ledger_format::FsReadPayload {
+                        path_ref: path_ref(path),
+                        offset: 0,
+                        requested_len: 1,
+                        observed: ledger_format::ObservedRead::Missing,
+                    }),
+                )?;
                 Ok(None)
             }
         }
@@ -205,7 +242,15 @@ impl SimFs {
         from: &str,
         to: &str,
     ) -> Result<Hash, JournalError> {
-        let id = journal.append(EntryKind::FsWrite, actor, [], Payload::Text(to.to_owned()))?;
+        let id = journal.append(
+            EntryKind::FsWrite,
+            actor,
+            [],
+            EntryPayload::FsWrite(ledger_format::FsWritePayload::Rename {
+                from_path_ref: path_ref(from),
+                to_path_ref: path_ref(to),
+            }),
+        )?;
         if let Some((value, write_id, state)) = self.values.remove(from) {
             self.values.insert(to.to_owned(), (value, write_id, state));
         }
@@ -239,10 +284,11 @@ impl SimFs {
             EntryKind::FsWrite,
             actor,
             [],
-            Payload::Pair {
-                left: path.len() as u64,
-                right: value,
-            },
+            EntryPayload::FsWrite(ledger_format::FsWritePayload::Write {
+                path_ref: path_ref(path),
+                offset: 0,
+                content: value.to_le_bytes().to_vec(),
+            }),
         )?;
         let current = self.values.get(path).map_or(0, |(value, _, _)| *value);
         let full = current.saturating_add(value);

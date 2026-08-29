@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use ledger_format::cbor::{self, CborValue};
-use ledger_format::{EntryData, EntryKind, FaultSpec, Payload, RunManifest};
+use ledger_format::{EntryData, EntryKind, RunManifest};
 
 /// Mutation rounds per seed. Bounded so the harness finishes fast in CI.
 const ROUNDS_PER_SEED: usize = 1500;
@@ -52,38 +52,67 @@ impl SplitMix64 {
 /// The entries cover unit, structured, and fault kinds plus the full manifest
 /// wire form, so mutations hit every CBOR structure the engine writes.
 fn seed_corpus() -> Vec<Vec<u8>> {
-    let entries = [
-        (EntryKind::Spawn, Payload::Empty),
-        (EntryKind::Send, Payload::Text("hello determinism".into())),
-        (EntryKind::RngDraw { stream: 7 }, Payload::Number(42)),
+    let entries: Vec<(EntryKind, ledger_format::EntryPayload)> = [
         (
-            EntryKind::InputStep {
+            EntryKind::Spawn,
+            ledger_format::EntryPayload::Spawn { child_actor: 7 },
+        ),
+        (
+            EntryKind::Send,
+            ledger_format::EntryPayload::Send(ledger_format::SendFrame {
+                message_id: ledger_format::MessageId::new(7, 0),
+                from: 7,
+                to: 1,
+                original_content: b"hello determinism".to_vec(),
+            }),
+        ),
+        (
+            EntryKind::RngDraw,
+            ledger_format::EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                stream: 7,
+                draw_index: 0,
+                content: 42u64.to_le_bytes().to_vec(),
+            }),
+        ),
+        (
+            EntryKind::InputStep,
+            ledger_format::EntryPayload::InputStep(ledger_format::InputStepPayload {
                 generator: 2,
                 replay: 3,
-            },
-            Payload::Pair { left: 5, right: 6 },
+                value: ledger_format::CanonicalValue::Unsigned(5),
+            }),
         ),
         (
-            EntryKind::Fault {
-                fault: FaultSpec::Partition { src: 1, dst: 2 },
-            },
-            Payload::Bytes(vec![0xaa, 0xbb]),
+            EntryKind::Fault,
+            ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::Partition {
+                src: 1,
+                dst: 2,
+                enabled: true,
+            }),
         ),
         (
-            EntryKind::Fault {
-                fault: FaultSpec::CrashState(9),
-            },
-            Payload::Value(CborValue::Map(vec![(
-                CborValue::Text("k".into()),
-                CborValue::Unsigned(1),
-            )])),
+            EntryKind::Fault,
+            ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::CrashActor {
+                actor: 7,
+                crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
+            }),
         ),
-        (EntryKind::FsWrite, Payload::Signed(-1000)),
-    ];
+        (
+            EntryKind::FsWrite,
+            ledger_format::EntryPayload::FsWrite(ledger_format::FsWritePayload::Allocate {
+                path_ref: ledger_format::PathRef {
+                    path_hash: [0xcc; 32],
+                    canonical_path: b"/data/f".to_vec(),
+                },
+            }),
+        ),
+    ]
+    .to_vec();
     let mut corpus: Vec<Vec<u8>> = entries
         .iter()
         .map(|(kind, payload)| {
             EntryData {
+                format_version: ledger_format::FORMAT_VERSION,
                 kind: *kind,
                 actor: 7,
                 parents: vec![[0xaa; 32], [0xbb; 32]],
@@ -97,14 +126,14 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         .collect();
 
     let manifest = RunManifest {
-        format_version: 1,
+        format_version: ledger_format::FORMAT_VERSION,
+        crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
+        execution_identity: None,
         root_seed: [7u8; 32],
         policy_tag: "pct".into(),
         journal_root: [9u8; 32],
         entry_count: 42,
         actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
-        execution_identity: None,
-        extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(1))]),
     };
     corpus.push(
         manifest
@@ -237,14 +266,14 @@ fn mutation_harness_never_panics() {
     }
 
     let manifest = RunManifest {
-        format_version: 1,
+        format_version: ledger_format::FORMAT_VERSION,
+        crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
+        execution_identity: None,
         root_seed: [7u8; 32],
         policy_tag: "pct".into(),
         journal_root: [9u8; 32],
         entry_count: 42,
         actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
-        execution_identity: None,
-        extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(1))]),
     };
     let manifest_bytes = manifest
         .to_canonical_bytes()

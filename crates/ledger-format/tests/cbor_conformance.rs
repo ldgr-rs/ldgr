@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use ledger_format::cbor::{self, CborError, CborValue};
-use ledger_format::{EntryData, EntryKind, FaultSpec, Payload, RunManifest};
+use ledger_format::{EntryData, EntryKind, RunManifest};
 
 #[test]
 fn cbor_enforces_canonical_key_sorting() {
@@ -73,8 +73,9 @@ fn cbor_round_trips_nested_structures() {
     assert_eq!(val, decoded);
 }
 
-fn entry(kind: EntryKind, actor: u32, payload: Payload) -> EntryData {
+fn entry(kind: EntryKind, actor: u32, payload: ledger_format::EntryPayload) -> EntryData {
     EntryData {
+        format_version: ledger_format::FORMAT_VERSION,
         kind,
         actor,
         parents: vec![],
@@ -85,17 +86,21 @@ fn entry(kind: EntryKind, actor: u32, payload: Payload) -> EntryData {
 }
 
 #[test]
-fn payload_empty_round_trips() {
-    // Payload::Empty encodes as array(1) followed by discriminant 6: [0x81, 0x06].
-    let mut out = Vec::new();
-    Payload::Empty.try_encode(&mut out).unwrap();
-    assert_eq!(out, vec![0x81, 0x06]);
-
-    // In a full entry the payload is the final element of the 6-item array.
-    let data = entry(EntryKind::Spawn, 0, Payload::Empty);
+fn spawn_payload_round_trips() {
+    // Spawn encodes as [child_actor]: array(1) with the actor.
+    let data = entry(
+        EntryKind::Spawn,
+        0,
+        ledger_format::EntryPayload::Spawn { child_actor: 5 },
+    );
     let bytes = data.try_canonical_bytes().unwrap();
-    assert_eq!(bytes[0], 0x86);
-    assert!(bytes.ends_with(&[0x81, 0x06]));
+    // 7-element EntryData array: version, tag 0, actor 0, parents, clock,
+    // sequence, payload array(1) child_actor 5.
+    assert_eq!(bytes[0], 0x87);
+    assert_eq!(bytes[1], 0x02); // format_version = 2
+    assert_eq!(bytes[2], 0x00); // kind tag 0
+    let decoded = EntryData::from_canonical_bytes(&bytes).unwrap();
+    assert_eq!(decoded, data);
 }
 
 #[test]
@@ -491,113 +496,105 @@ fn tolerant_reader_enforces_depth_limit() {
 
 #[test]
 fn entry_kind_structured_encoding_stable() {
-    let rng = entry(EntryKind::RngDraw { stream: 7 }, 0, Payload::Empty);
+    // v2 golden bytes: EntryData = [format_version, kind_tag, actor,
+    // parents, vector_clock, sequence, typed_payload].
+    let rng = entry(
+        EntryKind::RngDraw,
+        0,
+        ledger_format::EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+            stream: 7,
+            draw_index: 0,
+            content: Vec::new(),
+        }),
+    );
     assert_eq!(
         rng.try_canonical_bytes().unwrap(),
-        vec![0x86, 0x82, 0x0b, 0x07, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06]
+        vec![
+            0x87, 0x02, 0x0b, 0x00, 0x80, 0x80, 0x00, 0x83, 0x07, 0x00, 0x40
+        ]
     );
 
     let step = entry(
-        EntryKind::InputStep {
+        EntryKind::InputStep,
+        0,
+        ledger_format::EntryPayload::InputStep(ledger_format::InputStepPayload {
             generator: 2,
             replay: 3,
-        },
-        0,
-        Payload::Empty,
+            value: ledger_format::CanonicalValue::Unsigned(0),
+        }),
     );
     assert_eq!(
         step.try_canonical_bytes().unwrap(),
         vec![
-            0x86, 0x83, 0x10, 0x02, 0x03, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
-        ]
-    );
-
-    let crash = entry(
-        EntryKind::Fault {
-            fault: FaultSpec::CrashState(3),
-        },
-        0,
-        Payload::Empty,
-    );
-    assert_eq!(
-        crash.try_canonical_bytes().unwrap(),
-        vec![
-            0x86, 0x82, 0x15, 0x82, 0x05, 0x03, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
-        ]
-    );
-
-    let delay = entry(
-        EntryKind::Fault {
-            fault: FaultSpec::Delay { ticks: 100 },
-        },
-        0,
-        Payload::Empty,
-    );
-    assert_eq!(
-        delay.try_canonical_bytes().unwrap(),
-        vec![
-            0x86, 0x82, 0x15, 0x82, 0x01, 0x18, 0x64, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
+            0x87, 0x02, 0x10, 0x00, 0x80, 0x80, 0x00, 0x83, 0x02, 0x03, 0x00
         ]
     );
 
     let partition = entry(
-        EntryKind::Fault {
-            fault: FaultSpec::Partition { src: 1, dst: 2 },
-        },
+        EntryKind::Fault,
         0,
-        Payload::Empty,
+        ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::Partition {
+            src: 1,
+            dst: 2,
+            enabled: true,
+        }),
     );
     assert_eq!(
         partition.try_canonical_bytes().unwrap(),
         vec![
-            0x86, 0x82, 0x15, 0x83, 0x02, 0x01, 0x02, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06
+            0x87, 0x02, 0x15, 0x00, 0x80, 0x80, 0x00, 0x84, 0x04, 0x01, 0x02, 0xf5
         ]
     );
 
-    let drop = entry(
-        EntryKind::Fault {
-            fault: FaultSpec::Drop,
-        },
+    let outcome = entry(
+        EntryKind::Outcome,
         0,
-        Payload::Empty,
+        ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
+            schema: [0xaa; 32],
+            value: ledger_format::CanonicalValue::Unsigned(42),
+        }),
     );
     assert_eq!(
-        drop.try_canonical_bytes().unwrap(),
-        vec![0x86, 0x82, 0x15, 0x00, 0x00, 0x80, 0x80, 0x00, 0x81, 0x06]
+        outcome.try_canonical_bytes().unwrap(),
+        vec![
+            0x87, 0x02, 0x0c, 0x00, 0x80, 0x80, 0x00, 0x82, 0x58, 0x20, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0x18, 0x2a
+        ]
     );
 
-    for data in [&rng, &step, &crash, &delay, &partition, &drop] {
-        assert_eq!(
-            data.try_canonical_bytes().unwrap(),
-            data.try_canonical_bytes().unwrap()
-        );
+    for data in [&rng, &step, &partition, &outcome] {
+        let bytes = data.try_canonical_bytes().unwrap();
+        let decoded = EntryData::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(&decoded, data);
     }
 }
 
 #[test]
 fn manifest_round_trip_and_version_reject() {
     let manifest = RunManifest {
-        format_version: 1,
+        format_version: ledger_format::FORMAT_VERSION,
+        crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
+        execution_identity: None,
         root_seed: [7u8; 32],
         policy_tag: "bandit".into(),
         journal_root: [9u8; 32],
         entry_count: 1234,
         actor_heads: BTreeMap::from([(1u32, [1u8; 32]), (2u32, [2u8; 32])]),
-        execution_identity: None,
-        extensions: BTreeMap::new(),
     };
 
     let bytes = manifest.to_canonical_bytes().unwrap();
-    assert_eq!(bytes[0], 0x87);
+    assert_eq!(bytes[0], 0x88);
 
     let decoded = RunManifest::from_canonical_bytes(&bytes).unwrap();
     assert_eq!(decoded, manifest);
 
-    // A manifest declaring version 2 must be rejected.
+    // A manifest declaring version 1 must be rejected.
     let mut bad = bytes.clone();
-    bad[1] = 0x02;
+    bad[1] = 0x01;
     assert_eq!(
         RunManifest::from_canonical_bytes(&bad),
-        Err(CborError::UnsupportedVersion(2))
+        Err(CborError::UnsupportedVersion(1))
     );
 }

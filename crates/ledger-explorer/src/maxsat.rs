@@ -295,7 +295,7 @@ mod tests {
     use super::*;
     use crate::solver::{FaultSolver, HittingSetSolver, SolverConfig};
     use ledger_format::EntryKind;
-    use ledger_format::Payload;
+    use ledger_format::{CanonicalValue, EntryPayload};
     use ledger_journal::Journal;
     fn cost_of(j: &Journal, hs: &[Hash]) -> u64 {
         hs.iter().map(|h| event_fault_cost(j, h)).sum()
@@ -304,13 +304,41 @@ mod tests {
     fn encode_produces_hard_covering_every_path_and_soft_covering_every_faultable() {
         let mut j = Journal::new();
         let a = j
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let b = j
-            .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 2 })
+            .append(
+                EntryKind::Send,
+                2,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 2,
+                    to: 3,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let w = j
-            .append(EntryKind::Outcome, 3, [a, b], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                3,
+                [a, b],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let v = Verdict::fail(vec![w], "two supports");
         let e = encode_hazard(&j, &v, &SolverConfig::default()).unwrap();
@@ -328,16 +356,54 @@ mod tests {
     fn solve_returns_subset_minimal_cut_matching_brute_force() {
         let mut j = Journal::new();
         let shared = j
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 99 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 99u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let ba = j
-            .append(EntryKind::Recv, 2, [shared], Payload::Number(0))
+            .append(
+                EntryKind::Recv,
+                2,
+                [shared],
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 1,
+                    to: 2,
+                    observed_content: 0u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let bb = j
-            .append(EntryKind::Recv, 3, [shared], Payload::Number(0))
+            .append(
+                EntryKind::Recv,
+                3,
+                [shared],
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(3, 0),
+                    from: 1,
+                    to: 3,
+                    observed_content: 0u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let w = j
-            .append(EntryKind::Outcome, 4, [ba, bb], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                4,
+                [ba, bb],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let v = Verdict::fail(vec![w], "shared root");
         let e = encode_hazard(&j, &v, &SolverConfig::default()).unwrap();
@@ -359,13 +425,41 @@ mod tests {
     fn lower_bound_le_optimal_and_equals_when_disjoint() {
         let mut j = Journal::new();
         let a = j
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let b = j
-            .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 2 })
+            .append(
+                EntryKind::Send,
+                2,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 2,
+                    to: 3,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let w = j
-            .append(EntryKind::Outcome, 3, [a, b], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                3,
+                [a, b],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let v = Verdict::fail(vec![w], "disjoint");
         let e = encode_hazard(&j, &v, &SolverConfig::default()).unwrap();
@@ -375,16 +469,54 @@ mod tests {
         assert_eq!(s.lower_bound_proof.method, LOWER_BOUND_METHOD);
         let mut j2 = Journal::new();
         let shared = j2
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 99 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 99u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let ba = j2
-            .append(EntryKind::Recv, 2, [shared], Payload::Number(0))
+            .append(
+                EntryKind::Recv,
+                2,
+                [shared],
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 1,
+                    to: 2,
+                    observed_content: 0u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let bb = j2
-            .append(EntryKind::Recv, 3, [shared], Payload::Number(0))
+            .append(
+                EntryKind::Recv,
+                3,
+                [shared],
+                EntryPayload::Recv(ledger_format::RecvFrame {
+                    message_id: ledger_format::MessageId::new(3, 0),
+                    from: 1,
+                    to: 3,
+                    observed_content: 0u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let w2 = j2
-            .append(EntryKind::Outcome, 4, [ba, bb], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                4,
+                [ba, bb],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let v2 = Verdict::fail(vec![w2], "overlap");
         let e2 = encode_hazard(&j2, &v2, &SolverConfig::default()).unwrap();
@@ -395,13 +527,41 @@ mod tests {
     fn determinism_same_input_same_solution_bytes() {
         let mut j = Journal::new();
         let s1 = j
-            .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 1 })
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let s2 = j
-            .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 2 })
+            .append(
+                EntryKind::Send,
+                2,
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(2, 0),
+                    from: 2,
+                    to: 3,
+                    original_content: 2u64.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap();
         let w = j
-            .append(EntryKind::Outcome, 3, [s1, s2], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                3,
+                [s1, s2],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .unwrap();
         let v = Verdict::fail(vec![w], "det");
         let e1 = encode_hazard(&j, &v, &SolverConfig::default()).unwrap();

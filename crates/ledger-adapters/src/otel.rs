@@ -23,7 +23,7 @@ use std::path::Path;
 
 use crate::envelope::{EntryMapping, EnvelopeHeader, Fidelity, InterchangeEnvelope};
 use crate::{AdapterError, IngestedJournal, mark_fidelity};
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash};
 use ledger_journal::Journal;
 
 /// An OTel event attached to a span.
@@ -319,13 +319,26 @@ pub fn ingest_otel_with_fidelity(
                 EntryKind::Outcome,
                 1,
                 observed,
-                Payload::Text(span.name.clone()),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Text(span.name.clone()),
+                }),
             )
             .map_err(AdapterError::Journal)?;
         span_id_to_hash.entry(span.span_id.clone()).or_insert(hash);
         for event in &span.events {
             journal
-                .append(EntryKind::Send, 1, [], Payload::Text(event.name.clone()))
+                .append(
+                    EntryKind::Send,
+                    1,
+                    [],
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: 2,
+                        original_content: event.name.clone().into_bytes(),
+                    }),
+                )
                 .map_err(AdapterError::Journal)?;
         }
     }
@@ -371,7 +384,10 @@ pub fn ingest_otel_enveloped(
                 EntryKind::Outcome,
                 1,
                 observed,
-                Payload::Text(span.name.clone()),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Text(span.name.clone()),
+                }),
             )
             .map_err(AdapterError::Journal)?;
         span_id_to_hash.entry(span.span_id.clone()).or_insert(hash);
@@ -382,7 +398,17 @@ pub fn ingest_otel_enveloped(
         });
         for event in &span.events {
             journal
-                .append(EntryKind::Send, 1, [], Payload::Text(event.name.clone()))
+                .append(
+                    EntryKind::Send,
+                    1,
+                    [],
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: 2,
+                        original_content: event.name.clone().into_bytes(),
+                    }),
+                )
                 .map_err(AdapterError::Journal)?;
             mappings.push(EntryMapping {
                 kind: EntryKind::Send.into(),
@@ -480,7 +506,10 @@ pub fn ingest_otel_dedup(
                 EntryKind::Outcome,
                 1,
                 observed,
-                Payload::Text(span.name.clone()),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Text(span.name.clone()),
+                }),
             )
             .map_err(AdapterError::Journal)?;
         // First occurrence of a span_id owns parent resolution, matching
@@ -493,7 +522,17 @@ pub fn ingest_otel_dedup(
         });
         for event in &span.events {
             journal
-                .append(EntryKind::Send, 1, [], Payload::Text(event.name.clone()))
+                .append(
+                    EntryKind::Send,
+                    1,
+                    [],
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(1, 0),
+                        from: 1,
+                        to: 2,
+                        original_content: event.name.clone().into_bytes(),
+                    }),
+                )
                 .map_err(AdapterError::Journal)?;
             mappings.push(EntryMapping {
                 kind: EntryKind::Send.into(),
@@ -874,11 +913,11 @@ mod tests {
         let entries: Vec<_> = ing.journal.entries().collect();
         let parent_entry = entries
             .iter()
-            .find(|e| e.data.payload == Payload::Text("parent-op".into()))
+            .find(|e| matches!(&e.data.payload, EntryPayload::Outcome(ledger_format::OutcomePayload { value: ledger_format::CanonicalValue::Text(t), .. }) if t == "parent-op"))
             .unwrap();
         let child_entry = entries
             .iter()
-            .find(|e| e.data.payload == Payload::Text("child-op".into()))
+            .find(|e| matches!(&e.data.payload, EntryPayload::Outcome(ledger_format::OutcomePayload { value: ledger_format::CanonicalValue::Text(t), .. }) if t == "child-op"))
             .unwrap();
         // Child should have parent's hash in its parents.
         assert!(
@@ -925,11 +964,11 @@ mod tests {
         let entries: Vec<_> = reordered.journal.entries().collect();
         let parent_entry = entries
             .iter()
-            .find(|e| e.data.payload == Payload::Text("parent-op".into()))
+            .find(|e| matches!(&e.data.payload, EntryPayload::Outcome(ledger_format::OutcomePayload { value: ledger_format::CanonicalValue::Text(t), .. }) if t == "parent-op"))
             .unwrap();
         let child_entry = entries
             .iter()
-            .find(|e| e.data.payload == Payload::Text("child-op".into()))
+            .find(|e| matches!(&e.data.payload, EntryPayload::Outcome(ledger_format::OutcomePayload { value: ledger_format::CanonicalValue::Text(t), .. }) if t == "child-op"))
             .unwrap();
         // The child entry carries the parent entry hash as observed parent,
         // even though the parent was appended after the child arrived.

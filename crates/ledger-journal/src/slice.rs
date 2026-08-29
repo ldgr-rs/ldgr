@@ -110,19 +110,43 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{EntryKind, EntryPayload};
 
     #[test]
     fn causal_slice_forward_includes_consumers_of_boundary_inputs() {
         let mut journal = Journal::new();
         let boundary = journal
-            .append(EntryKind::Send, 1, [], Payload::Number(1))
+            .append(
+                EntryKind::Send,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
+            )
             .expect("append must succeed");
         let witness = journal
-            .append(EntryKind::Assert, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Assert,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("append must succeed");
         let consumer = journal
-            .append(EntryKind::Recv, 2, [boundary], Payload::Number(1))
+            .append(
+                EntryKind::Recv,
+                2,
+                [boundary],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: ledger_format::CanonicalValue::Unsigned(1),
+                }),
+            )
             .expect("append must succeed");
 
         let backward = journal

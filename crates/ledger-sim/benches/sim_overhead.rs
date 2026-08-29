@@ -21,7 +21,7 @@
 // ledger-lint:allow (host-side benchmark measures the sim; it is not simulation code)
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{EntryKind, EntryPayload, MessageId, RecvFrame, SendFrame};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, Simulation};
 
@@ -91,20 +91,48 @@ fn append_one(
                 EntryKind::Send,
                 actor,
                 [],
-                Payload::Pair {
-                    left: 1,
-                    right: step,
-                },
+                EntryPayload::Send(SendFrame {
+                    message_id: MessageId::new(actor, step),
+                    from: actor,
+                    to: (actor + 1) % 4,
+                    original_content: step.to_le_bytes().to_vec(),
+                }),
             )
             .unwrap(),
         1 => journal
-            .append(EntryKind::Recv, actor, observed, Payload::Number(step))
+            .append(
+                EntryKind::Recv,
+                actor,
+                observed,
+                EntryPayload::Recv(RecvFrame {
+                    message_id: MessageId::new((actor + 1) % 4, step),
+                    from: (actor + 1) % 4,
+                    to: actor,
+                    observed_content: step.to_le_bytes().to_vec(),
+                }),
+            )
             .unwrap(),
         2 => journal
-            .append(EntryKind::TimerSet, actor, [], Payload::Number(step))
+            .append(
+                EntryKind::TimerSet,
+                actor,
+                [],
+                EntryPayload::TimerSet {
+                    timer_id: step,
+                    deadline_ticks: step + 1,
+                },
+            )
             .unwrap(),
         _ => journal
-            .append(EntryKind::TimerFire, actor, observed, Payload::Empty)
+            .append(
+                EntryKind::TimerFire,
+                actor,
+                observed,
+                EntryPayload::TimerFire {
+                    timer_id: step,
+                    deadline_ticks: step + 1,
+                },
+            )
             .unwrap(),
     }
 }

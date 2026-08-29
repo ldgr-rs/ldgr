@@ -15,7 +15,7 @@
 use crate::ldfi::FaultHypothesis;
 use crate::solver::{HittingSetSolver, SolverConfig, SolverEngine, SolverError};
 use crate::solver_cache::{WeightedClause, engine_tag};
-use ledger_format::{ActorId, EntryKind, Hash, Payload};
+use ledger_format::{ActorId, CanonicalValue, EntryKind, EntryPayload, Hash};
 use ledger_journal::{Journal, JournalError};
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -512,14 +512,25 @@ pub fn save(
     let bytes = encode_artifact(artifact)?;
     // Dedup: if an entry with identical payload already exists, reuse it.
     for entry in journal.entries() {
-        if let Payload::Bytes(payload) = &entry.data.payload
+        if let EntryPayload::Outcome(ledger_format::OutcomePayload {
+            value: CanonicalValue::Bytes(payload),
+            ..
+        }) = &entry.data.payload
             && payload == &bytes
         {
             return Ok(entry.id);
         }
     }
     journal
-        .append(EntryKind::Outcome, actor, [], Payload::Bytes(bytes))
+        .append(
+            EntryKind::Outcome,
+            actor,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Bytes(bytes),
+            }),
+        )
         .map_err(SolverStateError::from)
 }
 
@@ -531,7 +542,10 @@ pub fn save(
 pub fn load(journal: &Journal) -> Result<Vec<SolverStateArtifact>, SolverError> {
     let mut out = Vec::new();
     for entry in journal.entries() {
-        if let Payload::Bytes(payload) = &entry.data.payload
+        if let EntryPayload::Outcome(ledger_format::OutcomePayload {
+            value: CanonicalValue::Bytes(payload),
+            ..
+        }) = &entry.data.payload
             && payload.starts_with(MAGIC)
         {
             match decode_artifact(payload) {
@@ -714,7 +728,7 @@ mod tests {
     use crate::oracle::Verdict;
     use crate::solver::{FaultSolver, HittingSetSolver, MaxSatSolver};
     use crate::solver_cache::{ClauseCache, engine_tag};
-    use ledger_format::Payload;
+    use ledger_format::{CanonicalValue, EntryPayload};
     use ledger_journal::Journal;
 
     fn test_hash(byte: u8) -> Hash {
@@ -732,18 +746,26 @@ mod tests {
         let mut journal = Journal::new();
         let send = journal
             .append(
-                ledger_format::EntryKind::Send,
+                EntryKind::Send,
                 1,
                 [],
-                Payload::Pair { left: 2, right: 1 },
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
             )
             .expect("append send");
         let timer = journal
             .append(
-                ledger_format::EntryKind::TimerFire,
+                EntryKind::TimerFire,
                 2,
                 [],
-                Payload::Number(7),
+                EntryPayload::TimerFire {
+                    timer_id: 7,
+                    deadline_ticks: 7,
+                },
             )
             .expect("append timer");
         let write = journal
@@ -751,15 +773,22 @@ mod tests {
                 ledger_format::EntryKind::FsWrite,
                 3,
                 [],
-                Payload::Bytes(vec![1, 2, 3]),
+                EntryPayload::FsWrite(ledger_format::FsWritePayload::Write {
+                    path_ref: ledger_format::PathRef::new([0x00; 32], b"/k".to_vec()),
+                    offset: 0,
+                    content: vec![1, 2, 3],
+                }),
             )
             .expect("append fs write");
         let witness = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 4,
                 [send, timer, write],
-                Payload::Number(0),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
             )
             .expect("append witness");
         (journal, witness)
@@ -1393,18 +1422,24 @@ mod tests {
         // Append a regular outcome entry with different payload.
         let _regular = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 1,
                 [],
-                Payload::Number(123),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(123),
+                }),
             )
             .expect("regular append");
         let _bytes_other = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 1,
                 [],
-                Payload::Bytes(b"not a solver state".to_vec()),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Bytes(b"not a solver state".to_vec()),
+                }),
             )
             .expect("bytes other");
 
@@ -1644,7 +1679,15 @@ mod tests {
         // hypothesis, which it persists with EMPTY clauses.
         let mut journal = Journal::new();
         let witness = journal
-            .append(ledger_format::EntryKind::Outcome, 1, [], Payload::Number(0))
+            .append(
+                EntryKind::Outcome,
+                1,
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
             .expect("append witness");
         let verdict = Verdict::fail(vec![witness], "no faultables");
         let mut maxsat = MaxSatSolver::new();
@@ -1744,18 +1787,26 @@ mod tests {
         let mut journal = Journal::new();
         let send_a = journal
             .append(
-                ledger_format::EntryKind::Send,
+                EntryKind::Send,
                 1,
                 [],
-                Payload::Pair { left: 2, right: 1 },
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(1, 0),
+                    from: 1,
+                    to: 2,
+                    original_content: 1u64.to_le_bytes().to_vec(),
+                }),
             )
             .expect("append send_a");
         let witness = journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 2,
                 [send_a],
-                Payload::Number(0),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Unsigned(0),
+                }),
             )
             .expect("append witness");
         let verdict = Verdict::fail(vec![witness], "forged mismatch");
@@ -2065,10 +2116,13 @@ mod tests {
         );
         journal
             .append(
-                ledger_format::EntryKind::Outcome,
+                EntryKind::Outcome,
                 1,
                 [],
-                Payload::Bytes(malformed),
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: [0x00; 32],
+                    value: CanonicalValue::Bytes(malformed),
+                }),
             )
             .expect("append malformed state entry");
         assert!(matches!(

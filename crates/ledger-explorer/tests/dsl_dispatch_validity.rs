@@ -6,7 +6,7 @@
 use ledger_explorer::faultspec_bridge::to_sim_injections;
 use ledger_explorer::search::{FaultReplayError, Workload, replay_with_faults};
 use ledger_faultspec::{canonical_library, compile};
-use ledger_format::{EntryKind, Hash, Payload};
+use ledger_format::{EntryKind, EntryPayload, Hash};
 use ledger_sim::{Instruction, Policy, RunConfig, SimFault, Simulation};
 
 struct ProbeWorkload {
@@ -384,7 +384,10 @@ fn payload_and_kind_match_for_probe_entries() {
             .get(&id)
             .unwrap_or_else(|| panic!("send id must exist in journal"));
         assert_eq!(entry.data.kind, EntryKind::Send);
-        assert!(matches!(entry.data.payload, Payload::Pair { .. }));
+        assert!(matches!(
+            entry.data.payload,
+            EntryPayload::Send(ledger_format::SendFrame { .. })
+        ));
     }
     for id in writes {
         let entry = base

@@ -836,18 +836,22 @@ fn cert_verify_journal_mode_valid() {
     use ledger_explorer::search::PersistentJournal;
     use ledger_explorer::search::{CampaignReport, Finding};
     use ledger_explorer::{CampaignCertificate, Verdict};
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{EntryKind, EntryPayload, MessageId, SendFrame};
     use ledger_sim::{RunOutcome, RunResult};
     let dir = temp_dir("cert-journal-valid");
     let journal_dir = dir.join("journal");
     let mut pj = PersistentJournal::create(&journal_dir).expect("create journal");
     // Append a simple journal: two sends and an outcome.
-    let s1 = pj
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 7 })
-        .unwrap();
-    let s2 = pj
-        .append(EntryKind::Send, 2, [], Payload::Pair { left: 3, right: 9 })
-        .unwrap();
+    let send = |to: u32, content: u64| {
+        EntryPayload::Send(SendFrame {
+            message_id: MessageId::new(1, 0),
+            from: 1,
+            to,
+            original_content: content.to_le_bytes().to_vec(),
+        })
+    };
+    let s1 = pj.append(EntryKind::Send, 1, [], send(2, 7)).unwrap();
+    let s2 = pj.append(EntryKind::Send, 2, [], send(3, 9)).unwrap();
     let journal = pj.journal().clone();
     drop(pj);
     // Build a finding whose journal matches the persistent one.
@@ -912,21 +916,25 @@ fn cert_verify_journal_mode_wrong_root() {
     use ledger_explorer::search::PersistentJournal;
     use ledger_explorer::search::{CampaignReport, Finding};
     use ledger_explorer::{CampaignCertificate, Verdict};
-    use ledger_format::{EntryKind, Payload};
+    use ledger_format::{EntryKind, EntryPayload, MessageId, SendFrame};
     use ledger_sim::{RunOutcome, RunResult};
     let dir = temp_dir("cert-journal-wrong");
     let journal_dir_a = dir.join("journal_a");
     let journal_dir_b = dir.join("journal_b");
     let mut pj_a = PersistentJournal::create(&journal_dir_a).expect("create a");
     let mut pj_b = PersistentJournal::create(&journal_dir_b).expect("create b");
+    let send = |to: u32, content: u64| {
+        EntryPayload::Send(SendFrame {
+            message_id: MessageId::new(1, 0),
+            from: 1,
+            to,
+            original_content: content.to_le_bytes().to_vec(),
+        })
+    };
     // Journal A: one entry value 7.
-    let s1 = pj_a
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 7 })
-        .unwrap();
+    let s1 = pj_a.append(EntryKind::Send, 1, [], send(2, 7)).unwrap();
     // Journal B: different payload so root differs.
-    let _s2 = pj_b
-        .append(EntryKind::Send, 1, [], Payload::Pair { left: 2, right: 77 })
-        .unwrap();
+    let _s2 = pj_b.append(EntryKind::Send, 1, [], send(2, 77)).unwrap();
     let journal_a = pj_a.journal().clone();
     let journal_b = pj_b.journal().clone();
     assert_ne!(

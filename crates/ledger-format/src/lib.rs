@@ -11,12 +11,24 @@ extern crate std;
 
 pub mod cbor;
 pub mod entry;
+pub mod frame;
 pub mod hex;
+pub mod limits;
 pub mod manifest;
+pub mod path;
+pub mod value;
 
 pub use cbor::{CborError, CborValue, TolerantReader, compare_canonical_keys, parse_tolerant};
 pub use entry::{
-    ActorId, EntryData, EntryKind, FaultSpec, GenId, Hash, InputKey, Payload, StreamId,
+    ActorId, AssertPayload, BlockPayload, CapGrantPayload, CapInvokePayload, CapRequestPayload,
+    CapRevokePayload, CrashOperation, EntryData, EntryKind, EntryPayload, EpochPayload,
+    FaultPayload, FaultSpec, FsReadPayload, FsSyncPayload, FsWritePayload, GenId, Hash, InputKey,
+    InputStepPayload, MessageId, ObservedRead, OutcomePayload, RecvFrame, RngDrawPayload,
+    SendFrame, SnapshotPayload, StepBeginPayload, StepEndPayload, StreamId, WakePayload,
 };
+pub use frame::{FRAME_PREFIX_LEN, FrameError, FramePrefix};
 pub use hex::{HexError, hash_from_hex, hash_to_hex};
+pub use limits::{CRASH_SEMANTICS_VERSION, FORMAT_VERSION};
 pub use manifest::{MANIFEST_FORMAT_VERSION, ManifestVersion, RunManifest};
+pub use path::{PATH_DOMAIN, PATH_HASH_LEN, PathError, PathRef, canonicalize};
+pub use value::{CanonicalValue, ValueError};

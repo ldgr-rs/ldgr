@@ -2,7 +2,7 @@ use ledger_adapters::envelope::{EntryMapping, EnvelopeHeader, Fidelity, Intercha
 use ledger_adapters::otel::{
     OtelEvent, OtelSpan, ingest_otel_enveloped, ingest_otel_with_fidelity,
 };
-use ledger_format::{EntryKind, FaultSpec};
+use ledger_format::EntryKind;
 
 fn sample_envelope(f: Fidelity) -> InterchangeEnvelope {
     InterchangeEnvelope::new(
@@ -86,11 +86,11 @@ fn envelope_empty_fidelity_bit_exact() {
 }
 
 #[test]
-fn envelope_roundtrip_rngdraw_stream5() {
+fn envelope_roundtrip_rngdraw() {
     let e = InterchangeEnvelope::new(
         EnvelopeHeader::new("t".into(), "e".into()),
         vec![EntryMapping {
-            kind: EntryKind::RngDraw { stream: 5 }.into(),
+            kind: EntryKind::RngDraw.into(),
             external_type: "rng".into(),
             fidelity: Fidelity::BitExact,
         }],
@@ -98,19 +98,15 @@ fn envelope_roundtrip_rngdraw_stream5() {
     let b = e.to_canonical_bytes().unwrap();
     let d = InterchangeEnvelope::from_bytes(&b).unwrap();
     assert_eq!(e, d);
-    assert_eq!(d.body[0].kind.0, EntryKind::RngDraw { stream: 5 });
+    assert_eq!(d.body[0].kind.0, EntryKind::RngDraw);
 }
 
 #[test]
-fn envelope_roundtrip_inputstep_gen7() {
+fn envelope_roundtrip_inputstep() {
     let e = InterchangeEnvelope::new(
         EnvelopeHeader::new("t".into(), "e".into()),
         vec![EntryMapping {
-            kind: EntryKind::InputStep {
-                generator: 7,
-                replay: 42,
-            }
-            .into(),
+            kind: EntryKind::InputStep.into(),
             external_type: "input".into(),
             fidelity: Fidelity::BitExact,
         }],
@@ -118,24 +114,15 @@ fn envelope_roundtrip_inputstep_gen7() {
     let b = e.to_canonical_bytes().unwrap();
     let d = InterchangeEnvelope::from_bytes(&b).unwrap();
     assert_eq!(e, d);
-    assert_eq!(
-        d.body[0].kind.0,
-        EntryKind::InputStep {
-            generator: 7,
-            replay: 42
-        }
-    );
+    assert_eq!(d.body[0].kind.0, EntryKind::InputStep);
 }
 
 #[test]
-fn envelope_roundtrip_fault_corrupt() {
+fn envelope_roundtrip_fault() {
     let e = InterchangeEnvelope::new(
         EnvelopeHeader::new("t".into(), "e".into()),
         vec![EntryMapping {
-            kind: EntryKind::Fault {
-                fault: FaultSpec::Corrupt,
-            }
-            .into(),
+            kind: EntryKind::Fault.into(),
             external_type: "fault".into(),
             fidelity: Fidelity::BitExact,
         }],
@@ -143,38 +130,17 @@ fn envelope_roundtrip_fault_corrupt() {
     let b = e.to_canonical_bytes().unwrap();
     let d = InterchangeEnvelope::from_bytes(&b).unwrap();
     assert_eq!(e, d);
-    assert_eq!(
-        d.body[0].kind.0,
-        EntryKind::Fault {
-            fault: FaultSpec::Corrupt
-        }
-    );
+    assert_eq!(d.body[0].kind.0, EntryKind::Fault);
 }
 
 #[test]
 fn envelope_roundtrip_all_structured_kinds() {
     let kinds = vec![
-        EntryKind::RngDraw { stream: 0 },
-        EntryKind::RngDraw { stream: u32::MAX },
-        EntryKind::InputStep {
-            generator: 0,
-            replay: 0,
-        },
-        EntryKind::Fault {
-            fault: FaultSpec::Drop,
-        },
-        EntryKind::Fault {
-            fault: FaultSpec::Delay { ticks: 123 },
-        },
-        EntryKind::Fault {
-            fault: FaultSpec::Partition { src: 1, dst: 2 },
-        },
-        EntryKind::Fault {
-            fault: FaultSpec::Crash,
-        },
-        EntryKind::Fault {
-            fault: FaultSpec::CrashState(99),
-        },
+        EntryKind::RngDraw,
+        EntryKind::InputStep,
+        EntryKind::Fault,
+        EntryKind::StepBegin,
+        EntryKind::StepEnd,
     ];
     for kind in kinds {
         let e = InterchangeEnvelope::new(
@@ -201,11 +167,11 @@ fn envelope_hash_deterministic() {
 }
 
 #[test]
-fn envelope_hash_differs_on_stream() {
+fn envelope_hash_differs_on_kind() {
     let e1 = InterchangeEnvelope::new(
         EnvelopeHeader::new("t".into(), "e".into()),
         vec![EntryMapping {
-            kind: EntryKind::RngDraw { stream: 5 }.into(),
+            kind: EntryKind::RngDraw.into(),
             external_type: "x".into(),
             fidelity: Fidelity::BitExact,
         }],
@@ -213,7 +179,7 @@ fn envelope_hash_differs_on_stream() {
     let e2 = InterchangeEnvelope::new(
         EnvelopeHeader::new("t".into(), "e".into()),
         vec![EntryMapping {
-            kind: EntryKind::RngDraw { stream: 6 }.into(),
+            kind: EntryKind::Send.into(),
             external_type: "x".into(),
             fidelity: Fidelity::BitExact,
         }],

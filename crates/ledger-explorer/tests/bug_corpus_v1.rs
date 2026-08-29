@@ -18,7 +18,7 @@ use ledger_explorer::oracle::{AssertionOracle, HistoryOperation, HistoryOracle, 
 use ledger_explorer::reference::corpus_scenarios;
 use ledger_explorer::search::{Workload, search};
 use ledger_explorer::solver::HittingSetSolver;
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{CrashOperator, Instruction, Policy, RunConfig, RunResult, SimFs, Simulation};
 
@@ -67,8 +67,15 @@ impl Workload for Bug01StaleRead {
         run.journal
             .entries()
             .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-                (EntryKind::Send, Payload::Pair { left: 1, right: 42 })
-                    if entry.data.actor == 0 =>
+                (
+                    EntryKind::Send,
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        to: 1,
+                        original_content,
+                        ..
+                    }),
+                ) if entry.data.actor == 0
+                    && original_content.as_slice() == 42u64.to_le_bytes() =>
                 {
                     Some(HistoryOperation::Write {
                         key: "k".into(),
@@ -76,13 +83,17 @@ impl Workload for Bug01StaleRead {
                         witness: entry.id,
                     })
                 }
-                (EntryKind::Outcome, Payload::Number(value)) if entry.data.actor == 2 => {
-                    Some(HistoryOperation::Read {
-                        key: "k".into(),
-                        value: *value,
-                        witness: entry.id,
-                    })
-                }
+                (
+                    EntryKind::Outcome,
+                    EntryPayload::Outcome(ledger_format::OutcomePayload {
+                        value: CanonicalValue::Unsigned(value),
+                        ..
+                    }),
+                ) if entry.data.actor == 2 => Some(HistoryOperation::Read {
+                    key: "k".into(),
+                    value: *value,
+                    witness: entry.id,
+                }),
                 _ => None,
             })
             .collect()
@@ -238,17 +249,26 @@ fn vector_clock_monotonicity_increases() {
     let mut j = Journal::new();
     let e1 = j
         .append(
-            EntryKind::InputStep {
-                generator: 0,
-                replay: 0,
-            },
+            EntryKind::InputStep,
             1,
             [],
-            Payload::Number(1),
+            EntryPayload::InputStep(ledger_format::InputStepPayload {
+                generator: 0,
+                replay: 0,
+                value: CanonicalValue::Unsigned(1),
+            }),
         )
         .unwrap();
     let e2 = j
-        .append(EntryKind::Outcome, 1, [], Payload::Number(2))
+        .append(
+            EntryKind::Outcome,
+            1,
+            [],
+            EntryPayload::Outcome(ledger_format::OutcomePayload {
+                schema: [0x00; 32],
+                value: CanonicalValue::Unsigned(2),
+            }),
+        )
         .unwrap();
     let vc1 = &j.get(&e1).unwrap().vector_clock;
     let vc2 = &j.get(&e2).unwrap().vector_clock;
