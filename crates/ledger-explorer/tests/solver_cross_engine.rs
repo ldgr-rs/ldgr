@@ -189,14 +189,14 @@ fn builtin_bnb_is_deterministic_valid_and_minimal_on_randomized_encodings() {
             "case {index}: the builtin cost must be deterministic"
         );
         assert_eq!(
-            extension_a.recorded_lower_bound, extension_b.recorded_lower_bound,
-            "case {index}: the recorded solver bound must be deterministic"
+            extension_a.cost, extension_b.cost,
+            "case {index}: the recorded cut cost must be deterministic"
         );
         assert_cut_valid_and_minimal(encoding, &extension_a.cut);
         assert_cost_consistent(&case.journal, &extension_a.cut, first_cost);
-        assert!(
-            extension_a.recorded_lower_bound <= first_cost,
-            "case {index}: the recorded solver bound must not exceed the cut cost"
+        assert_eq!(
+            extension_a.cost, first_cost,
+            "case {index}: the recorded cut cost must equal the solved cost"
         );
     }
 }
@@ -243,23 +243,23 @@ fn bnb_and_cadical_agree_on_randomized_bounded_encodings() {
         // COST CONSISTENCY for both cuts.
         assert_cost_consistent(&case.journal, &builtin_ext.cut, builtin_cost);
         assert_cost_consistent(&case.journal, &cadical_ext.cut, cadical_cost);
-        // CERTIFICATE PARITY: same method, same lower bound, bound <= cost.
+        // CERTIFICATE PARITY: same method, same cut cost, cost == solved.
         assert_eq!(
             builtin_ext.method, cadical_ext.method,
-            "case {index}: the lower-bound method must match across engines"
+            "case {index}: the cost method must match across engines"
         );
         assert_eq!(
-            builtin_ext.recorded_lower_bound, cadical_ext.recorded_lower_bound,
-            "case {index}: the recorded solver bounds must agree across engines"
+            builtin_ext.cost, cadical_ext.cost,
+            "case {index}: the recorded cut costs must agree across engines"
         );
-        assert!(
-            builtin_ext.recorded_lower_bound <= builtin_cost,
-            "case {index}: the bound must never exceed the cut cost"
+        assert_eq!(
+            builtin_ext.cost, builtin_cost,
+            "case {index}: the recorded cost must equal the solved cost"
         );
         println!(
-            "case {index}: hard={} builtin_cost={builtin_cost} cadical_cost={cadical_cost} recorded_bound={} builtin_cut={} cadical_cut={}",
+            "case {index}: hard={} builtin_cost={builtin_cost} cadical_cost={cadical_cost} recorded_cost={} builtin_cut={} cadical_cut={}",
             encoding.hard.len(),
-            builtin_ext.recorded_lower_bound,
+            builtin_ext.cost,
             builtin_ext.cut.len(),
             cadical_ext.cut.len(),
         );
@@ -299,9 +299,9 @@ fn cadical_request_falls_back_to_builtin_truthfully_without_the_feature() {
     let cost = hypotheses[0].total_cost;
     assert_cut_valid_and_minimal(&encoding, &extension.cut);
     assert_cost_consistent(&case.journal, &extension.cut, cost);
-    assert!(
-        extension.recorded_lower_bound <= cost,
-        "the recorded solver bound must not exceed the cut cost"
+    assert_eq!(
+        extension.cost, cost,
+        "the recorded cut cost must equal the solved cost"
     );
     assert_eq!(
         extension.horizon,

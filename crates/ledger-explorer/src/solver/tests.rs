@@ -204,7 +204,7 @@ fn maxsat_solver_matches_hitting_set_optimum() {
         .expect("certificate solve must succeed");
     let ext = ext.expect("non-empty solve must return recorded solver data");
     assert_eq!(ext.method, "mcs-lower-bound-v1");
-    assert!(ext.recorded_lower_bound <= got[0].total_cost);
+    assert_eq!(ext.cost, got[0].total_cost, "recorded cost must be exact");
 }
 
 #[test]

@@ -8,7 +8,8 @@ use ledger_explorer::certs::{CERT_MAX_BYTES, CertError, check_cert_bytes};
 use ledger_explorer::search::PersistentJournal;
 use ledger_explorer::services::ServiceError;
 use ledger_explorer::services::{
-    parse_statement, validate_cut_against_journal, validate_statement,
+    parse_statement, validate_cut_against_journal, validate_inclusion_minimal_cut,
+    validate_statement,
 };
 
 /// Errors from `ledger cert verify`.
@@ -54,9 +55,19 @@ fn to_verify_error(error: ServiceError) -> CertVerifyError {
 /// # Errors
 /// Returns [`CertVerifyError`] when the file cannot be read, parsed, validated,
 /// or bound to the supplied journal.
+/// Verifies a campaign certificate JSON file.
+///
+/// Reads `path` through a bounded reader and runs the named operation.
+/// `Journal` and `InclusionMinimal` require an explicit journal directory;
+/// `Statement` ignores it.
+///
+/// # Errors
+/// Returns [`CertVerifyError`] when the file cannot be read, parsed, validated,
+/// or bound to the supplied journal.
 pub fn run_verify(
     path: &Path,
     journal: Option<&Path>,
+    op: crate::CertVerifyOp,
     json: bool,
 ) -> Result<String, CertVerifyError> {
     let file = std::fs::File::open(path).map_err(CertVerifyError::Io)?;
@@ -67,14 +78,33 @@ pub fn run_verify(
         .map_err(CertVerifyError::Io)?;
     check_cert_bytes(raw.len()).map_err(CertVerifyError::Decode)?;
     let cert = parse_statement(&raw).map_err(to_verify_error)?;
-    let mode_label = if let Some(journal_dir) = journal {
-        let persistent =
-            PersistentJournal::open(journal_dir).map_err(CertVerifyError::JournalOpen)?;
-        validate_cut_against_journal(&cert, persistent.journal()).map_err(to_verify_error)?;
-        "journal-bound"
-    } else {
-        validate_statement(&cert).map_err(to_verify_error)?;
-        "statement-validated"
+    let mode_label = match op {
+        crate::CertVerifyOp::Statement => {
+            validate_statement(&cert).map_err(to_verify_error)?;
+            "statement-validated"
+        }
+        crate::CertVerifyOp::Journal => {
+            let Some(journal_dir) = journal else {
+                return Err(CertVerifyError::Verification(CertError::Schema(
+                    "journal mode requires --journal".into(),
+                )));
+            };
+            let persistent =
+                PersistentJournal::open(journal_dir).map_err(CertVerifyError::JournalOpen)?;
+            validate_cut_against_journal(&cert, persistent.journal()).map_err(to_verify_error)?;
+            "journal-bound"
+        }
+        crate::CertVerifyOp::InclusionMinimal => {
+            let Some(journal_dir) = journal else {
+                return Err(CertVerifyError::Verification(CertError::Schema(
+                    "inclusion-minimal mode requires --journal".into(),
+                )));
+            };
+            let persistent =
+                PersistentJournal::open(journal_dir).map_err(CertVerifyError::JournalOpen)?;
+            validate_inclusion_minimal_cut(&cert, persistent.journal()).map_err(to_verify_error)?;
+            "inclusion-minimal-verified"
+        }
     };
 
     if json {
@@ -90,10 +120,21 @@ pub fn run_verify(
             "findings_count": cert.findings_count,
             "solver_data": cert.solver_data.as_ref().map(|entry| serde_json::json!({
                 "cut": entry.cut.iter().map(ledger_format::hash_to_hex).collect::<Vec<_>>(),
-                "recorded_lower_bound": entry.recorded_lower_bound,
+                "cost": entry.cost,
                 "method": entry.method,
-                "horizon": entry.horizon
+                "horizon": entry.horizon,
+                "reproduced": entry.reproduced,
+                "baseline_passed": entry.baseline_passed,
+                "support_provider_version": entry.support_provider_version,
+                "witnesses": entry.witnesses.iter().map(ledger_format::hash_to_hex).collect::<Vec<_>>()
             })).unwrap_or(serde_json::Value::Null),
+            "journal_validation": cert.journal_validation.map(|v| match v {
+                ledger_explorer::certs::JournalValidation::Bound => "bound"
+            }),
+            "inclusion_minimal": cert.inclusion_minimal.map(|v| match v {
+                ledger_explorer::certs::InclusionMinimal::Minimal => true,
+                ledger_explorer::certs::InclusionMinimal::NotMinimal => false
+            }),
             "statistical": cert.statistical.as_ref().map(|entry| serde_json::json!({
                 "upper_p": entry.upper_p,
                 "confidence": entry.confidence,
@@ -116,11 +157,13 @@ pub fn run_verify(
         match &cert.solver_data {
             Some(entry) => {
                 out.push_str(&format!(
-                    "solver data: cut={} recorded_lower_bound={} method={} horizon={:?}\n",
+                    "solver data: cut={} cost={} method={} horizon={:?} reproduced={} baseline_passed={}\n",
                     entry.cut.len(),
-                    entry.recorded_lower_bound,
+                    entry.cost,
                     entry.method,
-                    entry.horizon
+                    entry.horizon,
+                    entry.reproduced,
+                    entry.baseline_passed
                 ));
             }
             None => out.push_str("solver data: none\n"),

@@ -164,8 +164,8 @@ fn main() -> ExitCode {
         Command::Completions { shell } => run_completions(*shell),
         Command::Ingest { input, fidelity } => run_ingest(&cli, input, *fidelity),
         Command::Cert { cmd } => match cmd {
-            ledger_cli::CertCommand::Verify { path, journal } => {
-                run_cert_verify(&cli, path, journal.as_deref())
+            ledger_cli::CertCommand::Verify { path, journal, op } => {
+                run_cert_verify(&cli, path, journal.as_deref(), *op)
             }
         },
         Command::Faults { cmd } => match cmd {
@@ -815,9 +815,10 @@ fn run_cert_verify(
     cli: &Cli,
     path: &Path,
     journal: Option<&Path>,
+    op: ledger_cli::CertVerifyOp,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let effective_json = cli.json || cli.ndjson;
-    match ledger_cli::cert_cmd::run_verify(path, journal, effective_json) {
+    match ledger_cli::cert_cmd::run_verify(path, journal, op, effective_json) {
         Ok(output) => {
             println!("{output}");
             Ok(ExitCode::SUCCESS)
