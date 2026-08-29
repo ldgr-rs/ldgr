@@ -272,6 +272,26 @@ pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> Hash
             hasher.update(&[0x00]);
         }
     }
+    hasher.update(&[0x07]);
+    match config.support_version {
+        Some(value) => {
+            hasher.update(&[0x01]);
+            hasher.update(&value.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0x00]);
+        }
+    }
+    hasher.update(&[0x08]);
+    match config.support_digest {
+        Some(digest) => {
+            hasher.update(&[0x01]);
+            hasher.update(&digest);
+        }
+        None => {
+            hasher.update(&[0x00]);
+        }
+    }
     *hasher.finalize().as_bytes()
 }
 
@@ -830,6 +850,8 @@ mod tests {
             max_faults: None,
             engine: SolverEngine::Auto,
             run_config_hash: None,
+            support_version: None,
+            support_digest: None,
         };
         assert_eq!(
             fingerprint(&literal, SolverEngine::Builtin),
@@ -1428,6 +1450,8 @@ mod tests {
             max_faults: None,
             engine: SolverEngine::Auto,
             run_config_hash: None,
+            support_version: None,
+            support_digest: None,
         };
         let zero_horizon = SolverConfig {
             max_horizon: Some(0),
@@ -1436,6 +1460,8 @@ mod tests {
             max_faults: Some(0),
             engine: SolverEngine::Auto,
             run_config_hash: None,
+            support_version: None,
+            support_digest: None,
         };
         assert_ne!(
             fingerprint(&none_horizon, SolverEngine::Builtin),
@@ -1453,6 +1479,43 @@ mod tests {
         assert_ne!(
             fingerprint(&with_horizon_none, SolverEngine::Builtin),
             fingerprint(&with_horizon_zero, SolverEngine::Builtin)
+        );
+    }
+
+    #[test]
+    fn fingerprint_isolates_support_provider() {
+        let digest_a = test_hash(1);
+        let digest_b = test_hash(2);
+        let base = SolverConfig {
+            support_version: Some(1),
+            support_digest: Some(digest_a),
+            ..Default::default()
+        };
+        let other_version = SolverConfig {
+            support_version: Some(2),
+            support_digest: Some(digest_a),
+            ..Default::default()
+        };
+        let other_digest = SolverConfig {
+            support_version: Some(1),
+            support_digest: Some(digest_b),
+            ..Default::default()
+        };
+        let no_support = SolverConfig::default();
+        assert_ne!(
+            fingerprint(&base, SolverEngine::Builtin),
+            fingerprint(&other_version, SolverEngine::Builtin),
+            "provider version change must isolate the state fingerprint"
+        );
+        assert_ne!(
+            fingerprint(&base, SolverEngine::Builtin),
+            fingerprint(&other_digest, SolverEngine::Builtin),
+            "provider model change must isolate the state fingerprint"
+        );
+        assert_ne!(
+            fingerprint(&base, SolverEngine::Builtin),
+            fingerprint(&no_support, SolverEngine::Builtin),
+            "an absent provider must not collide with a pinned one"
         );
     }
 

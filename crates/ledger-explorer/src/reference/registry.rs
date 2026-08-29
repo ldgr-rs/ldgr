@@ -1,8 +1,14 @@
 use super::sims::{
-    mini_2pc, mini_cassandra, mini_cloud_az_double_assign, mini_cloud_config_drift,
-    mini_cloud_instance_flap, mini_cloud_quota_retry_storm, mini_hdfs, mini_hdfs_lease_expiry,
-    mini_leader_stepdown, mini_lease_timer_race, mini_membership_churn, mini_partition_retry_dup,
-    mini_reorder_lost_update, mini_restart_dup_append, mini_zab,
+    mini_2pc, mini_2pc_support, mini_cassandra, mini_cassandra_support,
+    mini_cloud_az_double_assign, mini_cloud_az_double_assign_support, mini_cloud_config_drift,
+    mini_cloud_config_drift_support, mini_cloud_instance_flap, mini_cloud_instance_flap_support,
+    mini_cloud_quota_retry_storm, mini_cloud_quota_retry_storm_support, mini_hdfs,
+    mini_hdfs_lease_expiry, mini_hdfs_lease_expiry_support, mini_hdfs_support,
+    mini_kv_stale_read_support, mini_leader_stepdown, mini_leader_stepdown_support,
+    mini_lease_timer_race, mini_lease_timer_race_support, mini_membership_churn,
+    mini_membership_churn_support, mini_partition_retry_dup, mini_partition_retry_dup_support,
+    mini_reorder_lost_update, mini_reorder_lost_update_support, mini_restart_dup_append,
+    mini_restart_dup_append_support, mini_zab, mini_zab_support,
 };
 use crate::oracle::{HistoryOracle, KeyValueSpec, Oracle, PropertyOracle, Verdict};
 use crate::search::Finding;
@@ -62,6 +68,10 @@ pub struct CorpusScenario {
     /// schedule exploration. The space is derived from a seed-0 probe run,
     /// never from a violating run.
     pub fault_space: fn() -> Result<Vec<SimFault>, String>,
+    /// Explicit support model for this scenario's planted violation. The
+    /// provider digest and version join solver cache keys, so a model change
+    /// never reuses derived clauses.
+    pub support: fn(&Journal) -> crate::support::SupportExpr,
 }
 
 /// Every bug-corpus-v1 scenario in manifest-name order.
@@ -75,6 +85,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: zab_property,
             },
             fault_space: four_link_faults,
+            support: mini_zab_support,
         },
         CorpusScenario {
             name: "mini-hdfs-double-grant",
@@ -84,6 +95,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: hdfs_property,
             },
             fault_space: four_link_faults,
+            support: mini_hdfs_support,
         },
         CorpusScenario {
             name: "mini-cassandra-stale-read",
@@ -93,6 +105,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: cassandra_property,
             },
             fault_space: four_link_faults,
+            support: mini_cassandra_support,
         },
         CorpusScenario {
             name: "mini-2pc-coordinator-crash",
@@ -102,6 +115,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: two_pc_property,
             },
             fault_space: four_link_faults,
+            support: mini_2pc_support,
         },
         CorpusScenario {
             name: "mini-leader-stepdown",
@@ -111,6 +125,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: leader_stepdown_property,
             },
             fault_space: four_link_faults,
+            support: mini_leader_stepdown_support,
         },
         CorpusScenario {
             name: "mini-membership-churn",
@@ -120,6 +135,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: membership_churn_property,
             },
             fault_space: four_link_faults,
+            support: mini_membership_churn_support,
         },
         CorpusScenario {
             name: "mini-hdfs-lease-expiry",
@@ -129,12 +145,14 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: hdfs_lease_expiry_property,
             },
             fault_space: four_link_faults,
+            support: mini_hdfs_lease_expiry_support,
         },
         CorpusScenario {
             name: "mini-kv-stale-read",
             base_seed: [0; 32],
             runner: CorpusRunner::MiniKv,
             fault_space: mini_kv_faults,
+            support: mini_kv_stale_read_support,
         },
         CorpusScenario {
             name: "mini-reorder-lost-update",
@@ -144,6 +162,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: reorder_lost_update_property,
             },
             fault_space: four_link_faults,
+            support: mini_reorder_lost_update_support,
         },
         CorpusScenario {
             name: "mini-lease-timer-race",
@@ -153,6 +172,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: lease_timer_race_property,
             },
             fault_space: four_link_faults,
+            support: mini_lease_timer_race_support,
         },
         CorpusScenario {
             name: "mini-restart-dup-append",
@@ -162,6 +182,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: restart_dup_append_property,
             },
             fault_space: appender_chain_faults,
+            support: mini_restart_dup_append_support,
         },
         CorpusScenario {
             name: "mini-partition-retry-dup",
@@ -171,6 +192,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
                 property: partition_retry_dup_property,
             },
             fault_space: client_server_faults,
+            support: mini_partition_retry_dup_support,
         },
     ]
 }
@@ -226,6 +248,7 @@ pub fn corpus_v2_scenarios() -> Vec<CorpusScenario> {
                 property: cloud_az_double_assign_property,
             },
             fault_space: four_link_faults,
+            support: mini_cloud_az_double_assign_support,
         },
         CorpusScenario {
             name: "mini-cloud-instance-flap",
@@ -235,6 +258,7 @@ pub fn corpus_v2_scenarios() -> Vec<CorpusScenario> {
                 property: cloud_instance_flap_property,
             },
             fault_space: appender_chain_faults,
+            support: mini_cloud_instance_flap_support,
         },
         CorpusScenario {
             name: "mini-cloud-config-drift",
@@ -244,6 +268,7 @@ pub fn corpus_v2_scenarios() -> Vec<CorpusScenario> {
                 property: cloud_config_drift_property,
             },
             fault_space: four_link_faults,
+            support: mini_cloud_config_drift_support,
         },
         CorpusScenario {
             name: "mini-cloud-quota-retry-storm",
@@ -253,6 +278,7 @@ pub fn corpus_v2_scenarios() -> Vec<CorpusScenario> {
                 property: cloud_quota_retry_storm_property,
             },
             fault_space: client_server_faults,
+            support: mini_cloud_quota_retry_storm_support,
         },
     ]
 }
@@ -279,6 +305,11 @@ pub fn corpus_scenario(name: &str) -> Option<CorpusScenario> {
 }
 
 impl CorpusScenario {
+    /// Versioned support provider for this scenario's declared model.
+    pub fn support_provider(&self) -> crate::support::StaticSupportProvider {
+        crate::support::StaticSupportProvider::new(1, (self.support)(&Journal::new()))
+    }
+
     /// Run the scenario at `seed` with optional injected faults under the
     /// corpus gate config (Random policy, 4096-step budget).
     pub fn run(&self, seed: [u8; 32], faults: Vec<SimFault>) -> Result<RunResult, RuntimeError> {

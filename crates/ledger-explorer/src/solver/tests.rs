@@ -406,21 +406,17 @@ fn solver_config_input_class_partitions_cache() {
     // Different input classes must not share cache entry (keys differ).
     let ka = ClauseCache::compute_key(
         closure,
-        Some(64),
-        None,
-        Some(crate::pbt::gen_id("alpha")),
-        None,
         crate::solver_cache::engine_tag::BUILTIN,
-        None,
+        &crate::solver::SolverConfig::default()
+            .with_horizon(64)
+            .with_input_class(crate::pbt::gen_id("alpha")),
     );
     let kb = ClauseCache::compute_key(
         closure,
-        Some(64),
-        None,
-        Some(crate::pbt::gen_id("beta")),
-        None,
         crate::solver_cache::engine_tag::BUILTIN,
-        None,
+        &crate::solver::SolverConfig::default()
+            .with_horizon(64)
+            .with_input_class(crate::pbt::gen_id("beta")),
     );
     assert_ne!(ka, kb);
     assert_eq!(key_a, key_b);

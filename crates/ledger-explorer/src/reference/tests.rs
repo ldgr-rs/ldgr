@@ -39,6 +39,52 @@ fn corpus_scenarios_all_reproduce_and_violate() {
 }
 
 #[test]
+fn every_scenario_exposes_an_explicit_support_model() {
+    let scenarios = all_corpus_scenarios();
+    assert_eq!(
+        scenarios.len(),
+        16,
+        "v1 plus v2 registry holds 16 scenarios"
+    );
+    for scenario in &scenarios {
+        let provider = scenario.support_provider();
+        assert!(
+            provider.version() >= 1,
+            "{}: the support provider must carry a version",
+            scenario.name
+        );
+        let expression = provider.expression();
+        // Every model is one of the three explicit forms; construction
+        // rejects empty sets, so any AllOf or AnyOf here is non-empty.
+        match expression {
+            crate::support::SupportExpr::AllOf(ids) => {
+                assert!(
+                    !ids.is_empty(),
+                    "{}: AllOf must be non-empty",
+                    scenario.name
+                );
+            }
+            crate::support::SupportExpr::AnyOf(branches) => {
+                assert!(
+                    !branches.is_empty(),
+                    "{}: AnyOf must be non-empty",
+                    scenario.name
+                );
+            }
+            crate::support::SupportExpr::Opaque => {}
+        }
+        // The provider digest is stable for the same model.
+        let again = scenario.support_provider();
+        assert_eq!(
+            provider.digest(),
+            again.digest(),
+            "{}: the provider digest must be deterministic",
+            scenario.name
+        );
+    }
+}
+
+#[test]
 fn mini_raft_double_leader_fires_for_some_seed() {
     let mut found: Option<u8> = None;
     let mut holds_for_seed = Vec::new();
