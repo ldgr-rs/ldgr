@@ -26,7 +26,7 @@ mod sentinel_belt;
 mod simfs;
 mod time;
 #[cfg(feature = "backend-wasm")]
-mod wasi_fs;
+pub mod wasi_fs;
 
 pub use backend_sim::{SimBackend, SimStreamRng};
 pub use backend_tokio::{TokioBackend, VirtualOverride};

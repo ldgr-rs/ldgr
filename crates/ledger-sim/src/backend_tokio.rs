@@ -5,7 +5,7 @@ use crate::effects::{Effects, Fs, Net};
 use crate::net::{Message, SimNet};
 use crate::simfs::SimFs;
 use crate::time::Clock;
-use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, MessageId, StreamId};
+use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, StreamId};
 use ledger_journal::{Journal, JournalError};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -348,11 +348,10 @@ impl Net for TokioBackend {
             EntryKind::Send,
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                // CONSUMER DEBT (lane 2): real message identity.
-                message_id: MessageId::new(message.from as ActorId, message.payload),
+                message_id: message.message_id,
                 from: message.from as ActorId,
                 to: message.to as ActorId,
-                original_content: message.payload.to_le_bytes().to_vec(),
+                original_content: message.content.clone(),
             }),
         ) else {
             return false;
@@ -369,11 +368,10 @@ impl Net for TokioBackend {
             EntryKind::Recv,
             [message.send_id],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                // CONSUMER DEBT (lane 2): real message identity.
-                message_id: MessageId::new(message.from as ActorId, message.payload),
+                message_id: message.message_id,
                 from: message.from as ActorId,
                 to: task as ActorId,
-                observed_content: message.payload.to_le_bytes().to_vec(),
+                observed_content: message.content.clone(),
             }),
         );
         Some(message)
@@ -432,11 +430,12 @@ mod tests {
             assert!(backend.net().send(Message {
                 from: 0,
                 to: 1,
-                payload: 7,
+                content: 7u64.to_le_bytes().to_vec(),
+                message_id: ledger_format::MessageId::new(0, 0),
                 send_id: [0; 32],
                 deliver_at: now,
             }));
-            assert_eq!(backend.net().recv(1, now).map(|m| m.payload), Some(7));
+            assert_eq!(backend.net().recv(1, now).map(|m| m.payload()), Some(7));
             assert!(backend.fs().write("k", 7).is_ok());
             backend.fs().crash();
             assert_eq!(

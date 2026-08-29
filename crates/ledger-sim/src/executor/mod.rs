@@ -97,6 +97,9 @@ pub(crate) struct ExecutorShared {
     net_offset: RefCell<u64>,
     /// Monotonic offset for the `fs` seed stream.
     fs_offset: RefCell<u64>,
+    /// Per-task count of journaled Send entries; feeds
+    /// `MessageId.sender_sequence` (the sender entry sequence).
+    send_seq: RefCell<Vec<u64>>,
     /// Per-actor count of journaled entries, for the coverage check.
     ///
     /// Every journal write funnels through [`Self::journal_append`], so the
@@ -266,6 +269,7 @@ impl Executor {
             swarm: (*config.swarm()).clone(),
             net_offset: RefCell::new(0),
             fs_offset: RefCell::new(0),
+            send_seq: RefCell::new(Vec::new()),
             coverage: RefCell::new(HashMap::new()),
             fault_classes_used: RefCell::new(HashSet::new()),
             applied_faults: RefCell::new(Vec::new()),
@@ -1560,9 +1564,9 @@ mod swarm_tests {
         let second = net.send_at(0, 1, 20, send_id(2), now, 0);
         assert!(first && second);
         let msg = net.recv_at(1, now).unwrap();
-        assert_eq!(msg.payload, 20);
+        assert_eq!(msg.payload(), 20);
         let msg = net.recv_at(1, now).unwrap();
-        assert_eq!(msg.payload, 10);
+        assert_eq!(msg.payload(), 10);
     }
 
     #[test]
@@ -1574,7 +1578,7 @@ mod swarm_tests {
         let _ = net.send_at(0, 1, 10, send_id(1), now, 0);
         let _ = net.send_at(0, 1, 20, send_id(2), now, 0);
         let msg = net.recv_at(1, now).unwrap();
-        assert_eq!(msg.payload, 10);
+        assert_eq!(msg.payload(), 10);
     }
 }
 

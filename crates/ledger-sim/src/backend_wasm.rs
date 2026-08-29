@@ -46,7 +46,7 @@ use crate::effects::{Effects, Fs, Net};
 use crate::net::Message;
 use crate::seedtree::SeedTree;
 use crate::time::Clock;
-use crate::wasi_fs::{WasiFdTable, bytes_to_u64, deterministic_fd};
+use crate::wasi_fs::{WasiFdTable, bytes_to_u64};
 use futures::executor::block_on;
 use ledger_format::{ActorId, EntryKind, EntryPayload, Hash, StreamId};
 use ledger_journal::{Journal, JournalError};
@@ -647,7 +647,8 @@ impl WasmBackend {
                 let accepted = caller.data().effects.net().send(Message {
                     from: from as usize,
                     to: peer as usize,
-                    payload,
+                    content: payload.to_le_bytes().to_vec(),
+                    message_id: ledger_format::MessageId::new(from, 0),
                     send_id: [0; 32],
                     deliver_at: now,
                 });
@@ -661,7 +662,7 @@ impl WasmBackend {
             |caller: Caller<'_, WasmStoreData>, peer: u32| -> i64 {
                 let now = caller.data().effects.clock().now();
                 match caller.data().effects.net().recv(peer as usize, now) {
-                    Some(message) => message.payload as i64,
+                    Some(message) => message.payload() as i64,
                     None => -1,
                 }
             },
@@ -818,13 +819,16 @@ impl WasmBackend {
                     .map_err(|_| Error::msg("path_open path not utf8"))?;
                 let key = path.trim_start_matches('/').to_owned();
                 let key = if key.is_empty() { path.clone() } else { key };
-                caller
+                let opened = caller
                     .data()
                     .wasi_fs
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .open(&key);
-                let fd_to_write = deterministic_fd(&key);
+                let fd_to_write = match opened {
+                    Ok(fd) => fd,
+                    Err(_) => return Ok(24), // EBADF: table full or invalid.
+                };
                 let mem = memory.data_mut(&mut caller);
                 let dst = opened_fd_ptr as usize;
                 if dst.checked_add(4).is_none() || dst + 4 > mem.len() {
@@ -887,7 +891,7 @@ impl WasmBackend {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(fd)
-                    .map(|s| s.to_owned());
+                    .map(|description| description.path.clone());
                 let path = match path_opt {
                     Some(path) => path,
                     None => return Ok(8),
@@ -931,7 +935,7 @@ impl WasmBackend {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(fd)
-                    .map(|s| s.to_owned());
+                    .map(|description| description.path.clone());
                 let path = match path_opt {
                     Some(path) => path,
                     None => return Ok(8),
