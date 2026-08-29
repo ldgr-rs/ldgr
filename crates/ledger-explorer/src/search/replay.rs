@@ -8,7 +8,7 @@ use ledger_sim::{Policy, RunConfig, RunResult, SimFault, Simulation};
 /// Alias to [`replay_strict`]; ready-set drift is surfaced as a typed
 /// `StrictReplay` violation instead of being normalized. Use
 /// [`replay_prefix`] for lenient minimization-only prefix replay.
-pub fn replay<W: Workload>(
+pub fn replay<W: Workload + ?Sized>(
     workload: &W,
     seed: Hash,
     decisions: Vec<usize>,
@@ -23,7 +23,7 @@ pub fn replay<W: Workload>(
 /// Strict replay rejects out-of-range, exhausted, or trailing decisions
 /// and surfaces a typed [`ledger_sim::RuntimeError::StrictReplay`] error.
 /// Callers needing to distinguish violations should match on the typed error.
-pub fn replay_strict<W: Workload>(
+pub fn replay_strict<W: Workload + ?Sized>(
     workload: &W,
     seed: Hash,
     decisions: Vec<usize>,
@@ -41,7 +41,7 @@ pub fn replay_strict<W: Workload>(
 /// This uses lenient replay with a seeded fallback for the suffix, so it is
 /// suitable for delta debugging but must not be used to claim a bug
 /// reproduction. Use [`replay_strict`] to validate a reproduction gate.
-pub fn replay_prefix<W: Workload>(
+pub fn replay_prefix<W: Workload + ?Sized>(
     workload: &W,
     seed: Hash,
     decisions: Vec<usize>,
@@ -87,7 +87,7 @@ pub enum FaultReplayError {
 /// by a seeded fallback. No lenient fallback is performed. Callers that need
 /// lenient prefix behavior for delta debugging use [`replay_prefix`], which
 /// must never back a reproduction claim.
-pub fn replay_with_faults<W: Workload>(
+pub fn replay_with_faults<W: Workload + ?Sized>(
     workload: &W,
     base: &ledger_journal::Journal,
     seed: Hash,
