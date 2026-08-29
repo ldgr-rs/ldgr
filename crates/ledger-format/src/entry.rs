@@ -824,6 +824,7 @@ impl EntryData {
 
     /// Encodes all hash-covered fields into a caller-provided buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CborError> {
+        let start = out.len();
         cbor::array(out, 7);
         cbor::unsigned(out, self.format_version as u64);
         cbor::unsigned(out, self.kind.tag());
@@ -837,7 +838,16 @@ impl EntryData {
             cbor::unsigned(out, *component);
         }
         cbor::unsigned(out, self.sequence);
-        self.payload.encode_into(out)
+        self.payload.encode_into(out)?;
+        let encoded = out.len() - start;
+        // The decoder rejects entries over the limit, so the encoder must
+        // reject them too: an entry that encodes but cannot decode would be
+        // written, sealed, and hash-verified, then fail on every read.
+        if encoded > MAX_ENTRY_BYTES {
+            out.truncate(start);
+            return Err(CborError::EntryTooLarge(encoded));
+        }
+        Ok(())
     }
 
     /// Decodes an entry from canonical CBOR bytes with all bounds enforced

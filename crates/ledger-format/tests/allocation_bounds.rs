@@ -99,3 +99,58 @@ fn oversized_frame_header_fails_before_any_header_copy() {
         "hostile frame header allocated {delta} bytes; bound check must run first"
     );
 }
+
+#[test]
+fn encoder_rejects_an_entry_the_decoder_would_reject() {
+    // The 17 MiB entry cap is enforced on decode; the encoder must reject
+    // the same shape, or a journal could seal and hash-verify an entry that
+    // then fails on every read.
+    use ledger_format::{EntryData, EntryKind, EntryPayload, RngDrawPayload};
+    let oversized = EntryData {
+        format_version: ledger_format::FORMAT_VERSION,
+        kind: EntryKind::RngDraw,
+        actor: 1,
+        parents: Vec::new(),
+        vector_clock: Vec::new(),
+        sequence: 0,
+        payload: EntryPayload::RngDraw(RngDrawPayload {
+            stream: 0,
+            draw_index: 0,
+            content: vec![0xab; ledger_format::limits::MAX_ENTRY_BYTES],
+        }),
+    };
+    let mut scratch = Vec::new();
+    let error = oversized.encode_into(&mut scratch).unwrap_err();
+    assert!(
+        matches!(error, CborError::EntryTooLarge(_)),
+        "encoder must reject an entry over the cap, got {error:?}"
+    );
+    assert!(
+        scratch.is_empty(),
+        "the rejected encode must not leave partial bytes in the buffer"
+    );
+
+    // A valid entry just under the cap still round-trips.
+    let valid = EntryData {
+        payload: EntryPayload::RngDraw(RngDrawPayload {
+            stream: 0,
+            draw_index: 0,
+            content: vec![0xab; ledger_format::limits::MAX_ENTRY_BYTES - 4096],
+        }),
+        ..oversized
+    };
+    let mut scratch = Vec::new();
+    valid
+        .encode_into(&mut scratch)
+        .expect("valid entry encodes");
+    let decoded = EntryData::from_canonical_bytes(&scratch).expect("valid entry decodes");
+    match decoded.payload {
+        EntryPayload::RngDraw(draw) => {
+            assert_eq!(
+                draw.content.len(),
+                ledger_format::limits::MAX_ENTRY_BYTES - 4096
+            )
+        }
+        other => panic!("wrong payload kind: {other:?}"),
+    }
+}

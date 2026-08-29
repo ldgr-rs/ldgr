@@ -504,11 +504,11 @@ mod tests {
     fn segment_seals_at_target_size() {
         let dir = temp_dir("multi-seal");
         let mut store = SegmentStore::new(&dir).unwrap();
-        for (sequence, _) in (0..3).enumerate() {
+        for (sequence, _) in (0..5).enumerate() {
             let entry = Entry::new(
                 EntryData {
                     format_version: ledger_format::FORMAT_VERSION,
-                    kind: EntryKind::Outcome,
+                    kind: EntryKind::RngDraw,
                     actor: 1,
                     parents: Vec::new(),
                     vector_clock: Vec::new(),
@@ -516,7 +516,9 @@ mod tests {
                     payload: EntryPayload::RngDraw(ledger_format::RngDrawPayload {
                         stream: 0,
                         draw_index: 0,
-                        content: vec![0xab; 30 * 1024 * 1024],
+                        // Just under the 17 MiB entry cap; five entries cross
+                        // the 64 MiB seal target.
+                        content: vec![0xab; 16 * 1024 * 1024 - 1024],
                     }),
                 },
                 VectorClock::new(),
