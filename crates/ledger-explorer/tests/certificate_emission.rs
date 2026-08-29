@@ -1,9 +1,9 @@
+use ledger_explorer::CampaignCertificate;
+use ledger_explorer::MaxSatSolver;
 use ledger_explorer::certs::MAX_EVENT_COST;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::run_campaign;
 use ledger_explorer::workloads::MiniKvWorkload;
-use ledger_explorer::CampaignCertificate;
-use ledger_explorer::MaxSatSolver;
 use ledger_sim::{Policy, RunConfig};
 
 fn temp_cert_path(name: &str) -> std::path::PathBuf {

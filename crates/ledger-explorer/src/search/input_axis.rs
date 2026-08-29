@@ -1,6 +1,6 @@
 use super::{Finding, SearchError, Workload};
 use crate::oracle::Oracle;
-use crate::pbt::{EnergyDistribution, PbtBridge, INPUT_SAMPLE_RANGE};
+use crate::pbt::{EnergyDistribution, INPUT_SAMPLE_RANGE, PbtBridge};
 use ledger_format::Hash;
 use ledger_sim::{RunConfig, SeedTree, Simulation};
 

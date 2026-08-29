@@ -4,7 +4,7 @@
 // so the replay exercises the executor's fault paths, not ghost reporting.
 
 use ledger_explorer::faultspec_bridge::to_sim_injections;
-use ledger_explorer::search::{replay_with_faults, FaultReplayError, Workload};
+use ledger_explorer::search::{FaultReplayError, Workload, replay_with_faults};
 use ledger_faultspec::{canonical_library, compile};
 use ledger_format::{EntryKind, Hash, Payload};
 use ledger_sim::{Instruction, Policy, RunConfig, SimFault, Simulation};
@@ -339,7 +339,7 @@ fn ghost_injection_is_reported_as_voided_negative_control() {
 
 #[test]
 fn bridge_output_is_stable_for_all_canonical_ids() {
-    use ledger_faultspec::{dsl_for, ScenarioId};
+    use ledger_faultspec::{ScenarioId, dsl_for};
     let ids = [
         ScenarioId::Partition,
         ScenarioId::CrashRestart,

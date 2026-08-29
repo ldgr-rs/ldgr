@@ -1,9 +1,9 @@
 use super::input_axis::draw_inputs;
 use super::{
-    describe_variant, draw_fault_subset, draw_swarm, CampaignReport, Finding, QuadMutation,
-    SearchError, Workload, SWARM_CRASH_CEILING,
+    CampaignReport, Finding, QuadMutation, SWARM_CRASH_CEILING, SearchError, Workload,
+    describe_variant, draw_fault_subset, draw_swarm,
 };
-use crate::memo::{hash_inputs, memo_key, CampaignMemo, MemoEntry};
+use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
 use crate::oracle::Oracle;
 use ledger_format::Hash;
 use ledger_sim::{Policy, RunConfig, SeedTree, SimFault, Simulation, SwarmConfig};

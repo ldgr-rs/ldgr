@@ -7,13 +7,13 @@
 use ledger_explorer::ldfi::hypothesis_to_schedule;
 use ledger_explorer::maxsat::encode_hazard;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
-use ledger_explorer::search::{replay_with_faults, search, FaultReplayError, SearchError};
-use ledger_explorer::{select_solver, solve_with, FaultHypothesis, SolverConfig, SolverError};
+use ledger_explorer::search::{FaultReplayError, SearchError, replay_with_faults, search};
+use ledger_explorer::{FaultHypothesis, SolverConfig, SolverError, select_solver, solve_with};
 use ledger_format::Hash;
 use ledger_sim::{Policy, RunConfig, SimFault};
 use thiserror::Error;
 
-use crate::{default_pct_mix, seed_from_u64, DefaultMiniKv, MaxSatEngineArg};
+use crate::{DefaultMiniKv, MaxSatEngineArg, default_pct_mix, seed_from_u64};
 
 /// Errors from the `ldfi` campaign driver.
 #[derive(Debug, Error)]

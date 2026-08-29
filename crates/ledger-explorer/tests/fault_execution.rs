@@ -2,9 +2,9 @@
 //! replays fork the journal, voided faults are data, and replays are
 //! deterministic.
 
-use ledger_explorer::ldfi::{hypothesis_to_schedule, solve_with, FaultHypothesis};
+use ledger_explorer::ldfi::{FaultHypothesis, hypothesis_to_schedule, solve_with};
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
-use ledger_explorer::search::{replay_with_faults, search, FaultReplayError, Workload};
+use ledger_explorer::search::{FaultReplayError, Workload, replay_with_faults, search};
 use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::{MiniKvWorkload, TwoPhaseCommitWorkload};
 use ledger_format::{EntryKind, FaultSpec, Payload};
