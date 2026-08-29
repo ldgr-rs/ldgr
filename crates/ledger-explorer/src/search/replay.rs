@@ -75,9 +75,59 @@ pub enum FaultReplayError {
     /// Strict replay rejected a decision.
     #[error("strict replay violation: {0}")]
     StrictReplay(#[from] ledger_sim::ReplayViolation),
+    /// The replayed run journaled a crash operation that does not match the
+    /// canonical operation the injected fault requests.
+    #[error("crash-semantics mismatch: {0}")]
+    CrashSemanticsMismatch(Box<CrashMismatch>),
     /// Other runtime or journal failure.
     #[error(transparent)]
-    Runtime(#[from] ledger_sim::RuntimeError),
+    Runtime(Box<ledger_sim::RuntimeError>),
+}
+
+/// Details of a crash-semantics mismatch: the injected fault, the canonical
+/// operation it requests, and the operation the replayed run journaled.
+#[derive(Debug, thiserror::Error)]
+#[error("requested {requested:?}, journaled {journaled:?}, fault {fault:?}")]
+pub struct CrashMismatch {
+    pub fault: ledger_sim::SimFault,
+    pub requested: ledger_format::CrashOperation,
+    pub journaled: Option<ledger_format::CrashOperation>,
+}
+
+impl From<ledger_sim::RuntimeError> for FaultReplayError {
+    fn from(error: ledger_sim::RuntimeError) -> Self {
+        Self::Runtime(Box::new(error))
+    }
+}
+
+/// Canonical crash operation a replayed run journaled, if any.
+fn journaled_crash_operations(run: &ledger_sim::RunResult) -> Vec<ledger_format::CrashOperation> {
+    run.journal
+        .entries()
+        .filter_map(|entry| match &entry.data.payload {
+            ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::CrashActor {
+                crash_operation,
+                ..
+            }) => Some(crash_operation.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Look up the canonical path of the `FsWrite` entry `write_id` in `run`.
+fn write_path_of(run: &ledger_sim::RunResult, write_id: ledger_format::Hash) -> Option<String> {
+    run.journal.entries().find_map(|entry| {
+        if entry.id != write_id {
+            return None;
+        }
+        match &entry.data.payload {
+            ledger_format::EntryPayload::FsWrite(ledger_format::FsWritePayload::Write {
+                path_ref,
+                ..
+            }) => Some(String::from_utf8_lossy(&path_ref.canonical_path).into_owned()),
+            _ => None,
+        }
+    })
 }
 
 /// Replay one workload with a fault schedule injected at causal positions.
@@ -106,7 +156,7 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
             ledger_sim::RuntimeError::StrictReplay(violation) => {
                 FaultReplayError::StrictReplay(violation)
             }
-            other => FaultReplayError::Runtime(other),
+            other => FaultReplayError::Runtime(Box::new(other)),
         })?;
     let applied_set: std::collections::HashSet<&Hash> = run.applied_faults.iter().collect();
     let mut seen_applied = std::collections::HashSet::new();
@@ -138,6 +188,49 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
             .zip(replay_ids.iter())
             .take(first_fault)
             .all(|(base, replay)| base == replay);
+    // Crash-semantics verification: every applied crash-type fault must have
+    // journaled exactly the canonical operation it requests. A drift between
+    // the requested semantics and what the run applied fails the replay
+    // closed instead of silently trusting a mismatched crash.
+    if !applied.is_empty() {
+        let journaled = journaled_crash_operations(&run);
+        for fault in &applied {
+            let write = match super::fault_injection_target(fault) {
+                Some(write) => write,
+                None => continue,
+            };
+            let Some(path) = write_path_of(&run, write) else {
+                continue;
+            };
+            let Some(requested) = fault.crash_operation_for(&path) else {
+                continue;
+            };
+            // The executor rejects unknown crash-state identifiers before
+            // this point (fail closed), so the error arm is defense in
+            // depth: it surfaces the same typed mismatch without a panic.
+            let requested = match requested {
+                Ok(operation) => operation,
+                Err(_) => {
+                    return Err(FaultReplayError::CrashSemanticsMismatch(Box::new(
+                        CrashMismatch {
+                            fault: fault.clone(),
+                            requested: ledger_format::CrashOperation::DropAllUnsynced,
+                            journaled: None,
+                        },
+                    )));
+                }
+            };
+            if !journaled.contains(&requested) {
+                return Err(FaultReplayError::CrashSemanticsMismatch(Box::new(
+                    CrashMismatch {
+                        fault: fault.clone(),
+                        requested,
+                        journaled: None,
+                    },
+                )));
+            }
+        }
+    }
     Ok(FaultReplayReport {
         run,
         applied,

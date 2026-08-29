@@ -27,7 +27,9 @@
 //! (paired begin and end) are skipped. Callers must make external effects
 //! idempotent or safe to retry.
 //!
-//! A typed `StepBeginPayload` v2 is deferred to stage E2; the v1 text-name payload is the current contract. This documents the approved G1 contract and its E2 evolution, not a pending plan marker.
+//! The typed `StepBeginPayload` carries the step id, the step name bytes, and
+//! an optional idempotency key as separate fields; the executor journals it
+//! as the canonical `EntryPayload::StepBegin` payload.
 
 pub mod workflow;
 pub use workflow::{FlowError, ResumeStatus, StepOutcome, WorkflowExecution, WorkflowPlan};

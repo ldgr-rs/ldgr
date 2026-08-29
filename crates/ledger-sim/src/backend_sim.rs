@@ -106,6 +106,11 @@ pub struct SimBackend {
     fs: Arc<Mutex<SimFs>>,
     actor: ActorId,
     rng_streams: Vec<Option<SimStreamRng>>,
+    /// Seed-drawn picks inside the configured reorder window; `false` keeps
+    /// the deterministic newest-first window.
+    reorder_draw: bool,
+    /// Monotonic offset for the `net` seed stream.
+    net_offset: Mutex<u64>,
     /// Optional shared tick sink published to WASI virtual clocks.
     tick_sink: Option<Arc<Mutex<u64>>>,
     /// Side channel of effect origins keyed by entry hash. Never serialized
@@ -130,6 +135,8 @@ impl SimBackend {
             fs: Arc::new(Mutex::new(SimFs::new())),
             actor,
             rng_streams: Vec::new(),
+            reorder_draw: false,
+            net_offset: Mutex::new(0),
             tick_sink: None,
             origins: Mutex::new(OriginLog::default()),
         }
@@ -139,6 +146,13 @@ impl SimBackend {
     ///
     /// WASI virtual clocks in the Wasm backend read this sink so `clock_time_get`
     /// serves virtual time rather than the ambient wall clock.
+    /// Serve a seeded draw inside the configured reorder window instead of
+    /// the deterministic newest-first pick. Defaults to `false`; the native
+    /// executor selects this from [`crate::RunConfig::reorder_draw`].
+    pub fn set_reorder_draw(&mut self, reorder_draw: bool) {
+        self.reorder_draw = reorder_draw;
+    }
+
     pub fn attach_tick_sink(&mut self, sink: Arc<Mutex<u64>>) {
         self.tick_sink = Some(sink);
     }
@@ -297,7 +311,17 @@ impl Net for SimBackend {
     }
 
     fn recv(&self, task: usize, now: u64) -> Option<Message> {
-        let message = lock(&self.net).recv_at(task, now)?;
+        let message = if self.reorder_draw {
+            let mut offset = lock(&self.net_offset);
+            let draw = |bound: u64| -> u64 {
+                let value = self.seed_tree.draw_u64("net", *offset);
+                *offset += 1;
+                value % bound
+            };
+            lock(&self.net).recv_at_drawn(task, now, draw)
+        } else {
+            lock(&self.net).recv_at(task, now)
+        }?;
         let id = self.append(
             EntryKind::Recv,
             [message.send_id],

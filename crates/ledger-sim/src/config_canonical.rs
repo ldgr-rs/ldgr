@@ -235,7 +235,7 @@ pub fn from_canonical_bytes(input: &[u8]) -> Result<RunConfig, ConfigCanonicalEr
         return Err(ConfigCanonicalError::WrongDocumentShape);
     };
 
-    let mut seen = [false; 10];
+    let mut seen = [false; 13];
     let mut seed = None;
     let mut policy = None;
     let mut max_steps = None;
@@ -246,6 +246,9 @@ pub fn from_canonical_bytes(input: &[u8]) -> Result<RunConfig, ConfigCanonicalEr
     let mut fault_schedule = None;
     let mut fs_journaling: Option<DecodedJournalingMode> = None;
     let mut monitor = None;
+    let mut reorder_draw = false;
+    let mut max_file_extent = None;
+    let mut max_resident_bytes = None;
 
     for (key, value) in fields {
         let CborValue::Text(name) = key else {
@@ -262,6 +265,9 @@ pub fn from_canonical_bytes(input: &[u8]) -> Result<RunConfig, ConfigCanonicalEr
             "fs_journaling" => 7,
             "dropped_events" => 8,
             "fault_schedule" => 9,
+            "reorder_draw" => 10,
+            "max_file_extent" => 11,
+            "max_resident_bytes" => 12,
             other => return Err(ConfigCanonicalError::UnknownField(other.to_string())),
         };
         seen[index] = true;
@@ -276,7 +282,10 @@ pub fn from_canonical_bytes(input: &[u8]) -> Result<RunConfig, ConfigCanonicalEr
             7 => fs_journaling = Some(decode_fs_journaling(value)?),
             8 => dropped_events = Some(decode_hash_list(value, "dropped_events")?),
             9 => fault_schedule = Some(decode_faults(value)?),
-            _ => unreachable!("index bounded to ten fields"),
+            10 => reorder_draw = bool_of(value, "reorder_draw")?,
+            11 => max_file_extent = Some(optional_u64(value, "max_file_extent")?),
+            12 => max_resident_bytes = Some(optional_u64(value, "max_resident_bytes")?),
+            _ => unreachable!("index bounded to thirteen fields"),
         }
     }
 
@@ -299,6 +308,20 @@ pub fn from_canonical_bytes(input: &[u8]) -> Result<RunConfig, ConfigCanonicalEr
             break;
         }
     }
+    // The reorder-draw and budget fields are optional: absent means the
+    // defaults (deterministic window pick, format-hard extent, unlimited
+    // resident). `null` also means the default, so round trips are stable.
+    let reorder_draw = if seen[10] { reorder_draw } else { false };
+    let max_file_extent = if seen[11] {
+        max_file_extent.unwrap_or(None)
+    } else {
+        None
+    };
+    let max_resident_bytes = if seen[12] {
+        max_resident_bytes.unwrap_or(None)
+    } else {
+        None
+    };
     let Some(missing) = missing else {
         // Every required field is present; the `let ... else` guards below
         // are therefore unreachable and exist only to keep the typed error
@@ -325,7 +348,9 @@ pub fn from_canonical_bytes(input: &[u8]) -> Result<RunConfig, ConfigCanonicalEr
             .links(links)
             .dns(dns)
             .fault_schedule(fault_schedule)
-            .monitor(monitor);
+            .monitor(monitor)
+            .reorder_draw(reorder_draw)
+            .fs_budgets(max_file_extent, max_resident_bytes);
         #[cfg(feature = "sim-fs-journaling")]
         let builder = builder.fs_journaling(fs_journaling);
         #[cfg(not(feature = "sim-fs-journaling"))]
@@ -408,6 +433,15 @@ fn fields(config: &RunConfig) -> Result<Vec<(CborValue, CborValue)>, ConfigCanon
             .map(fault_value)
             .collect::<Result<Vec<_>, ConfigCanonicalError>>()?,
     );
+    let reorder_draw = CborValue::Bool(config.reorder_draw());
+    let max_file_extent = match config.max_file_extent() {
+        Some(bytes) => CborValue::Unsigned(bytes),
+        None => CborValue::Null,
+    };
+    let max_resident_bytes = match config.max_resident_bytes() {
+        Some(bytes) => CborValue::Unsigned(bytes),
+        None => CborValue::Null,
+    };
     Ok(vec![
         (CborValue::Text("dns".into()), dns),
         (CborValue::Text("seed".into()), seed),
@@ -419,6 +453,12 @@ fn fields(config: &RunConfig) -> Result<Vec<(CborValue, CborValue)>, ConfigCanon
         (CborValue::Text("dropped_events".into()), dropped_events),
         (CborValue::Text("fs_journaling".into()), fs_journaling),
         (CborValue::Text("fault_schedule".into()), fault_schedule),
+        (CborValue::Text("reorder_draw".into()), reorder_draw),
+        (CborValue::Text("max_file_extent".into()), max_file_extent),
+        (
+            CborValue::Text("max_resident_bytes".into()),
+            max_resident_bytes,
+        ),
     ])
 }
 
@@ -542,6 +582,19 @@ fn usize_of(value: &CborValue, field: &'static str) -> Result<usize, ConfigCanon
         CborValue::Unsigned(value) => {
             usize::try_from(*value).map_err(|_| ConfigCanonicalError::IntegerOutOfRange(field))
         }
+        _ => Err(ConfigCanonicalError::WrongFieldType(field)),
+    }
+}
+
+/// Decode an optional `u64`: `null` or absent means `None`; a non-negative
+/// integer is `Some`. Any other shape is a type error.
+fn optional_u64(
+    value: &CborValue,
+    field: &'static str,
+) -> Result<Option<u64>, ConfigCanonicalError> {
+    match value {
+        CborValue::Null => Ok(None),
+        CborValue::Unsigned(value) => Ok(Some(*value)),
         _ => Err(ConfigCanonicalError::WrongFieldType(field)),
     }
 }

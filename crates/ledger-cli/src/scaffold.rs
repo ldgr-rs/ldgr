@@ -174,7 +174,7 @@ const MAIN_RS_TEMPLATE: &str = r#"//! Two-task Send/Receive reference simulation
 
 use ledger_explorer::search::{Workload, search};
 use ledger_explorer::{HistoryOracle, KeyValueSpec, SolverConfig, select_solver, solve_with};
-use ledger_format::{EntryKind, Payload};
+use ledger_format::{CanonicalValue, EntryKind, EntryPayload, OutcomePayload, SendFrame};
 use ledger_sim::{Instruction, Policy, Probability, RunConfig, RunResult};
 
 /// Two-task workload: task 0 sends value 42 to task 1, task 1 receives it.
@@ -198,18 +198,26 @@ impl Workload for TwoTask {
     fn history(&self, run: &RunResult) -> Vec<ledger_explorer::HistoryOperation> {
         run.journal
             .entries()
-            .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-                (EntryKind::Send, Payload::Pair { left: 1, right: 42 }) => {
+            .filter_map(|entry| match &entry.data.payload {
+                EntryPayload::Send(SendFrame {
+                    to: 1,
+                    original_content,
+                    ..
+                }) if original_content.as_slice() == 42u64.to_le_bytes() => {
                     Some(ledger_explorer::HistoryOperation::Write {
                         key: "k".into(),
                         value: 42,
                         witness: entry.id,
                     })
                 }
-                (EntryKind::Outcome, Payload::Number(value)) => {
+                EntryPayload::Outcome(OutcomePayload { value, .. }) => {
+                    let value = match value {
+                        CanonicalValue::Unsigned(value) => *value,
+                        _ => return None,
+                    };
                     Some(ledger_explorer::HistoryOperation::Read {
                         key: "k".into(),
-                        value: *value,
+                        value,
                         witness: entry.id,
                     })
                 }

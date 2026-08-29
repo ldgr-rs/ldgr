@@ -11,6 +11,26 @@ use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
 use ledger_journal::BatchEntry;
 
 impl ExecutorShared {
+    /// Take one ready message for `task`, honoring the configured reorder
+    /// semantics: the deterministic newest-first pick by default, or a
+    /// seeded draw inside the bounded candidate window when `reorder_draw`
+    /// is set. The draw consumes from the `net` seed stream only when a
+    /// window is actually configured, keeping window-zero journals
+    /// byte-identical to the plain path.
+    pub(crate) fn recv_at_effective(&self, task: usize, now: u64) -> Option<crate::net::Message> {
+        let mut net = self.net.borrow_mut();
+        if !self.reorder_draw {
+            return net.recv_at(task, now);
+        }
+        let mut offset = self.net_offset.borrow_mut();
+        let draw = |bound: u64| -> u64 {
+            let value = self.seed_tree.draw_u64("net", *offset);
+            *offset += 1;
+            value % bound
+        };
+        net.recv_at_drawn(task, now, draw)
+    }
+
     /// Append one entry and count it against the actor's coverage.
     pub(crate) fn journal_append(
         &self,

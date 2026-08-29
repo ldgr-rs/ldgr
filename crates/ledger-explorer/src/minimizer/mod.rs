@@ -31,7 +31,7 @@ pub enum MinimizeError {
 
 /// Extract the generated input sequence from a journal.
 ///
-/// The sequence is the `Payload::Number` values of the `InputStep` entries
+/// The sequence is the `InputStepPayload` values of the `InputStep` entries
 /// for `generator`, in journal order. This is the exact input that produced
 /// the journal, never a fresh re-sample.
 fn journal_inputs(journal: &Journal, generator: &str) -> Vec<u64> {

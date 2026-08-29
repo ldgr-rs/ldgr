@@ -10,7 +10,7 @@ use ledger_format::{
     CrashOperation, EntryKind, EntryPayload, Hash, ObservedRead, PATH_DOMAIN, PathRef,
 };
 use ledger_journal::{Journal, JournalError};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use ledger_format::limits::{MAX_FILE_EXTENT_HARD, MAX_READ_BYTES, MAX_WRITE_BYTES};
 
@@ -76,44 +76,6 @@ pub fn path_ref(path: &str) -> PathRef {
 /// Canonical string key for the file table.
 fn canonical_key(path: &str) -> String {
     String::from_utf8(path_ref(path).canonical_path).unwrap_or_else(|_| path.to_owned())
-}
-
-/// Legacy scalar crash operators retained for the corpus fixtures; the
-/// canonical [`CrashOperation`] wire operators execute through
-/// [`SimFs::apply_crash_operation`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CrashOperator {
-    /// Drop all dirty, unsynced writes.
-    DropAllUnsynced,
-    /// Drop an adversarial subset of dirty paths.
-    // ledger-lint:allow:HashSet (apply_crash_operator sorts the subset
-    // before iterating, so restore order is deterministic)
-    DropSubset(HashSet<String>),
-    /// Simulate a torn write by persisting a truncated/partial value.
-    TornWrite { path: String, partial_value: u64 },
-    /// Corrupt stored bits at a specific path.
-    BitFlipCorruption { path: String, xor_mask: u64 },
-    /// Torn write at sector granularity: only a prefix of the write's sectors
-    /// commit to storage.
-    TornWriteSectors {
-        /// Path of the torn write.
-        path: String,
-        /// Number of sectors committed before the crash.
-        sectors_committed: u64,
-        /// Total sectors the write spans. Must be at least 1.
-        total_sectors: u64,
-    },
-    /// Flip a deterministic bit pattern across a sector range.
-    CorruptRange {
-        /// Path whose stored value is corrupted.
-        path: String,
-        /// First affected sector.
-        start_sector: u64,
-        /// Number of affected sectors.
-        sector_count: u64,
-        /// Bytes per sector.
-        sector_size: u64,
-    },
 }
 
 /// Page-level state in simulated storage.
@@ -672,7 +634,10 @@ impl SimFs {
 
     /// Execute a standard crash by resetting all dirty writes to last fsynced state.
     pub fn crash(&mut self) {
-        self.apply_crash_operator(&CrashOperator::DropAllUnsynced);
+        // DropAllUnsynced is total (retain + drop_unsynced), so the discard
+        // is safe: it cannot produce the UnknownWriteTarget-style errors of
+        // the targeted operators.
+        let _ = self.apply_crash_operation(&CrashOperation::DropAllUnsynced);
     }
 
     /// Replay the journal and apply the crash model for the configured mode.
@@ -694,7 +659,8 @@ impl SimFs {
         }
         self.journal.clear();
         self.pending_renames.clear();
-        self.apply_crash_operator(&CrashOperator::DropAllUnsynced);
+        // See [`SimFs::crash`]: DropAllUnsynced cannot fail.
+        let _ = self.apply_crash_operation(&CrashOperation::DropAllUnsynced);
     }
 
     #[cfg(feature = "sim-fs-journaling")]
@@ -806,101 +772,6 @@ impl SimFs {
         }
         Err(SimFsError::UnknownWriteTarget)
     }
-
-    /// Apply an explicit legacy crash operator to simulate arbitrary crash
-    /// states (scalar corpus fixtures; byte semantics underneath).
-    pub fn apply_crash_operator(&mut self, op: &CrashOperator) {
-        #[cfg(feature = "sim-fs-journaling")]
-        {
-            self.journal.clear();
-            self.pending_renames.clear();
-        }
-        match op {
-            CrashOperator::DropAllUnsynced => {
-                self.files.retain(|_, file| file.drop_unsynced());
-            }
-            CrashOperator::DropSubset(paths_to_drop) => {
-                let mut ordered: Vec<&String> = paths_to_drop.iter().collect();
-                ordered.sort();
-                for path in ordered {
-                    let key = canonical_key(path);
-                    if let Some(file) = self.files.get_mut(&key) {
-                        if !file.drop_unsynced() {
-                            self.files.remove(&key);
-                        }
-                    } else {
-                        self.files.remove(&key);
-                    }
-                }
-            }
-            CrashOperator::TornWrite {
-                path,
-                partial_value,
-            } => {
-                let key = canonical_key(path);
-                if let Some(file) = self.files.get_mut(&key) {
-                    file.cache.insert(
-                        0,
-                        ByteRange {
-                            content: partial_value.to_le_bytes().to_vec(),
-                            write_id: file.created_by.unwrap_or_default(),
-                            state: PageState::Dirty,
-                        },
-                    );
-                    file.recompute_length();
-                }
-            }
-            CrashOperator::BitFlipCorruption { path, xor_mask } => {
-                let key = canonical_key(path);
-                if let Some(file) = self.files.get_mut(&key)
-                    && let Some(range) = file.cache.get_mut(&0)
-                {
-                    for (index, byte) in range.content.iter_mut().enumerate() {
-                        if index < 8 {
-                            *byte ^= ((xor_mask >> (index * 8)) & 0xFF) as u8;
-                        }
-                    }
-                }
-            }
-            CrashOperator::TornWriteSectors {
-                path,
-                sectors_committed,
-                total_sectors,
-            } => {
-                let key = canonical_key(path);
-                if let Some(file) = self.files.get_mut(&key)
-                    && let Some(range) = file.cache.get_mut(&0)
-                    && range.state == PageState::Dirty
-                {
-                    let divisor = (*total_sectors).max(1);
-                    let fraction = (*sectors_committed as u128)
-                        .saturating_mul(range.content.len() as u128)
-                        / divisor as u128;
-                    range.content.truncate(fraction as usize);
-                    file.recompute_length();
-                }
-            }
-            CrashOperator::CorruptRange {
-                path,
-                start_sector,
-                sector_count,
-                sector_size,
-            } => {
-                let key = canonical_key(path);
-                if let Some(file) = self.files.get_mut(&key)
-                    && let Some(range) = file.cache.get_mut(&0)
-                {
-                    let start = start_sector.saturating_mul(*sector_size) as usize;
-                    let len = sector_count.saturating_mul(*sector_size) as usize;
-                    for (index, byte) in range.content.iter_mut().enumerate() {
-                        if index >= start && index < start.saturating_add(len) {
-                            *byte ^= 0xFF;
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -940,24 +811,24 @@ mod tests {
     fn torn_write_sectors_commits_prefix_only() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write(&mut journal, 0, "k", 100).unwrap();
-        fs.apply_crash_operator(&CrashOperator::TornWriteSectors {
-            path: "k".into(),
-            sectors_committed: 1,
-            total_sectors: 2,
-        });
+        let write_id = fs.write(&mut journal, 0, "k", 100).unwrap();
+        fs.apply_crash_operation(&CrashOperation::TornWrite {
+            write_entry: write_id,
+            persisted_prefix: 4,
+        })
+        .unwrap();
         // One of two 8-byte sectors persists: the first 4 bytes of the LE
         // u64 100, which still decodes to 100.
         assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(100));
 
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write(&mut journal, 0, "k", 100).unwrap();
-        fs.apply_crash_operator(&CrashOperator::TornWriteSectors {
-            path: "k".into(),
-            sectors_committed: 0,
-            total_sectors: 2,
-        });
+        let write_id = fs.write(&mut journal, 0, "k", 100).unwrap();
+        fs.apply_crash_operation(&CrashOperation::TornWrite {
+            write_entry: write_id,
+            persisted_prefix: 0,
+        })
+        .unwrap();
         assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(0));
     }
 
@@ -965,23 +836,26 @@ mod tests {
     fn corrupt_range_flips_in_range_bytes_only() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write(&mut journal, 0, "k", 0xA5A5A5A5A5A5A5A5).unwrap();
+        let write_id = fs.write(&mut journal, 0, "k", 0xA5A5A5A5A5A5A5A5).unwrap();
         let original = fs.read(&mut journal, 0, "k").unwrap().unwrap();
-        fs.apply_crash_operator(&CrashOperator::CorruptRange {
-            path: "k".into(),
-            start_sector: 0,
-            sector_count: 1,
-            sector_size: 4,
-        });
+        fs.apply_crash_operation(&CrashOperation::CorruptRange {
+            write_entry: write_id,
+            offset: 0,
+            xor_bytes: vec![0xFF; 4],
+        })
+        .unwrap();
         let corrupted = fs.read(&mut journal, 0, "k").unwrap().unwrap();
         assert_ne!(corrupted, original);
-        // An out-of-range corruption leaves the value unchanged.
-        fs.apply_crash_operator(&CrashOperator::CorruptRange {
-            path: "k".into(),
-            start_sector: 2,
-            sector_count: 1,
-            sector_size: 4,
-        });
+        // An out-of-range corruption fails closed instead of silently
+        // leaving the value unchanged.
+        assert!(matches!(
+            fs.apply_crash_operation(&CrashOperation::CorruptRange {
+                write_entry: write_id,
+                offset: 8,
+                xor_bytes: vec![0xFF; 4],
+            }),
+            Err(SimFsError::UnknownWriteTarget)
+        ));
         assert_eq!(fs.read(&mut journal, 0, "k").unwrap().unwrap(), corrupted);
     }
 

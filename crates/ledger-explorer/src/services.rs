@@ -38,10 +38,16 @@ pub enum ServiceError {
     Minimize(#[from] MinimizeError),
     /// A simulation failed outside a search or replay path.
     #[error(transparent)]
-    Simulation(#[from] RuntimeError),
+    Simulation(Box<RuntimeError>),
     /// A journal could not be read.
     #[error("journal error: {0}")]
     Journal(#[from] ledger_journal::JournalError),
+}
+
+impl From<RuntimeError> for ServiceError {
+    fn from(error: RuntimeError) -> Self {
+        Self::Simulation(Box::new(error))
+    }
 }
 
 /// Run a multi-attempt campaign over one workload and oracle.

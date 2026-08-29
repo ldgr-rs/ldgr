@@ -63,7 +63,9 @@ pub fn escalate(injection: &SimFault) -> Option<SimFault> {
             }
         }
         SimFault::CrashState { write, state } => {
-            let next = state.saturating_add(1).min(3);
+            // Canonical crash-state identifiers are 0 through 2; the next
+            // mutation stops at the last canonical one.
+            let next = state.saturating_add(1).min(2);
             if next == *state {
                 None
             } else {

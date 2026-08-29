@@ -6,7 +6,7 @@
 //! locally, not in CI (shared runners are too noisy).
 //!
 //! Workload: synthetic journal with chain appends of `EntryKind::Send` from
-//! actor 1 with `Payload::Number(i)`, plus every k-th entry a `Recv` observing
+//! actor 1 with `SendFrame` content carrying `i`, plus every k-th entry a `Recv` observing
 //! the previous `Send` as parent (creates derivation paths), and a final
 //! `Outcome` witness. A `Verdict` with that outcome as witness drives both
 //! solvers. Journal is built once per size outside the timed section; the
@@ -34,7 +34,7 @@ const RECV_PERIOD: usize = 10;
 
 /// Build a synthetic journal of `n` entries (including final Outcome).
 ///
-/// Chain appends `Send` from actor 1 with `Payload::Number(i)`. Every
+/// Chain appends `Send` from actor 1 with `SendFrame` content carrying `i`. Every
 /// `RECV_PERIOD`-th entry (excluding i==0) a `Recv` observing the previous
 /// `Send` is appended instead, creating derivation paths. The final `Outcome`
 /// observes the last chain entry (and the previous one when available, to
