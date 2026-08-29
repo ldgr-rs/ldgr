@@ -348,14 +348,19 @@ impl SimNet {
             .map(|(index, _)| index)
             .collect();
         let first = *ready.first()?;
-        let window = self.effective_reorder_window(self.queue[first].from, task);
+        let sender = self.queue[first].from;
+        let window = self.effective_reorder_window(sender, task);
+        let link_candidates: Vec<usize> = ready
+            .into_iter()
+            .filter(|&idx| self.queue[idx].from == sender)
+            .collect();
         let index = if window == 0 {
             first
         } else {
             // The exact bounded candidate window: the last `window` ready
-            // messages, newest-first within it.
-            let start = ready.len().saturating_sub(window);
-            ready[ready.len() - 1].max(ready[start])
+            // messages for this link, newest-first within it.
+            let start = link_candidates.len().saturating_sub(window);
+            link_candidates[link_candidates.len() - 1].max(link_candidates[start])
         };
         self.queue.remove(index)
     }
@@ -365,7 +370,7 @@ impl SimNet {
     ///
     /// Window zero draws nothing and serves the queue head (FIFO). A nonzero
     /// window limits the candidate set to the last `window` ready messages
-    /// and serves `candidate[draw(candidate.len())]`.
+    /// on this link and serves `candidate[draw(candidate.len())]`.
     pub fn recv_at_drawn(
         &mut self,
         task: usize,
@@ -380,12 +385,17 @@ impl SimNet {
             .map(|(index, _)| index)
             .collect();
         let first = *ready.first()?;
-        let window = self.effective_reorder_window(self.queue[first].from, task);
+        let sender = self.queue[first].from;
+        let window = self.effective_reorder_window(sender, task);
+        let link_candidates: Vec<usize> = ready
+            .into_iter()
+            .filter(|&idx| self.queue[idx].from == sender)
+            .collect();
         let index = if window == 0 {
             first
         } else {
-            let start = ready.len().saturating_sub(window);
-            let suffix = &ready[start..];
+            let start = link_candidates.len().saturating_sub(window);
+            let suffix = &link_candidates[start..];
             suffix[(draw(suffix.len() as u64) % suffix.len() as u64) as usize]
         };
         self.queue.remove(index)

@@ -317,7 +317,7 @@ fn golden_fixtures_round_trip_identity() {
         let bytes = hex_bytes(&raw);
         let decoded = CborValue::from_canonical_bytes(&bytes)
             .unwrap_or_else(|err| panic!("fixture {} must decode: {err:?}", path.display()));
-        let reencoded = decoded.to_canonical_bytes();
+        let reencoded = decoded.to_canonical_bytes().unwrap();
         assert_eq!(
             reencoded,
             bytes,
@@ -365,7 +365,7 @@ fn golden_fixture_semantic_expectations() {
                     "semantic mismatch for {}",
                     path.display()
                 );
-                let reencoded = expected.to_canonical_bytes();
+                let reencoded = expected.to_canonical_bytes().unwrap();
                 assert_eq!(
                     reencoded,
                     bytes,

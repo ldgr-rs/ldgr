@@ -158,6 +158,7 @@ impl From<RunConfigBuilder> for RunConfig {
 ///
 /// Facade-local carrier: liveness detail requires the simulation backend;
 /// other builds report [`RunCompletion::Completed`] for their runs.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunCompletion {
     /// Every task finished.
@@ -593,14 +594,17 @@ impl Handle {
         // Non-sim (and sim IPC): destination-based receive over the shared
         // in-process net; sender ids are never scanned or bounded here.
         loop {
-            let payload = match self.shared_net.inner().lock() {
-                Ok(mut net) => net.recv_for(self.actor),
-                Err(_) => None,
+            let notified = {
+                let mut net = match self.shared_net.inner().lock() {
+                    Ok(g) => g,
+                    Err(_) => return 0,
+                };
+                if let Some(payload) = net.recv_for(self.actor) {
+                    return payload;
+                }
+                self.shared_net.notify().notified()
             };
-            if let Some(payload) = payload {
-                return payload;
-            }
-            tokio::task::yield_now().await;
+            notified.await;
         }
     }
 

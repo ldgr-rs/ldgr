@@ -268,34 +268,7 @@ fn mapping_to_json(m: &EntryMapping) -> JsonMapping {
 }
 
 fn json_to_kind(jm: &JsonMapping) -> Result<EntryKind, AdapterError> {
-    let tag = jm.kind_tag;
-    match tag {
-        0 => Ok(EntryKind::Spawn),
-        1 => Ok(EntryKind::Block),
-        2 => Ok(EntryKind::Wake),
-        3 => Ok(EntryKind::TimerSet),
-        4 => Ok(EntryKind::TimerFire),
-        5 => Ok(EntryKind::ClockRead),
-        6 => Ok(EntryKind::Send),
-        7 => Ok(EntryKind::Recv),
-        8 => Ok(EntryKind::FsWrite),
-        9 => Ok(EntryKind::FsFsync),
-        10 => Ok(EntryKind::FsRead),
-        11 => Ok(EntryKind::RngDraw),
-        12 => Ok(EntryKind::Outcome),
-        13 => Ok(EntryKind::Assert),
-        14 => Ok(EntryKind::Snapshot),
-        15 => Ok(EntryKind::Epoch),
-        16 => Ok(EntryKind::InputStep),
-        17 => Ok(EntryKind::CapRequest),
-        18 => Ok(EntryKind::CapGrant),
-        19 => Ok(EntryKind::CapInvoke),
-        20 => Ok(EntryKind::CapRevoke),
-        21 => Ok(EntryKind::Fault),
-        22 => Ok(EntryKind::StepBegin),
-        23 => Ok(EntryKind::StepEnd),
-        _ => Err(AdapterError::InvalidHeader),
-    }
+    EntryKind::try_from(jm.kind_tag).map_err(|_| AdapterError::InvalidHeader)
 }
 
 #[cfg(test)]

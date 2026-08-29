@@ -68,6 +68,8 @@ impl Conn {
             to: self.to,
             payload,
         });
+        drop(net);
+        self.shared.notify().notify_waiters();
         true
     }
 
@@ -133,12 +135,18 @@ impl Conn {
 #[derive(Debug, Clone, Default)]
 pub struct SharedNetwork {
     inner: Arc<Mutex<SharedNet>>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl SharedNetwork {
     /// Crate-internal access to the guarded net state.
     pub(crate) fn inner(&self) -> &Arc<Mutex<SharedNet>> {
         &self.inner
+    }
+
+    /// Crate-internal access to the notification primitive.
+    pub(crate) fn notify(&self) -> &Arc<tokio::sync::Notify> {
+        &self.notify
     }
 }
 

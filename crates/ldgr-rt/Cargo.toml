@@ -1,8 +1,8 @@
 [package]
 name = "ldgr-rt"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.90"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license = "Apache-2.0"
 description = "Drop-in deterministic runtime facade for ldgr simulation"
 readme = "README.md"
@@ -14,7 +14,7 @@ ledger-sim = { path = "../ledger-sim", optional = true }
 # route that maps `ledger_sim::RuntimeError`.
 ledger-journal = { path = "../ledger-journal", optional = true }
 blake3 = { workspace = true }
-tokio = { workspace = true, features = ["rt", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "time", "net", "sync"] }
 rand_core = { workspace = true }
 rand_chacha = { workspace = true }
 getrandom = { workspace = true }

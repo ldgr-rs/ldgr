@@ -68,6 +68,7 @@ pub struct WorkerResult {
 }
 
 /// Errors from worker execution.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum WorkerError {
     /// The queued run_config hash did not match the recomputed canonical

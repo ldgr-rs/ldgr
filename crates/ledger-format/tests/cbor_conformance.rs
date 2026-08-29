@@ -12,7 +12,7 @@ fn cbor_enforces_canonical_key_sorting() {
     ];
 
     let val = CborValue::Map(map_items);
-    let bytes = val.to_canonical_bytes();
+    let bytes = val.to_canonical_bytes().unwrap();
 
     let decoded = CborValue::from_canonical_bytes(&bytes).unwrap();
     if let CborValue::Map(entries) = decoded {
@@ -68,7 +68,7 @@ fn cbor_round_trips_nested_structures() {
         CborValue::Null,
     ]);
 
-    let bytes = val.to_canonical_bytes();
+    let bytes = val.to_canonical_bytes().unwrap();
     let decoded = CborValue::from_canonical_bytes(&bytes).unwrap();
     assert_eq!(val, decoded);
 }
@@ -181,7 +181,7 @@ fn floats_reject_non_canonical() {
 }
 
 #[test]
-fn all_half_precision_patterns_round_trip() {
+fn all_f16_bit_patterns_either_roundtrip_or_reject() {
     // Every f16 bit pattern must either decode to a canonical float that
     // re-encodes to the same bytes, or be rejected as -0.0 / NaN. This guards
     // the manual half-precision conversion against regressions.
@@ -189,7 +189,7 @@ fn all_half_precision_patterns_round_trip() {
         let bytes = [0xf9, (bits >> 8) as u8, bits as u8];
         match CborValue::from_canonical_bytes(&bytes) {
             Ok(value) => {
-                let reencoded = value.to_canonical_bytes();
+                let reencoded = value.to_canonical_bytes().unwrap();
                 assert_eq!(reencoded, bytes.to_vec(), "f16 pattern {bits:#06x}");
             }
             Err(CborError::NonCanonicalFloat) => {}

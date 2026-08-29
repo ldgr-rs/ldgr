@@ -134,6 +134,22 @@ impl EntryKind {
     }
 }
 
+impl TryFrom<u64> for EntryKind {
+    type Error = u64;
+
+    fn try_from(tag: u64) -> Result<Self, Self::Error> {
+        Self::from_tag(tag).ok_or(tag)
+    }
+}
+
+impl TryFrom<u32> for EntryKind {
+    type Error = u32;
+
+    fn try_from(tag: u32) -> Result<Self, Self::Error> {
+        Self::from_tag(tag as u64).ok_or(tag)
+    }
+}
+
 /// Message identity: sender actor and the sender entry sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageId {

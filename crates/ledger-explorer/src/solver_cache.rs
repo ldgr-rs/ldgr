@@ -481,14 +481,17 @@ mod tests {
 
     #[test]
     fn global_cache_is_singleton() {
-        global_clear();
+        let mut guard = global_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clear();
         let key = hash_of(11);
         let clause = WeightedClause::new(vec![hash_of(2)], 7);
-        global_insert(key, vec![clause.clone()]);
-        assert_eq!(global_get(&key), Some(vec![clause]));
-        assert_eq!(global_len(), 1);
-        global_clear();
-        assert_eq!(global_len(), 0);
+        guard.insert(key, vec![clause.clone()]);
+        assert_eq!(guard.get_cloned(&key), Some(vec![clause]));
+        assert_eq!(guard.len(), 1);
+        guard.clear();
+        assert_eq!(guard.len(), 0);
     }
 
     #[test]
