@@ -66,6 +66,7 @@ changes. The main crate roles are:
 | `ledger-cli` | `ledger` command-line composition root |
 | `ledger-worker` | Queue draining, task execution, UDS/gRPC transport, and artifact publication |
 | `ldgr-rt` | Apache-2.0 SUT porting facade and IPC boundary |
+| `rt-server` | AGPL runtime engine server backing SUT IPC transports |
 | `ledger-lint` | Static scanner for forbidden ambient APIs |
 | `wasm-guest` | Deterministic `wasm32-wasip1` guest |
 | `guests/` | Polyglot Wasm guest sources and prebuilt guest notes |

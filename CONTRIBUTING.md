@@ -40,10 +40,13 @@ Build and test:
 
 ```sh
 cargo check --workspace --all-targets
-cargo nextest run --workspace --all-features
+cargo nextest run --workspace --all-features --profile ci
 cargo test --workspace --doc
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
+cargo run -p ledger-lint -- crates/
+cargo run -p xtask -- licenses
+cargo run -p xtask -- doctor
 ```
 
 Before running the Wasm tests, build the guest:
@@ -56,15 +59,22 @@ cargo build --target wasm32-wasip1 -p wasm-guest
 
 | Directory | Purpose |
 | :--- | :--- |
-| `crates/ledger-format` | Canonical CBOR codec, entry types, hashing. |
-| `crates/ledger-journal` | Causal DAG, vector clocks, segments, snapshots. |
-| `crates/ledger-sim` | The deterministic simulation runtime and Effects boundary. |
-| `crates/ledger-lint` | Static scanner for forbidden ambient APIs. |
-| `crates/ledger-explorer` | Search, LDFI, minimization, oracles, reference sims. |
-| `crates/ledger-flow` | Durable-execution step logging. |
-| `crates/ledger-cli` | The `ledger` command-line tool. |
-| `docs/` | The design and verification documents (source of truth). |
-| `corpora/` | Planted-leak and bug-corpus fixtures. |
+| `crates/ledger-format` | Canonical RFC 8949 CBOR codec, entry types, hashing, and manifests. |
+| `crates/ledger-journal` | Causal DAG, vector clocks, segments, snapshots, and persistence. |
+| `crates/ledger-sim` | Deterministic simulation runtime, Effects boundary, SimNet, and SimFs. |
+| `crates/ledger-explorer` | Search, LDFI, MaxSAT, minimization, oracles, and certificates. |
+| `crates/ledger-faultspec` | Failure-spec DSL parser, compiler, and scenario library. |
+| `crates/ledger-flow` | Durable-execution step logging over the causal journal. |
+| `crates/ledger-adapters` | OpenTelemetry ingest adapters and journal envelopes. |
+| `crates/ldgr-rt` | Apache-2.0 SUT porting facade and IPC boundary. |
+| `crates/rt-server` | AGPL engine server backing the SUT IPC transport. |
+| `crates/ledger-worker` | Daemon, outbound session transport, queue, and artifact publishing. |
+| `crates/ledger-lint` | Static scanner for forbidden ambient host APIs. |
+| `crates/wasm-guest` | Deterministic `wasm32-wasip1` guest reference. |
+| `crates/ledger-cli` | The `ledger` command-line tool and composition root. |
+| `xtask/` | Workspace automation: license boundary and environment doctor. |
+| `docs/` | User documentation and architectural guides. |
+| `corpora/` | Planted-leak and deterministic bug-corpus fixtures. |
 
 ## A note on determinism
 

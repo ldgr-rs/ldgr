@@ -45,8 +45,10 @@ A second view shows how a system under test connects:
 | `ledger-flow` | Step logging over the journal for durable execution |
 | `ledger-adapters` | OTel span ingest into journal envelopes |
 | `ldgr-rt` | Porting facade for systems under test and the IPC boundary |
+| `rt-server` | AGPL runtime engine server backing SUT IPC transports |
 | `ledger-lint` | Static check that simulation paths avoid ambient APIs |
 | `wasm-guest` | Deterministic `wasm32-wasip1` guest example |
+| `xtask` | Workspace automation: license boundary and environment doctor |
 
 `ledger-cli` is the composition root. Use explicit `-p` or `--workspace`
 flags for checks. Do not infer workspace state from a bare `cargo test`.

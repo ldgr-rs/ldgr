@@ -241,8 +241,8 @@ checks, treat this file as wrong and open an issue.
 | Layer | Crates | License |
 | --- | --- | --- |
 | Contracts and codecs | `ledger-format`, `ledger-journal`, `wasm-guest` | MIT OR Apache-2.0 |
-| Engine | `ledger-sim`, `ledger-explorer` | AGPL-3.0-or-later; commercial license available |
-| Tooling | CLI, worker, adapters, rt, lint, flow, faultspec | Apache-2.0 |
+| Engine | `ledger-sim`, `ledger-explorer`, `rt-server` | AGPL-3.0-or-later; commercial license available |
+| Tooling | CLI, worker, adapters, rt, lint, flow, faultspec, xtask | Apache-2.0 |
 
 Embed the contracts freely. Use the engine under the AGPL, including for
 commercial work. If AGPL section 13 does not fit your deployment, ask about the

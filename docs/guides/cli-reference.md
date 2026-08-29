@@ -221,13 +221,20 @@ ledger ingest --input traces.json --fidelity lineage-only
 Verify a campaign certificate JSON file.
 
 ```bash
-ledger cert verify <FILE>
+ledger cert verify <FILE> [--journal <DIR>] [--op statement|journal|inclusion-minimal]
 ```
 
-Example:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<FILE>` | (required) | Path to the certificate JSON file. |
+| `--journal` | None | Directory of the persisted journal for journal-anchored validation. |
+| `--op` | statement | Selected operation: `statement` (schema/size checks), `journal` (journal-anchored proof), or `inclusion-minimal` (verifies cut minimality). `--journal` is required for `journal` and `inclusion-minimal`. |
+
+Examples:
 
 ```bash
 ledger cert verify cert.json
+ledger cert verify cert.json --journal /path/to/journal --op inclusion-minimal
 ```
 
 ## `ledger faults`
