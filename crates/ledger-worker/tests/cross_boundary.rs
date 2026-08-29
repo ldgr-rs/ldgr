@@ -9,19 +9,18 @@
 //! simulation, asserting byte-identical roots across the wire boundary and
 //! across two runs (hash-drift guard).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use ledger_explorer::search::Workload;
 use ledger_sim::{RunConfig, Simulation};
-use ledger_worker::{
-    InMemoryQueue, Task, WorkerConfig, hash_to_hex, run_config_hash, run_drain_once, workload_for,
-};
+use ledger_worker::{InMemoryQueue, Task, WorkerConfig, hash_to_hex, run_drain_once, workload_for};
 
-/// Bound on how long a freshly spawned server may take to serve a
-/// readiness probe. A longer wait is a dead server, not a slow one.
-/// Bound on one request/response exchange. A longer wait is a wedged
-/// server, not a busy one.
+#[cfg(feature = "grpc")]
+use ledger_worker::run_config_hash;
+#[cfg(feature = "grpc")]
+use std::sync::Arc;
+
+#[cfg(feature = "grpc")]
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 
 fn golden_config() -> RunConfig {

@@ -2084,6 +2084,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rt-server"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "futures",
+ "ldgr-rt",
+ "ledger-explorer",
+ "ledger-format",
+ "ledger-sim",
+ "libc",
+ "rand_core 0.10.1",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

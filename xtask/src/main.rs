@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 /// Crates allowed to import AGPL engine code: they are process boundaries
 /// (binaries/services), not embeddable libraries.
-const COMPOSITION_ROOTS: [&str; 2] = ["ledger-cli", "ledger-worker"];
+const COMPOSITION_ROOTS: [&str; 3] = ["ledger-cli", "ledger-worker", "rt-server"];
 
 /// Codec crates expose the ingest/embedding edge. Their whole value is
 /// external embedding under a permissive license, so their engine surface
@@ -48,7 +48,7 @@ const ROLE_DEPENDENCIES: [&str; 1] = ["tokio"];
 
 fn expected_license(crate_name: &str) -> &'static str {
     match crate_name {
-        "ledger-sim" | "ledger-explorer" => "AGPL-3.0-or-later",
+        "ledger-sim" | "ledger-explorer" | "rt-server" => "AGPL-3.0-or-later",
         "ledger-format" | "ledger-journal" | "wasm-guest" => "MIT OR Apache-2.0",
         _ => "Apache-2.0",
     }
@@ -113,7 +113,12 @@ fn package_name(manifest_text: &str) -> Option<String> {
 /// A name counts when it matches a known workspace crate, which covers both
 /// explicit `path = ...` forms and `workspace = true` inheritance.
 /// Dev and build dependencies do not propagate to consumers and are skipped.
-fn internal_dependencies(manifest_text: &str, workspace_names: &[String]) -> Vec<String> {
+/// When `mandatory_only` is true, optional dependencies are excluded.
+fn internal_dependencies(
+    manifest_text: &str,
+    workspace_names: &[String],
+    mandatory_only: bool,
+) -> Vec<String> {
     let mut in_deps = false;
     let mut found = Vec::new();
     for line in manifest_text.lines() {
@@ -123,9 +128,12 @@ fn internal_dependencies(manifest_text: &str, workspace_names: &[String]) -> Vec
             continue;
         }
         if in_deps
-            && let Some((key, _)) = trimmed.split_once('=')
+            && let Some((key, val)) = trimmed.split_once('=')
             && workspace_names.iter().any(|n| n == key.trim())
         {
+            if mandatory_only && val.contains("optional = true") {
+                continue;
+            }
             found.push(key.trim().to_string());
         }
     }
@@ -284,7 +292,11 @@ fn cmd_licenses(root: &Path) {
     let names: Vec<String> = manifests.iter().map(|(n, _, _)| n.clone()).collect();
     let graph: Vec<(String, Vec<String>)> = manifests
         .iter()
-        .map(|(name, _, text)| (name.clone(), internal_dependencies(text, &names)))
+        .map(|(name, _, text)| (name.clone(), internal_dependencies(text, &names, false)))
+        .collect();
+    let mandatory_graph: Vec<(String, Vec<String>)> = manifests
+        .iter()
+        .map(|(name, _, text)| (name.clone(), internal_dependencies(text, &names, true)))
         .collect();
     let agpl: Vec<&str> = manifests
         .iter()
@@ -304,32 +316,39 @@ fn cmd_licenses(root: &Path) {
             println!("ok: {name} may import AGPL engine code (declared composition root)");
             continue;
         }
-        if reaches_agpl(name, &graph, &agpl) {
-            let text = manifests
-                .iter()
-                .find(|(n, _, _)| n == name)
-                .map(|(_, _, t)| t.as_str())
-                .unwrap_or("");
-            let direct_agpl: Vec<&str> = graph
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, deps)| {
-                    deps.iter()
-                        .filter(|d| agpl.contains(&d.as_str()))
-                        .map(|d| d.as_str())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if agpl_edges_opt_in(text, &direct_agpl) {
-                println!("ok: {name} reaches AGPL only behind optional, non-default features");
-                continue;
-            }
+        let mandatory_reaches = reaches_agpl(name, &mandatory_graph, &agpl);
+        let direct_agpl: Vec<&str> = graph
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, deps)| {
+                deps.iter()
+                    .filter(|d| agpl.contains(&d.as_str()))
+                    .map(|d| d.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if mandatory_reaches {
             eprintln!(
                 "license boundary violation: {name} must not reach AGPL crates {agpl:?}; \
                  only composition roots {COMPOSITION_ROOTS:?} may import the engine, \
                  and library edges must be optional"
             );
             failures += 1;
+        } else if !direct_agpl.is_empty() {
+            let text = manifests
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, _, t)| t.as_str())
+                .unwrap_or("");
+            if agpl_edges_opt_in(text, &direct_agpl) {
+                println!("ok: {name} reaches AGPL only behind optional, non-default features");
+            } else {
+                eprintln!(
+                    "license boundary violation: {name} directly depends on AGPL crates {direct_agpl:?} without optional configuration"
+                );
+                failures += 1;
+            }
         } else {
             println!("ok: {name} stays clear of AGPL transitive deps");
         }
@@ -341,7 +360,7 @@ fn cmd_licenses(root: &Path) {
             continue;
         };
         let allowed_engines = ["ledger-format", "ledger-journal"];
-        let adapter_deps = internal_dependencies(text, &names);
+        let adapter_deps = internal_dependencies(text, &names, false);
         let engine_deps: Vec<&String> = adapter_deps
             .iter()
             .filter(|d| d.starts_with("ledger-") || d.starts_with("ldgr-"))
@@ -524,7 +543,7 @@ mod tests {
         let manifest = "\
 [dependencies]\n\nledger-journal = { path = ../ledger-journal }\nserde_json = 1\ntokio.workspace = true\n\n[dev-dependencies]\nledger-explorer = { path = ../ledger-explorer }\n";
         let ws = vec!["ledger-journal".to_string(), "ledger-explorer".to_string()];
-        let deps = internal_dependencies(manifest, &ws);
+        let deps = internal_dependencies(manifest, &ws, false);
         assert_eq!(deps, vec!["ledger-journal".to_string()]);
     }
 

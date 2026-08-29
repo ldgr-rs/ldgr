@@ -426,6 +426,39 @@ impl SimBackend {
         fs.fsync(&mut journal, self.actor)
     }
 
+    /// Write a byte payload at `offset` to `path` in simulated storage,
+    /// recording the byte mutation in the journal.
+    pub fn fs_write_bytes(
+        &self,
+        path: &str,
+        offset: u64,
+        content: Vec<u8>,
+    ) -> Result<Hash, crate::simfs::SimFsError> {
+        let mut journal = lock(&self.journal);
+        let mut fs = lock(&*self.fs);
+        fs.write_bytes(&mut journal, self.actor, path, offset, content)
+    }
+
+    /// Read up to `requested_len` bytes from `offset` at `path` in simulated storage,
+    /// journaling the observed bytes with causal provenance parents.
+    pub fn fs_read_bytes(
+        &self,
+        path: &str,
+        offset: u64,
+        requested_len: u64,
+    ) -> Result<ledger_format::ObservedRead, crate::simfs::SimFsError> {
+        let mut journal = lock(&self.journal);
+        let fs = lock(&*self.fs);
+        fs.read_bytes(&mut journal, self.actor, path, offset, requested_len)
+    }
+
+    /// Flush all dirty data for `path` to durable state, journaling `FsFsync`.
+    pub fn fs_sync_path(&self, path: &str) -> Result<Hash, crate::simfs::SimFsError> {
+        let mut journal = lock(&self.journal);
+        let mut fs = lock(&*self.fs);
+        fs.fsync_path(&mut journal, self.actor, path)
+    }
+
     /// Append the crash-fault entry and fold storage into the post-crash
     /// state. Returns the entry id when journaling worked.
     fn crash_impl(&self) -> Option<Hash> {

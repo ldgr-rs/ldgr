@@ -27,5 +27,9 @@ default = []
 sim = ["dep:serde", "dep:serde_json"]
 sim-link = ["dep:ledger-sim", "dep:serde", "dep:serde_json", "dep:ledger-journal"]
 
+[[example]]
+name = "canary"
+required-features = ["sim"]
+
 [lints]
 workspace = true

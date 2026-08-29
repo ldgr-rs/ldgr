@@ -1,0 +1,21 @@
+[package]
+name = "rt-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "AGPL-3.0-or-later"
+description = "AGPL composition root: the deterministic engine effect server"
+
+[dependencies]
+ldgr-rt = { path = "../ldgr-rt", default-features = false }
+ledger-sim = { path = "../ledger-sim" }
+ledger-format = { path = "../ledger-format" }
+ledger-explorer = { path = "../ledger-explorer" }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+rand_core = { workspace = true }
+futures = { workspace = true }
+libc = { workspace = true }
+
+[lints]
+workspace = true
