@@ -138,12 +138,14 @@ pub fn emit_statement(
     builder_id: &str,
     dependencies: Vec<ResolvedDependency>,
     run_config_digest: Hash,
+    execution_identity: Option<Hash>,
 ) -> Result<CampaignCertificate, ServiceError> {
     Ok(CampaignCertificate::from_campaign(
         report,
         builder_id,
         dependencies,
         run_config_digest,
+        execution_identity,
     )?)
 }
 

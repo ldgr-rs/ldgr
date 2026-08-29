@@ -22,6 +22,12 @@ pub struct WorkerResult {
     pub steps: usize,
     /// Findings count from the pre-run explorer campaign.
     pub campaign_findings: usize,
+    /// Execution-identity digest assembled by the worker for this task.
+    ///
+    /// `None` when the worker build data is incomplete (no source revision
+    /// captured at compile time); such results must be treated as
+    /// identity-incomplete by the control plane.
+    pub execution_identity: Option<Hash>,
 }
 
 /// Errors from worker execution.
@@ -31,6 +37,22 @@ pub enum WorkerError {
     /// hash; the deterministic boundary rejects the task.
     #[error("run_config_hash mismatch for task {task_id}")]
     HashMismatch {
+        /// Identifier of the rejected task.
+        task_id: String,
+    },
+    /// The task pinned an execution-identity digest that differs from the
+    /// identity the worker assembled for it; the run is rejected before
+    /// execution.
+    #[error("execution identity mismatch for task {task_id}")]
+    IdentityMismatch {
+        /// Identifier of the rejected task.
+        task_id: String,
+    },
+    /// The task pinned an execution-identity digest but the worker build
+    /// data is incomplete, so no comparable identity exists; the run is
+    /// rejected before execution.
+    #[error("execution identity incomplete for task {task_id}")]
+    IdentityIncomplete {
         /// Identifier of the rejected task.
         task_id: String,
     },
@@ -286,6 +308,22 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
             task_id: task.id.clone(),
         });
     }
+    // Identity gate runs before the simulation: a pinned identity that does
+    // not match the worker's own assembly (or that cannot be compared because
+    // the worker build data is incomplete) rejects the task.
+    let execution_identity = task_identity(&task, computed)?;
+    if let Some(pin) = task.execution_identity {
+        let Some(assembled) = execution_identity else {
+            return Err(WorkerError::IdentityIncomplete {
+                task_id: task.id.clone(),
+            });
+        };
+        if assembled != pin {
+            return Err(WorkerError::IdentityMismatch {
+                task_id: task.id.clone(),
+            });
+        }
+    }
     let workload = workload_for(&task.workload);
     let oracle = AlwaysPassOracle;
     let campaign =
@@ -297,7 +335,43 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
         journal_root: run.journal.root_hash(),
         steps: run.steps,
         campaign_findings,
+        execution_identity,
     })
+}
+
+/// Assemble the worker's execution-identity digest for one task.
+///
+/// The build segment comes from the worker binary's compile-time capture; the
+/// run segment comes from the task's run config and workload selector. Returns
+/// `None` when the worker build data is incomplete.
+fn task_identity(
+    task: &crate::queue::Task,
+    run_config_digest: Hash,
+) -> Result<Option<Hash>, WorkerError> {
+    use ledger_explorer::identity::{EngineBuild, IdentityContext};
+    let build = EngineBuild::detect();
+    let context = IdentityContext {
+        sut_revision: None,
+        sut_dirty: false,
+        sut_artifact_digest: None,
+        guest_digest: None,
+        workload_id: task.workload.clone(),
+        // The program selector binds which program set was chosen; the
+        // workload provider owns the program-by-program binding.
+        program_digest: *blake3::hash(task.workload.as_bytes()).as_bytes(),
+        input_digests: Vec::new(),
+        backend: "sim".to_string(),
+        runtime_profile: crate::RuntimeProfile::detect().fingerprint_hex8(),
+        run_config_digest,
+        seed_tree_root: task.run_config.seed(),
+        faultspec_digest: None,
+        oracle_version: None,
+        support_provider_version: None,
+        resource_limits: ledger_journal::ResourceLimits {
+            max_steps: task.run_config.max_steps() as u64,
+        },
+    };
+    Ok(ledger_explorer::identity::assemble_identity(&build, &context).digest())
 }
 
 pub fn workload_for(name: &str) -> SmallWorkload {
@@ -337,6 +411,35 @@ mod tests {
     use crate::queue::{InMemoryQueue, Task};
     use ledger_sim::RunConfig;
     use std::time::Duration;
+
+    #[test]
+    fn pinned_identity_rejects_before_execution() {
+        // A pinned identity must reject the task before the simulation runs,
+        // either because the worker build data is incomplete (dev builds) or
+        // because the assembled identity differs (any build). Both arms are
+        // fail-closed; neither lets a mismatched task execute.
+        let mut task = Task::new("pinned", RunConfig::default(), "trivial");
+        task.execution_identity = Some([0xab; 32]);
+        let error = execute_task(task).expect_err("pinned identity must reject the task");
+        assert!(
+            matches!(
+                error,
+                WorkerError::IdentityIncomplete { .. } | WorkerError::IdentityMismatch { .. }
+            ),
+            "fail-closed identity rejection, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn unpinned_task_records_its_identity() {
+        let task = Task::new("unpinned", RunConfig::default(), "trivial");
+        let result = execute_task(task).expect("unpinned task must run");
+        // The recorded digest follows the worker build: complete builds carry
+        // a digest, incomplete builds carry None (the control plane treats
+        // None as identity-incomplete).
+        let _ = result.execution_identity;
+        assert_eq!(result.task_id, "unpinned");
+    }
 
     #[test]
     fn run_one_produces_deterministic_root() {

@@ -56,6 +56,13 @@ pub struct Task {
     pub workload: String,
     /// Optional deterministic hash of run_config, computed at queue push.
     pub run_config_hash: Option<Hash>,
+    /// Execution-identity digest pinned by the task author.
+    ///
+    /// When present, the worker recomputes its own identity for the task
+    /// and rejects the task before execution when the digests differ or its
+    /// own identity is incomplete. `None` leaves the worker to record its
+    /// own assembled identity in the result.
+    pub execution_identity: Option<Hash>,
     /// Execution attempts charged against this task.
     pub attempts: u32,
     /// Attempt budget; exhaustion moves the task to the failed list.
@@ -73,6 +80,7 @@ impl Task {
             run_config,
             workload: workload.into(),
             run_config_hash: None,
+            execution_identity: None,
             attempts: 0,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             status: TaskStatus::Queued,

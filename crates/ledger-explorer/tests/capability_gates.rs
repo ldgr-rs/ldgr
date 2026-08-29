@@ -448,6 +448,7 @@ fn run_scaling_chain(n: usize) -> (usize, usize, usize, usize, bool, bool, Durat
         "capability-gate-builder",
         Vec::new(),
         [9u8; 32],
+        None,
     )
     .expect("certificate emission must succeed");
     let verified = cert

@@ -157,6 +157,7 @@ fn default_manifest() -> Result<Vec<u8>, ScaffoldError> {
         journal_root: [0u8; 32],
         entry_count: 0,
         actor_heads: BTreeMap::new(),
+        execution_identity: None,
         extensions: BTreeMap::new(),
     };
     manifest

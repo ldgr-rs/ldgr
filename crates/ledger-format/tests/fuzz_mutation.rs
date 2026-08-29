@@ -103,6 +103,7 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         journal_root: [9u8; 32],
         entry_count: 42,
         actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
+        execution_identity: None,
         extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(1))]),
     };
     corpus.push(
@@ -242,6 +243,7 @@ fn mutation_harness_never_panics() {
         journal_root: [9u8; 32],
         entry_count: 42,
         actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
+        execution_identity: None,
         extensions: BTreeMap::from([("probe".into(), CborValue::Unsigned(1))]),
     };
     let manifest_bytes = manifest

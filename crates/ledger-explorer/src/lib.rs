@@ -9,6 +9,7 @@ pub mod coverage;
 mod diagnosis;
 pub mod faultspec_bridge;
 pub mod forensics;
+pub mod identity;
 pub mod ldfi;
 pub mod lineage;
 pub mod maxsat;

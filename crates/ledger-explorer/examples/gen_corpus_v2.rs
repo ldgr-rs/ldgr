@@ -30,6 +30,7 @@ fn main() {
             journal_root: finding.run.journal.root_hash(),
             entry_count: finding.run.journal.len() as u64,
             actor_heads,
+            execution_identity: None,
             extensions: BTreeMap::new(),
         };
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");

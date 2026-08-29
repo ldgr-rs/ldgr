@@ -876,7 +876,7 @@ fn cert_verify_journal_mode_valid() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [9u8; 32])
+    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [9u8; 32], None)
         .expect("valid report must create a certificate");
     let cert_path = dir.join("cert.json");
     std::fs::write(&cert_path, cert.to_json().unwrap()).unwrap();
@@ -951,7 +951,7 @@ fn cert_verify_journal_mode_wrong_root() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [9u8; 32])
+    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [9u8; 32], None)
         .expect("valid report must create a certificate");
     let cert_path = dir.join("cert.json");
     std::fs::write(&cert_path, cert.to_json().unwrap()).unwrap();
@@ -976,8 +976,9 @@ fn cert_verify_human_recorded_solver_data_label() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let mut cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32])
-        .expect("valid report must create a certificate");
+    let mut cert =
+        CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32], None)
+            .expect("valid report must create a certificate");
     cert.solver_data = Some(RecordedSolverData {
         cut: vec![[3u8; 32]],
         recorded_lower_bound: 2,
@@ -1051,7 +1052,7 @@ fn cert_verify_rejects_oversized_via_bounded_reader() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32])
+    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32], None)
         .expect("valid report must create a certificate");
     let json = cert.to_json().unwrap();
     assert!(json.len() < 1024 * 1024, "base cert must be small");
