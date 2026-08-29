@@ -35,9 +35,11 @@ fn doctor_reports_ok_on_repo() {
     assert!(lines.iter().any(|line| line.starts_with("[ok] toolchain")));
     assert!(lines.iter().any(|line| line.starts_with("[ok] lockfile")));
     assert!(lines.iter().any(|line| line.starts_with("[ok] ci parity")));
-    assert!(lines
-        .iter()
-        .any(|line| line.starts_with("[ok] format conformance")));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("[ok] format conformance"))
+    );
 }
 
 #[test]
@@ -201,7 +203,7 @@ fn completions_generate_bash() {
 
 #[test]
 fn format_check_reports_non_canonical() {
-    use ledger_cli::format_check::{check_bytes, FormatCheckOutcome};
+    use ledger_cli::format_check::{FormatCheckOutcome, check_bytes};
 
     let canonical = [0x18, 0x2a];
     assert_eq!(check_bytes(&canonical), FormatCheckOutcome::Canonical);
@@ -607,7 +609,7 @@ fn repro_strict_default_passes() {
 // Helpers for binary-level artifact tests.
 
 fn generate_valid_decisions(seed: u64) -> Vec<usize> {
-    use ledger_cli::{seed_from_u64, DefaultMiniKv};
+    use ledger_cli::{DefaultMiniKv, seed_from_u64};
     use ledger_explorer::search::Workload;
     use ledger_sim::{Policy, RunConfig, Simulation};
     let workload = DefaultMiniKv;
@@ -1034,8 +1036,8 @@ fn cert_verify_rejects_oversized_file() {
 #[test]
 fn cert_verify_rejects_oversized_via_bounded_reader() {
     // A valid prefix plus padding still fails at the bounded reader limit.
-    use ledger_explorer::search::CampaignReport;
     use ledger_explorer::CampaignCertificate;
+    use ledger_explorer::search::CampaignReport;
     let dir = temp_dir("cert-oversize-bound");
     let report = CampaignReport {
         runs_executed: 10,

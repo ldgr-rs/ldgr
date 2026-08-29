@@ -1,9 +1,9 @@
 use super::input_axis::draw_inputs;
 use super::{
-    describe_variant, draw_fault_subset, draw_swarm, CampaignReport, Finding, SearchError,
-    Workload, SWARM_CAMPAIGN_MAX_DELAY_BUDGET, SWARM_CRASH_CEILING,
+    CampaignReport, Finding, SWARM_CAMPAIGN_MAX_DELAY_BUDGET, SWARM_CRASH_CEILING, SearchError,
+    Workload, describe_variant, draw_fault_subset, draw_swarm,
 };
-use crate::memo::{hash_inputs, memo_key, CampaignMemo, MemoEntry};
+use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
 use crate::oracle::Oracle;
 use crate::pbt::EnergyDistribution;
 use ledger_format::Hash;

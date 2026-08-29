@@ -22,8 +22,8 @@ use std::path::Path;
 use ledger_format::cbor::{self, CborValue};
 use ledger_format::hash_from_hex;
 use ledger_sim::{
-    canonical_hash, from_canonical_bytes, to_canonical_bytes, ConfigCanonicalError, LinkConfig,
-    Policy, RunConfig, SimFault, SwarmConfig, FORMAT_VERSION,
+    ConfigCanonicalError, FORMAT_VERSION, LinkConfig, Policy, RunConfig, SimFault, SwarmConfig,
+    canonical_hash, from_canonical_bytes, to_canonical_bytes,
 };
 
 fn fixtures_dir() -> std::path::PathBuf {

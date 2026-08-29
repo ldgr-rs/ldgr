@@ -1,15 +1,15 @@
 use super::input_axis::INPUT_AXIS_SAMPLE;
-use super::{find_first_violation, CampaignReport, Finding, SearchError, Workload};
+use super::{CampaignReport, Finding, SearchError, Workload, find_first_violation};
 use crate::ldfi::hypothesis_to_schedule;
 use crate::maxsat::encode_hazard;
-use crate::memo::{hash_inputs, memo_key, CampaignMemo, MemoEntry};
+use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
 use crate::oracle::Oracle;
-use crate::pbt::{gen_id, PbtBridge, INPUT_SAMPLE_RANGE};
-use crate::solver::{select_solver, FaultSolver, HittingSetSolver, SolverConfig};
+use crate::pbt::{INPUT_SAMPLE_RANGE, PbtBridge, gen_id};
+use crate::solver::{FaultSolver, HittingSetSolver, SolverConfig, select_solver};
 use crate::solver_state::{load as load_solver_state, save as save_solver_state};
 use ledger_format::{ActorId, Hash};
 use ledger_journal::Journal;
-use ledger_sim::{canonical_hash, Policy, RunConfig, SeedTree, Simulation};
+use ledger_sim::{Policy, RunConfig, SeedTree, Simulation, canonical_hash};
 use std::collections::HashSet;
 
 /// Opt-in cross-round state for the stateful campaign variants.

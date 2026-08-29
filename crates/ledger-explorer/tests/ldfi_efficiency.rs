@@ -52,10 +52,10 @@
 //! fault reproduction is schedule-dependent; the measured costs at those
 //! seeds are still real executions.
 
-use ledger_explorer::reference::ReferenceReplayError;
-use ledger_explorer::reference::{corpus_scenarios, CorpusScenario};
-use ledger_explorer::search::Workload;
 use ledger_explorer::Verdict;
+use ledger_explorer::reference::ReferenceReplayError;
+use ledger_explorer::reference::{CorpusScenario, corpus_scenarios};
+use ledger_explorer::search::Workload;
 use ledger_sim::{Instruction, RunConfig, RunResult, SeedTree, SimFault, Simulation};
 use rand_core::Rng;
 

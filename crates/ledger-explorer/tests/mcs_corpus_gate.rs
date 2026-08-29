@@ -6,11 +6,11 @@
 //! (`ledger_explorer::reference::corpus_scenarios`); this gate holds no
 //! private name-to-builder mapping.
 
+use ledger_explorer::MaxSatSolver;
 use ledger_explorer::certs::MAX_EVENT_COST;
 use ledger_explorer::ldfi::hypothesis_to_schedule;
-use ledger_explorer::reference::corpus_scenario;
 use ledger_explorer::reference::ReferenceReplayError;
-use ledger_explorer::MaxSatSolver;
+use ledger_explorer::reference::corpus_scenario;
 use ledger_format::RunManifest;
 use std::fs;
 use std::path::Path;

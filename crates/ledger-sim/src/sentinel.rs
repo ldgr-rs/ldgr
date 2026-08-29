@@ -196,7 +196,7 @@ pub(crate) fn belt_env_mode_from_env() -> BeltMode {
 /// Belt hook invoked at the sim run entry on Linux builds with `sentinel`.
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
 pub use crate::sentinel_belt::{
-    activate_process_belt, activate_process_belt_for_effective, TscTrapGuard,
+    TscTrapGuard, activate_process_belt, activate_process_belt_for_effective,
 };
 
 /// Sentinel belt errors.

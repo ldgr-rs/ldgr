@@ -55,9 +55,8 @@ pub use oracles::{
     last_write_wins_oracle, live_quorum_commit_oracle, single_leader_per_term_oracle,
 };
 pub use registry::{
-    all_corpus_scenarios, corpus_scenario, corpus_scenarios, corpus_v2_scenario,
-    corpus_v2_scenarios, scenario_class, CorpusRunner, CorpusScenario, ReferenceReplayError,
-    ScenarioClass,
+    CorpusRunner, CorpusScenario, ReferenceReplayError, ScenarioClass, all_corpus_scenarios,
+    corpus_scenario, corpus_scenarios, corpus_v2_scenario, corpus_v2_scenarios, scenario_class,
 };
 pub use sims::{
     mini_2pc, mini_cassandra, mini_cloud_az_double_assign, mini_cloud_config_drift,

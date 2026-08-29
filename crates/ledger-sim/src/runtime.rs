@@ -465,12 +465,16 @@ mod tests {
             .map(|entry| entry.data.kind)
             .collect::<Vec<_>>();
         assert!(kinds.iter().any(|kind| matches!(kind, EntryKind::Spawn)));
-        assert!(kinds
-            .iter()
-            .any(|kind| matches!(kind, EntryKind::ClockRead)));
-        assert!(kinds
-            .iter()
-            .any(|kind| matches!(kind, EntryKind::TimerFire)));
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, EntryKind::ClockRead))
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, EntryKind::TimerFire))
+        );
         assert!(kinds.iter().any(|kind| matches!(kind, EntryKind::Wake)));
         assert!(run.monitor_issues.is_empty());
     }

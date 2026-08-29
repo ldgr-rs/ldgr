@@ -5,22 +5,22 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use clap_complete::Shell;
 
-use ledger_cli::format_check::{check_file, FormatCheckOutcome};
+use ledger_cli::format_check::{FormatCheckOutcome, check_file};
 use ledger_cli::ldfi_cmd::{self, LdfiReport};
 use ledger_cli::scaffold;
 use ledger_cli::scaffold_consensus;
 use ledger_cli::{
-    generate_completions, is_verbose, seed_from_u64, Cli, Command, DefaultMiniKv, MaxSatEngineArg,
+    Cli, Command, DefaultMiniKv, MaxSatEngineArg, generate_completions, is_verbose, seed_from_u64,
 };
-use ledger_explorer::search::{replay_prefix, replay_strict, search, Workload};
-use ledger_explorer::{minimize_schedule, HistoryOracle, KeyValueSpec, Oracle};
+use ledger_explorer::search::{Workload, replay_prefix, replay_strict, search};
+use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle, minimize_schedule};
 use ledger_format::Hash;
 use ledger_sim::{Policy, ReplayViolation, RunConfig, RuntimeError, SimFault, Simulation};
 
