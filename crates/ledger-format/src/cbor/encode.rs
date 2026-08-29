@@ -5,32 +5,22 @@ use super::{CborError, CborValue, TAG_ALLOWLIST, compare_canonical_keys};
 impl CborValue {
     /// Returns the canonical serialized bytes of this value.
     ///
-    /// This method cannot fail. A value from the tolerant reader may hold
-    /// `-0.0`, `NaN`, or a disallowed tag; for those values the encoding
-    /// silently writes nothing. Use [`Self::try_to_canonical_bytes`] for
-    /// untrusted input so the failure is visible.
-    pub fn to_canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.encode(&mut out);
-        out
-    }
-
-    pub fn try_to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
+    /// Returns a [`CborError`] when encountering disallowed values (such as `-0.0`, `NaN`, or
+    /// disallowed tags).
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
         let mut out = Vec::new();
         self.try_encode(&mut out)?;
         Ok(out)
     }
 
+    /// Explicit alias for [`Self::to_canonical_bytes`].
+    pub fn try_to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
+        self.to_canonical_bytes()
+    }
+
     /// Encodes this value into the output byte buffer.
-    ///
-    /// On error nothing is written to the buffer. Values from the canonical
-    /// path always encode. Values from the tolerant reader can fail when they
-    /// hold `-0.0`, `NaN`, or a disallowed tag.
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        let start = out.len();
-        if self.try_encode(out).is_err() {
-            out.truncate(start);
-        }
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), CborError> {
+        self.try_encode(out)
     }
 
     /// Encodes this value into the output byte buffer, reporting the error.

@@ -466,4 +466,37 @@ mod tests {
         );
         assert_eq!(recovered2.step_counter, 2);
     }
+
+    #[test]
+    fn resume_async_executes_steps() {
+        let mut journal = Journal::new();
+        let plan = WorkflowPlan::plan(vec!["step_a".to_string(), "step_b".to_string()]).unwrap();
+        let mut wf = WorkflowExecution::new(1);
+        wf.set_plan(plan);
+
+        let fut = wf.resume_async(&mut journal, |name| {
+            let name = name.to_string();
+            async move {
+                match name.as_str() {
+                    "step_a" => Ok(10),
+                    "step_b" => Ok(20),
+                    _ => Err(FlowError::DuplicateStep("unknown".into())),
+                }
+            }
+        });
+
+        let mut pinned = Box::pin(fut);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let outcomes = match std::future::Future::poll(pinned.as_mut(), &mut cx) {
+            std::task::Poll::Ready(res) => res.unwrap(),
+            std::task::Poll::Pending => panic!("expected immediate ready"),
+        };
+
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].status, ResumeStatus::Executed);
+        assert_eq!(outcomes[0].result, 10);
+        assert_eq!(outcomes[1].status, ResumeStatus::Executed);
+        assert_eq!(outcomes[1].result, 20);
+    }
 }

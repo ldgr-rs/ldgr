@@ -269,6 +269,62 @@ impl WorkflowExecution {
         }
         Ok(outcomes)
     }
+
+    /// Asynchronous variant of [`Self::resume`] accepting an async step executor.
+    ///
+    /// # Errors
+    /// Returns [`FlowError::NoPlan`] when no plan is attached via
+    /// [`Self::set_plan`], [`FlowError::Journal`] when an append fails, and
+    /// propagates errors from `exec`.
+    pub async fn resume_async<F, Fut>(
+        &mut self,
+        journal: &mut Journal,
+        mut exec: F,
+    ) -> Result<Vec<StepOutcome>, FlowError>
+    where
+        F: FnMut(&str) -> Fut,
+        Fut: core::future::Future<Output = Result<u64, FlowError>>,
+    {
+        let steps: Vec<String> = self
+            .plan
+            .as_ref()
+            .ok_or(FlowError::NoPlan)?
+            .steps()
+            .to_vec();
+        let evidence = scan_step_evidence(journal, self.actor);
+
+        let mut outcomes = Vec::with_capacity(steps.len());
+        for name in &steps {
+            let outcome = match classify(name, &evidence) {
+                StepPrior::Skipped { result } => StepOutcome {
+                    name: name.clone(),
+                    status: ResumeStatus::Skipped,
+                    result,
+                },
+                StepPrior::InProgress(begin_hash) => {
+                    let value = exec(name).await?;
+                    self.step_end(journal, name, begin_hash, value)?;
+                    StepOutcome {
+                        name: name.clone(),
+                        status: ResumeStatus::Rerun,
+                        result: value,
+                    }
+                }
+                StepPrior::Pending => {
+                    let begin_hash = self.step_begin(journal, name)?;
+                    let value = exec(name).await?;
+                    self.step_end(journal, name, begin_hash, value)?;
+                    StepOutcome {
+                        name: name.clone(),
+                        status: ResumeStatus::Executed,
+                        result: value,
+                    }
+                }
+            };
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
+    }
 }
 
 /// Journal evidence about durable steps, keyed by step name.

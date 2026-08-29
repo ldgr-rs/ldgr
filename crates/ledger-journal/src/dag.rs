@@ -18,6 +18,7 @@ use ledger_format::{ActorId, EntryData, EntryKind, EntryPayload, Hash};
 const OVERLAY_THRESHOLD: usize = 1024;
 
 /// Error returned when a journal invariant is violated.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalError {
     /// A referenced parent is not present in the journal.

@@ -1,8 +1,8 @@
 [package]
 name = "ledger-adapters"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.90"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license = "Apache-2.0"
 description = "OTel ingest adapters for ledger journal"
 readme = "README.md"

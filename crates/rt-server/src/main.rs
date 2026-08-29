@@ -26,11 +26,15 @@ fn main() -> ExitCode {
             }
             "--seed" => {
                 i += 1;
-                if let Some(hex) = args.get(i)
-                    && let Some(bytes) = decode_hex(hex)
-                {
-                    seed = bytes;
-                }
+                let Some(hex) = args.get(i) else {
+                    eprintln!("rt-server: missing argument for --seed");
+                    return ExitCode::from(2);
+                };
+                let Some(bytes) = decode_hex(hex) else {
+                    eprintln!("rt-server: invalid 64-hex seed: {hex}");
+                    return ExitCode::from(2);
+                };
+                seed = bytes;
             }
             _ => {}
         }

@@ -149,7 +149,7 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         CborValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
         CborValue::Float(1.5),
     ]);
-    corpus.push(nested.to_canonical_bytes());
+    corpus.push(nested.to_canonical_bytes().unwrap());
 
     corpus
 }
