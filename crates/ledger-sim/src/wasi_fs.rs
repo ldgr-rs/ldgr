@@ -288,6 +288,25 @@ impl WasiFdTable {
         description.cursor = description.cursor.saturating_add(delta);
         Ok(())
     }
+
+    /// Check that `fd` is open and grants the requested direction before any
+    /// guest I/O runs on it.
+    pub fn check_io(&self, fd: u32, write: bool) -> Result<(), FdError> {
+        let description = self.get(fd).ok_or(FdError::NotOpen)?;
+        if description.closed {
+            return Err(FdError::Closed);
+        }
+        let granted = if write {
+            description.rights.write
+        } else {
+            description.rights.read
+        };
+        if granted {
+            Ok(())
+        } else {
+            Err(FdError::NotGranted)
+        }
+    }
 }
 
 #[cfg(test)]

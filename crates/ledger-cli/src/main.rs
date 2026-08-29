@@ -122,7 +122,6 @@ fn main() -> ExitCode {
             decisions,
         } => run_repro(
             &cli,
-            verbose,
             *seed,
             policy.to_policy(*exploration_constant, *priority_changes),
             *max_steps,
@@ -137,7 +136,6 @@ fn main() -> ExitCode {
             runs,
         } => run_minimize(
             &cli,
-            verbose,
             *seed,
             policy.to_policy(*exploration_constant, *priority_changes),
             *max_steps,
@@ -147,7 +145,7 @@ fn main() -> ExitCode {
             seed_a,
             seed_b,
             max_steps,
-        } => run_diff(&cli, verbose, *seed_a, *seed_b, *max_steps),
+        } => run_diff(&cli, *seed_a, *seed_b, *max_steps),
         Command::Doctor => run_doctor(&cli),
         Command::Init { dir, force, sut } => run_init(&cli, dir.as_deref(), *force, *sut),
         Command::Format { file, check } if *check => run_format_check(&cli, file),
@@ -176,7 +174,7 @@ fn main() -> ExitCode {
                 workload,
             } => run_faults_apply(&cli, file, seed_hex, workload),
         },
-        Command::Coverage { input, format } => run_coverage(&cli, input, format),
+        Command::Coverage { input, format } => run_coverage(input, format),
         Command::Scaffold {
             template,
             dir,
@@ -297,7 +295,6 @@ fn run_sim(
 
 fn run_repro(
     cli: &Cli,
-    _verbose: bool,
     seed: u64,
     policy: Policy,
     max_steps: usize,
@@ -454,7 +451,6 @@ fn strict_violation_exit(
 
 fn run_minimize(
     cli: &Cli,
-    _verbose: bool,
     seed: u64,
     policy: Policy,
     max_steps: usize,
@@ -494,7 +490,6 @@ fn run_minimize(
 
 fn run_diff(
     cli: &Cli,
-    _verbose: bool,
     seed_a: u64,
     seed_b: u64,
     max_steps: usize,
@@ -871,11 +866,7 @@ fn run_faults_apply(
     }
 }
 
-fn run_coverage(
-    _cli: &Cli,
-    input: &Path,
-    format: &str,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn run_coverage(input: &Path, format: &str) -> Result<ExitCode, Box<dyn std::error::Error>> {
     match ledger_cli::coverage_cmd::run(input, format) {
         Ok(output) => {
             println!("{output}");
