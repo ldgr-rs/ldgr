@@ -4,11 +4,13 @@
 //! LDFI fault hypotheses, and replays the top hypothesis with fault
 //! injection to report how many faults applied or were voided.
 
-use ledger_explorer::ldfi::hypothesis_to_schedule;
-use ledger_explorer::maxsat::encode_hazard;
+use ledger_explorer::FaultHypothesis;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
-use ledger_explorer::search::{FaultReplayError, SearchError, replay_with_faults, search};
-use ledger_explorer::{FaultHypothesis, SolverConfig, SolverError, select_solver, solve_with};
+use ledger_explorer::services::ServiceError;
+use ledger_explorer::services::{
+    ldfi_solve, replay_faults, schedule_from_hypothesis, search_first,
+};
+use ledger_explorer::solver::SolverConfig;
 use ledger_format::Hash;
 use ledger_sim::{Policy, RunConfig, SimFault};
 use thiserror::Error;
@@ -18,15 +20,9 @@ use crate::{DefaultMiniKv, MaxSatEngineArg, default_pct_mix, seed_from_u64};
 /// Errors from the `ldfi` campaign driver.
 #[derive(Debug, Error)]
 pub enum LdfiCmdError {
-    /// Campaign search failed.
+    /// A service operation failed; the source error is preserved.
     #[error(transparent)]
-    Search(#[from] SearchError),
-    /// Ranking the fault hypotheses failed.
-    #[error(transparent)]
-    Solve(#[from] SolverError),
-    /// Fault replay failed.
-    #[error(transparent)]
-    Replay(#[from] FaultReplayError),
+    Service(#[from] ServiceError),
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +87,7 @@ pub fn run_ldfi(
         .max_steps(max_steps)
         .build();
 
-    let Some(finding) = search(&workload, &oracle, config, attempts)? else {
+    let Some(finding) = search_first(&workload, &oracle, config, attempts)? else {
         return Ok(None);
     };
 
@@ -101,17 +97,13 @@ pub fn run_ldfi(
         engine: maxsat_engine.to_solver_engine(),
         ..SolverConfig::default()
     };
-    let encoded = encode_hazard(&finding.run.journal, &finding.verdict, &solver_config)
-        .map_err(LdfiCmdError::Solve)?;
-    let mut solver = select_solver(&solver_config, &encoded);
     let hypotheses: Vec<FaultHypothesis> =
-        solve_with(solver.as_mut(), &finding.run.journal, &finding.verdict)
-            .map_err(LdfiCmdError::Solve)?;
+        ldfi_solve(&finding.run.journal, &finding.verdict, &solver_config)?;
     let schedule = hypotheses
         .first()
-        .map(|top| hypothesis_to_schedule(top, &finding.run.journal))
+        .map(|top| schedule_from_hypothesis(top, &finding.run.journal))
         .unwrap_or_default();
-    let replay_report = replay_with_faults(
+    let replay_report = replay_faults(
         &workload,
         &finding.run.journal,
         finding.seed,
