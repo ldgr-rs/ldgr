@@ -7,9 +7,8 @@
 //! patterns). The blake3 [`RuntimeProfile::fingerprint`] over the canonical
 //! field encoding is the handshake identity:
 //!
-//! - Wire: `WorkerRequest.profile_fingerprint` carries the hex fingerprint;
-//!   `proto::validate_request` checks format and, when the server pins an
-//!   expected profile, rejects mismatches.
+//! - Wire: the session hello carries the hex fingerprint in
+//!   `RuntimeProfile.fingerprint_hex`; the control plane validates it.
 //! - Certificates: emission sites append `+<hex8>` to the builder id when
 //!   `LEDGER_PROFILE_FINGERPRINT` is set (see
 //!   `examples/nightly_swarm_campaign.rs`), binding certificates to the
@@ -123,9 +122,6 @@ fn feature_list() -> String {
     }
     if cfg!(feature = "grpc") {
         features.push("grpc");
-    }
-    if cfg!(feature = "pg") {
-        features.push("pg");
     }
     if cfg!(feature = "sim-fs-journaling") {
         features.push("sim-fs-journaling");
@@ -243,9 +239,6 @@ mod tests {
         }
         if cfg!(feature = "grpc") {
             expected.push("grpc");
-        }
-        if cfg!(feature = "pg") {
-            expected.push("pg");
         }
         if cfg!(feature = "sim-fs-journaling") {
             expected.push("sim-fs-journaling");

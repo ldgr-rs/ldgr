@@ -209,9 +209,8 @@ impl InMemoryQueue {
 
     /// Remove and return a task by id, searching both queued and leased slots.
     ///
-    /// Used by [`crate::proto::serve_uds_real`] to fulfill a UDS request with
-    /// the real simulation root. When the task is not found the UDS layer
-    /// replies with an error response instead of a fabricated root. Terminal
+    /// Used by the standalone drain loop to take a task by id. Terminal
+    /// tasks (failed, cancelled, done) are never returned.
     /// tasks (failed, cancelled, done) are never returned.
     pub fn take_by_id(&mut self, task_id: &str) -> Option<Task> {
         if let Some(pos) = self.queue.iter().position(|t| t.id == task_id) {

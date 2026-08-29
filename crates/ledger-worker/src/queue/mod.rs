@@ -1,17 +1,15 @@
 //! Task queue backends and their shared contracts.
 //!
 //! The module root keeps the task model ([`Task`], [`TaskStatus`]) and the
-//! [`TaskQueue`] trait. [`wire`] owns the queue-file serde projections,
-//! [`memory`] owns the lease-accounting in-memory backend, and `pg`
-//! (feature-gated) owns the River/Postgres backend. The root re-exports
-//! every public item so the historical `queue` API surface is unchanged.
+//! [`TaskQueue`] trait. [`wire`] owns the queue-file serde projections and
+//! [`memory`] owns the lease-accounting in-memory backend used by
+//! standalone mode. The root re-exports every public item so the historical
+//! `queue` API surface is unchanged.
 
 use ledger_format::Hash;
 use ledger_sim::RunConfig;
 
 mod memory;
-#[cfg(feature = "pg")]
-pub mod pg;
 mod wire;
 
 pub use memory::InMemoryQueue;
@@ -113,7 +111,7 @@ pub trait TaskQueue {
     /// Acknowledge completion and release the lease.
     ///
     /// Default no-op keeps trait object compatible for stubs. Real queues
-    /// (Postgres/River) delete or complete the job; [`InMemoryQueue`] moves
+    /// (external control plane) delete or complete the job; [`InMemoryQueue`] moves
     /// the task to the terminal done list.
     fn ack(&mut self, _task_id: &str) {}
 

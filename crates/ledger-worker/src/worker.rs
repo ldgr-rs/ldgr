@@ -11,6 +11,43 @@ use crate::artifact::{ArtifactSink, NoopSink, WORKER_BUILDER_ID, certificate_jso
 use crate::config::WorkerConfig;
 use crate::queue::{InMemoryQueue, Task, TaskQueue};
 
+/// One failure class routed through the worker's single failure funnel.
+///
+/// Every task-ending failure - transport, join, execution, upload,
+/// unknown workload, or cancellation - funnels into the same transition:
+/// charge one attempt and requeue or retire the task
+/// ([`route_failure`]). Keeping the classes explicit makes the funnel's
+/// coverage testable without message-text matching.
+#[derive(Debug)]
+pub enum TaskFailure {
+    /// The session transport broke while the task was in flight.
+    Transport(String),
+    /// The blocking-pool execution task panicked.
+    Join(String),
+    /// The deterministic execution rejected the task.
+    Execution(WorkerError),
+    /// Uploading the result to the control plane failed.
+    Upload(String),
+    /// The dispatch named a workload the worker does not implement.
+    UnknownWorkload(String),
+    /// The control plane cancelled the task.
+    Cancelled(String),
+}
+
+impl TaskFailure {
+    /// Human-readable cause for logs and the attempt record.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Transport(reason) => format!("transport: {reason}"),
+            Self::Join(reason) => format!("join: {reason}"),
+            Self::Execution(err) => err.to_string(),
+            Self::Upload(reason) => format!("upload: {reason}"),
+            Self::UnknownWorkload(name) => format!("unknown workload: {name}"),
+            Self::Cancelled(reason) => format!("cancelled: {reason}"),
+        }
+    }
+}
+
 /// Result of a successful task execution.
 #[derive(Debug, Clone)]
 pub struct WorkerResult {
@@ -39,6 +76,15 @@ pub enum WorkerError {
     HashMismatch {
         /// Identifier of the rejected task.
         task_id: String,
+    },
+    /// The dispatch named a workload the worker does not implement; the
+    /// task fails closed instead of running a substitute program.
+    #[error("unknown workload {workload} for task {task_id}")]
+    UnknownWorkload {
+        /// Identifier of the rejected task.
+        task_id: String,
+        /// Workload name carried by the dispatch.
+        workload: String,
     },
     /// The task pinned an execution-identity digest that differs from the
     /// identity the worker assembled for it; the run is rejected before
@@ -137,17 +183,27 @@ impl Worker {
                 self.queue.ack(&result.task_id);
                 Ok(Some(result))
             }
-            Err(err) => Err(route_failure(self.queue.as_mut(), &task_id, err)),
+            Err(err) => Err(route_failure(
+                self.queue.as_mut(),
+                &task_id,
+                TaskFailure::Execution(err),
+            )),
         }
     }
 }
 
-/// Charge a failed execution against the queue's attempt accounting.
+/// Charge a failed task through the queue's attempt accounting.
 ///
-/// Maps the queue's routing decision onto [`WorkerError::TaskFailed`]; when
-/// the queue does not track leases (stub default) the original error is
-/// returned unchanged.
-pub fn route_failure(queue: &mut dyn TaskQueue, task_id: &str, err: WorkerError) -> WorkerError {
+/// This is the worker's single failure funnel: every task-ending failure
+/// class ([`TaskFailure`]) converges here, maps onto the queue's routing
+/// decision, and surfaces as [`WorkerError::TaskFailed`] when the queue
+/// tracks leases. Queues that do not track leases (stub default) return
+/// the original error unchanged so callers keep the typed cause.
+pub fn route_failure(
+    queue: &mut dyn TaskQueue,
+    task_id: &str,
+    failure: TaskFailure,
+) -> WorkerError {
     match queue.report_failure(task_id) {
         Some(crate::queue::AttemptOutcome::Retried {
             attempts,
@@ -156,15 +212,23 @@ pub fn route_failure(queue: &mut dyn TaskQueue, task_id: &str, err: WorkerError)
             task_id: task_id.to_string(),
             attempts,
             max_attempts,
-            detail: err.to_string(),
+            detail: failure.message(),
         },
         Some(crate::queue::AttemptOutcome::Exhausted { attempts }) => WorkerError::TaskFailed {
             task_id: task_id.to_string(),
             attempts,
             max_attempts: attempts,
-            detail: err.to_string(),
+            detail: failure.message(),
         },
-        None => err,
+        None => match failure {
+            TaskFailure::Execution(err) => err,
+            other => WorkerError::TaskFailed {
+                task_id: task_id.to_string(),
+                attempts: 0,
+                max_attempts: 0,
+                detail: other.message(),
+            },
+        },
     }
 }
 
@@ -263,11 +327,16 @@ pub async fn execute_with_heartbeat(
         }
         Err(err) => {
             let mut q = queue.lock().await;
-            Err(route_failure(&mut *q, &task_id, err))
+            Err(route_failure(
+                &mut *q,
+                &task_id,
+                TaskFailure::Execution(err),
+            ))
         }
     }
 }
 
+#[derive(Debug)]
 pub struct SmallWorkload(Vec<Vec<Instruction>>);
 
 impl Workload for SmallWorkload {
@@ -286,10 +355,10 @@ impl Workload for SmallWorkload {
 /// Execute a single task through the deterministic simulation.
 ///
 /// Shared helper used by [`Worker::run_one`], [`execute_with_heartbeat`], and
-/// [`crate::proto::serve_uds_real`] so the UDS boundary and the in-process
-/// dispatcher run identical logic. Validates the queued `run_config_hash`,
-/// exercises the explorer campaign, and runs the simulation to produce the
-/// journal root.
+/// the session client ([`crate::transport::run_assigned_task`]) so the wire
+/// boundary and the in-process dispatcher run identical logic. Validates the
+/// queued `run_config_hash`, exercises the explorer campaign, and runs the
+/// simulation to produce the journal root.
 ///
 pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerError> {
     // Always recompute and compare. A task without a stored hash (its config
@@ -324,7 +393,7 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
             });
         }
     }
-    let workload = workload_for(&task.workload);
+    let workload = workload_for(&task.workload)?;
     let oracle = AlwaysPassOracle;
     let campaign =
         ledger_explorer::services::run_campaign(&workload, &oracle, task.run_config.clone(), 1)?;
@@ -374,21 +443,20 @@ fn task_identity(
     Ok(ledger_explorer::identity::assemble_identity(&build, &context).digest())
 }
 
-pub fn workload_for(name: &str) -> SmallWorkload {
+pub fn workload_for(name: &str) -> Result<SmallWorkload, WorkerError> {
     match name {
-        "kv" => SmallWorkload(vec![
+        "kv" => Ok(SmallWorkload(vec![
             vec![Instruction::Send { to: 1, payload: 42 }, Instruction::Done],
             vec![
                 Instruction::Receive,
                 Instruction::Outcome,
                 Instruction::Done,
             ],
-        ]),
-        _ => SmallWorkload(vec![vec![
-            Instruction::Set(0),
-            Instruction::Outcome,
-            Instruction::Done,
-        ]]),
+        ])),
+        _ => Err(WorkerError::UnknownWorkload {
+            task_id: String::new(),
+            workload: name.to_string(),
+        }),
     }
 }
 
@@ -418,7 +486,7 @@ mod tests {
         // either because the worker build data is incomplete (dev builds) or
         // because the assembled identity differs (any build). Both arms are
         // fail-closed; neither lets a mismatched task execute.
-        let mut task = Task::new("pinned", RunConfig::default(), "trivial");
+        let mut task = Task::new("pinned", RunConfig::default(), "kv");
         task.execution_identity = Some([0xab; 32]);
         let error = execute_task(task).expect_err("pinned identity must reject the task");
         assert!(
@@ -432,7 +500,7 @@ mod tests {
 
     #[test]
     fn unpinned_task_records_its_identity() {
-        let task = Task::new("unpinned", RunConfig::default(), "trivial");
+        let task = Task::new("unpinned", RunConfig::default(), "kv");
         let result = execute_task(task).expect("unpinned task must run");
         // The recorded digest follows the worker build: complete builds carry
         // a digest, incomplete builds carry None (the control plane treats
@@ -446,8 +514,8 @@ mod tests {
         let config = WorkerConfig::default();
         let mut q = InMemoryQueue::new(Duration::from_secs(30));
         let run_config = RunConfig::builder().seed([11u8; 32]).build();
-        q.push(Task::new("task-1", run_config.clone(), "trivial"));
-        q.push(Task::new("task-2", run_config, "trivial"));
+        q.push(Task::new("task-1", run_config.clone(), "kv"));
+        q.push(Task::new("task-2", run_config, "kv"));
         let mut worker = Worker::new(config, Box::new(q));
         let first = worker.run_one().unwrap().unwrap();
         let second = worker.run_one().unwrap().unwrap();
@@ -469,12 +537,12 @@ mod tests {
         let mut q = InMemoryQueue::new(Duration::from_secs(30));
         let run_config = RunConfig::builder().seed([9u8; 32]).build();
         // Push correctly hashes at queue layer.
-        q.push(Task::new("ok", run_config.clone(), "trivial"));
+        q.push(Task::new("ok", run_config.clone(), "kv"));
         let mut worker = Worker::new(config, Box::new(q));
         assert!(worker.run_one().unwrap().is_some());
         // Now craft a task with tampered hash to ensure boundary rejects mismatch.
         let bad_hash = [0xffu8; 32];
-        let mut bad_task = crate::queue::Task::new("bad", run_config.clone(), "trivial");
+        let mut bad_task = crate::queue::Task::new("bad", run_config.clone(), "kv");
         bad_task.run_config_hash = Some(bad_hash);
         // Directly inject bad task via a custom queue to bypass push hashing.
         struct BadQueue(crate::queue::Task);
@@ -532,7 +600,7 @@ mod tests {
             }
         }
         // The tampered hash forces the execution error; routing wraps it.
-        let mut doomed = Task::new("doomed", RunConfig::default(), "trivial");
+        let mut doomed = Task::new("doomed", RunConfig::default(), "kv");
         doomed.run_config_hash = Some([0xffu8; 32]);
         let queue = FailingQueue {
             leased: Some(doomed),
@@ -613,7 +681,7 @@ mod tests {
 
         let sink = std::sync::Arc::new(RecordingSink(std::sync::Mutex::new(Vec::new())));
         let mut q = InMemoryQueue::new(Duration::from_secs(30));
-        q.push(Task::new("cert-task", RunConfig::default(), "trivial"));
+        q.push(Task::new("cert-task", RunConfig::default(), "kv"));
         let mut worker =
             Worker::new(WorkerConfig::default(), Box::new(q)).with_artifact_sink(sink.clone());
         let result = worker.run_one().unwrap().expect("task must succeed");
@@ -629,7 +697,7 @@ mod tests {
 
         // A broken sink must not fail the task.
         let mut q = InMemoryQueue::new(Duration::from_secs(30));
-        q.push(Task::new("still-runs", RunConfig::default(), "trivial"));
+        q.push(Task::new("still-runs", RunConfig::default(), "kv"));
         let mut worker = Worker::new(WorkerConfig::default(), Box::new(q))
             .with_artifact_sink(std::sync::Arc::new(FailingSink));
         let done = worker
@@ -648,7 +716,7 @@ mod tests {
         queue
             .lock()
             .await
-            .push(Task::new("hb-task", RunConfig::default(), "trivial"));
+            .push(Task::new("hb-task", RunConfig::default(), "kv"));
         let task = queue.lock().await.pull().unwrap();
 
         let result = execute_with_heartbeat(Arc::clone(&queue), task, lease / 3, lease)
@@ -669,7 +737,7 @@ mod tests {
         queue
             .lock()
             .await
-            .push(Task::new("hb-orphan", RunConfig::default(), "trivial"));
+            .push(Task::new("hb-orphan", RunConfig::default(), "kv"));
         let orphan = queue.lock().await.pull().unwrap();
         let id = orphan.id.clone();
         // Remove the lease behind the executor's back to hit the warning path.
@@ -680,4 +748,63 @@ mod tests {
         let res = execute_with_heartbeat(Arc::clone(&queue), orphan, lease / 3, lease).await;
         assert!(res.is_ok(), "missing lease must not fail execution");
     }
+}
+
+/// Every failure arm funnels into the same transition: one attempt is
+/// charged and the task requeues or retires. This pins the plan's
+/// single-funnel contract across transport, join, execution, upload,
+/// unknown-workload, and cancellation failures.
+#[test]
+fn every_failure_arm_funnels_through_one_transition() {
+    struct CountingQueue {
+        failures: usize,
+    }
+    impl crate::queue::TaskQueue for CountingQueue {
+        fn pull(&mut self) -> Option<Task> {
+            None
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn report_failure(&mut self, _task_id: &str) -> Option<crate::queue::AttemptOutcome> {
+            self.failures += 1;
+            Some(crate::queue::AttemptOutcome::Retried {
+                attempts: 1,
+                max_attempts: 3,
+            })
+        }
+    }
+    let arms: Vec<TaskFailure> = vec![
+        TaskFailure::Transport("stream closed".to_string()),
+        TaskFailure::Join("blocking pool panicked".to_string()),
+        TaskFailure::Execution(WorkerError::HashMismatch {
+            task_id: "t".to_string(),
+        }),
+        TaskFailure::Upload("rejected".to_string()),
+        TaskFailure::UnknownWorkload("bogus".to_string()),
+        TaskFailure::Cancelled("lease expired".to_string()),
+    ];
+    for arm in arms {
+        let mut queue = CountingQueue { failures: 0 };
+        let err = route_failure(&mut queue, "t", arm);
+        assert_eq!(
+            queue.failures, 1,
+            "each arm must charge exactly one attempt"
+        );
+        assert!(
+            matches!(err, WorkerError::TaskFailed { .. }),
+            "each arm must surface as TaskFailed, got {err:?}"
+        );
+    }
+}
+
+/// Unknown workloads fail closed: `workload_for` rejects the name
+/// instead of running a substitute program.
+#[test]
+fn unknown_workload_fails_closed() {
+    let err = workload_for("no-such-workload").expect_err("must reject");
+    assert!(
+        matches!(err, WorkerError::UnknownWorkload { ref workload, .. } if workload == "no-such-workload"),
+        "got {err:?}"
+    );
 }

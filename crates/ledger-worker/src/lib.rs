@@ -2,24 +2,22 @@
 
 //! Campaign task execution daemon.
 //!
-//! The worker pulls [`Task`] items from a [`TaskQueue`], runs them through
-//! the deterministic simulation, and reports the journal root. Leases carry
-//! attempt budgets, extension (heartbeat), cancellation, and terminal states;
-//! see [`TaskStatus`]. The runtime profile handshake in [`RuntimeProfile`]
-//! binds worker identity to the engine build and host shape. The JSON-lines
-//! protocol in [`WorkerRequest`] is the legacy UDS worker path; with the
-//! `grpc` feature, [`serve_grpc_uds`] delivers the tonic-generated
-//! `ControlPlane` as real gRPC over a Unix domain socket, and the `r#gen`
-//! module holds the generated `ledger.control.v1` wire bindings. With the
-//! `pg` feature,
-//! [`PostgresQueue`] implements the Postgres/River queue backend (schema
-//! `river.job`) driven by the daemon's `--pg-dsn` drain loop. Artifact
-//! publication is best-effort: the default [`NoopSink`] logs only, and the
-//! `control-plane` feature (optional, off by default) swaps in an HTTP sink.
+//! The worker is a pure client: it hosts no control-plane service. In
+//! standalone mode it drains a local queue file through the in-memory
+//! [`InMemoryQueue`]; with the `grpc` feature it dials the external control
+//! plane over one outbound `ledger.control.v2` session and executes the
+//! tasks the control plane assigns over that session, uploading results
+//! carrying the [`ExecutionIdentity`](ledger_journal::ExecutionIdentity)
+//! digest. Leases carry attempt budgets, extension (heartbeat),
+//! cancellation, and terminal states; see [`TaskStatus`]. The runtime
+//! profile handshake in [`RuntimeProfile`] binds worker identity to the
+//! engine build and host shape. Artifact publication is best-effort: the
+//! default [`NoopSink`] logs only, and the `control-plane` feature
+//! (optional, off by default) swaps in an HTTP sink.
 //!
 //! The crate exposes a curated root facade: implementation modules stay
-//! private and every public contract item is re-exported here. The generated
-//! protobuf bindings stay public as `r#gen` because they are the
+//! private and every public contract item is re-exported here. The
+//! generated protobuf bindings stay public as `r#gen` because they are the
 //! control-plane wire contract.
 
 mod artifact;
@@ -36,25 +34,21 @@ mod transport;
 #[cfg(feature = "control-plane")]
 pub use artifact::HttpSink;
 pub use artifact::{ArtifactError, ArtifactSink, NoopSink, WORKER_BUILDER_ID, checksum_hex};
-pub use config::{WorkerConfig, default_uds_path, private_socket_dir};
+pub use config::WorkerConfig;
 pub use profile::{DEFAULT_ENV_SANITATION, RuntimeProfile};
-pub use proto::{
-    MAX_CONCURRENT_UDS_CONNECTIONS, MAX_UDS_LINE_SIZE, UDS_READ_TIMEOUT, WorkerRequest,
-    WorkerResponse, canonical_bytes, hash_to_hex, hex_to_hash, profile_pin_matches,
-    run_config_hash, serve_uds_real, validate_request, validate_request_hex8,
-};
-#[cfg(feature = "pg")]
-pub use queue::pg::{PostgresQueue, QueueError, RIVER_SCHEMA_SQL};
+pub use proto::{canonical_bytes, hash_to_hex, hex_to_hash, profile_pin_matches, run_config_hash};
 pub use queue::{
     AttemptOutcome, DEFAULT_MAX_ATTEMPTS, FlatQueueFileLine, InMemoryQueue, QueueFileError,
     QueueFileLine, Task, TaskQueue, TaskSpecError, TaskStatus, WorkerTaskSpec,
 };
 #[cfg(feature = "grpc")]
 pub use transport::{
-    ArtifactSvc, MAX_MESSAGE_SIZE, WorkerControlSvc, WorkerSvc, connect_grpc_uds, serve_grpc_uds,
+    MAX_MESSAGE_SIZE, SessionError, TaskOutcome, handle_cancel, next_response, open_session,
+    run_assigned_task, session_ack_worker_id, task_from_dispatch, unix_endpoint, upload_failure,
+    worker_hello,
 };
 pub use worker::{
-    Worker, WorkerError, WorkerResult, execute_task, execute_with_heartbeat,
+    TaskFailure, Worker, WorkerError, WorkerResult, execute_task, execute_with_heartbeat,
     publish_result_certificate, route_failure, workload_for,
 };
 
@@ -64,9 +58,7 @@ pub use worker::{
 /// otherwise returns `Some(json)` with fields `task_id`, `journal_root` (64-hex
 /// lowercase), and `steps`. [`Worker::run_one`] acks the lease on success,
 /// marking the task done, and charges failed attempts against the task's
-/// budget. [`TaskQueue`] is the sync seam behind this entry point; the
-/// Postgres/River backend (`PostgresQueue`, `pg` feature) is async-only and driven
-/// directly by the daemon's `--pg-dsn` drain loop.
+/// budget through the single failure funnel ([`route_failure`]).
 ///
 /// This is the in-process entry point used by the `ledger-worker --drain-once`
 /// binary and by `tests/standalone.rs`.

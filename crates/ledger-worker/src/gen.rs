@@ -1,20 +1,18 @@
-//! Generated `ledger.control.v1` wire bindings.
+//! Generated `ledger.control.v2` wire bindings.
 //!
 //! The contract lives in
-//! `crates/ledger-format/proto/ledger/control/v1/control.proto`. With the
+//! `crates/ledger-format/proto/ledger/control/v2/control.proto`. With the
 //! `grpc` feature, this module holds the tonic/prost mirror of every message
 //! and the service stubs. The build script regenerates
-//! `gen/ledger.control.v1.rs` on every `grpc` build where `protoc` succeeds;
+//! `gen/ledger.control.v2.rs` on every `grpc` build where `protoc` succeeds;
 //! the checked-in copy keeps offline builds working because `include!`
 //! resolves against this source tree, not `OUT_DIR`.
 //!
-//! This module is the single wire codec for the control plane. The former
-//! hand-rolled codec in `pb.rs` was deleted after the generated bindings
-//! proved wire-identical in parity tests; prost skips unknown fields, so
-//! older readers tolerate newer writers.
+//! This module is the single wire codec for the control plane. prost skips
+//! unknown fields, so older readers tolerate newer writers within v2.
 
 #[cfg(feature = "grpc")]
-include!("gen/ledger.control.v1.rs");
+include!("gen/ledger.control.v2.rs");
 
 #[cfg(all(test, feature = "grpc"))]
 mod tests {
@@ -57,10 +55,12 @@ mod tests {
         encode_raw_varint((u64::from(field) << 3) | u64::from(wire_type), out);
     }
 
-    fn sample_identity() -> WorkerIdentity {
-        WorkerIdentity {
+    fn sample_hello() -> WorkerHello {
+        WorkerHello {
             worker_id: "worker-7".to_string(),
             version: "0.1.0".to_string(),
+            execution_identity: [0xabu8; 32].to_vec(),
+            profile: Some(sample_profile()),
         }
     }
 
@@ -76,21 +76,35 @@ mod tests {
         }
     }
 
-    fn sample_register() -> RegisterWorkerRequest {
-        RegisterWorkerRequest {
-            identity: Some(sample_identity()),
-            profile: Some(sample_profile()),
+    fn sample_dispatch() -> TaskDispatch {
+        TaskDispatch {
+            task_id: "t1".to_string(),
+            run_config_bytes: vec![1, 2, 3],
+            workload: "kv".to_string(),
+            run_config_hash_hex: "ab".repeat(32),
+            execution_identity: [0xcdu8; 32].to_vec(),
+        }
+    }
+
+    fn sample_upload() -> ResultUpload {
+        ResultUpload {
+            task_id: "t1".to_string(),
+            journal_root_hex: "ef".repeat(32),
+            steps: 4096,
+            ok: true,
+            error: String::new(),
+            execution_identity: [0xabu8; 32].to_vec(),
         }
     }
 
     // Round-trips prove encode/decode agreement for every message the
-    // control plane exchanges in the v1 contract.
+    // session exchanges in the v2 contract.
 
     #[test]
-    fn worker_identity_round_trip() {
-        let msg = sample_identity();
+    fn worker_hello_round_trip() {
+        let msg = sample_hello();
         let bytes = msg.encode_to_vec();
-        assert_eq!(WorkerIdentity::decode(bytes.as_slice()).unwrap(), msg);
+        assert_eq!(WorkerHello::decode(bytes.as_slice()).unwrap(), msg);
     }
 
     #[test]
@@ -101,134 +115,194 @@ mod tests {
     }
 
     #[test]
-    fn register_worker_round_trip_preserves_submessages() {
-        let msg = sample_register();
+    fn session_ack_round_trip() {
+        let msg = SessionAck {
+            accepted: false,
+            assigned_worker_id: String::new(),
+            reason: "build rejected".to_string(),
+        };
         let bytes = msg.encode_to_vec();
-        let back = RegisterWorkerRequest::decode(bytes.as_slice()).unwrap();
+        assert_eq!(SessionAck::decode(bytes.as_slice()).unwrap(), msg);
+    }
+
+    #[test]
+    fn task_dispatch_round_trip_preserves_identity() {
+        let msg = sample_dispatch();
+        let bytes = msg.encode_to_vec();
+        let back = TaskDispatch::decode(bytes.as_slice()).unwrap();
         assert_eq!(back, msg);
+        assert_eq!(back.execution_identity, [0xcdu8; 32].to_vec());
+    }
+
+    #[test]
+    fn result_upload_round_trip_preserves_identity_and_steps() {
+        let msg = sample_upload();
+        let bytes = msg.encode_to_vec();
+        let back = ResultUpload::decode(bytes.as_slice()).unwrap();
+        assert_eq!(back, msg);
+        assert_eq!(back.steps, 4096);
+        assert_eq!(back.execution_identity, [0xabu8; 32].to_vec());
     }
 
     #[test]
     fn heartbeat_round_trip() {
-        let msg = HeartbeatRequest {
+        let msg = Heartbeat {
             worker_id: "w".to_string(),
             task_id: "t".to_string(),
             attempts: 7,
         };
         let bytes = msg.encode_to_vec();
-        assert_eq!(HeartbeatRequest::decode(bytes.as_slice()).unwrap(), msg);
+        assert_eq!(Heartbeat::decode(bytes.as_slice()).unwrap(), msg);
     }
 
     #[test]
-    fn lease_dispatch_round_trip() {
-        let msg = LeaseResponse {
-            tasks: vec![TaskDispatch {
-                task_id: "t1".to_string(),
-                run_config_bytes: vec![1, 2, 3],
-                workload: "kv".to_string(),
-                run_config_hash_hex: "ab".repeat(32),
-            }],
-        };
-        let bytes = msg.encode_to_vec();
-        assert_eq!(LeaseResponse::decode(bytes.as_slice()).unwrap(), msg);
-    }
-
-    #[test]
-    fn task_progress_counters_round_trip() {
-        let msg = TaskProgress {
+    fn cancel_round_trip() {
+        let msg = CancelTask {
             task_id: "t".to_string(),
-            phase: "run".to_string(),
-            counters: [("steps".to_string(), 10u64), ("retries".to_string(), 2u64)]
-                .into_iter()
-                .collect(),
+            reason: "lease expired".to_string(),
         };
         let bytes = msg.encode_to_vec();
-        let back = TaskProgress::decode(bytes.as_slice()).unwrap();
-        assert_eq!(back.counters.len(), 2);
-        assert_eq!(back.counters.get("steps"), Some(&10));
-        assert_eq!(back.counters.get("retries"), Some(&2));
+        assert_eq!(CancelTask::decode(bytes.as_slice()).unwrap(), msg);
+    }
+
+    #[test]
+    fn session_request_hello_oneof_round_trip() {
+        let msg = SessionRequest {
+            message: Some(session_request::Message::Hello(sample_hello())),
+        };
+        let bytes = msg.encode_to_vec();
+        let back = SessionRequest::decode(bytes.as_slice()).unwrap();
+        assert!(matches!(
+            back.message,
+            Some(session_request::Message::Hello(_))
+        ));
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn session_response_assign_oneof_round_trip() {
+        let msg = SessionResponse {
+            message: Some(session_response::Message::Assign(sample_dispatch())),
+        };
+        let bytes = msg.encode_to_vec();
+        let back = SessionResponse::decode(bytes.as_slice()).unwrap();
+        assert!(matches!(
+            back.message,
+            Some(session_response::Message::Assign(_))
+        ));
+        assert_eq!(back, msg);
     }
 
     // Wire-layout pins: the proto source names these field numbers, and a
     // renumber without an approved format change would flip these bytes.
 
     #[test]
-    fn register_worker_field_numbers_stable() {
-        let bytes = sample_register().encode_to_vec();
+    fn worker_hello_field_numbers_stable() {
+        let bytes = sample_hello().encode_to_vec();
         assert_eq!(
             bytes[0], 0x0A,
-            "RegisterWorkerRequest identity field should be 1/LEN => 0x0A"
+            "WorkerHello worker_id must be field 1/LEN => 0x0A"
         );
+        // worker_id body, then version (2/LEN => 0x12), then
+        // execution_identity (3/LEN => 0x1A).
+        let worker_id_len = 8u64; // "worker-7"
+        let pos = varint_len(0x0A) + varint_len(worker_id_len) + worker_id_len as usize;
+        assert_eq!(decode_field_tag(&bytes, pos), 0x12, "version must be 2/LEN");
+        let version_len = 5u64; // "0.1.0"
+        let pos = pos + varint_len(0x12) + varint_len(version_len) + version_len as usize;
         assert_eq!(
-            decode_field_tag(&bytes, 0),
-            0x0A,
-            "identity tag must be 1/LEN"
-        );
-        let len = decode_field_len(&bytes, 1) as usize;
-        // Profile tag sits right after the identity body: tag, tag-len, body.
-        let profile_tag_pos = varint_len(0x0A) + varint_len(len as u64) + len;
-        assert_eq!(
-            decode_field_tag(&bytes, profile_tag_pos),
-            0x12,
-            "profile field should be 2/LEN => 0x12"
+            decode_field_tag(&bytes, pos),
+            0x1A,
+            "execution_identity must be 3/LEN"
         );
     }
 
     #[test]
-    fn task_progress_map_entry_layout_stable() {
-        let msg = TaskProgress {
-            task_id: String::new(),
-            phase: String::new(),
-            counters: [("k".to_string(), 5u64)].into_iter().collect(),
+    fn result_upload_field_numbers_stable() {
+        let msg = sample_upload();
+        let bytes = msg.encode_to_vec();
+        // task_id = 1/LEN => 0x0A; journal_root_hex = 2/LEN => 0x12;
+        // steps = 3/VARINT => 0x18; ok = 4/VARINT => 0x20; error is empty
+        // and omitted; execution_identity = 6/LEN => 0x32.
+        assert_eq!(bytes[0], 0x0A, "task_id must be 1/LEN");
+        let pos = varint_len(0x0A) + varint_len(2) + 2;
+        assert_eq!(decode_field_tag(&bytes, pos), 0x12, "root must be 2/LEN");
+        let pos = pos + varint_len(0x12) + varint_len(64) + 64;
+        assert_eq!(
+            decode_field_tag(&bytes, pos),
+            0x18,
+            "steps must be 3/VARINT"
+        );
+        let pos = pos + varint_len(0x18) + varint_len(4096);
+        assert_eq!(decode_field_tag(&bytes, pos), 0x20, "ok must be 4/VARINT");
+        let pos = pos + varint_len(0x20) + 1;
+        assert_eq!(
+            decode_field_tag(&bytes, pos),
+            0x32,
+            "execution_identity must be 6/LEN"
+        );
+    }
+
+    #[test]
+    fn session_request_oneof_field_numbers_stable() {
+        let msg = SessionRequest {
+            message: Some(session_request::Message::Hello(sample_hello())),
         };
         let bytes = msg.encode_to_vec();
-        // The empty strings are omitted, so only the map entry travels;
-        // its tag is field 3 / LEN => 0x1A.
-        assert_eq!(bytes[0], 0x1A, "counters must be field 3/LEN => 0x1A");
-        let entry_len = decode_field_len(&bytes, 1) as usize;
-        let entry = &bytes[varint_len(0x1A) + varint_len(entry_len as u64)..][..entry_len];
-        // Entry body: key = field 1 / LEN => 0x0A, value = field 2 / VARINT => 0x10.
-        assert_eq!(decode_field_tag(entry, 0), 0x0A, "map key must be 1/LEN");
-        let key_len = decode_field_len(entry, 1) as usize;
-        let key_pos = varint_len(0x0A) + varint_len(key_len as u64);
-        assert_eq!(&entry[key_pos..key_pos + key_len], b"k");
+        // The oneof wrapper carries the variant: hello = field 1 => 0x0A.
         assert_eq!(
-            decode_field_tag(entry, key_pos + key_len),
-            0x10,
-            "map value must be 2/VARINT"
+            bytes[0], 0x0A,
+            "SessionRequest hello variant must be field 1/LEN => 0x0A"
         );
+        // The payload is exactly the encoded hello; nothing else follows.
+        let hello_len = decode_field_len(&bytes, 1) as usize;
+        let pos = varint_len(0x0A) + varint_len(hello_len as u64);
+        assert_eq!(pos + hello_len, bytes.len(), "hello must be the only field");
+    }
+
+    #[test]
+    fn session_response_oneof_field_numbers_stable() {
+        let msg = SessionResponse {
+            message: Some(session_response::Message::Assign(sample_dispatch())),
+        };
+        let bytes = msg.encode_to_vec();
+        // assign = field 2 => 0x12.
+        assert_eq!(
+            bytes[0], 0x12,
+            "SessionResponse assign variant must be field 2/LEN => 0x12"
+        );
+        let dispatch_len = decode_field_len(&bytes, 1) as usize;
+        let pos = varint_len(0x12) + varint_len(dispatch_len as u64) + dispatch_len;
+        // No trailing fields after the dispatch.
+        assert_eq!(pos, bytes.len(), "dispatch must be the only field");
     }
 
     // Unknown fields are skipped, so older readers tolerate newer writers.
 
     #[test]
     fn unknown_fields_are_skipped() {
-        let mut bytes = sample_identity().encode_to_vec();
+        let mut bytes = sample_hello().encode_to_vec();
         append_unknown_len(&mut bytes, 99, b"unknown-bytes");
         append_unknown_varint(&mut bytes, 100, 12345);
-        let back = WorkerIdentity::decode(bytes.as_slice()).unwrap();
-        assert_eq!(back, sample_identity());
+        let back = WorkerHello::decode(bytes.as_slice()).unwrap();
+        assert_eq!(back, sample_hello());
     }
 
     // Malformed input must produce a typed decode error, never a panic.
-    // prost performs the length checks the deleted hand codec used to run.
 
     #[test]
     fn truncated_input_returns_error() {
-        let mut bytes = sample_identity().encode_to_vec();
+        let mut bytes = sample_hello().encode_to_vec();
         bytes.truncate(bytes.len() - 1);
         let err =
-            WorkerIdentity::decode(bytes.as_slice()).expect_err("truncated input must not decode");
+            WorkerHello::decode(bytes.as_slice()).expect_err("truncated input must not decode");
         assert!(err.to_string().contains("buffer underflow"), "got {err}");
     }
 
     #[test]
     fn length_prefix_at_u64_max_is_rejected_not_wrapped() {
-        // A length prefix of u64::MAX must never wrap a length check into a
-        // wrong-sized slice. prost bounds the length against the remaining
-        // bytes before any allocation.
         let bytes = len_tag(1, u64::MAX);
-        let err = WorkerIdentity::decode(bytes.as_slice())
+        let err = WorkerHello::decode(bytes.as_slice())
             .expect_err("u64::MAX length prefix must not decode");
         let msg = err.to_string();
         assert!(
@@ -240,10 +314,9 @@ mod tests {
 
     #[test]
     fn length_prefix_exceeding_buffer_is_rejected() {
-        // Claiming 1 MiB over a 4-byte body must fail without allocation.
         let mut bytes = len_tag(1, 1 << 20);
         bytes.extend_from_slice(b"abcd");
-        let err = WorkerIdentity::decode(bytes.as_slice())
+        let err = WorkerHello::decode(bytes.as_slice())
             .expect_err("oversized length prefix must not decode");
         let msg = err.to_string();
         assert!(
@@ -254,20 +327,18 @@ mod tests {
 
     #[test]
     fn varint_overflow_returns_error() {
-        // 11 continuation bytes overflow the 64-bit varint.
         let bytes = vec![0x80u8; 11];
-        let err = WorkerIdentity::decode(bytes.as_slice())
-            .expect_err("overflowed varint must not decode");
+        let err =
+            WorkerHello::decode(bytes.as_slice()).expect_err("overflowed varint must not decode");
         assert!(err.to_string().contains("invalid varint"), "got {err}");
     }
 
     #[test]
     fn invalid_wire_type_returns_error() {
-        // Field 1 with wire type 3 (group start): prost rejects it.
         let mut bytes = Vec::new();
         encode_tag_varint(1, 3, &mut bytes);
-        let err = WorkerIdentity::decode(bytes.as_slice())
-            .expect_err("invalid wire type must not decode");
+        let err =
+            WorkerHello::decode(bytes.as_slice()).expect_err("invalid wire type must not decode");
         assert!(err.to_string().contains("invalid wire type"), "got {err}");
     }
 
@@ -275,8 +346,7 @@ mod tests {
     fn invalid_utf8_returns_error() {
         let mut bytes = len_tag(1, 1);
         bytes.push(0xFF);
-        let err =
-            WorkerIdentity::decode(bytes.as_slice()).expect_err("invalid UTF-8 must not decode");
+        let err = WorkerHello::decode(bytes.as_slice()).expect_err("invalid UTF-8 must not decode");
         assert!(err.to_string().contains("not UTF-8 encoded"), "got {err}");
     }
 

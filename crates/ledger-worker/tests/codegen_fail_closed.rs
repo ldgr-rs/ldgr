@@ -24,7 +24,7 @@ fn codegen_paths_resolve_contract_and_out_dir() {
     assert_eq!(
         paths.proto,
         PathBuf::from(
-            "/repo/crates/ledger-worker/../ledger-format/proto/ledger/control/v1/control.proto"
+            "/repo/crates/ledger-worker/../ledger-format/proto/ledger/control/v2/control.proto"
         )
     );
     assert_eq!(
