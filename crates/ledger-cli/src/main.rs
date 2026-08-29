@@ -19,8 +19,10 @@ use ledger_cli::scaffold_consensus;
 use ledger_cli::{
     Cli, Command, DefaultMiniKv, MaxSatEngineArg, generate_completions, is_verbose, seed_from_u64,
 };
-use ledger_explorer::search::{Workload, replay_prefix, replay_strict, search};
-use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle, minimize_schedule};
+use ledger_explorer::search::Workload;
+use ledger_explorer::services::ServiceError;
+use ledger_explorer::services::{minimize_decisions, replay_prefix, replay_strict, search_first};
+use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle};
 use ledger_format::Hash;
 use ledger_sim::{Policy, ReplayViolation, RunConfig, RuntimeError, SimFault, Simulation};
 
@@ -266,7 +268,7 @@ fn run_sim(
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Some(finding) = search(&workload, &oracle, config, runs)? {
+    if let Some(finding) = search_first(&workload, &oracle, config, runs)? {
         if cli.json {
             println!(
                 "{}",
@@ -309,7 +311,7 @@ fn run_repro(
         let replay_result = replay_strict(&workload, seed_hash, decisions);
         let replayed = match replay_result {
             Ok(value) => value,
-            Err(RuntimeError::StrictReplay(violation)) => {
+            Err(ServiceError::Simulation(RuntimeError::StrictReplay(violation))) => {
                 return strict_violation_exit(cli, &violation);
             }
             Err(other) => return Err(other.into()),
@@ -342,7 +344,7 @@ fn run_repro(
     let replay_result = replay_strict(&workload, seed_hash, run.decisions.clone());
     let replayed = match replay_result {
         Ok(value) => value,
-        Err(RuntimeError::StrictReplay(violation)) => {
+        Err(ServiceError::Simulation(RuntimeError::StrictReplay(violation))) => {
             return strict_violation_exit(cli, &violation);
         }
         Err(other) => return Err(other.into()),
@@ -457,8 +459,8 @@ fn run_minimize(
         .policy(policy)
         .max_steps(max_steps)
         .build();
-    if let Some(finding) = search(&workload, &oracle, config, runs)? {
-        let report = minimize_schedule(&finding.run.decisions, |decisions| {
+    if let Some(finding) = search_first(&workload, &oracle, config, runs)? {
+        let report = minimize_decisions(&finding.run.decisions, |decisions| {
             replay_prefix(&workload, finding.seed, decisions.to_vec())
                 .map(|run| oracle.check(&run).violated)
                 .unwrap_or(false)

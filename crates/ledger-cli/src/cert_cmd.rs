@@ -4,9 +4,12 @@
 use std::io::Read;
 use std::path::Path;
 
-use ledger_explorer::certs::{CERT_MAX_BYTES, check_cert_bytes};
+use ledger_explorer::certs::{CERT_MAX_BYTES, CertError, check_cert_bytes};
 use ledger_explorer::search::PersistentJournal;
-use ledger_explorer::{CampaignCertificate, CertError};
+use ledger_explorer::services::ServiceError;
+use ledger_explorer::services::{
+    parse_statement, validate_cut_against_journal, validate_statement,
+};
 
 /// Errors from `ledger cert verify`.
 #[derive(Debug, thiserror::Error)]
@@ -26,6 +29,21 @@ pub enum CertVerifyError {
     /// JSON serialization failed.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+/// Maps a statement service failure onto the command error, keeping the
+/// decode-versus-validation distinction the CLI surfaces.
+fn to_verify_error(error: ServiceError) -> CertVerifyError {
+    match error {
+        ServiceError::Cert(err) => match &err {
+            CertError::Verification(_) => CertVerifyError::Verification(err),
+            _ => CertVerifyError::Decode(err),
+        },
+        ServiceError::Journal(err) => CertVerifyError::JournalOpen(err),
+        other => CertVerifyError::Decode(CertError::Schema(format!(
+            "unexpected service failure: {other}"
+        ))),
+    }
 }
 
 /// Verifies a campaign certificate JSON file.
@@ -48,15 +66,14 @@ pub fn run_verify(
         .read_to_string(&mut raw)
         .map_err(CertVerifyError::Io)?;
     check_cert_bytes(raw.len()).map_err(CertVerifyError::Decode)?;
-    let cert = CampaignCertificate::from_json(&raw).map_err(CertVerifyError::Decode)?;
+    let cert = parse_statement(&raw).map_err(to_verify_error)?;
     let mode_label = if let Some(journal_dir) = journal {
         let persistent =
             PersistentJournal::open(journal_dir).map_err(CertVerifyError::JournalOpen)?;
-        cert.verify_with_journal(persistent.journal())
-            .map_err(CertVerifyError::Verification)?;
+        validate_cut_against_journal(&cert, persistent.journal()).map_err(to_verify_error)?;
         "journal-bound"
     } else {
-        cert.verify().map_err(CertVerifyError::Verification)?;
+        validate_statement(&cert).map_err(to_verify_error)?;
         "statement-validated"
     };
 

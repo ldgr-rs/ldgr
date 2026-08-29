@@ -318,15 +318,19 @@ fn ldfi_executes_top_hypothesis() {
             assert!(
                 matches!(
                     error,
-                    ledger_cli::ldfi_cmd::LdfiCmdError::Replay(
-                        ledger_explorer::search::FaultReplayError::StrictReplay(_)
+                    ledger_cli::ldfi_cmd::LdfiCmdError::Service(
+                        ledger_explorer::services::ServiceError::Replay(
+                            ledger_explorer::search::FaultReplayError::StrictReplay(_)
+                        )
                     )
                 ),
                 "ldfi must fail with a typed strict violation, got: {error:?}"
             );
             let violation = match error {
-                ledger_cli::ldfi_cmd::LdfiCmdError::Replay(
-                    ledger_explorer::search::FaultReplayError::StrictReplay(violation),
+                ledger_cli::ldfi_cmd::LdfiCmdError::Service(
+                    ledger_explorer::services::ServiceError::Replay(
+                        ledger_explorer::search::FaultReplayError::StrictReplay(violation),
+                    ),
                 ) => violation,
                 other => panic!("ldfi must fail with a typed strict violation, got: {other:?}"),
             };

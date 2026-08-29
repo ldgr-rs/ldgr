@@ -45,7 +45,7 @@ pub enum WorkerError {
     },
     /// The explorer pre-run campaign failed.
     #[error(transparent)]
-    Campaign(#[from] ledger_explorer::search::SearchError),
+    Campaign(#[from] ledger_explorer::services::ServiceError),
     /// The deterministic simulation run failed.
     #[error("simulation failed: {0}")]
     Sim(#[from] ledger_sim::RuntimeError),
@@ -289,7 +289,7 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
     let workload = workload_for(&task.workload);
     let oracle = AlwaysPassOracle;
     let campaign =
-        ledger_explorer::search::run_campaign(&workload, &oracle, task.run_config.clone(), 1)?;
+        ledger_explorer::services::run_campaign(&workload, &oracle, task.run_config.clone(), 1)?;
     let campaign_findings = campaign.findings.len();
     let run = Simulation::new(task.run_config.clone(), workload.programs()).run()?;
     Ok(WorkerResult {
