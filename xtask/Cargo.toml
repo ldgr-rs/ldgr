@@ -1,8 +1,12 @@
 [package]
 name = "xtask"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 publish = false
 description = "Workspace automation: license gate, onboarding doctor"
 
 [dependencies]
+
+[lints]
+workspace = true
