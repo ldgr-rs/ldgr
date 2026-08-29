@@ -65,8 +65,11 @@ type runConfigDesc struct {
 	Links         []linkDesc      `json:"links"`
 	DNS           []dnsDesc       `json:"dns"`
 	FaultSchedule []faultDesc     `json:"fault_schedule"`
-	FsJournaling  json.RawMessage `json:"fs_journaling"`
-	Monitor       bool            `json:"monitor"`
+	FsJournaling     json.RawMessage `json:"fs_journaling"`
+	Monitor          bool            `json:"monitor"`
+	ReorderDraw      bool            `json:"reorder_draw"`
+	MaxFileExtent    *uint64         `json:"max_file_extent"`
+	MaxResidentBytes *uint64         `json:"max_resident_bytes"`
 }
 
 type policyDesc struct {
@@ -327,6 +330,20 @@ func encodeRunConfig(desc *runConfigDesc) ([]byte, error) {
 		return nil, err
 	}
 
+	var maxFileExtent Value
+	if desc.MaxFileExtent != nil {
+		maxFileExtent = Uint(*desc.MaxFileExtent)
+	} else {
+		maxFileExtent = Null()
+	}
+
+	var maxResidentBytes Value
+	if desc.MaxResidentBytes != nil {
+		maxResidentBytes = Uint(*desc.MaxResidentBytes)
+	} else {
+		maxResidentBytes = Null()
+	}
+
 	document := Array(
 		Uint(1),
 		Map(
@@ -340,6 +357,9 @@ func encodeRunConfig(desc *runConfigDesc) ([]byte, error) {
 			Entry{Key: Text("fs_journaling"), Value: fsJournaling},
 			Entry{Key: Text("dropped_events"), Value: Array(dropped...)},
 			Entry{Key: Text("fault_schedule"), Value: Array(faults...)},
+			Entry{Key: Text("reorder_draw"), Value: Bool(desc.ReorderDraw)},
+			Entry{Key: Text("max_file_extent"), Value: maxFileExtent},
+			Entry{Key: Text("max_resident_bytes"), Value: maxResidentBytes},
 		),
 	)
 	return Encode(document)

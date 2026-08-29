@@ -46,7 +46,7 @@ jobs:
       - name: Build debug Wasm guest artifact (needed by wasm tests)
         run: cargo build --target wasm32-wasip1 -p wasm-guest
       - name: Run tests with cargo-nextest
-        run: cargo nextest run --workspace --all-features --profile ci -E 'not binary(pg_queue)'
+        run: cargo nextest run --workspace --all-features --profile ci
       - name: Run doctests
         run: cargo test --workspace --doc
       - name: Verify all benchmarks compile

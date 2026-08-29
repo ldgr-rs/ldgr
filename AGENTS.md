@@ -181,7 +181,7 @@ cargo nextest run -p <crate> --all-features
 cargo fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo nextest run --workspace --all-features --profile ci -E 'not binary(pg_queue)'
+cargo nextest run --workspace --all-features --profile ci
 cargo test --workspace --doc
 cargo run -p ledger-lint -- crates/
 cargo run -p xtask -- licenses
@@ -216,12 +216,11 @@ cargo check -p ledger-worker --all-features --all-targets
 cargo clippy -p ledger-worker --all-features --all-targets -- -D warnings
 cargo nextest run -p ledger-worker --test cross_boundary --all-features --profile ci
 cargo nextest run -p ledger-worker --features grpc --test cross_boundary --profile ci
-cargo nextest run -p ledger-worker --features pg --test pg_queue --profile ci
 ```
 
-The Postgres test needs a live Postgres service. The gRPC test needs the
-protobuf toolchain. Do not turn an unavailable required service into a passing
-skip. Report the missing prerequisite and run the other checks.
+The gRPC test needs the protobuf toolchain. Do not turn an unavailable required
+service into a passing skip. Report the missing prerequisite and run the other
+checks.
 
 CI also runs checks that need extra tools or services. Run the applicable leg
 when changing its surface: `cargo hack` for feature combinations,
