@@ -311,10 +311,14 @@ fn run_repro(
         let replay_result = replay_strict(&workload, seed_hash, decisions);
         let replayed = match replay_result {
             Ok(value) => value,
-            Err(ServiceError::Simulation(RuntimeError::StrictReplay(violation))) => {
-                return strict_violation_exit(cli, &violation);
+            Err(err) => {
+                if let ServiceError::Simulation(inner) = &err
+                    && let RuntimeError::StrictReplay(violation) = &**inner
+                {
+                    return strict_violation_exit(cli, violation);
+                }
+                return Err(err.into());
             }
-            Err(other) => return Err(other.into()),
         };
         // Valid artifact replayed successfully.
         if cli.json || cli.ndjson {
@@ -344,10 +348,14 @@ fn run_repro(
     let replay_result = replay_strict(&workload, seed_hash, run.decisions.clone());
     let replayed = match replay_result {
         Ok(value) => value,
-        Err(ServiceError::Simulation(RuntimeError::StrictReplay(violation))) => {
-            return strict_violation_exit(cli, &violation);
+        Err(err) => {
+            if let ServiceError::Simulation(inner) = &err
+                && let RuntimeError::StrictReplay(violation) = &**inner
+            {
+                return strict_violation_exit(cli, violation);
+            }
+            return Err(err.into());
         }
-        Err(other) => return Err(other.into()),
     };
     let matches = run.journal.root_hash() == replayed.journal.root_hash();
     if cli.json || cli.ndjson {

@@ -18,9 +18,9 @@ use ledger_explorer::oracle::{AssertionOracle, HistoryOperation, HistoryOracle, 
 use ledger_explorer::reference::corpus_scenarios;
 use ledger_explorer::search::{Workload, search};
 use ledger_explorer::solver::HittingSetSolver;
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
+use ledger_format::{CanonicalValue, CrashOperation, EntryKind, EntryPayload};
 use ledger_journal::Journal;
-use ledger_sim::{CrashOperator, Instruction, Policy, RunConfig, RunResult, SimFs, Simulation};
+use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SimFs, Simulation};
 
 // ---- Genuine distributed-bug reproductions (12, registry-driven) ----
 
@@ -131,15 +131,19 @@ fn storage_crash_discards_unsynced_dirty_write() {
 fn storage_torn_write_preserves_only_prefix() {
     let mut fs = SimFs::new();
     let mut journal = Journal::new();
-    fs.write(&mut journal, 1, "record.bin", 0xDEAD_BEEF)
+    let write_id = fs
+        .write(&mut journal, 1, "record.bin", 0xDEAD_BEEF)
         .unwrap();
-    fs.apply_crash_operator(&CrashOperator::TornWrite {
-        path: "record.bin".into(),
-        partial_value: 0xDEAD_0000,
-    });
+    fs.apply_crash_operation(&CrashOperation::TornWrite {
+        write_entry: write_id,
+        persisted_prefix: 4,
+    })
+    .unwrap();
+    // The LE u64 0xDEAD_BEEF is eight bytes; persisting the first four
+    // keeps the high half, which still decodes to 0xDEAD_BEEF.
     assert_eq!(
         fs.read(&mut journal, 1, "record.bin").unwrap(),
-        Some(0xDEAD_0000)
+        Some(0xDEAD_BEEF)
     );
 }
 
@@ -147,11 +151,13 @@ fn storage_torn_write_preserves_only_prefix() {
 fn storage_bit_flip_corruption_detected() {
     let mut fs = SimFs::new();
     let mut journal = Journal::new();
-    fs.write(&mut journal, 1, "data.bin", 0b1111).unwrap();
-    fs.apply_crash_operator(&CrashOperator::BitFlipCorruption {
-        path: "data.bin".into(),
-        xor_mask: 0b0010,
-    });
+    let write_id = fs.write(&mut journal, 1, "data.bin", 0b1111).unwrap();
+    fs.apply_crash_operation(&CrashOperation::BitFlip {
+        write_entry: write_id,
+        offset: 0,
+        bit: 1,
+    })
+    .unwrap();
     assert_eq!(fs.read(&mut journal, 1, "data.bin").unwrap(), Some(0b1101));
 }
 

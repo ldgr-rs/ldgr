@@ -599,6 +599,23 @@ impl Boundary {
         write_id: Hash,
         path: &str,
     ) -> Result<(), ledger_journal::JournalError> {
+        // Crash-type faults derive their canonical operation from the shared
+        // `SimFault::crash_operation_for` mapping so replay verifies the
+        // same operations the executor applies. Non-crash injections are
+        // matched here by construction; a missing derivation is a typed
+        // error, never a panic.
+        let operation = match self
+            .schedule_injection_for(write_id)
+            .and_then(|fault| fault.crash_operation_for(path))
+        {
+            Some(Ok(operation)) => Some(operation),
+            Some(Err(identifier)) => {
+                return Err(ledger_journal::JournalError::InvalidPayload(format!(
+                    "unknown crash-state identifier {identifier}"
+                )));
+            }
+            None => None,
+        };
         match self.schedule_injection_for(write_id) {
             Some(SimFault::Crash(_)) => {
                 self.mark_fault_applied(write_id);
@@ -612,13 +629,13 @@ impl Boundary {
                     }),
                 )?;
             }
-            Some(SimFault::Corrupt { write, xor_mask }) => {
-                self.mark_fault_applied(*write);
-                let operation = ledger_format::CrashOperation::CorruptRange {
-                    write_entry: *write,
-                    offset: 0,
-                    xor_bytes: xor_mask.to_le_bytes().to_vec(),
+            Some(SimFault::Corrupt { .. }) => {
+                let Some(operation) = operation else {
+                    return Err(ledger_journal::JournalError::InvalidPayload(
+                        "corrupt fault implies a crash operation".to_string(),
+                    ));
                 };
+                self.mark_fault_applied(write_id);
                 if let Err(error) = self
                     .shared
                     .fs
@@ -640,17 +657,12 @@ impl Boundary {
                     }),
                 )?;
             }
-            Some(SimFault::CrashState { write, state }) => {
+            Some(SimFault::CrashState { write, .. }) => {
                 self.mark_fault_applied(*write);
-                let operation = match *state {
-                    0 => ledger_format::CrashOperation::DropAllUnsynced,
-                    1 => ledger_format::CrashOperation::DropPaths {
-                        paths: vec![crate::simfs::path_ref(path)],
-                    },
-                    _ => ledger_format::CrashOperation::TornWrite {
-                        write_entry: *write,
-                        persisted_prefix: 0,
-                    },
+                let Some(operation) = operation else {
+                    return Err(ledger_journal::JournalError::InvalidPayload(
+                        "crash-state fault implies a crash operation".to_string(),
+                    ));
                 };
                 if let Err(error) = self
                     .shared
@@ -767,7 +779,7 @@ impl Boundary {
     /// entry, and return its scalar payload.
     pub(crate) fn recv_now(&self) -> Option<u64> {
         let now = self.shared.time.borrow().now();
-        let message = self.shared.net.borrow_mut().recv_at(self.task, now)?;
+        let message = self.shared.recv_at_effective(self.task, now)?;
         let recv_id = self.journal_recv(&message);
         self.inherit_recv_origin(recv_id, message.send_id);
         Some(message.payload())
@@ -987,7 +999,7 @@ impl Net for Boundary {
     }
 
     fn recv(&self, task: usize, now: u64) -> Option<Message> {
-        let message = self.shared.net.borrow_mut().recv_at(task, now)?;
+        let message = self.shared.recv_at_effective(task, now)?;
         let recv_id = self.journal_recv(&message);
         self.inherit_recv_origin(recv_id, message.send_id);
         Some(message)
@@ -1133,7 +1145,7 @@ impl Future for RecvFuture {
 
     fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<u64> {
         let now = self.shared.time.borrow().now();
-        if let Some(message) = self.shared.net.borrow_mut().recv_at(self.task, now) {
+        if let Some(message) = self.shared.recv_at_effective(self.task, now) {
             // Record a failed Recv append; the message is already consumed.
             match self.shared.journal_append(
                 self.task as ActorId,

@@ -501,7 +501,7 @@ fn decode_artifact(bytes: &[u8]) -> Result<SolverStateArtifact, SolverStateError
 /// Persist an artifact to the journal.
 ///
 /// The artifact is appended as a single `Outcome` entry with
-/// `Payload::Bytes` containing the deterministic encoding. The entry id is the
+/// A `Snapshot` payload containing the deterministic encoding. The entry id is the
 /// content address. Saving an identical artifact twice returns the same entry
 /// id without duplicating the entry (payload equality check).
 pub fn save(

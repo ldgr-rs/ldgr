@@ -37,7 +37,7 @@ use std::collections::HashSet;
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     #[error("simulation failed: {0}")]
-    Simulation(#[from] ledger_sim::RuntimeError),
+    Simulation(Box<ledger_sim::RuntimeError>),
     #[error("solver failed: {0}")]
     Solver(#[from] crate::solver::SolverError),
     #[error("canonical hash failed: {0}")]
@@ -51,7 +51,19 @@ pub enum SearchError {
     #[error("bandit selected unknown arm {arm:#x}")]
     UnknownArm { arm: u64 },
     #[error(transparent)]
-    Replay(#[from] FaultReplayError),
+    Replay(Box<FaultReplayError>),
+}
+
+impl From<ledger_sim::RuntimeError> for SearchError {
+    fn from(error: ledger_sim::RuntimeError) -> Self {
+        Self::Simulation(Box::new(error))
+    }
+}
+
+impl From<FaultReplayError> for SearchError {
+    fn from(error: FaultReplayError) -> Self {
+        Self::Replay(Box::new(error))
+    }
 }
 
 fn fault_injection_target(injection: &SimFault) -> Option<Hash> {

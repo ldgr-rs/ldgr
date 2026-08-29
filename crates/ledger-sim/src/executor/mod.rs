@@ -97,6 +97,8 @@ pub(crate) struct ExecutorShared {
     net_offset: RefCell<u64>,
     /// Monotonic offset for the `fs` seed stream.
     fs_offset: RefCell<u64>,
+    /// Serve a seeded draw inside the configured reorder window.
+    reorder_draw: bool,
     /// Per-task count of journaled Send entries; feeds
     /// `MessageId.sender_sequence` (the sender entry sequence).
     send_seq: RefCell<Vec<u64>>,
@@ -259,7 +261,12 @@ impl Executor {
             journal: RefCell::new(Journal::new()),
             time: RefCell::new(VirtualTime::default()),
             net: RefCell::new(net),
-            fs: RefCell::new(SimFs::new()),
+            fs: RefCell::new(SimFs::with_budgets(
+                config
+                    .max_file_extent()
+                    .unwrap_or(ledger_format::limits::MAX_FILE_EXTENT_HARD),
+                config.max_resident_bytes(),
+            )),
             dns: (*config.dns()).clone(),
             scheduler: RefCell::new(scheduler),
             tasks: RefCell::new(Vec::new()),
@@ -269,6 +276,7 @@ impl Executor {
             swarm: (*config.swarm()).clone(),
             net_offset: RefCell::new(0),
             fs_offset: RefCell::new(0),
+            reorder_draw: config.reorder_draw(),
             send_seq: RefCell::new(Vec::new()),
             coverage: RefCell::new(HashMap::new()),
             fault_classes_used: RefCell::new(HashSet::new()),
@@ -1349,6 +1357,111 @@ mod swarm_tests {
             "a budget of 1 must journal exactly one CrashState fault"
         );
         assert!(run.monitor_issues.is_empty());
+    }
+
+    #[test]
+    fn unknown_crash_state_identifier_fails_closed() {
+        use crate::runtime::Instruction;
+        // A probe run locates the FsWrite entry; the injected fault then
+        // targets it with a state identifier outside the canonical 0..=2 set.
+        let probe = Simulation::new(
+            base_config(15),
+            vec![vec![
+                Instruction::FsWrite {
+                    path: "a".into(),
+                    value: 1,
+                },
+                Instruction::Done,
+            ]],
+        )
+        .run()
+        .unwrap();
+        let write = probe
+            .journal
+            .entries()
+            .find(|entry| matches!(entry.data.kind, ledger_format::EntryKind::FsWrite))
+            .map(|entry| entry.id)
+            .expect("the probe journals one FsWrite");
+        let config =
+            base_config(15).with_fault_schedule(vec![crate::config::SimFault::CrashState {
+                write,
+                state: 3,
+            }]);
+        let error = Simulation::new(
+            config,
+            vec![vec![
+                Instruction::FsWrite {
+                    path: "a".into(),
+                    value: 1,
+                },
+                Instruction::Done,
+            ]],
+        )
+        .run()
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Journal(ledger_journal::JournalError::InvalidPayload(_))
+            ),
+            "an unknown crash-state identifier must fail the run closed"
+        );
+    }
+
+    #[test]
+    fn reorder_draw_is_selectable_and_deterministic() {
+        use crate::net::LinkConfig;
+        use crate::runtime::Instruction;
+        let programs = vec![
+            vec![
+                Instruction::Send { to: 1, payload: 10 },
+                Instruction::Send { to: 1, payload: 20 },
+                Instruction::Send { to: 1, payload: 30 },
+                Instruction::Done,
+            ],
+            vec![
+                Instruction::Receive,
+                Instruction::Receive,
+                Instruction::Receive,
+                Instruction::Done,
+            ],
+        ];
+        let make = |seed: u8, draw: bool| {
+            base_config(seed)
+                .with_links(vec![(
+                    0,
+                    1,
+                    LinkConfig {
+                        reorder_window: 2,
+                        ..LinkConfig::default()
+                    },
+                )])
+                .with_reorder_draw(draw)
+        };
+        let run_root = |seed: u8, draw: bool| {
+            Simulation::new(make(seed, draw), programs.clone())
+                .run()
+                .unwrap()
+                .journal
+                .root_hash()
+        };
+        let mut differing = 0usize;
+        for seed in 0..16u8 {
+            let newest = run_root(seed, false);
+            let drawn = run_root(seed, true);
+            let drawn_again = run_root(seed, true);
+            assert_eq!(
+                drawn, drawn_again,
+                "the drawn window must be deterministic for one seed"
+            );
+            if drawn != newest {
+                differing += 1;
+            }
+        }
+        assert!(
+            differing > 0,
+            "the seeded draw must sometimes differ from newest-first inside the window"
+        );
     }
 
     #[test]

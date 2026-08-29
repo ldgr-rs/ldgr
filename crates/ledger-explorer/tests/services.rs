@@ -108,9 +108,13 @@ fn replay_strict_pins_the_root_and_rejects_bad_decisions() {
     assert!(
         matches!(
             err,
-            ServiceError::Simulation(ledger_sim::RuntimeError::StrictReplay(
-                ledger_sim::ReplayViolation::OutOfRange { .. }
-            ))
+            ServiceError::Simulation(ref inner)
+                if matches!(
+                    **inner,
+                    ledger_sim::RuntimeError::StrictReplay(
+                        ledger_sim::ReplayViolation::OutOfRange { .. }
+                    )
+                )
         ),
         "typed strict violation: {err:?}"
     );

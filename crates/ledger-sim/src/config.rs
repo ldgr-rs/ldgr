@@ -112,6 +112,44 @@ pub enum SimFault {
     CrashState { write: Hash, state: u64 },
 }
 
+impl SimFault {
+    /// The canonical crash operation this fault requests, when it is a
+    /// crash-type fault. The executor applies exactly this operation and
+    /// journals it; replay verifies the journaled operation against this
+    /// same derivation, so the two sides cannot drift.
+    ///
+    /// Returns `None` for non-crash faults, `Ok(op)` for the canonical
+    /// operation, and `Err(identifier)` for an unknown crash-state
+    /// identifier that must fail closed.
+    pub fn crash_operation_for(
+        &self,
+        write_path: &str,
+    ) -> Option<Result<ledger_format::CrashOperation, u64>> {
+        match self {
+            SimFault::Crash(_) => Some(Ok(ledger_format::CrashOperation::DropAllUnsynced)),
+            SimFault::Corrupt { write, xor_mask } => {
+                Some(Ok(ledger_format::CrashOperation::CorruptRange {
+                    write_entry: *write,
+                    offset: 0,
+                    xor_bytes: xor_mask.to_le_bytes().to_vec(),
+                }))
+            }
+            SimFault::CrashState { write, state } => Some(match state {
+                0 => Ok(ledger_format::CrashOperation::DropAllUnsynced),
+                1 => Ok(ledger_format::CrashOperation::DropPaths {
+                    paths: vec![crate::simfs::path_ref(write_path)],
+                }),
+                2 => Ok(ledger_format::CrashOperation::TornWrite {
+                    write_entry: *write,
+                    persisted_prefix: 0,
+                }),
+                other => Err(*other),
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Scheduling policy for one deterministic run.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Policy {
@@ -202,6 +240,15 @@ pub struct RunConfig {
     #[cfg(feature = "sim-fs-journaling")]
     pub(crate) fs_journaling: Option<crate::simfs::JournalingMode>,
     pub(crate) monitor: bool,
+    /// Seed-drawn picks inside the configured reorder window. `false` keeps
+    /// the deterministic newest-first window; `true` serves a seeded draw
+    /// from the bounded candidate suffix.
+    pub(crate) reorder_draw: bool,
+    /// Per-run file-extent cap in bytes; `None` uses the format hard limit.
+    pub(crate) max_file_extent: Option<u64>,
+    /// Per-run resident budget (content plus range and path overhead);
+    /// `None` is unlimited.
+    pub(crate) max_resident_bytes: Option<u64>,
 }
 
 impl Default for RunConfig {
@@ -218,6 +265,9 @@ impl Default for RunConfig {
             #[cfg(feature = "sim-fs-journaling")]
             fs_journaling: None,
             monitor: true,
+            reorder_draw: false,
+            max_file_extent: None,
+            max_resident_bytes: None,
         }
     }
 }
@@ -286,6 +336,22 @@ impl RunConfig {
         self.monitor
     }
 
+    /// Whether a configured reorder window serves a seeded draw instead of
+    /// the deterministic newest-first message.
+    pub fn reorder_draw(&self) -> bool {
+        self.reorder_draw
+    }
+
+    /// Per-run file-extent cap; `None` means the format hard limit.
+    pub fn max_file_extent(&self) -> Option<u64> {
+        self.max_file_extent
+    }
+
+    /// Per-run resident budget; `None` is unlimited.
+    pub fn max_resident_bytes(&self) -> Option<u64> {
+        self.max_resident_bytes
+    }
+
     /// Journaling-FS crash model.
     ///
     /// `None` keeps the black-box `DropAllUnsynced` operator (the byte-identical
@@ -337,6 +403,12 @@ impl RunConfig {
         self
     }
 
+    /// Consuming setter for seeded reorder draws inside configured windows.
+    pub fn with_reorder_draw(mut self, reorder_draw: bool) -> Self {
+        self.reorder_draw = reorder_draw;
+        self
+    }
+
     /// Consuming setter for dropped events.
     pub fn with_dropped_events(mut self, dropped_events: Vec<Hash>) -> Self {
         self.dropped_events = dropped_events;
@@ -362,6 +434,9 @@ impl RunConfig {
             #[cfg(feature = "sim-fs-journaling")]
             fs_journaling: self.fs_journaling,
             monitor: self.monitor,
+            reorder_draw: self.reorder_draw,
+            max_file_extent: self.max_file_extent,
+            max_resident_bytes: self.max_resident_bytes,
         }
     }
 }
@@ -385,6 +460,9 @@ pub struct RunConfigBuilder {
     #[cfg(feature = "sim-fs-journaling")]
     fs_journaling: Option<crate::simfs::JournalingMode>,
     monitor: bool,
+    reorder_draw: bool,
+    max_file_extent: Option<u64>,
+    max_resident_bytes: Option<u64>,
 }
 
 impl Default for RunConfigBuilder {
@@ -401,6 +479,9 @@ impl Default for RunConfigBuilder {
             #[cfg(feature = "sim-fs-journaling")]
             fs_journaling: None,
             monitor: true,
+            reorder_draw: false,
+            max_file_extent: None,
+            max_resident_bytes: None,
         }
     }
 }
@@ -479,6 +560,26 @@ impl RunConfigBuilder {
         self
     }
 
+    /// Serve a seeded draw inside the configured reorder window instead of
+    /// the deterministic newest-first pick. Defaults to `false`.
+    pub fn reorder_draw(mut self, reorder_draw: bool) -> Self {
+        self.reorder_draw = reorder_draw;
+        self
+    }
+
+    /// Set per-run filesystem budgets: a file-extent cap in bytes and an
+    /// optional resident budget. `None` for the extent means the format hard
+    /// limit; `None` for the resident budget means unlimited.
+    pub fn fs_budgets(
+        mut self,
+        max_file_extent: Option<u64>,
+        max_resident_bytes: Option<u64>,
+    ) -> Self {
+        self.max_file_extent = max_file_extent;
+        self.max_resident_bytes = max_resident_bytes;
+        self
+    }
+
     /// Build the [`RunConfig`].
     pub fn build(self) -> RunConfig {
         RunConfig {
@@ -493,6 +594,9 @@ impl RunConfigBuilder {
             #[cfg(feature = "sim-fs-journaling")]
             fs_journaling: self.fs_journaling,
             monitor: self.monitor,
+            reorder_draw: self.reorder_draw,
+            max_file_extent: self.max_file_extent,
+            max_resident_bytes: self.max_resident_bytes,
         }
     }
 }
