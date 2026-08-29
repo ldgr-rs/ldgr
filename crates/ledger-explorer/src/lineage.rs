@@ -28,6 +28,11 @@ pub struct LineageIndex {
     pub journal_len_at_build: usize,
     /// Fingerprint of the solver configuration at last build.
     pub config_fingerprint: Hash,
+    /// Entries visited by the last build or refresh walk. This is the
+    /// intended-work measure: a differential refresh walks only witnesses
+    /// absent from the cached closure, so this stays small relative to the
+    /// journal even after the journal grows.
+    pub walked_entries: usize,
 }
 
 fn collect_bounded_hash(
@@ -112,6 +117,7 @@ fn collect_lineage(
     journal: &Journal,
     witnesses: &[Hash],
     config: &SolverConfig,
+    walked: &mut usize,
 ) -> (BTreeSet<Hash>, Vec<Vec<Hash>>) {
     let mut closure = BTreeSet::new();
     let mut paths = Vec::new();
@@ -137,6 +143,7 @@ fn collect_lineage(
             );
         }
     }
+    *walked = closure.len();
     paths.sort();
     (closure, paths)
 }
@@ -153,22 +160,26 @@ impl LineageIndex {
         config: &SolverConfig,
         resolved_engine: SolverEngine,
     ) -> Self {
-        let (closure, paths) = collect_lineage(journal, witnesses, config);
+        let mut walked = 0usize;
+        let (closure, paths) = collect_lineage(journal, witnesses, config, &mut walked);
         Self {
             closure,
             paths,
             journal_len_at_build: journal.len(),
             config_fingerprint: fingerprint(config, resolved_engine),
+            walked_entries: walked,
         }
     }
 
     /// Refresh the index after the journal may have grown.
     ///
-    /// Returns `false` when nothing changed (same journal length and config
-    /// fingerprint), in which case the cached state stays untouched.
-    /// Otherwise recomputes the full witness walk and replaces the cached
-    /// closure and paths, so a refreshed index equals a fresh
-    /// [`LineageIndex::build`].
+    /// The journal DAG is append-only: parents of existing entries never
+    /// change, so the cached closure of an already-walked witness stays
+    /// valid when only the journal length moves. This refresh walks only
+    /// witnesses absent from the cached closure (a differential update);
+    /// the return value reports whether the cached state changed. A
+    /// config-fingerprint change forces a full re-walk because the walk
+    /// semantics themselves changed.
     pub fn refresh(
         &mut self,
         journal: &Journal,
@@ -178,14 +189,41 @@ impl LineageIndex {
     ) -> bool {
         let new_fp = fingerprint(config, resolved_engine);
         let new_len = journal.len();
-        if new_len == self.journal_len_at_build && new_fp == self.config_fingerprint {
+        if new_fp != self.config_fingerprint {
+            // Walk semantics changed; rebuild from scratch.
+            let mut walked = 0usize;
+            let (closure, paths) = collect_lineage(journal, witnesses, config, &mut walked);
+            self.closure = closure;
+            self.paths = paths;
+            self.journal_len_at_build = new_len;
+            self.config_fingerprint = new_fp;
+            self.walked_entries = walked;
+            return true;
+        }
+        // Append-only: only witnesses not yet in the cached closure can
+        // contribute new lineage.
+        let new_witnesses: Vec<Hash> = witnesses
+            .iter()
+            .filter(|w| !self.closure.contains(*w))
+            .copied()
+            .collect();
+        if new_witnesses.is_empty() {
+            // Nothing new to walk. The journal may still have grown; the
+            // cached closure remains valid and the growth is recorded so
+            // the next same-length refresh reports no change.
+            self.journal_len_at_build = new_len;
+            self.walked_entries = 0;
             return false;
         }
-        let (closure, paths) = collect_lineage(journal, witnesses, config);
-        self.closure = closure;
-        self.paths = paths;
+        let mut walked = 0usize;
+        let (new_closure, new_paths) =
+            collect_lineage(journal, &new_witnesses, config, &mut walked);
+        self.closure.extend(new_closure);
+        self.paths.extend(new_paths);
+        self.paths.sort();
         self.journal_len_at_build = new_len;
         self.config_fingerprint = new_fp;
+        self.walked_entries = walked;
         true
     }
 
