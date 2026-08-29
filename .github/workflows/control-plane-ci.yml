@@ -25,23 +25,6 @@ jobs:
   worker:
     name: Worker build plus cross-boundary determinism
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        # pg_queue integration tests need a real Postgres to apply the
-        # River river.job schema subset against.
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      # Also feeds the all-features test step, which compiles pg_queue in.
-      LEDGER_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,7 +36,7 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: Install protoc
         # tonic_prost_build needs protoc to regenerate the checked-in
-        # src/gen/ledger.control.v1.rs under --all-features.
+        # src/gen/ledger.control.v2.rs under --all-features.
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ github.token }}
@@ -63,8 +46,6 @@ jobs:
         run: cargo clippy -p ledger-worker --all-features --all-targets -- -D warnings
       - name: Test ledger-worker (all features)
         run: cargo nextest run -p ledger-worker --all-features --profile ci
-      - name: Postgres/River queue integration (real Postgres service)
-        run: cargo nextest run -p ledger-worker --features pg --test pg_queue --profile ci
       - name: Cross-boundary determinism (explicit)
         run: cargo nextest run -p ledger-worker --test cross_boundary --all-features --profile ci
       - name: Cross-boundary determinism (gRPC transport)

@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package ledger.control.v2;
+
+// Session contract between a worker and the external control plane.
+//
+// The external control plane owns campaigns, queues, leases, attempts, and
+// task assignment. A worker initiates ONE outbound authenticated session;
+// the control plane assigns tasks over that session; the worker executes
+// tasks and uploads results carrying the ExecutionIdentity digest. The
+// worker hosts no service; this service is hosted by the control plane.
+//
+// Field numbers are append-only within v2. Never reorder or renumber
+// fields 1..N; new fields always take fresh numbers.
+
+// WorkerHello opens the session with worker identity and build profile.
+message WorkerHello {
+  string worker_id = 1;
+  string version = 2;
+  // ExecutionIdentity digest of the worker build. Empty when the build
+  // data is incomplete; the control plane must treat the session as
+  // identity-incomplete and fail closed.
+  bytes execution_identity = 3;
+  RuntimeProfile profile = 4;
+}
+
+// RuntimeProfile mirrors ledger_worker::profile::RuntimeProfile.
+message RuntimeProfile {
+  string engine_sha = 1;
+  string toolchain = 2;
+  string features = 3;
+  repeated string sut_hashes = 4;
+  string cpu_topology = 5;
+  repeated string env_sanitation = 6;
+  string fingerprint_hex = 7;
+}
+
+// SessionAck answers WorkerHello with accept or reject.
+message SessionAck {
+  bool accepted = 1;
+  // Worker id assigned by the control plane, when different from the hello.
+  string assigned_worker_id = 2;
+  string reason = 3;
+}
+
+// TaskDispatch carries one campaign task from control plane to worker.
+message TaskDispatch {
+  string task_id = 1;
+  bytes run_config_bytes = 2;      // canonical RunConfig encoding
+  string workload = 3;
+  string run_config_hash_hex = 4;  // blake3 hex for boundary check
+  // ExecutionIdentity digest pinned by the task author. The worker rejects
+  // the task before execution when its own digest differs or is incomplete.
+  bytes execution_identity = 5;
+}
+
+// ResultUpload reports a completed task result to the control plane.
+// ok=false carries the failure; the error text names the cause.
+message ResultUpload {
+  string task_id = 1;
+  string journal_root_hex = 2;
+  uint64 steps = 3;
+  bool ok = 4;
+  string error = 5;
+  // ExecutionIdentity digest of the run that produced the result.
+  bytes execution_identity = 6;
+}
+
+// Ack answers an upload.
+message Ack {
+  string task_id = 1;
+  bool accepted = 2;
+}
+
+// Heartbeat proves liveness while a task runs.
+message Heartbeat {
+  string worker_id = 1;
+  string task_id = 2;
+  uint32 attempts = 3;
+}
+
+// HeartbeatAck answers Heartbeat.
+message HeartbeatAck {
+  bool lease_extended = 1;
+  uint64 new_deadline_unix_s = 2;
+}
+
+// CancelTask asks the worker to abandon a task.
+message CancelTask {
+  string task_id = 1;
+  string reason = 2;
+}
+
+// CancelAck answers CancelTask.
+message CancelAck {
+  string task_id = 1;
+  bool cancelled = 2;
+}
+
+// SessionRequest is one worker-to-control-plane stream message.
+message SessionRequest {
+  oneof message {
+    WorkerHello hello = 1;
+    ResultUpload result = 2;
+    Heartbeat heartbeat = 3;
+    CancelAck cancel_ack = 4;
+  }
+}
+
+// SessionResponse is one control-plane-to-worker stream message.
+message SessionResponse {
+  oneof message {
+    SessionAck session_ack = 1;
+    TaskDispatch assign = 2;
+    CancelTask cancel = 3;
+    HeartbeatAck heartbeat_ack = 4;
+  }
+}
+
+// ControlPlaneService is hosted by the external control plane. A worker
+// dials one outbound session and streams hello, results, and heartbeats;
+// the control plane streams assignments, cancellations, and heartbeat
+// acks over the same session.
+service ControlPlaneService {
+  rpc Session(stream SessionRequest) returns (stream SessionResponse);
+}

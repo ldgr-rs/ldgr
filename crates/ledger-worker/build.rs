@@ -2,7 +2,7 @@
 include!("src/build_codegen.rs");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=../ledger-format/proto/ledger/control/v1/control.proto");
+    println!("cargo:rerun-if-changed=../ledger-format/proto/ledger/control/v2/control.proto");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/build_codegen.rs");
     if std::env::var("CARGO_FEATURE_GRPC").is_ok() {

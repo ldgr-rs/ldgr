@@ -53,8 +53,8 @@ pub enum ArtifactError {
 
 /// Destination for task artifacts (certificates, journals).
 ///
-/// The three operations mirror the `ledger.control.v1` wire contract:
-/// GetUploadURL, byte transfer, ConfirmUpload.
+/// The operations mirror the session upload handshake: GetUploadURL, byte
+/// transfer, ConfirmUpload.
 pub trait ArtifactSink: Send + Sync {
     /// Request a presigned upload URL for `task_id`/`name`.
     ///

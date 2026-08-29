@@ -6,8 +6,6 @@ use std::time::Duration;
 use clap::Parser;
 use tokio::sync::Mutex;
 
-#[cfg(feature = "pg")]
-use ledger_worker::Task;
 use ledger_worker::{
     FlatQueueFileLine, InMemoryQueue, QueueFileError, QueueFileLine, RuntimeProfile, TaskQueue,
     WorkerConfig, execute_with_heartbeat, hash_to_hex,
@@ -20,9 +18,6 @@ use ledger_worker::{
     about = "Deterministic simulation worker daemon"
 )]
 struct LedgerWorker {
-    /// Unix domain socket path for the control plane.
-    #[arg(long)]
-    uds_path: Option<PathBuf>,
     /// How long a pulled task stays leased before it can be re-queued.
     #[arg(long, default_value_t = 30)]
     lease_timeout_secs: u64,
@@ -42,12 +37,13 @@ struct LedgerWorker {
     /// 4096 and missing `workload` to "kv".
     #[arg(long)]
     queue_file: Option<PathBuf>,
-    /// Postgres DSN of the River queue backend, e.g.
-    /// `postgres://host:5432/db`. When set, the standalone drain loop claims
-    /// tasks from the `river.job` table instead of the in-memory queue file.
-    /// Requires building with `--features pg`.
+    /// Control-plane endpoint for the outbound session, e.g.
+    /// `unix:///run/cp.sock` or `http://[::1]:50051`. When set, the worker
+    /// dials the external control plane, opens one authenticated session,
+    /// and executes the tasks the control plane assigns over it. Requires
+    /// building with `--features grpc`.
     #[arg(long)]
-    pg_dsn: Option<String>,
+    control_plane_endpoint: Option<String>,
     /// Base URL of the control-plane artifact service, e.g.
     /// `https://control.example.internal`. When set together with the
     /// `control-plane` feature, certificates are published over HTTP;
@@ -120,15 +116,7 @@ fn load_queue_file(path: &PathBuf, queue: &mut InMemoryQueue) -> Result<usize, Q
 }
 
 fn build_config(args: &LedgerWorker) -> WorkerConfig {
-    // Default socket lands in a platform-private directory under a
-    // randomized per-process name; an explicit --uds-path is honored
-    // exactly as given.
-    let uds_path = args
-        .uds_path
-        .clone()
-        .unwrap_or_else(ledger_worker::default_uds_path);
     WorkerConfig {
-        uds_path,
         lease_timeout: Duration::from_secs(args.lease_timeout_secs),
         max_concurrent: args.max_concurrent,
         // Detected once at startup; every certificate this process publishes
@@ -157,94 +145,18 @@ fn build_sink(args: &LedgerWorker) -> Arc<dyn ledger_worker::ArtifactSink> {
     Arc::new(ledger_worker::NoopSink)
 }
 
-#[tokio::main]
-async fn main() {
-    let args = LedgerWorker::parse();
-    let config = build_config(&args);
-    let sink = build_sink(&args);
-
-    if args.drain_once {
-        let queue = Box::new(InMemoryQueue::new(config.lease_timeout));
-        if let Some(line) = ledger_worker::run_drain_once(config, queue) {
-            println!("{line}");
-        }
-        return;
-    }
-
-    // Daemon mode: one shared queue drives both the drain loop and the UDS
-    // real-execution server, so leases heartbeated by either path protect the
-    // same tasks. InMemoryQueue is the default backend; `--pg-dsn` replaces
-    // the loop with the Postgres/River backend (async-only, so the shared
-    // in-memory queue and its UDS server do not start).
-    #[cfg(feature = "pg")]
-    if let Some(dsn) = args.pg_dsn.clone() {
-        if let Err(err) = pg_drain_loop(&dsn, &config, Arc::clone(&sink)).await {
-            eprintln!("ledger-worker: {err}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    #[cfg(not(feature = "pg"))]
-    if args.pg_dsn.is_some() {
-        eprintln!("ledger-worker: --pg-dsn requires building with --features pg");
-        std::process::exit(1);
-    }
-    let queue = Arc::new(Mutex::new(InMemoryQueue::new(config.lease_timeout)));
-    if let Some(path) = &args.queue_file {
-        match load_queue_file(path, &mut *queue.lock().await) {
-            Ok(count) => eprintln!(
-                "ledger-worker: loaded {count} task(s) from {}",
-                path.display()
-            ),
-            Err(err) => {
-                eprintln!("ledger-worker: {err}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // The control plane always serves: either the operator's --uds-path or
-    // the randomized platform-private default resolved into config.
-    let uds_handle = {
-        let path = config.uds_path.clone();
-        let queue = Arc::clone(&queue);
-        let sink = Arc::clone(&sink);
-        let profile_hex8 = config.profile_hex8.clone();
-        tokio::spawn(async move {
-            // With the grpc feature the daemon serves the tonic-generated
-            // ledger.control.v1 ControlPlane, WorkerControl, and
-            // ArtifactService over UDS; without it the JSON-lines fallback
-            // serves the same wire contract and exposes no artifact endpoint.
-            #[cfg(feature = "grpc")]
-            let result = ledger_worker::serve_grpc_uds(path, queue, sink, &profile_hex8).await;
-            #[cfg(not(feature = "grpc"))]
-            let result = {
-                drop(sink);
-                ledger_worker::serve_uds_real(path, queue, Some(profile_hex8)).await
-            };
-            if let Err(err) = result {
-                eprintln!("ledger-worker UDS error: {err}");
-            }
-        })
-    };
-
-    eprintln!(
-        "ledger-worker: daemon start uds={} lease={}s max_concurrent={} profile={} sink={}",
-        config.uds_path.display(),
-        config.lease_timeout.as_secs(),
-        config.max_concurrent,
-        config.profile_hex8,
-        if args.artifact_base_url.is_some() {
-            "http"
-        } else {
-            "noop"
-        },
-    );
-
-    // Heartbeat cadence: extend every lease/3 so an executing task is never
-    // more than a third of a lease away from a fresh deadline.
+/// Run the standalone drain loop over a local in-memory queue.
+///
+/// Polls every 200ms, runs up to `max_concurrent` tasks per tick, and
+/// heartbeats each lease every lease/3. Results are printed as JSON lines.
+/// Standalone mode owns only its local queue and makes no control-plane
+/// claims.
+async fn run_standalone_drain(
+    config: &WorkerConfig,
+    queue: Arc<Mutex<InMemoryQueue>>,
+    sink: Arc<dyn ledger_worker::ArtifactSink>,
+) {
     let heartbeat = (config.lease_timeout / 3).max(Duration::from_millis(1));
-
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -252,9 +164,6 @@ async fn main() {
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                // Drain up to max_concurrent tasks per tick, sequentially for
-                // determinism. Each task runs on the blocking pool while the
-                // async heartbeat extends its lease until completion.
                 for _ in 0..config.max_concurrent {
                     let task = queue.lock().await.pull();
                     let Some(task) = task else { break };
@@ -304,138 +213,213 @@ async fn main() {
             }
         }
     }
-
-    // Shutdown aborts the always-running control-plane server.
-    uds_handle.abort();
 }
 
-/// Standalone drain loop over the Postgres/River queue.
+/// Run the outbound control-plane session.
 ///
-/// Mirrors the in-memory loop: poll every 200ms, run up to `max_concurrent`
-/// tasks per tick, heartbeat each lease every lease/3 so it is refreshed
-/// well before expiry. Attempt budgets are honored by `fail_async`, which
-/// retries within budget and discards past `max_attempts`.
-#[cfg(feature = "pg")]
-async fn pg_drain_loop(
-    dsn: &str,
+/// Dials the endpoint, opens one session, and executes every task the
+/// control plane assigns over it. The worker hosts no service; the control
+/// plane owns the queue, leases, and attempts.
+#[cfg(feature = "grpc")]
+async fn run_control_plane(
+    endpoint: &str,
     config: &WorkerConfig,
     sink: Arc<dyn ledger_worker::ArtifactSink>,
-) -> Result<(), ledger_worker::QueueError> {
-    use ledger_worker::PostgresQueue;
-
+) -> Result<(), ledger_worker::SessionError> {
+    use ledger_worker::r#gen::{session_request, session_response};
+    use ledger_worker::{
+        SessionError, handle_cancel, next_response, open_session, run_assigned_task,
+        session_ack_worker_id, task_from_dispatch, worker_hello,
+    };
     let worker_id = format!("ledger-worker-{}", std::process::id());
-    let mut queue = PostgresQueue::connect(dsn, &worker_id, config.lease_timeout).await?;
     let heartbeat = (config.lease_timeout / 3).max(Duration::from_millis(1));
-    eprintln!(
-        "ledger-worker: pg drain start worker={worker_id} lease={}s max_concurrent={}",
-        config.lease_timeout.as_secs(),
-        config.max_concurrent,
-    );
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("ledger-worker: shutdown on ctrl-c");
-                return Ok(());
+    let (tx, mut rx) = open_session(endpoint).await?;
+    let hello = worker_hello(&worker_id, env!("CARGO_PKG_VERSION"));
+    let hello_msg = ledger_worker::r#gen::SessionRequest {
+        message: Some(session_request::Message::Hello(hello)),
+    };
+    if tx.send(hello_msg).await.is_err() {
+        return Err(SessionError::RequestChannelClosed);
+    }
+    // First inbound message must be the session ack.
+    let ack = match next_response(&mut rx).await? {
+        Some(resp) => match resp.message {
+            Some(session_response::Message::SessionAck(ack)) => ack,
+            Some(_) => {
+                return Err(SessionError::Rejected {
+                    reason: "expected session ack first".to_string(),
+                });
             }
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                for _ in 0..config.max_concurrent {
-                    match queue.pull_async().await {
-                        Ok(Some(task)) => {
-                            match execute_pg_with_heartbeat(&mut queue, task, heartbeat).await {
-                                Ok(ok) => {
-                                    // Same blocking-pool rule as the
-                                    // in-memory loop: publication never
-                                    // blocks the drain loop's ticks.
-                                    let publish_sink = Arc::clone(&sink);
-                                    let publish_result = ok.clone();
-                                    let publish_profile = config.profile_hex8.clone();
-                                    let published = tokio::task::spawn_blocking(move || {
-                                        ledger_worker::publish_result_certificate(
-                                            publish_sink.as_ref(),
-                                            &publish_result,
-                                            Some(ledger_worker::WORKER_BUILDER_ID),
-                                            Some(&publish_profile),
-                                        )
-                                    })
-                                    .await;
-                                    if let Err(join_err) = published {
-                                        eprintln!(
-                                            "ledger-worker: certificate publish task panicked: {join_err}"
-                                        );
-                                    }
-                                    let line = serde_json::json!({
-                                        "task_id": ok.task_id,
-                                        "journal_root": hash_to_hex(&ok.journal_root),
-                                        "steps": ok.steps,
-                                    })
-                                    .to_string();
-                                    println!("{line}");
+            None => {
+                return Err(SessionError::Rejected {
+                    reason: "empty first session message".to_string(),
+                });
+            }
+        },
+        None => {
+            return Err(SessionError::Rejected {
+                reason: "session closed before ack".to_string(),
+            });
+        }
+    };
+    let _assigned_worker_id = session_ack_worker_id(&ack)?;
+    eprintln!(
+        "ledger-worker: control-plane session accepted worker={worker_id} endpoint={endpoint}"
+    );
+
+    // In-flight task ids: a duplicate assignment of the same task fails
+    // closed instead of running twice.
+    let mut in_flight: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while let Some(resp) = next_response(&mut rx).await? {
+        match resp.message {
+            Some(session_response::Message::Assign(dispatch)) => {
+                let task = match task_from_dispatch(dispatch) {
+                    Ok(task) => task,
+                    Err(err) => {
+                        // Invalid dispatches fail closed through the funnel:
+                        // upload the failure so the control plane retires or
+                        // requeues it.
+                        eprintln!("ledger-worker: {err}");
+                        if let ledger_worker::SessionError::InvalidDispatch { task_id, .. } = &err {
+                            let _ = ledger_worker::upload_failure(
+                                &tx,
+                                task_id,
+                                &ledger_worker::TaskFailure::Execution(
+                                    ledger_worker::WorkerError::TaskFailed {
+                                        task_id: task_id.clone(),
+                                        attempts: 0,
+                                        max_attempts: 0,
+                                        detail: err.to_string(),
+                                    },
+                                ),
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                };
+                if !in_flight.insert(task.id.clone()) {
+                    // Duplicate assignment: fail closed through the funnel.
+                    eprintln!("ledger-worker: duplicate assignment of {}", task.id);
+                    let _ = ledger_worker::upload_failure(
+                        &tx,
+                        &task.id,
+                        &ledger_worker::TaskFailure::Execution(
+                            ledger_worker::WorkerError::TaskFailed {
+                                task_id: task.id.clone(),
+                                attempts: 0,
+                                max_attempts: 0,
+                                detail: "duplicate assignment".to_string(),
+                            },
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                match run_assigned_task(&tx, task, &worker_id, heartbeat).await {
+                    Ok(outcome) => {
+                        use ledger_worker::TaskOutcome;
+                        match outcome {
+                            TaskOutcome::Completed(ok) => {
+                                in_flight.remove(&ok.task_id);
+                                let publish_sink = Arc::clone(&sink);
+                                let publish_result = ok.clone();
+                                let publish_profile = config.profile_hex8.clone();
+                                let published = tokio::task::spawn_blocking(move || {
+                                    ledger_worker::publish_result_certificate(
+                                        publish_sink.as_ref(),
+                                        &publish_result,
+                                        Some(ledger_worker::WORKER_BUILDER_ID),
+                                        Some(&publish_profile),
+                                    )
+                                })
+                                .await;
+                                if let Err(join_err) = published {
+                                    eprintln!(
+                                        "ledger-worker: certificate publish task panicked: {join_err}"
+                                    );
                                 }
-                                Err(err) => eprintln!("ledger-worker: task failed: {err}"),
+                                let line = serde_json::json!({
+                                    "task_id": ok.task_id,
+                                    "journal_root": hash_to_hex(&ok.journal_root),
+                                    "steps": ok.steps,
+                                })
+                                .to_string();
+                                println!("{line}");
+                            }
+                            TaskOutcome::Failed(err) => {
+                                eprintln!("ledger-worker: task failed: {err}");
                             }
                         }
-                        Ok(None) => break,
-                        Err(err) => {
-                            eprintln!("ledger-worker: queue error: {err}");
-                            return Err(err);
-                        }
+                    }
+                    Err(session_err) => {
+                        eprintln!("ledger-worker: session error: {session_err}");
+                        return Err(session_err);
                     }
                 }
             }
+            Some(session_response::Message::Cancel(cancel)) => {
+                handle_cancel(&tx, cancel).await?;
+            }
+            Some(session_response::Message::HeartbeatAck(_)) => {}
+            Some(session_response::Message::SessionAck(_)) => {}
+            None => {}
         }
     }
+    Ok(())
 }
 
-/// Execute one Postgres-claimed task while heartbeating its lease.
-///
-/// Same contract as the in-memory `execute_with_heartbeat`: the task runs
-/// on the blocking pool, and each heartbeat tick (lease/3) refreshes the
-/// lease markers before expiry. River tracks no lease deadline column, so
-/// the refresh re-stamps `attempted_by`/`attempted_at` instead of extending
-/// a timer. Success acks (job completed); failure routes through
-/// `fail_async` so the attempt budget is charged in the database.
-#[cfg(feature = "pg")]
-async fn execute_pg_with_heartbeat(
-    queue: &mut ledger_worker::PostgresQueue,
-    task: Task,
-    heartbeat: Duration,
-) -> Result<ledger_worker::WorkerResult, ledger_worker::WorkerError> {
-    let task_id = task.id.clone();
-    let mut exec = tokio::task::spawn_blocking(move || ledger_worker::execute_task(task));
-    let mut ticker = tokio::time::interval(heartbeat.max(Duration::from_millis(1)));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let result = loop {
-        tokio::select! {
-            res = &mut exec => {
-                match res {
-                    Ok(inner) => break inner,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            _ = ticker.tick() => {
-                // Heartbeat failures are logged, not fatal: the lease
-                // markers refresh again on the next tick.
-                if let Err(err) = queue.extend_lease_async(&task_id).await {
-                    eprintln!("ledger-worker: lease heartbeat failed for {task_id}: {err}");
-                }
-            }
+#[tokio::main]
+async fn main() {
+    let args = LedgerWorker::parse();
+    let config = build_config(&args);
+    let sink = build_sink(&args);
+
+    if args.drain_once {
+        let queue = Box::new(InMemoryQueue::new(config.lease_timeout));
+        if let Some(line) = ledger_worker::run_drain_once(config, queue) {
+            println!("{line}");
         }
-    };
-    match result {
-        Ok(ok) => {
-            if let Err(err) = queue.ack_async(&ok.task_id).await {
-                eprintln!("ledger-worker: ack failed for {}: {err}", ok.task_id);
+        return;
+    }
+
+    if let Some(endpoint) = args.control_plane_endpoint.as_deref() {
+        #[cfg(feature = "grpc")]
+        {
+            if let Err(err) = run_control_plane(endpoint, &config, sink).await {
+                eprintln!("ledger-worker: {err}");
+                std::process::exit(1);
             }
-            Ok(ok)
+            return;
         }
-        Err(err) => {
-            let reason = err.to_string();
-            if let Err(fail_err) = queue.fail_async(&task_id, &reason).await {
-                eprintln!("ledger-worker: failure routing failed for {task_id}: {fail_err}");
-            }
-            Err(err)
+        #[cfg(not(feature = "grpc"))]
+        {
+            // Deliberate discard: without the grpc feature the endpoint is
+            // still consumed so the binding stays used in every build.
+            let _ = endpoint;
+            eprintln!(
+                "ledger-worker: --control-plane-endpoint requires building with --features grpc"
+            );
+            std::process::exit(1);
         }
     }
+
+    let queue = Arc::new(Mutex::new(InMemoryQueue::new(config.lease_timeout)));
+    if let Some(path) = &args.queue_file {
+        match load_queue_file(path, &mut *queue.lock().await) {
+            Ok(count) => eprintln!(
+                "ledger-worker: loaded {count} task(s) from {}",
+                path.display()
+            ),
+            Err(err) => {
+                eprintln!("ledger-worker: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    run_standalone_drain(&config, queue, sink).await;
 }
 
 #[cfg(test)]

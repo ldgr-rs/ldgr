@@ -1,19 +1,25 @@
 // ledger-lint:allow - integration test uses temp UDS and deterministic sim
-use std::path::PathBuf;
+//! Cross-boundary determinism through the outbound control-plane session.
+//!
+//! The worker is a pure client: it hosts no service. A fake external
+//! control plane hosts the `ledger.control.v2` service over a temp UDS
+//! socket; the worker (in-process or the compiled binary) dials it, opens
+//! one session, executes the assigned golden task, and uploads the result.
+//! The control plane verifies the uploaded journal root against a direct
+//! simulation, asserting byte-identical roots across the wire boundary and
+//! across two runs (hash-drift guard).
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use ledger_explorer::search::Workload;
 use ledger_sim::{RunConfig, Simulation};
 use ledger_worker::{
-    InMemoryQueue, Task, WorkerConfig, WorkerRequest, WorkerResponse, hash_to_hex, run_config_hash,
-    run_drain_once, workload_for,
+    InMemoryQueue, Task, WorkerConfig, hash_to_hex, run_config_hash, run_drain_once, workload_for,
 };
-use tokio::sync::Mutex;
 
 /// Bound on how long a freshly spawned server may take to serve a
 /// readiness probe. A longer wait is a dead server, not a slow one.
-const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// Bound on one request/response exchange. A longer wait is a wedged
 /// server, not a busy one.
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
@@ -28,7 +34,7 @@ fn golden_task(id: &str) -> Task {
 
 fn direct_root_hex() -> String {
     let cfg = golden_config();
-    let workload = workload_for("kv");
+    let workload = workload_for("kv").expect("kv workload");
     let run = Simulation::new(cfg, workload.programs())
         .run()
         .expect("direct simulation must succeed");
@@ -50,181 +56,260 @@ fn drain_once_root(task_id: &str) -> String {
         .to_string()
 }
 
-/// Connect to a UDS socket a freshly spawned server is binding, bounded by
-/// [`CONNECT_DEADLINE`]. Every connect failure is retried; a deadline miss
-/// panics with diagnostics instead of hanging.
-async fn uds_connect_ready(sock: &std::path::Path, what: &str) -> tokio::net::UnixStream {
-    let mut last_error = String::new();
-    tokio::time::timeout(CONNECT_DEADLINE, async {
-        loop {
-            match tokio::net::UnixStream::connect(sock).await {
-                Ok(stream) => return stream,
-                Err(error) => {
-                    last_error = error.to_string();
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "{what}: no listener at {} within {CONNECT_DEADLINE:?}; \
-             last connect error: {last_error}. The server task may have exited before binding.",
-            sock.display()
-        )
-    })
-}
-
-/// Readiness handshake: wait for the socket, then complete one
-/// request/response roundtrip against a task id that cannot exist. The
-/// server's error reply proves its accept loop is live and serving, so the
-/// caller's next request is handled instead of sitting in a backlog behind
-/// a listener that never accepts.
-async fn uds_ready(sock: &std::path::Path, what: &str) {
-    let probe_id = "readiness-probe";
-    let req = WorkerRequest {
-        task_id: probe_id.into(),
-        run_config_hash: hash_to_hex(&[0xabu8; 32]),
-        run_config: None,
-        profile_fingerprint: None,
-    };
-    let json = serde_json::to_string(&req).unwrap();
-    let mut stream = uds_connect_ready(sock, what).await;
-    {
-        use tokio::io::AsyncWriteExt;
-        stream
-            .write_all(format!("{json}\n").as_bytes())
-            .await
-            .expect("probe write");
-    }
-    let line = read_response_line(&mut stream, what).await;
-    let value: serde_json::Value =
-        serde_json::from_str(line.trim()).expect("probe response must be JSON");
-    let expected = format!("task not found: {probe_id}");
-    assert_eq!(
-        value["error"].as_str(),
-        Some(expected.as_str()),
-        "{what}: readiness probe must be answered by the server, got {value}"
-    );
-}
-
-/// Connect a tonic channel to a worker that is still starting up, bounded
-/// by [`CONNECT_DEADLINE`]. A deadline miss panics with diagnostics.
-#[cfg(feature = "grpc")]
-async fn grpc_ready(sock: &std::path::Path, what: &str) -> tonic::transport::Channel {
-    let mut last_error = String::new();
-    tokio::time::timeout(CONNECT_DEADLINE, async {
-        loop {
-            match ledger_worker::connect_grpc_uds(sock.to_path_buf()).await {
-                Ok(channel) => return channel,
-                Err(error) => {
-                    last_error = error.to_string();
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "{what}: worker never bound its gRPC socket at {} within {CONNECT_DEADLINE:?}; \
-             last connect error: {last_error}. Check the binary build or the server task stderr.",
-            sock.display()
-        )
-    })
-}
-
-/// Read one response line with [`RESPONSE_DEADLINE`]. An empty reply or a
-/// hang fails the test with diagnostics instead of parking forever.
-async fn read_response_line(stream: &mut tokio::net::UnixStream, what: &str) -> String {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    let bytes = tokio::time::timeout(RESPONSE_DEADLINE, reader.read_line(&mut line))
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "{what}: no response within {RESPONSE_DEADLINE:?}; \
-                 the server may have stalled or the request was malformed"
-            )
-        })
-        .unwrap_or_else(|error| panic!("{what}: response read failed: {error}"));
-    if bytes == 0 {
-        panic!("{what}: server closed the connection without a response");
-    }
-    if line.trim().is_empty() {
-        panic!("{what}: server replied with an empty line");
-    }
-    line
-}
-
-/// Bound one gRPC exchange with [`RESPONSE_DEADLINE`].
+/// Fake external control plane: hosts the v2 `ControlPlaneService` over a
+/// temp UDS socket and assigns the golden task, then records the uploaded
+/// result for verification.
 ///
-/// The tonic clients have no request timeout of their own, so a server
-/// that bound its socket but never enters its accept loop would park the
-/// first RPC forever. Mirrors [`uds_ready`]: a missing response fails with
-/// diagnostics instead of hanging.
+/// The fake owns the assignment: it leases exactly one task (the golden kv
+/// task) on session open, then records the first uploaded result.
 #[cfg(feature = "grpc")]
-async fn rpc_ready<T, E>(
-    pending: impl std::future::Future<Output = Result<T, E>>,
-    what: &str,
-) -> Result<T, E> {
-    tokio::time::timeout(RESPONSE_DEADLINE, pending)
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "{what}: no gRPC response within {RESPONSE_DEADLINE:?}; \
-                 the server may have bound its socket without serving its accept loop"
-            )
-        })
+mod fake_cp {
+    use super::*;
+    use ledger_worker::r#gen::control_plane_service_server::{
+        ControlPlaneService, ControlPlaneServiceServer,
+    };
+    use ledger_worker::r#gen::{
+        SessionAck, SessionRequest, SessionResponse, TaskDispatch, session_request,
+        session_response,
+    };
+    use std::path::Path;
+    use tonic::{Request, Response, Status, Streaming};
+
+    /// Shared state between the server task and the test.
+    #[derive(Default)]
+    pub struct FakeCpState {
+        /// Uploaded results, in order.
+        pub uploads: std::sync::Mutex<Vec<ledger_worker::r#gen::ResultUpload>>,
+        /// Heartbeats received, in order.
+        pub heartbeats: std::sync::Mutex<Vec<ledger_worker::r#gen::Heartbeat>>,
+        /// The hello that opened the session.
+        pub hello: std::sync::Mutex<Option<ledger_worker::r#gen::WorkerHello>>,
+    }
+
+    impl FakeCpState {
+        pub fn uploads(&self) -> Vec<ledger_worker::r#gen::ResultUpload> {
+            self.uploads.lock().unwrap().clone()
+        }
+        pub fn heartbeat_count(&self) -> usize {
+            self.heartbeats.lock().unwrap().len()
+        }
+    }
+
+    /// Session handler: ack the hello, assign the golden task, collect the
+    /// upload. Runs until the client closes the stream.
+    pub struct FakeCpSvc {
+        pub state: Arc<FakeCpState>,
+        pub dispatch: TaskDispatch,
+        pub accept: bool,
+    }
+
+    #[tonic::async_trait]
+    impl ControlPlaneService for FakeCpSvc {
+        type SessionStream =
+            tokio_stream::wrappers::ReceiverStream<Result<SessionResponse, Status>>;
+
+        async fn session(
+            &self,
+            request: Request<Streaming<SessionRequest>>,
+        ) -> Result<Response<Self::SessionStream>, Status> {
+            let mut incoming = request.into_inner();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            let state = Arc::clone(&self.state);
+            let dispatch = self.dispatch.clone();
+            let accept = self.accept;
+            tokio::spawn(async move {
+                // Hello must arrive first.
+                match incoming.message().await {
+                    Ok(Some(req)) => {
+                        if let Some(session_request::Message::Hello(hello)) = req.message {
+                            *state.hello.lock().unwrap() = Some(hello);
+                        }
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = tx
+                            .send(Ok(SessionResponse {
+                                message: Some(session_response::Message::SessionAck(SessionAck {
+                                    accepted: false,
+                                    assigned_worker_id: String::new(),
+                                    reason: "no hello".to_string(),
+                                })),
+                            }))
+                            .await;
+                        return;
+                    }
+                }
+                let ack = SessionResponse {
+                    message: Some(session_response::Message::SessionAck(SessionAck {
+                        accepted: accept,
+                        assigned_worker_id: if accept {
+                            "assigned-w1".to_string()
+                        } else {
+                            String::new()
+                        },
+                        reason: if accept {
+                            String::new()
+                        } else {
+                            "fake control plane rejects".to_string()
+                        },
+                    })),
+                };
+                if tx.send(Ok(ack)).await.is_err() {
+                    return;
+                }
+                if !accept {
+                    return;
+                }
+                // Assign the golden task once.
+                let assign = SessionResponse {
+                    message: Some(session_response::Message::Assign(dispatch)),
+                };
+                if tx.send(Ok(assign)).await.is_err() {
+                    return;
+                }
+                // Collect heartbeats and the upload until the client leaves.
+                while let Ok(Some(req)) = incoming.message().await {
+                    match req.message {
+                        Some(session_request::Message::Heartbeat(hb)) => {
+                            state.heartbeats.lock().unwrap().push(hb);
+                        }
+                        Some(session_request::Message::Result(upload)) => {
+                            state.uploads.lock().unwrap().push(upload);
+                        }
+                        Some(session_request::Message::Hello(_)) => {}
+                        Some(session_request::Message::CancelAck(_)) => {}
+                        None => {}
+                    }
+                }
+            });
+            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            )))
+        }
+    }
+
+    /// Spawn the fake control plane on a fresh temp socket.
+    pub async fn spawn(sock: &Path, dispatch: TaskDispatch, accept: bool) -> Arc<FakeCpState> {
+        let state = Arc::new(FakeCpState::default());
+        let listener = tokio::net::UnixListener::bind(sock).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+        let svc = FakeCpSvc {
+            state: Arc::clone(&state),
+            dispatch,
+            accept,
+        };
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(ControlPlaneServiceServer::new(svc))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        state
+    }
 }
 
-async fn uds_real_root(task_id: &str, sock: PathBuf) -> String {
-    let queue = Arc::new(Mutex::new(InMemoryQueue::new(Duration::from_secs(30))));
-    {
-        let mut q = queue.lock().await;
-        q.push(golden_task(task_id));
-    }
-    let queue_clone = Arc::clone(&queue);
-    let serve_path = sock.clone();
-    let handle = tokio::spawn(async move {
-        let _ = ledger_worker::serve_uds_real(serve_path, queue_clone, None).await;
-    });
-    uds_ready(&sock, "uds_real server").await;
-
+#[cfg(feature = "grpc")]
+fn golden_dispatch() -> ledger_worker::r#gen::TaskDispatch {
     let cfg = golden_config();
     let hash = run_config_hash(&cfg).unwrap();
-    let req = WorkerRequest {
-        task_id: task_id.to_string(),
-        run_config_hash: hash_to_hex(&hash),
-        run_config: None,
-        profile_fingerprint: None,
-    };
-    let json = serde_json::to_string(&req).unwrap();
-    let mut stream = uds_connect_ready(&sock, "uds_real client connect").await;
-    {
-        use tokio::io::AsyncWriteExt;
-        stream
-            .write_all(format!("{json}\n").as_bytes())
-            .await
-            .expect("request write");
+    ledger_worker::r#gen::TaskDispatch {
+        task_id: "golden-task".to_string(),
+        run_config_bytes: ledger_worker::canonical_bytes(&cfg).unwrap(),
+        workload: "kv".to_string(),
+        run_config_hash_hex: hash_to_hex(&hash),
+        execution_identity: Vec::new(),
     }
-    let resp_root = {
-        let line = read_response_line(&mut stream, "uds_real request").await;
-        let resp: WorkerResponse = serde_json::from_str(line.trim()).expect("valid json");
-        assert_eq!(resp.task_id, task_id);
-        assert!(
-            resp.error.is_none(),
-            "uds_real leg hit an error: {:?}",
-            resp.error
-        );
-        // The task was preloaded, so the real root must be present.
-        resp.journal_root.expect("journal_root for preloaded task")
+}
+
+#[cfg(feature = "grpc")]
+async fn session_root_through_fake_cp(sock: &std::path::Path, accept: bool) -> String {
+    use ledger_worker::r#gen::{session_request, session_response};
+    use ledger_worker::{
+        next_response, open_session, run_assigned_task, session_ack_worker_id, task_from_dispatch,
+        worker_hello,
     };
-    handle.abort();
-    let _ = std::fs::remove_file(&sock);
-    resp_root
+
+    let _state = fake_cp::spawn(sock, golden_dispatch(), accept).await;
+    // The worker dials OUT; no socket of its own is created.
+    let endpoint = ledger_worker::unix_endpoint(sock).expect("unix endpoint");
+    let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
+    let hello = worker_hello("w-cross", env!("CARGO_PKG_VERSION"));
+    tx.send(ledger_worker::r#gen::SessionRequest {
+        message: Some(session_request::Message::Hello(hello)),
+    })
+    .await
+    .expect("send hello");
+    let ack = next_response(&mut rx)
+        .await
+        .expect("read ack")
+        .expect("ack");
+    let ack = match ack.message {
+        Some(session_response::Message::SessionAck(ack)) => ack,
+        _ => panic!("expected session ack"),
+    };
+    let _assigned = session_ack_worker_id(&ack).expect("accepted");
+    if !accept {
+        // A rejected session has no further messages; done.
+        return String::new();
+    }
+    // Read the assignment.
+    let assign = next_response(&mut rx)
+        .await
+        .expect("read assign")
+        .expect("assign");
+    let dispatch = match assign.message {
+        Some(session_response::Message::Assign(dispatch)) => dispatch,
+        _ => panic!("expected assignment"),
+    };
+    let task = task_from_dispatch(dispatch).expect("dispatch parses");
+    let outcome = run_assigned_task(&tx, task, "w-cross", Duration::from_millis(5))
+        .await
+        .expect("assigned task runs");
+    match outcome {
+        ledger_worker::TaskOutcome::Completed(ok) => hash_to_hex(&ok.journal_root),
+        ledger_worker::TaskOutcome::Failed(err) => panic!("task failed: {err}"),
+    }
+}
+
+#[cfg(feature = "grpc")]
+async fn binary_session_root(_dir: &std::path::Path, sock: &std::path::Path) -> String {
+    use std::process::{Command, Stdio};
+
+    let state = fake_cp::spawn(sock, golden_dispatch(), true).await;
+    let bin = env!("CARGO_BIN_EXE_ledger-worker");
+    let endpoint = ledger_worker::unix_endpoint(sock).expect("unix endpoint");
+    let mut child = Command::new(bin)
+        .arg("--control-plane-endpoint")
+        .arg(&endpoint)
+        .arg("--lease-timeout-secs")
+        .arg("30")
+        .arg("--max-concurrent")
+        .arg("1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn ledger-worker binary");
+
+    // Wait for the upload with a deadline.
+    let root = tokio::time::timeout(RESPONSE_DEADLINE, async {
+        loop {
+            let uploads = state.uploads();
+            if let Some(u) = uploads.first() {
+                return u.journal_root_hex.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("binary worker must upload the result within the deadline");
+    child.kill().expect("kill worker binary");
+    let _ = child.wait();
+    let _ = std::fs::remove_file(sock);
+    root
 }
 
 #[tokio::test]
@@ -234,14 +319,10 @@ async fn cross_boundary_real_roots_equal_and_deterministic_twice() {
     assert_eq!(direct.len(), 64);
     assert_eq!(direct, direct.to_ascii_lowercase());
 
-    // Run golden campaign twice, asserting cross-boundary equality each time
-    // and determinism across iterations (journal-root equality asserted).
     let mut prev_direct = String::new();
     let mut prev_a = String::new();
-    let mut prev_b = String::new();
     for iter in 0..2 {
         let task_id = "golden-task";
-        // Use a per-iteration socket to avoid reuse races.
         let dir = std::env::temp_dir().join(format!(
             "ldgr-cross-{}-{}-{}",
             std::process::id(),
@@ -249,242 +330,46 @@ async fn cross_boundary_real_roots_equal_and_deterministic_twice() {
             task_id
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let sock = dir.join("cross.sock");
+        let sock = dir.join("cp.sock");
         if sock.exists() {
             let _ = std::fs::remove_file(&sock);
         }
 
         let root_a = drain_once_root(task_id);
-        let root_b = uds_real_root(task_id, sock.clone()).await;
-        let root_bin = binary_uds_root(&dir, task_id, &sock).await;
+        #[cfg(feature = "grpc")]
+        let root_b = session_root_through_fake_cp(&sock, true).await;
+        #[cfg(feature = "grpc")]
+        let root_bin = binary_session_root(&dir, &dir.join("cp-bin.sock")).await;
         let direct_now = direct_root_hex();
 
-        // Determinism: direct recomputed each iteration must equal the first direct.
         assert_eq!(
             direct_now, direct,
             "direct simulation drift across iterations {iter}"
         );
-        // Cross-boundary: in-process dispatcher vs UDS real worker.
-        assert_eq!(
-            root_a, root_b,
-            "cross-boundary mismatch iter {iter}: drain_once {root_a} vs uds_real {root_b}"
-        );
-        // The compiled worker binary over its own UDS must agree too.
-        assert_eq!(
-            root_bin, direct_now,
-            "binary worker root mismatch vs direct iter {iter}"
-        );
-        // Both must equal the direct simulation root.
         assert_eq!(
             root_a, direct_now,
             "dispatcher root mismatch vs direct iter {iter}"
         );
+        #[cfg(feature = "grpc")]
         assert_eq!(
             root_b, direct_now,
-            "uds_real root mismatch vs direct iter {iter}"
+            "session root mismatch vs direct iter {iter}"
         );
-        // Real root must not be the stub blake3(task_id).
-        let stub = hash_to_hex(blake3::hash(task_id.as_bytes()).as_bytes());
-        assert_ne!(
-            root_a, stub,
-            "real root must not equal stub blake3(task_id) iter {iter}"
+        #[cfg(feature = "grpc")]
+        assert_eq!(
+            root_bin, direct_now,
+            "binary worker session root mismatch vs direct iter {iter}"
         );
 
         if iter > 0 {
             assert_eq!(prev_direct, direct_now, "hash drift across golden runs");
             assert_eq!(prev_a, root_a, "hash drift across golden runs (drain_once)");
-            assert_eq!(prev_b, root_b, "hash drift across golden runs (uds_real)");
         }
         prev_direct = direct_now;
         prev_a = root_a;
-        prev_b = root_b;
 
         let _ = std::fs::remove_dir_all(&dir);
-        println!(
-            "iter {iter}: cross-boundary ok direct={} drain_once={} uds_real={} binary={root_bin}",
-            prev_direct, prev_a, prev_b
-        );
     }
-}
-
-/// Spawn the compiled `ledger-worker` binary with a queue file and query it
-/// over its own UDS. This is the fourth leg: the real process boundary. The
-/// probe speaks whichever transport the binary was built with.
-async fn binary_uds_root(dir: &std::path::Path, task_id: &str, sock: &std::path::Path) -> String {
-    use std::process::{Command, Stdio};
-
-    let bin = env!("CARGO_BIN_EXE_ledger-worker");
-    let queue_file = dir.join("queue.ndjson");
-    let cfg = golden_config();
-    let seed_hex: String = cfg.seed().iter().map(|b| format!("{b:02x}")).collect();
-    let spec = serde_json::json!({
-        "task_id": task_id,
-        "seed_hex": seed_hex,
-        "max_steps": 4096u64,
-        "workload": "kv",
-    });
-    std::fs::write(&queue_file, format!("{spec}\n")).expect("write queue file");
-
-    let child_sock = dir.join("bin.sock");
-    let mut child = Command::new(bin)
-        .arg("--uds-path")
-        .arg(&child_sock)
-        .arg("--queue-file")
-        .arg(&queue_file)
-        .arg("--lease-timeout-secs")
-        .arg("30")
-        .arg("--max-concurrent")
-        .arg("0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn ledger-worker binary");
-
-    #[cfg(feature = "grpc")]
-    let resp_root = {
-        // gRPC leg: lease the golden task from the real binary and upload the
-        // direct root; acceptance proves the daemon reproduced it exactly.
-        let channel = grpc_ready(&child_sock, "worker binary gRPC").await;
-        let mut client =
-            ledger_worker::r#gen::control_plane_client::ControlPlaneClient::new(channel);
-
-        // First RPC with a client deadline: a binary that bound its socket
-        // but never serves would otherwise park this test forever.
-        let lease = rpc_ready(
-            client.acquire_lease(ledger_worker::r#gen::LeaseRequest {
-                worker_id: "cross".into(),
-                max_tasks: 8,
-            }),
-            "worker binary gRPC acquire_lease",
-        )
-        .await
-        .expect("acquire_lease from binary");
-        let lease = lease.into_inner();
-        let dispatch = lease
-            .tasks
-            .iter()
-            .find(|t| t.task_id == task_id)
-            .expect("golden task must be leased from the binary queue");
-        assert_eq!(dispatch.workload, "kv");
-        // The queue file pins max_steps=4096, so the hash travels over that
-        // exact config, not the RunConfig default budget.
-        let file_cfg = RunConfig::builder()
-            .seed(cfg.seed())
-            .max_steps(4096)
-            .build();
-        assert_eq!(
-            dispatch.run_config_hash_hex,
-            hash_to_hex(&run_config_hash(&file_cfg).unwrap())
-        );
-
-        let direct = direct_root_hex();
-        let ack = client
-            .upload_result(ledger_worker::r#gen::ResultUpload {
-                task_id: task_id.to_string(),
-                journal_root_hex: direct.clone(),
-                steps: 4096,
-                ok: true,
-                error: String::new(),
-            })
-            .await
-            .expect("upload_result to binary")
-            .into_inner();
-        assert!(ack.accepted, "binary worker rejected the true journal root");
-        direct
-    };
-
-    #[cfg(not(feature = "grpc"))]
-    let resp_root = {
-        let mut stream = uds_connect_ready(&child_sock, "worker binary UDS").await;
-
-        // The queue file pins max_steps=4096, so the request must name the
-        // hash of that exact config, not the RunConfig default budget.
-        let file_cfg = RunConfig::builder()
-            .seed(cfg.seed())
-            .max_steps(4096)
-            .build();
-        let hash = run_config_hash(&file_cfg).unwrap();
-        let req = WorkerRequest {
-            task_id: task_id.to_string(),
-            run_config_hash: hash_to_hex(&hash),
-            run_config: None,
-            profile_fingerprint: None,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        {
-            use tokio::io::AsyncWriteExt;
-            stream
-                .write_all(format!("{json}\n").as_bytes())
-                .await
-                .unwrap();
-        }
-        {
-            let line = read_response_line(&mut stream, "worker binary request").await;
-            let resp: WorkerResponse = serde_json::from_str(line.trim()).unwrap();
-            assert_eq!(resp.task_id, task_id);
-            assert!(
-                resp.error.is_none(),
-                "binary leg hit an error: {:?}",
-                resp.error
-            );
-            resp.journal_root
-                .expect("journal_root for preloaded queue-file task")
-        }
-    };
-
-    child.kill().expect("kill worker binary");
-    let _ = child.wait();
-    let _ = std::fs::remove_file(&queue_file);
-    let _ = std::fs::remove_file(sock);
-    resp_root
-}
-
-#[tokio::test]
-async fn uds_real_unknown_task_returns_error() {
-    let dir = std::env::temp_dir().join(format!("ldgr-cross-fallback-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let sock = dir.join("fallback.sock");
-    if sock.exists() {
-        let _ = std::fs::remove_file(&sock);
-    }
-    let queue = Arc::new(Mutex::new(InMemoryQueue::new(Duration::from_secs(30))));
-    // Do not preload any task: the reply must be an error, never a
-    // fabricated root.
-    let queue_clone = Arc::clone(&queue);
-    let serve_path = sock.clone();
-    let handle = tokio::spawn(async move {
-        let _ = ledger_worker::serve_uds_real(serve_path, queue_clone, None).await;
-    });
-    uds_ready(&sock, "fallback uds server").await;
-
-    let req = WorkerRequest {
-        task_id: "missing-task".into(),
-        run_config_hash: hash_to_hex(&[9u8; 32]),
-        run_config: None,
-        profile_fingerprint: None,
-    };
-    let json = serde_json::to_string(&req).unwrap();
-    let mut stream = uds_connect_ready(&sock, "fallback client connect").await;
-    {
-        use tokio::io::AsyncWriteExt;
-        stream
-            .write_all(format!("{json}\n").as_bytes())
-            .await
-            .unwrap();
-    }
-    {
-        let line = read_response_line(&mut stream, "fallback request").await;
-        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(v["task_id"], "missing-task");
-        assert_eq!(v["error"], "task not found: missing-task");
-        assert!(
-            !v.as_object().unwrap().contains_key("journal_root"),
-            "error response must not carry a journal_root, got {v}"
-        );
-    }
-    handle.abort();
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -494,88 +379,188 @@ fn direct_simulation_is_deterministic_across_two_runs() {
     assert_eq!(a, b);
 }
 
-/// In-process gRPC leg: serve the tonic `ControlPlane` over a temp UDS inside
-/// this test process, lease the golden kv task, upload the direct root, and
-/// require acceptance. Skipped entirely when built without the `grpc`
-/// feature; the binary leg then exercises the JSON-lines fallback instead.
+/// The worker hosts no service: a rejected session must fail closed, and
+/// the worker must never bind its own socket.
 #[cfg(feature = "grpc")]
 #[tokio::test]
-async fn grpc_in_process_root_matches_direct() {
-    use ledger_worker::serve_grpc_uds;
+async fn rejected_session_fails_closed() {
+    use ledger_worker::r#gen::{session_request, session_response};
+    use ledger_worker::{next_response, open_session, worker_hello};
+    let dir = std::env::temp_dir().join(format!("ldgr-cross-reject-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("reject.sock");
+    let state = fake_cp::spawn(&sock, golden_dispatch(), false).await;
 
-    let dir = std::env::temp_dir().join(format!("ldgr-cross-grpc-inproc-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let sock = dir.join("grpc-inproc.sock");
-
-    let queue = Arc::new(Mutex::new(InMemoryQueue::new(Duration::from_secs(30))));
-    {
-        let mut q = queue.lock().await;
-        q.push(golden_task("grpc-golden"));
-    }
-    let serve_handle = {
-        let sock = sock.clone();
-        tokio::spawn(async move {
-            let _ =
-                serve_grpc_uds(sock, queue, Arc::new(ledger_worker::NoopSink), "deadbeef").await;
-        })
-    };
-
-    // Readiness handshake: the Health RPC must answer before the lease
-    // exchange starts, so the bind race cannot hide behind a retry. The
-    // exchange carries a client deadline: a server that binds without
-    // serving would otherwise park this test forever.
-    let channel = grpc_ready(&sock, "in-process gRPC server").await;
-    let mut health = ledger_worker::r#gen::health_client::HealthClient::new(channel.clone());
-    let reply = rpc_ready(
-        health.check(ledger_worker::r#gen::HealthCheck {
-            service: String::new(),
-        }),
-        "in-process gRPC health check",
-    )
+    let endpoint = ledger_worker::unix_endpoint(&sock).expect("unix endpoint");
+    let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
+    let hello = worker_hello("w-reject", env!("CARGO_PKG_VERSION"));
+    tx.send(ledger_worker::r#gen::SessionRequest {
+        message: Some(session_request::Message::Hello(hello)),
+    })
     .await
-    .expect("health check must answer on a serving daemon")
-    .into_inner();
-    assert!(reply.serving, "in-process daemon must report serving");
-
-    let mut client = ledger_worker::r#gen::control_plane_client::ControlPlaneClient::new(channel);
-
-    let lease = client
-        .acquire_lease(ledger_worker::r#gen::LeaseRequest {
-            worker_id: "cross-grpc".into(),
-            max_tasks: 4,
-        })
+    .expect("send hello");
+    let ack = next_response(&mut rx)
         .await
-        .expect("acquire_lease over in-process gRPC")
-        .into_inner();
-    assert_eq!(lease.tasks.len(), 1);
-    assert_eq!(lease.tasks[0].task_id, "grpc-golden");
-    assert_eq!(lease.tasks[0].workload, "kv");
-    assert_eq!(
-        lease.tasks[0].run_config_hash_hex,
-        hash_to_hex(&run_config_hash(&golden_config()).unwrap())
-    );
-
-    // UploadResult must accept exactly the direct simulation root.
-    let direct = direct_root_hex();
-    let ack = client
-        .upload_result(ledger_worker::r#gen::ResultUpload {
-            task_id: "grpc-golden".into(),
-            journal_root_hex: direct.clone(),
-            steps: 4096,
-            ok: true,
-            error: String::new(),
-        })
-        .await
-        .expect("upload_result over in-process gRPC")
-        .into_inner();
-    assert_eq!(ack.task_id, "grpc-golden");
+        .expect("read ack")
+        .expect("ack");
+    let ack = match ack.message {
+        Some(session_response::Message::SessionAck(ack)) => ack,
+        _ => panic!("expected session ack"),
+    };
+    assert!(!ack.accepted);
     assert!(
-        ack.accepted,
-        "in-process gRPC worker rejected the deterministic root"
+        ledger_worker::session_ack_worker_id(&ack).is_err(),
+        "rejected session must fail closed"
     );
-    assert_eq!(direct.len(), 64);
+    // The worker opened no listening socket of its own.
+    let _ = state;
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
-    serve_handle.abort();
-    let _ = std::fs::remove_file(&sock);
+/// The worker never binds its own socket: after a full session the temp
+/// directory holds only the control plane's socket.
+#[cfg(feature = "grpc")]
+#[tokio::test]
+async fn worker_creates_no_socket_of_its_own() {
+    let dir = std::env::temp_dir().join(format!("ldgr-cross-nosock-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("cp.sock");
+    let _root = session_root_through_fake_cp(&sock, true).await;
+    // Only the control plane's socket exists; the worker bound nothing.
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 1, "worker must not create its own socket");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Heartbeats flow during a long task: the fake control plane must observe
+/// at least one heartbeat before the upload for a slow workload.
+#[cfg(feature = "grpc")]
+#[tokio::test]
+async fn heartbeats_flow_while_task_runs() {
+    use ledger_worker::r#gen::{session_request, session_response};
+    use ledger_worker::{next_response, open_session, worker_hello};
+    use ledger_worker::{run_assigned_task, task_from_dispatch};
+    let dir = std::env::temp_dir().join(format!("ldgr-cross-hb-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("hb.sock");
+    let state = fake_cp::spawn(&sock, golden_dispatch(), true).await;
+    let endpoint = ledger_worker::unix_endpoint(&sock).expect("unix endpoint");
+    let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
+    let hello = worker_hello("w-hb", env!("CARGO_PKG_VERSION"));
+    tx.send(ledger_worker::r#gen::SessionRequest {
+        message: Some(session_request::Message::Hello(hello)),
+    })
+    .await
+    .expect("send hello");
+    let ack = next_response(&mut rx)
+        .await
+        .expect("read ack")
+        .expect("ack");
+    let ack = match ack.message {
+        Some(session_response::Message::SessionAck(ack)) => ack,
+        _ => panic!("expected session ack"),
+    };
+    assert!(ack.accepted);
+    let assign = next_response(&mut rx)
+        .await
+        .expect("read assign")
+        .expect("assign");
+    let dispatch = match assign.message {
+        Some(session_response::Message::Assign(d)) => d,
+        _ => panic!("expected assignment"),
+    };
+    let task = task_from_dispatch(dispatch).expect("dispatch parses");
+    // Very short heartbeat: the golden kv run takes a few ms, so a 1ms
+    // interval guarantees at least one tick.
+    let outcome = run_assigned_task(&tx, task, "w-hb", Duration::from_millis(1))
+        .await
+        .expect("assigned task runs");
+    assert!(matches!(outcome, ledger_worker::TaskOutcome::Completed(_)));
+    // Wait until the fake control plane observes the upload; heartbeats
+    // travel the same channel before it, so the count is settled then.
+    tokio::time::timeout(RESPONSE_DEADLINE, async {
+        loop {
+            if !state.uploads().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("upload must arrive");
+    assert!(
+        state.heartbeat_count() >= 1,
+        "the control plane must observe heartbeats while a task runs"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Unknown workloads fail closed: the upload carries the failure and no
+/// journal root.
+#[cfg(feature = "grpc")]
+#[tokio::test]
+async fn unknown_workload_fails_closed() {
+    use ledger_worker::r#gen::{session_request, session_response};
+    use ledger_worker::{next_response, open_session, worker_hello};
+    use ledger_worker::{run_assigned_task, task_from_dispatch};
+    let dir = std::env::temp_dir().join(format!("ldgr-cross-uw-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let sock = dir.join("uw.sock");
+    let mut dispatch = golden_dispatch();
+    dispatch.workload = "no-such-workload".to_string();
+    let state = fake_cp::spawn(&sock, dispatch, true).await;
+    let endpoint = ledger_worker::unix_endpoint(&sock).expect("unix endpoint");
+    let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
+    let hello = worker_hello("w-uw", env!("CARGO_PKG_VERSION"));
+    tx.send(ledger_worker::r#gen::SessionRequest {
+        message: Some(session_request::Message::Hello(hello)),
+    })
+    .await
+    .expect("send hello");
+    let ack = next_response(&mut rx)
+        .await
+        .expect("read ack")
+        .expect("ack");
+    let _ack = match ack.message {
+        Some(session_response::Message::SessionAck(ack)) => ack,
+        _ => panic!("expected session ack"),
+    };
+    let assign = next_response(&mut rx)
+        .await
+        .expect("read assign")
+        .expect("assign");
+    let dispatch = match assign.message {
+        Some(session_response::Message::Assign(d)) => d,
+        _ => panic!("expected assignment"),
+    };
+    let task = task_from_dispatch(dispatch).expect("dispatch parses");
+    let outcome = run_assigned_task(&tx, task, "w-uw", Duration::from_millis(50))
+        .await
+        .expect("assigned task runs");
+    assert!(
+        matches!(outcome, ledger_worker::TaskOutcome::Failed(_)),
+        "unknown workload must fail closed"
+    );
+    let upload = tokio::time::timeout(RESPONSE_DEADLINE, async {
+        loop {
+            let uploads = state.uploads();
+            if let Some(u) = uploads.first() {
+                return u.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upload must arrive");
+    assert!(!upload.ok, "failed upload must carry ok=false");
+    assert!(
+        upload.error.contains("unknown workload"),
+        "got {}",
+        upload.error
+    );
+    assert!(upload.journal_root_hex.is_empty(), "no root on failure");
     let _ = std::fs::remove_dir_all(&dir);
 }

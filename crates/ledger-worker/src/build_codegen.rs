@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 /// Paths the grpc codegen step writes: the proto source of truth, its
 /// include roots, and the out dir inside the source tree.
 pub struct CodegenPaths {
-    /// `ledger.control.v1` contract source.
+    /// `ledger.control.v2` contract source.
     pub proto: PathBuf,
     /// Directories searched for imports.
     pub includes: Vec<PathBuf>,
@@ -22,7 +22,7 @@ pub struct CodegenPaths {
 /// Resolve every codegen path from the crate manifest directory.
 pub fn codegen_paths(manifest_dir: &Path) -> CodegenPaths {
     CodegenPaths {
-        proto: manifest_dir.join("../ledger-format/proto/ledger/control/v1/control.proto"),
+        proto: manifest_dir.join("../ledger-format/proto/ledger/control/v2/control.proto"),
         includes: vec![manifest_dir.join("../ledger-format/proto")],
         out_dir: manifest_dir.join("src/gen"),
     }

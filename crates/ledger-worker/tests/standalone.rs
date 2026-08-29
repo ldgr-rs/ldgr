@@ -16,7 +16,7 @@ fn drain_once_with_task_produces_json() {
     };
     let mut q = InMemoryQueue::new(config.lease_timeout);
     let run_config = RunConfig::builder().seed([3u8; 32]).build();
-    q.push(Task::new("task-1", run_config, "trivial"));
+    q.push(Task::new("task-1", run_config, "kv"));
     let line = run_drain_once(config, Box::new(q)).expect("should produce a JSON line");
     let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
     assert_eq!(v["task_id"], "task-1");
@@ -61,9 +61,9 @@ fn drain_once_journal_root_is_deterministic() {
     let config_b = config_a.clone();
     let run_config = RunConfig::builder().seed([7u8; 32]).build();
     let mut qa = InMemoryQueue::new(Duration::from_secs(30));
-    qa.push(Task::new("det", run_config.clone(), "trivial"));
+    qa.push(Task::new("det", run_config.clone(), "kv"));
     let mut qb = InMemoryQueue::new(Duration::from_secs(30));
-    qb.push(Task::new("det", run_config, "trivial"));
+    qb.push(Task::new("det", run_config, "kv"));
     let la = run_drain_once(config_a, Box::new(qa)).unwrap();
     let lb = run_drain_once(config_b, Box::new(qb)).unwrap();
     let va: serde_json::Value = serde_json::from_str(&la).unwrap();

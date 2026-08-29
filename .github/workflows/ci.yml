@@ -16,27 +16,10 @@ jobs:
   rust:
     name: Rust checks
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        # pg_queue integration tests need a real Postgres to apply the
-        # River river.job schema subset against; without it the suite panics
-        # on a missing DSN. Mirrors the control-plane-ci.yml worker job.
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
       # Shared sccache across GitHub-hosted runners.
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
-      # Feeds the workspace all-features suite, which compiles pg_queue in.
-      LEDGER_TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,7 +46,7 @@ jobs:
       - name: Build debug Wasm guest artifact (needed by wasm tests)
         run: cargo build --target wasm32-wasip1 -p wasm-guest
       - name: Run tests with cargo-nextest
-        run: cargo nextest run --workspace --all-features --profile ci
+        run: cargo nextest run --workspace --all-features --profile ci -E 'not binary(pg_queue)'
       - name: Run doctests
         run: cargo test --workspace --doc
       - name: Verify all benchmarks compile
@@ -149,7 +132,7 @@ jobs:
         run: |
           cargo hack check -p ledger-sim --feature-powerset --include-features backend-wasm,sim-fs-journaling
           cargo hack check -p ldgr-rt --feature-powerset --include-features sim,sim-link
-          cargo hack check -p ledger-worker --feature-powerset --include-features pg,grpc
+          cargo hack check -p ledger-worker --feature-powerset --include-features grpc
       - name: ldgr-rt surface probe (all cfgs)
         run: |
           cargo check -p ldgr-rt
