@@ -19,11 +19,15 @@
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod proto;
+
 #[cfg(any(feature = "sim", feature = "sim-link"))]
 mod ipc;
 mod net;
 mod rng;
 mod runtime;
+#[cfg(feature = "sim")]
+mod shim;
 mod task;
 mod time;
 
@@ -36,6 +40,8 @@ pub use runtime::{
     Handle, IpcFault, JournalFault, RunCompletion, RunConfig, RunResult, RuntimeError, TaskMain,
     register_workload, run, run_named,
 };
+#[cfg(feature = "sim")]
+pub use shim::{EngineSession, ShimError};
 pub use task::{TaskId, task_id_for};
 pub use time::{SimClock, now};
 

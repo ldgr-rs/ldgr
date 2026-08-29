@@ -61,7 +61,7 @@ pub use sentinel_belt::{
 };
 #[cfg(feature = "sim-fs-journaling")]
 pub use simfs::JournalingMode;
-pub use simfs::{PageState, SimFs};
+pub use simfs::{PageState, SimFs, SimFsError};
 pub use time::{Clock, TimerFired, VirtualTime};
 #[cfg(feature = "backend-wasm")]
 pub use wasi_fs::SimFsHost;
