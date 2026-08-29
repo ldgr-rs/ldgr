@@ -1034,7 +1034,7 @@ fn cert_verify_rejects_oversized_file() {
 }
 
 #[test]
-fn cert_verify_rejects_oversized_via_bounded_reader() {
+fn cert_verify_rejects_oversized_certificate() {
     // A valid prefix plus padding still fails at the bounded reader limit.
     use ledger_explorer::CampaignCertificate;
     use ledger_explorer::search::CampaignReport;

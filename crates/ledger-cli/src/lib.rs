@@ -398,14 +398,6 @@ impl MaxSatEngineArg {
             Self::Cadical => ledger_explorer::SolverEngine::Cadical,
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Builtin => "builtin",
-            Self::Cadical => "cadical",
-        }
-    }
 }
 
 impl FidelityArg {
