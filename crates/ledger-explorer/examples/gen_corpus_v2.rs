@@ -1,8 +1,18 @@
 // ledger-lint:allow (host-side corpus manifest generator; it is not simulation code)
-//! Generate the pinned `corpora/bug-corpus-v2` manifests from the v2 scenario
-//! registry (`ledger_explorer::reference::corpus_v2_scenarios`).
+//! Generate the pinned `corpora/bug-corpus-v2` manifests from the
+//! fault-triggered scenario registry
+//! (`ledger_explorer::reference::faultdep_scenarios`).
+//!
+//! Run from the workspace root with `cargo run -p ledger-explorer --example
+//! gen_corpus_v2`. Each manifest pins the scenario's canonical WITNESS run:
+//! the run at the pinned seed with the pinned trigger schedule injected. The
+//! no-fault baseline at the same seed passes; only the trigger causes the
+//! violation. The trigger schedule itself is derived deterministically from
+//! the no-fault baseline journal of the pinned seed, so the manifest bytes
+//! plus the registry fully determine the witness run without storing a
+//! fault schedule in the manifest format.
 
-use ledger_explorer::reference::corpus_v2_scenarios;
+use ledger_explorer::reference::faultdep_scenarios;
 use ledger_format::RunManifest;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,10 +25,8 @@ fn main() {
     let out_dir = Path::new("corpora/bug-corpus-v2");
     std::fs::create_dir_all(out_dir).expect("create v2 dir");
     let mut written = 0usize;
-    for scenario in corpus_v2_scenarios() {
-        let finding = scenario
-            .reproduce()
-            .unwrap_or_else(|error| panic!("{error}"));
+    for scenario in faultdep_scenarios() {
+        let finding = scenario.witness().unwrap_or_else(|error| panic!("{error}"));
         let mut actor_heads = BTreeMap::new();
         for entry in finding.run.journal.entries() {
             actor_heads.insert(entry.data.actor, entry.id);
@@ -37,12 +45,12 @@ fn main() {
         let path = out_dir.join(format!("{}.ldgr", scenario.name));
         std::fs::write(&path, &bytes).expect("manifest write");
         println!(
-            "wrote {} ({} bytes, root {}, cloud-infra)",
+            "wrote {} ({} bytes, root {}, fault-triggered witness)",
             path.display(),
             bytes.len(),
             hex(&manifest.journal_root),
         );
         written += 1;
     }
-    println!("generated {written} corpus-v2 manifest fixtures");
+    println!("generated {written} fault-triggered corpus-v2 manifest fixtures");
 }
