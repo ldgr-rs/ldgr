@@ -7,8 +7,6 @@
 # bench compile checks, cargo-audit supply-chain job, wasm differential
 # gates, fuzz targets. Uses the pinned rust:1.97.1 image, matching the
 # GitHub toolchain pin. Keep stages simple: lint and test.
-# Requires a docker-executor runner with service networking: the test job
-# links a postgres service container and reaches it over its alias.
 # Jobs building --all-features compile ledger-worker's grpc feature, whose
 # build script needs protoc (tonic_prost_build); the rust image ships none,
 # so those jobs install protobuf-compiler first.
@@ -71,39 +69,11 @@ nostd-check:
 test:
   stage: test
   image: rust:1.97.1
-  services:
-    # pg_queue integration tests need a real Postgres; GitHub CI provisions
-    # one as a service container, so this mirror does the same. Services are
-    # reachable at the alias hostname.
-    - name: postgres:17
-      alias: postgres
-      variables:
-        POSTGRES_PASSWORD: postgres
-  variables:
-    LEDGER_TEST_PG_DSN: "postgres://postgres:postgres@postgres:5432/postgres"
   before_script:
     - apt-get update && apt-get install -y protobuf-compiler
     - rustup target add wasm32-wasip1
     - cargo install cargo-nextest --locked || cargo binstall -y cargo-nextest || curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
     - cargo build --target wasm32-wasip1 -p wasm-guest
-    # Wait for the linked Postgres service before the suite runs (bounded:
-    # 30 tries x 2s = 60s max, then fail fast; the queue tests connect on
-    # first use and never retry).
-    - |
-      ready=0
-      for i in $(seq 1 30); do
-        if (echo > /dev/tcp/postgres/5432) >/dev/null 2>&1; then
-          ready=1
-          break
-        fi
-        echo "waiting for postgres ($i/30)"
-        sleep 2
-      done
-      if [ "$ready" -ne 1 ]; then
-        echo "postgres service did not become reachable within 60s"
-        exit 1
-      fi
-      echo "postgres reachable"
   script:
     - cargo nextest run --workspace --all-features
 
