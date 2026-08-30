@@ -44,25 +44,28 @@
 //! runner, oracle, base seed, and fault space; the corpus gates, the manifest
 //! generator, and the LDFI efficiency gate all consume it.
 
+mod faultdep;
 mod oracles;
 mod registry;
 mod sims;
 #[cfg(test)]
 mod tests;
 
+pub use faultdep::{
+    FAULTDEP_SUPPORT_VERSION, FaultDepScenario, faultdep_scenario, faultdep_scenarios,
+};
 pub use oracles::{
     convergence_oracle, current_lease_holder_write_oracle, distinct_outcomes_oracle,
     last_write_wins_oracle, live_quorum_commit_oracle, single_leader_per_term_oracle,
 };
 pub use registry::{
-    CorpusRunner, CorpusScenario, ReferenceReplayError, ScenarioClass, all_corpus_scenarios,
-    corpus_scenario, corpus_scenarios, corpus_v2_scenario, corpus_v2_scenarios, scenario_class,
+    CorpusRunner, CorpusScenario, ReferenceReplayError, ScenarioClass, corpus_scenario,
+    corpus_scenarios, scenario_class,
 };
 pub use sims::{
-    mini_2pc, mini_cassandra, mini_cloud_az_double_assign, mini_cloud_config_drift,
-    mini_cloud_instance_flap, mini_cloud_quota_retry_storm, mini_hdfs, mini_hdfs_lease_expiry,
-    mini_leader_stepdown, mini_lease_timer_race, mini_membership_churn, mini_partition_retry_dup,
-    mini_raft, mini_reorder_lost_update, mini_restart_dup_append, mini_zab,
+    mini_2pc, mini_cassandra, mini_hdfs, mini_hdfs_lease_expiry, mini_leader_stepdown,
+    mini_lease_timer_race, mini_membership_churn, mini_partition_retry_dup, mini_raft,
+    mini_reorder_lost_update, mini_restart_dup_append, mini_zab,
 };
 
 use ledger_journal::Journal;
