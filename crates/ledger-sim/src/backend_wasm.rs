@@ -531,11 +531,11 @@ impl WasmBackend {
         let func = instance.get_typed_func::<(), ()>(&mut self.store, entry)?;
         match func.call(&mut self.store, ()) {
             Ok(()) => {}
-            Err(_) => {
+            Err(err) => {
                 if self.store.get_fuel()? == 0 {
                     return Err(WasmError::FuelExhausted);
                 }
-                return Err(WasmError::Wasmtime(wasmtime::Error::msg("guest trapped")));
+                return Err(WasmError::Wasmtime(err));
             }
         }
         let stdout = self
