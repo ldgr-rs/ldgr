@@ -886,7 +886,7 @@ impl EntryData {
             return Err(CborError::UnsupportedVersion(format_version));
         }
         let tag = reader.read_unsigned()?;
-        let kind = EntryKind::from_tag(tag).ok_or(CborError::UnsupportedType(tag as u8))?;
+        let kind = EntryKind::from_tag(tag).ok_or(CborError::UnknownTag(tag))?;
         let actor_u64 = reader.read_unsigned()?;
         let actor = u32::try_from(actor_u64)
             .map_err(|_| CborError::MalformedManifest("actor exceeds u32"))?;
@@ -1147,7 +1147,7 @@ fn decode_payload(reader: &mut ItemReader<'_>, kind: EntryKind) -> Result<EntryP
                     "RngDraw payload must have 3 items",
                 ));
             }
-            let stream = decode_actor(reader)?;
+            let stream = decode_stream(reader)?;
             let draw_index = reader.read_unsigned()?;
             let content = reader.read_bytes()?.to_vec();
             EntryPayload::RngDraw(RngDrawPayload {
@@ -1356,6 +1356,11 @@ fn decode_message_id(reader: &mut ItemReader<'_>) -> Result<MessageId, CborError
 fn decode_actor(reader: &mut ItemReader<'_>) -> Result<ActorId, CborError> {
     let value = reader.read_unsigned()?;
     u32::try_from(value).map_err(|_| CborError::MalformedManifest("actor exceeds u32"))
+}
+
+fn decode_stream(reader: &mut ItemReader<'_>) -> Result<StreamId, CborError> {
+    let value = reader.read_unsigned()?;
+    u32::try_from(value).map_err(|_| CborError::MalformedManifest("stream exceeds u32"))
 }
 
 fn decode_hash(reader: &mut ItemReader<'_>) -> Result<Hash, CborError> {
