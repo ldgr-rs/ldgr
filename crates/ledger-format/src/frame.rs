@@ -58,6 +58,20 @@ pub enum FrameError {
     TruncatedFrame,
 }
 
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::WrongMagic => f.write_str("container magic does not match expected magic"),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported outer format version: {v}"),
+            Self::ReservedFlags(flags) => write!(f, "reserved flag bit set: {flags:#x}"),
+            Self::HeaderTooLarge(len) => write!(f, "declared header length {len} exceeds limit"),
+            Self::TruncatedFrame => f.write_str("truncated frame input"),
+        }
+    }
+}
+
+impl core::error::Error for FrameError {}
+
 /// A validated outer frame prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramePrefix {

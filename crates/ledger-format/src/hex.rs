@@ -29,8 +29,7 @@ impl fmt::Display for HexError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for HexError {}
+impl core::error::Error for HexError {}
 
 /// Encode a hash as 64 lowercase hex chars.
 pub fn hash_to_hex(hash: &Hash) -> String {
@@ -61,7 +60,7 @@ pub fn hash_from_hex(s: &str) -> Result<Hash, HexError> {
         return Err(HexError::InvalidLength(s.len()));
     }
     let mut out = [0u8; 32];
-    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
         let high = hex_val(chunk[0]).ok_or(HexError::InvalidChar {
             index: i * 2,
             char: chunk[0] as char,

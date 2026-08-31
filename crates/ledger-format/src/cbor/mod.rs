@@ -81,8 +81,7 @@ impl fmt::Display for CborError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for CborError {}
+impl core::error::Error for CborError {}
 
 /// An in-memory CBOR data item.
 ///
