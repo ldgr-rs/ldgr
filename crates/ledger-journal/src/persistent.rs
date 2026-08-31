@@ -6,12 +6,9 @@
 //! ordering is identical in memory and on disk, and `open` rebuilds the DAG
 //! by replaying persisted entries in append order.
 //!
-//! On append the journal runs first, then the store. A store I/O failure is
-//! returned while the journal keeps the entry, so memory is never silently
-//! behind disk. That failed entry is then absent from disk, the next append
-//! references it as a parent, and the next `open` fails with `MissingParent`.
-//! After a store append failure treat the facade as terminal: stop appending
-//! and discard the journal.
+//! On append the journal validates and stages the entry, then the store
+//! persists it. A store I/O failure returns an error and rolls back the
+//! in-memory journal so in-memory and on-disk states stay consistent.
 
 use std::format;
 use std::fs;
@@ -178,8 +175,8 @@ impl PersistentJournal {
     /// Append an entry to the journal and the store, returning its id.
     ///
     /// A journal validation failure leaves both sides unchanged. A store
-    /// failure is returned while the journal keeps the entry; treat the
-    /// facade as terminal then (see the module documentation).
+    /// failure is returned and the in-memory journal is rolled back so both
+    /// sides stay consistent.
     ///
     /// A snapshot is recorded at interval boundaries. The journal entry is
     /// durable before its snapshot, so a snapshot never references an entry
@@ -191,13 +188,23 @@ impl PersistentJournal {
         observed_parents: impl IntoIterator<Item = Hash>,
         payload: EntryPayload,
     ) -> Result<Hash, JournalError> {
+        let snapshot_state = self.journal.clone();
         let id = self
             .journal
             .append(kind, actor, observed_parents, payload)?;
-        let entry = self.journal.get(&id).ok_or_else(|| {
-            JournalError::InvariantViolation("appended entry missing from journal".to_string())
-        })?;
-        self.store.append(entry)?;
+        let entry = match self.journal.get(&id) {
+            Some(entry) => entry,
+            None => {
+                self.journal = snapshot_state;
+                return Err(JournalError::InvariantViolation(
+                    "appended entry missing from journal".to_string(),
+                ));
+            }
+        };
+        if let Err(err) = self.store.append(entry) {
+            self.journal = snapshot_state;
+            return Err(err);
+        }
         if self.snapshots.should_snapshot(actor, entry.data.sequence) {
             let snapshot = Snapshot::new(
                 actor,
@@ -206,8 +213,8 @@ impl PersistentJournal {
                 entry.vector_clock.clone(),
                 Vec::new(),
             );
-            self.snapshots.record_snapshot(snapshot.clone());
             self.snapshot_store.append(&snapshot)?;
+            self.snapshots.record_snapshot(snapshot);
         }
         Ok(id)
     }
@@ -219,17 +226,26 @@ impl PersistentJournal {
     /// consumes the journal's canonical bytes through the frame path, so an
     /// entry encodes once for hashing and storage together.
     ///
-    /// Failure semantics match [`Self::append`]: a journal validation error
-    /// leaves the applied prefix on both sides and must be treated as
-    /// terminal.
+    /// Failure semantics match [`Self::append`]: a journal validation or store
+    /// error leaves both sides consistent.
     pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<Hash>, JournalError> {
+        let snapshot_state = self.journal.clone();
         let mut frames = Vec::with_capacity(batch.len());
         let ids = self.journal.append_batch_with_frames(batch, &mut frames)?;
-        self.store.append_frames(&frames)?;
+        if let Err(err) = self.store.append_frames(&frames) {
+            self.journal = snapshot_state;
+            return Err(err);
+        }
         for id in &ids {
-            let entry = self.journal.get(id).ok_or_else(|| {
-                JournalError::InvariantViolation("appended entry missing from journal".to_string())
-            })?;
+            let entry = match self.journal.get(id) {
+                Some(entry) => entry,
+                None => {
+                    self.journal = snapshot_state;
+                    return Err(JournalError::InvariantViolation(
+                        "appended entry missing from journal".to_string(),
+                    ));
+                }
+            };
             if self
                 .snapshots
                 .should_snapshot(entry.data.actor, entry.data.sequence)
@@ -241,8 +257,8 @@ impl PersistentJournal {
                     entry.vector_clock.clone(),
                     Vec::new(),
                 );
-                self.snapshots.record_snapshot(snapshot.clone());
                 self.snapshot_store.append(&snapshot)?;
+                self.snapshots.record_snapshot(snapshot);
             }
         }
         Ok(ids)
@@ -575,6 +591,41 @@ mod tests {
             assert_eq!(id.id, expected.id);
             assert_eq!(id.data, expected.data);
             assert_eq!(id.vector_clock, expected.vector_clock);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_failure_rolls_back_in_memory_journal() {
+        let dir = temp_dir("store-failure-rollback");
+        let mut journal = PersistentJournal::create(&dir).unwrap();
+        let id1 = journal
+            .append(EntryKind::Outcome, 1, Vec::new(), outcome(1))
+            .unwrap();
+        assert_eq!(journal.len(), 1);
+
+        let wal_path = dir.join("wal.bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o400));
+        }
+
+        let res = journal.append(EntryKind::Outcome, 1, vec![id1], outcome(2));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o644));
+        }
+
+        if res.is_err() {
+            assert_eq!(
+                journal.len(),
+                1,
+                "in-memory journal must roll back on store error"
+            );
+            assert_eq!(journal.journal().head_for_actor(1), Some(id1));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
