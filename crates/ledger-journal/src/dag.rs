@@ -594,6 +594,19 @@ impl Journal {
             .filter_map(|id| self.get(id))
     }
 
+    /// Return up to `count` trailing entry ids in chronological order.
+    pub fn tail_ids(&self, count: usize) -> Vec<Hash> {
+        let total = self.state.order.len() + self.state.overlay_order.len();
+        let skip = total.saturating_sub(count);
+        self.state
+            .order
+            .iter()
+            .chain(self.state.overlay_order.iter())
+            .skip(skip)
+            .copied()
+            .collect()
+    }
+
     /// Return the last entry, if any.
     pub fn last(&self) -> Option<&Entry> {
         let id = self.state.overlay_order.last().or(self.state.order.last());
