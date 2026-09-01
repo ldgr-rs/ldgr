@@ -103,7 +103,7 @@ impl SegmentWriter {
     /// The frame block is zstd-compressed, a sparse index samples every
     /// SAMPLE_INTERVAL-th frame, and the file is written atomically (temp
     /// file plus rename).
-    pub fn seal(&self, dir: &Path, segment_id: u64) -> Result<SealedSegment, JournalError> {
+    pub fn seal(self, dir: &Path, segment_id: u64) -> Result<SealedSegment, JournalError> {
         let compressed = zstd::encode_all(&self.buffer[..], 3).map_err(segment_io)?;
         let mut samples = Vec::new();
         let mut hasher = blake3::Hasher::new();
@@ -249,10 +249,10 @@ impl SegmentStore {
         if self.writer.is_empty() {
             return Ok(());
         }
-        let segment = self.writer.seal(&self.dir, self.next_segment_id)?;
+        let open_writer = std::mem::take(&mut self.writer);
+        let segment = open_writer.seal(&self.dir, self.next_segment_id)?;
         self.next_segment_id += 1;
         self.sealed.push(segment);
-        self.writer = SegmentWriter::new();
         self.wal = None;
         // Invariant: the WAL mirrors the open-writer contents. A stale WAL
         // left after a seal would be re-ingested by a later `load`,

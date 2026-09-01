@@ -266,7 +266,7 @@ fn bench_segment_seal(c: &mut Criterion) {
     c.bench_function("segment_seal_1m", |b| {
         b.iter(|| {
             let dir = std::env::temp_dir();
-            black_box(writer.seal(&dir, 0).unwrap());
+            black_box(writer.clone().seal(&dir, 0).unwrap());
         });
     });
 }
