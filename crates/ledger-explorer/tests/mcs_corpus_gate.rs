@@ -20,6 +20,7 @@ fn mcs_certificates_on_bug_corpus_v1() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpora/bug-corpus-v1");
     let mut checked = 0usize;
     let mut table: Vec<(String, usize, u64)> = Vec::new();
+    let mut non_reproducing: Vec<String> = Vec::new();
 
     for entry in fs::read_dir(&corpus).expect("corpus dir must exist") {
         let path = entry.unwrap().path();
@@ -123,31 +124,18 @@ fn mcs_certificates_on_bug_corpus_v1() {
                 }
             }
         }
-        // Historical cut for mini-kv relied on Delay on non-link sends being
-        // dropped (no-op). With correct Delay semantics (Delay keeps liveness, shifts deliver_at via send_at)
-        // (Delay keeps liveness, shifts deliver_at via send_at), Delay 1 on
-        // the stale Send (0->2) fixes the bug rather than reproducing it, so
-        // the stale-Recv cut's schedule no longer violates. The true causal
-        // faults for this bug are partitions/drops of the correct replication
-        // path, which do reproduce (brute-force below). Keep the corpus
-        // scenario but update the gate to accept a reproducing single from the
-        // declared fault_space, documenting the dropped-delay bug as root cause.
-        if !violated && name == "mini-kv-stale-read" {
-            let space = (scenario.fault_space)().unwrap_or_default();
-            for injection in &space {
-                if holds(std::slice::from_ref(injection)) {
-                    println!(
-                        "{name}: historical cut's schedule does not reproduce under correct Delay semantics; fault_space single {injection:?} does (accepted)"
-                    );
-                    violated = true;
-                    break;
-                }
-            }
+        // No fault-space fallback: a cut whose schedule cannot reproduce is
+        // reported, not accepted. The certificate for such a scenario is
+        // counted as evidence of the cut's shape only; the scenario cannot
+        // claim cut-caused reproduction. Non-reproducing scenarios are
+        // listed in the summary table and must stay a fixed, documented set.
+        if !violated {
+            non_reproducing.push(name.clone());
+            println!(
+                "{name}: the recorded cut's schedule does not reproduce the violation \
+                 (report-only, not counted as cut-caused reproduction)"
+            );
         }
-        assert!(
-            violated,
-            "{name}: fault-injected replay must reproduce the violation"
-        );
 
         table.push((name.clone(), cert.cut.len(), cert.cost));
         checked += 1;
@@ -157,6 +145,18 @@ fn mcs_certificates_on_bug_corpus_v1() {
         checked,
         ledger_explorer::reference::corpus_scenarios().len(),
         "every registry scenario must be exercised"
+    );
+
+    // The known non-reproducing set is fixed: mini-kv-stale-read's recorded
+    // cut relied on Delay on non-link sends being dropped (no-op). With the
+    // corrected Delay semantics the cut no longer reproduces; the scenario
+    // stays a v1 reproduction fixture, but it cannot claim cut-caused
+    // reproduction. Growing this list requires a review decision.
+    non_reproducing.sort();
+    assert_eq!(
+        non_reproducing,
+        vec!["mini-kv-stale-read".to_string()],
+        "the report-only non-reproducing set must stay fixed"
     );
 
     // Deterministic per-bug table for reporting (sorted by name for stability).
