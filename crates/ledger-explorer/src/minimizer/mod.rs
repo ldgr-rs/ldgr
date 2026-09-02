@@ -9,7 +9,7 @@ mod pipeline;
 mod tests;
 
 pub use ddmin::{MinimizationReport, causal_slice, causal_slice_forward, ddmin, minimize_schedule};
-pub use input::{InputReduction, minimize_input};
+pub use input::{InputReduction, minimize_input, minimize_input_with_faults};
 pub use memo::{MemoError, MemoizedReplay};
 pub use pipeline::{MinimizedRepro, minimize_full};
 

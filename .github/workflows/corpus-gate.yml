@@ -61,8 +61,14 @@ jobs:
         run: cargo test -p ledger-sim --test self_check --release
       - name: Minimization gate (>=90% off a 10^6-entry failure)
         run: cargo test -p ledger-explorer --test minimize_gate --release
+      - name: Fault-triggered corpus v2 (six-condition causation + certificates)
+        run: cargo nextest run -p ledger-explorer --test corpus_v2_gate --all-features --release
+      - name: LDFI corpus ratio gate (DR-0003 protocol, >=5x floor)
+        run: cargo nextest run -p ledger-explorer --test ldfi_dr0003_gate --all-features --release
+      - name: MCS cut reproduction on corpus v1 (no fault-space fallback)
+        run: cargo nextest run -p ledger-explorer --test mcs_corpus_gate --all-features --release
       - name: PBT-in-sim corpus (planted counterexamples found via input axis)
-        run: cargo nextest run -p ledger-explorer --test search_axes --test minimize_pipeline --all-features
+        run: cargo nextest run -p ledger-explorer --test pbt_corpus_gate --test search_axes --test minimize_pipeline --all-features
       - name: LDFI fault execution + replay semantics
         run: cargo nextest run -p ledger-explorer --test fault_execution --all-features
       - name: Source-DPOR determinism

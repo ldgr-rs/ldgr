@@ -60,15 +60,12 @@ impl CborValue {
                     let val_bytes = val.try_to_canonical_bytes()?;
                     encoded_entries.push((key_bytes, val_bytes));
                 }
-                // Reject duplicate canonical keys before sorting.
-                for i in 0..encoded_entries.len() {
-                    for j in (i + 1)..encoded_entries.len() {
-                        if encoded_entries[i].0 == encoded_entries[j].0 {
-                            return Err(CborError::DuplicateMapKey);
-                        }
+                encoded_entries.sort_by(|a, b| compare_canonical_keys(&a.0, &b.0));
+                for window in encoded_entries.windows(2) {
+                    if window[0].0 == window[1].0 {
+                        return Err(CborError::DuplicateMapKey);
                     }
                 }
-                encoded_entries.sort_by(|a, b| compare_canonical_keys(&a.0, &b.0));
 
                 map(out, encoded_entries.len());
                 for (key_bytes, val_bytes) in encoded_entries {

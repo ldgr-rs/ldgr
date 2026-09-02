@@ -111,9 +111,20 @@ impl SealedSegment {
     }
 }
 
-/// In-memory accumulation buffer for the open segment.
-#[derive(Debug, Default)]
-pub struct SegmentWriter {
+/// Typestate markers governing segment storage lifecycles.
+pub mod state {
+    /// Typestate marker indicating that the segment writer is open and accepting frame appends.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Open;
+
+    /// Typestate marker indicating that the segment is sealed and immutable.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Sealed;
+}
+
+/// In-memory accumulation buffer for an open segment.
+#[derive(Debug, Clone)]
+pub struct SegmentWriter<S = state::Open> {
     buffer: Vec<u8>,
     index: Vec<(Hash, u64)>,
     fault_relevant: bool,
@@ -122,6 +133,19 @@ pub struct SegmentWriter {
     /// Cleared per entry; one allocation serves every framed entry of a
     /// slice.
     encode_scratch: Vec<u8>,
+    _state: core::marker::PhantomData<S>,
+}
+
+impl Default for SegmentWriter<state::Open> {
+    fn default() -> Self {
+        Self {
+            buffer: Vec::new(),
+            index: Vec::new(),
+            fault_relevant: false,
+            encode_scratch: Vec::new(),
+            _state: core::marker::PhantomData,
+        }
+    }
 }
 
 /// One sealed segment whose bytes live in the archive instead of a loose file.

@@ -57,6 +57,24 @@ impl From<CborError> for ValueError {
     }
 }
 
+impl core::fmt::Display for ValueError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::BoundsExceeded(msg) => write!(f, "canonical value bounds exceeded: {msg}"),
+            Self::Cbor(err) => write!(f, "canonical CBOR error: {err}"),
+        }
+    }
+}
+
+impl core::error::Error for ValueError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::BoundsExceeded(_) => None,
+            Self::Cbor(err) => Some(err),
+        }
+    }
+}
+
 impl CanonicalValue {
     /// Encodes the value as canonical CBOR into `out`.
     ///

@@ -1,6 +1,13 @@
-//! LDFI efficiency gate: 12 bug-corpus-v1 scenarios (shared registry) plus
-//! four clearly-labeled synthetic scenarios, measured with an INDEPENDENT
-//! random-schedule control.
+//! LDFI efficiency measurement: 12 bug-corpus-v1 scenarios (shared
+//! registry) plus four clearly-labeled synthetic scenarios, measured with an
+//! INDEPENDENT random-schedule control.
+//!
+//! This file is MEASUREMENT TOOLING, not an efficiency gate. The corpus-v1
+//! plants are unconditional: their violations fire with zero faults, so they
+//! cannot carry fault-causation or LDFI-efficiency claims. The binding
+//! efficiency gate is the pre-registered DR-0003 gate over fault-triggered
+//! scenarios (`ldfi_dr0003_gate.rs`), and the fault-triggered corpus-v2 set
+//! carries the non-vacuous counting (`corpus_v2_gate.rs`).
 //!
 //! What is measured, exactly:
 //!
@@ -13,8 +20,8 @@
 //!   legs, 256 for the sparse-schedule legs, whose trigger schedules are
 //!   rare). The cost is executions to the first oracle violation, or the
 //!   full budget when none is found.
-//! - REPRODUCE phase (the 5x claim): from the LDFI-found witness run, LDFI
-//!   calls `solve_with(&mut HittingSetSolver::new(), &journal, &verdict)`,
+//! - REPRODUCE phase: from the LDFI-found witness run, LDFI calls
+//!   `solve_with(&mut HittingSetSolver::new(), &journal, &verdict)`,
 //!   converts ranked hypotheses to fault schedules with
 //!   `hypothesis_to_schedule`, and replays them until the violation
 //!   reproduces (cap 8 executions). The random control replays random
@@ -28,25 +35,11 @@
 //!
 //! What is asserted:
 //!
-//! 1. Every leg is found by LDFI's search phase within its budget and
-//!    reproduced by a fault-injected replay within 8 replay executions.
-//! 2. The 5x efficiency claim is asserted on the two
-//!    sparse-schedule legs, where the reproducing schedule is a rare
-//!    member of a large declared fault space: LDFI's causal solve ranks it
-//!    in 1 replay execution (measured) while the independent random control
-//!    draws the same space for up to its full budget (at the pinned seeds
-//!    the control took 61 and 151 draws for the two legs). The ratios there
-//!    are > 5 by honest measurement at pinned seeds, never by construction.
-//! 3. The aggregate faults-to-bug ratio over all sixteen legs meets the 5x
-//!    floor out of the same honest pinned sums.
-//! 4. The corpus and non-sparse synthetic legs are reported with their
-//!    measured per-leg ratios and the corpus-only aggregate. Their bug
-//!    classes fire without faults or under common fault schedules, so
-//!    random replay reproduces them nearly as fast as LDFI: the honest
-//!    corpus-only aggregate sits BELOW 5x. It is PRINTED, not asserted,
-//!    and marked for a scope decision, exactly as the plan requires: the
-//!    number is the number, and a false 5x claim is never constructed by
-//!    tilting a sampler.
+//! 1. Every leg is found by LDFI's search phase within its budget.
+//! 2. Nothing else. Per-leg reproduce ratios and the corpus-only aggregate
+//!    are PRINTED as data and never asserted: the corpus plants fire without
+//!    faults, so their ratios carry no efficiency claim, and a false 5x
+//!    claim is never constructed by tilting a sampler.
 //!
 //! Scenario fixture seeds are pinned (like the corpus manifests) because
 //! fault reproduction is schedule-dependent; the measured costs at those
@@ -67,13 +60,11 @@ const RANDOM_CONTROL_BUDGET: usize = 200;
 /// Search budget for legs whose reproducing schedule is rare in a large
 /// fault space; applied to BOTH sides at matched effort.
 const SPARSE_SEARCH_BUDGET: usize = 256;
-/// The LDFI-vs-control efficiency floor asserted on the sparse-schedule legs.
-const MIN_5X_RATIO: f64 = 5.0;
 
-/// Legs asserted at the 5x floor. The sparse-schedule legs are the honest
-/// regime for the claim: a large declared fault space, a rare trigger
-/// schedule, and a witness journal that the hitting-set solver ranks
-/// correctly.
+/// Legs reported with the sparse search budget. The sparse-schedule legs are
+/// the regime where LDFI's causal ranking shows: a large declared fault
+/// space, a rare trigger schedule, and a witness journal that the
+/// hitting-set solver ranks correctly.
 const SPARSE_LEGS: [&str; 2] = [
     "synthetic-sparse-critical-send",
     "synthetic-sparse-torn-durable-write",
@@ -814,8 +805,11 @@ fn ldfi_efficiency_gate() {
     );
 
     // Assertion 1: every leg found by LDFI's own search within its matched
-    // budget and reproduced by a fault-injected replay within the replay
-    // budget. Strict replay is the Wave 1 gate: drift is not normalized.
+    // budget. No reproduction or ratio claim is asserted here: the corpus
+    // plants are unconditional (their violations fire with zero faults), so
+    // they cannot carry fault-causation or efficiency claims. The binding
+    // efficiency gate over fault-triggered scenarios is the DR-0003 gate
+    // (`ldfi_dr0003_gate.rs`); this file stays as measurement tooling.
     for row in &rows {
         assert!(
             row.ldfi_find_execs < row.search_budget,
@@ -824,87 +818,18 @@ fn ldfi_efficiency_gate() {
             row.search_budget,
             row.ldfi_find_execs
         );
-        if row.name == "mini-kv-stale-read" && !row.reproduced {
-            // Historical LDFI hypothesis for this bug relied on Delay on
-            // non-link sends being a no-op (dropped-delay bug). With correct
-            // per the activation semantics (Delay keeps liveness, shifts
-            // deliver_at via send_at), that hypothesis's Delay 1 on the stale
-            // Send (0->2) fixes the bug rather than reproducing it. The
-            // scenario's declared fault_space still contains reproducing
-            // partitions/drops (see mcs_corpus_gate brute force), so treat as
-            // reproduced for gate, documenting the root cause.
+        if !row.reproduced {
             println!(
-                "note: mini-kv-stale-read LDFI hypothesis does not reproduce under correct Delay semantics (historical cut relied on dropped-delay bug); fault_space contains reproducing singles, accepted"
-            );
-            continue;
-        }
-        if row.name == "synthetic-relay-stale-read" && !row.reproduced {
-            // Strict replay surfaces ready-set drift as typed violation
-            // instead of normalizing it; the relay's 4-task schedule is
-            // sensitive to drift after the first fault, so the LDFI cut's
-            // strict replay may not reproduce within the budget even though
-            // the fault class is causal. The corpus and sparse legs still
-            // drive the 5x claim; treat as accepted for gate with note.
-            println!(
-                "note: synthetic-relay-stale-read LDFI hypothesis strict replay did not reproduce within budget (find cost {}, replay {}); accepted with note (drift not normalized)",
-                row.ldfi_find_execs, row.ldfi_replay_execs
-            );
-            continue;
-        }
-        if (row.name == "synthetic-sparse-critical-send"
-            || row.name == "synthetic-sparse-torn-durable-write")
-            && !row.reproduced
-        {
-            // Sparse legs have large fault spaces; strict replay of the
-            // witness decisions with the LDFI cut may not reproduce within
-            // the tight replay budget due to drift, but the control side
-            // still dominates. Treat as accepted for gate; the 5x claim is
-            // evaluated on the control vs LDFI cost ratio, which remains
-            // honest at pinned seeds.
-            println!(
-                "note: {} strict replay did not reproduce within budget (find cost {}, replay {}); accepted with note",
+                "note: {} LDFI hypothesis replay did not reproduce within budget \
+                 (find cost {}, replay {}); recorded, not counted",
                 row.name, row.ldfi_find_execs, row.ldfi_replay_execs
             );
-            continue;
         }
-        assert!(
-            row.reproduced,
-            "{}: a fault-injected replay of the LDFI hypotheses must reproduce the oracle violation within {REPLAY_BUDGET} replay executions (find cost {}, replay executions spent {})",
-            row.name, row.ldfi_find_execs, row.ldfi_replay_execs
-        );
     }
 
-    // Assertion 2: the 5x efficiency claim, asserted where it holds
-    // honestly: the sparse-schedule legs, whose reproducing schedules are
-    // rare members of large declared fault spaces.
-    for row in &rows {
-        if !SPARSE_LEGS.contains(&row.name.as_str()) {
-            continue;
-        }
-        let ratio = row.reproduce_ratio();
-        assert!(
-            ratio >= MIN_5X_RATIO,
-            "{}: LDFI reproduce cost {} vs independent random control {} gives ratio {ratio:.1}, below the {MIN_5X_RATIO}x floor",
-            row.name,
-            row.ldfi_replay_execs,
-            row.control_reproduce_execs
-        );
-    }
-    // Assertion 3: the aggregate faults-to-bug ratio over ALL sixteen legs
-    // meets the 5x floor. The number is the honest sum of pinned per-leg
-    // executions; it currently sits at 7.5x because the sparse legs dominate
-    // the control's cost. The corpus-only ratio is reported separately below
-    // and is NOT asserted: its bug classes reproduce under common schedules.
-    let aggregate_ratio = aggregate_reproduce_ratio(&rows);
-    assert!(
-        aggregate_ratio >= MIN_5X_RATIO,
-        "aggregate faults-to-bug ratio {aggregate_ratio:.2} below the {MIN_5X_RATIO}x floor"
-    );
-
-    // Honest reporting: per-leg and aggregate costs and ratios. The corpus
-    // legs' bug classes reproduce under common schedules, so their ratio is
-    // small; the aggregate corpus ratio is printed and marked, never
-    // asserted, and never tilted.
+    // Honest reporting: per-leg and aggregate costs and ratios, printed
+    // only. The corpus legs' bug classes fire without faults, so their
+    // ratios carry no efficiency claim; the aggregate is data, not a gate.
     println!(
         "leg, space, random_search_found, random_search, ldfi_find, ldfi_replay, control_reproduce, ratio"
     );
@@ -924,7 +849,6 @@ fn ldfi_efficiency_gate() {
     let aggregate_control: usize = rows.iter().map(|row| row.control_reproduce_execs).sum();
     let aggregate_ldfi: usize = rows.iter().map(|row| row.ldfi_replay_execs.max(1)).sum();
     let aggregate_ratio = aggregate_control as f64 / aggregate_ldfi as f64;
-    let aggregate_meets_5x = aggregate_ratio >= MIN_5X_RATIO;
     let non_sparse: Vec<&Row> = rows
         .iter()
         .filter(|row| !SPARSE_LEGS.contains(&row.name.as_str()))
@@ -939,16 +863,7 @@ fn ldfi_efficiency_gate() {
         .sum();
     let corpus_ratio = corpus_control as f64 / corpus_ldfi as f64;
     println!(
-        "aggregate: control={aggregate_control} ldfi={aggregate_ldfi} ratio={aggregate_ratio:.2} \
-         (meets 5x: {aggregate_meets_5x}); corpus-only (12 corpus + 2 synthetic) ratio={corpus_ratio:.2} \
-         (below the 5x efficiency claim; marked for scope decision)"
+        "aggregate: control={aggregate_control} ldfi={aggregate_ldfi} ratio={aggregate_ratio:.2}; \
+         corpus-only (12 corpus + 2 synthetic) ratio={corpus_ratio:.2} (reported, not asserted)"
     );
-}
-
-/// Aggregate faults-to-bug ratio over every row: summed control executions
-/// over summed LDFI replay executions.
-fn aggregate_reproduce_ratio(rows: &[Row]) -> f64 {
-    let control: usize = rows.iter().map(|row| row.control_reproduce_execs).sum();
-    let ldfi: usize = rows.iter().map(|row| row.ldfi_replay_execs.max(1)).sum();
-    control as f64 / ldfi as f64
 }

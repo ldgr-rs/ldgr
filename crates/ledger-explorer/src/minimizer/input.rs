@@ -2,7 +2,7 @@ use super::ddmin::ddmin;
 use super::journal_inputs;
 use crate::oracle::Oracle;
 use crate::search::{Finding, Workload};
-use ledger_sim::{Policy, RunConfig, Simulation};
+use ledger_sim::{Policy, RunConfig, SimFault, Simulation};
 
 /// Outcome of the input-delta debugging stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,8 +28,27 @@ pub fn minimize_input<W, O>(
     generator: &str,
 ) -> InputReduction
 where
-    W: Workload,
-    O: Oracle,
+    W: Workload + ?Sized,
+    O: Oracle + ?Sized,
+{
+    minimize_input_with_faults(workload_template, oracle, finding, generator, &[])
+}
+
+/// Input-delta debugging under a pinned fault schedule.
+///
+/// Every candidate replays with `schedule` injected, so the reduction runs
+/// on the finding's own (input, schedule, fault) triple. Required for joint
+/// plants whose violation needs the injected fault.
+pub fn minimize_input_with_faults<W, O>(
+    workload_template: &W,
+    oracle: &O,
+    finding: &Finding,
+    generator: &str,
+    schedule: &[SimFault],
+) -> InputReduction
+where
+    W: Workload + ?Sized,
+    O: Oracle + ?Sized,
 {
     let full = journal_inputs(&finding.run.journal, generator);
     let fails = |candidate: &[u64]| -> bool {
@@ -38,6 +57,7 @@ where
             .seed(finding.seed)
             .policy(Policy::Replay)
             .max_steps(finding.run.decisions.len().saturating_add(256))
+            .fault_schedule(schedule.to_vec())
             .build();
         Simulation::with_replay(config, workload.programs(), finding.run.decisions.clone())
             .run()

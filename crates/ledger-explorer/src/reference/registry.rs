@@ -1,8 +1,5 @@
 use super::sims::{
-    mini_2pc, mini_2pc_support, mini_cassandra, mini_cassandra_support,
-    mini_cloud_az_double_assign, mini_cloud_az_double_assign_support, mini_cloud_config_drift,
-    mini_cloud_config_drift_support, mini_cloud_instance_flap, mini_cloud_instance_flap_support,
-    mini_cloud_quota_retry_storm, mini_cloud_quota_retry_storm_support, mini_hdfs,
+    mini_2pc, mini_2pc_support, mini_cassandra, mini_cassandra_support, mini_hdfs,
     mini_hdfs_lease_expiry, mini_hdfs_lease_expiry_support, mini_hdfs_support,
     mini_kv_stale_read_support, mini_leader_stepdown, mini_leader_stepdown_support,
     mini_lease_timer_race, mini_lease_timer_race_support, mini_membership_churn,
@@ -208,7 +205,8 @@ pub enum ScenarioClass {
     CloudInfra,
 }
 
-/// Explicit class label for every scenario across v1 and v2.
+/// Explicit class label for every scenario across v1 and the fault-triggered
+/// v2 set.
 pub fn scenario_class(name: &str) -> Option<ScenarioClass> {
     match name {
         "mini-zab-split-brain" => Some(ScenarioClass::Jepsen),
@@ -227,74 +225,14 @@ pub fn scenario_class(name: &str) -> Option<ScenarioClass> {
         "mini-cloud-instance-flap" => Some(ScenarioClass::CloudInfra),
         "mini-cloud-config-drift" => Some(ScenarioClass::CloudInfra),
         "mini-cloud-quota-retry-storm" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-lease-heartbeat" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-config-publish" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-quota-dedup-sector" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-drain-completion" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-dual-region-commit" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-canary-promote" => Some(ScenarioClass::CloudInfra),
         _ => None,
     }
-}
-
-/// Every bug-corpus-v2 scenario (Anduril-style cloud-infra class).
-///
-/// Four cloud control-plane failures: AZ double assign, instance flap
-/// duplicate registration, staged config rollout divergence, and quota
-/// retry storm duplicate. Each mirrors the v1 reference-sim pattern:
-/// deterministic planted bug at the base seed, a property oracle, and a
-/// declared fault space for LDFI schedule exploration.
-pub fn corpus_v2_scenarios() -> Vec<CorpusScenario> {
-    vec![
-        CorpusScenario {
-            name: "mini-cloud-az-double-assign",
-            base_seed: [20; 32],
-            runner: CorpusRunner::Tasks {
-                builders: cloud_az_double_assign_builders,
-                property: cloud_az_double_assign_property,
-            },
-            fault_space: four_link_faults,
-            support: mini_cloud_az_double_assign_support,
-        },
-        CorpusScenario {
-            name: "mini-cloud-instance-flap",
-            base_seed: [21; 32],
-            runner: CorpusRunner::Tasks {
-                builders: cloud_instance_flap_builders,
-                property: cloud_instance_flap_property,
-            },
-            fault_space: appender_chain_faults,
-            support: mini_cloud_instance_flap_support,
-        },
-        CorpusScenario {
-            name: "mini-cloud-config-drift",
-            base_seed: [22; 32],
-            runner: CorpusRunner::Tasks {
-                builders: cloud_config_drift_builders,
-                property: cloud_config_drift_property,
-            },
-            fault_space: four_link_faults,
-            support: mini_cloud_config_drift_support,
-        },
-        CorpusScenario {
-            name: "mini-cloud-quota-retry-storm",
-            base_seed: [23; 32],
-            runner: CorpusRunner::Tasks {
-                builders: cloud_quota_retry_storm_builders,
-                property: cloud_quota_retry_storm_property,
-            },
-            fault_space: client_server_faults,
-            support: mini_cloud_quota_retry_storm_support,
-        },
-    ]
-}
-
-/// All scenarios across v1 and v2 (16 total: 12 + 4).
-pub fn all_corpus_scenarios() -> Vec<CorpusScenario> {
-    let mut all = corpus_scenarios();
-    all.extend(corpus_v2_scenarios());
-    all
-}
-
-/// Look up a v2 registry entry by manifest name.
-pub fn corpus_v2_scenario(name: &str) -> Option<CorpusScenario> {
-    corpus_v2_scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == name)
 }
 
 /// Look up one registry entry by manifest name.
@@ -305,9 +243,15 @@ pub fn corpus_scenario(name: &str) -> Option<CorpusScenario> {
 }
 
 impl CorpusScenario {
-    /// Versioned support provider for this scenario's declared model.
-    pub fn support_provider(&self) -> crate::support::StaticSupportProvider {
-        crate::support::StaticSupportProvider::new(1, (self.support)(&Journal::new()))
+    /// Versioned support provider for this scenario's declared model,
+    /// evaluated on a concrete journal.
+    ///
+    /// The expression ids are content hashes of the journal's entries, so a
+    /// model built from one run's journal is only meaningful for that run.
+    /// Callers pass the canonical run of the scenario (its pinned violating
+    /// run, or a no-fault probe).
+    pub fn support_provider(&self, journal: &Journal) -> crate::support::StaticSupportProvider {
+        crate::support::StaticSupportProvider::new(1, (self.support)(journal))
     }
 
     /// Run the scenario at `seed` with optional injected faults under the
@@ -494,30 +438,6 @@ fn partition_retry_dup_builders() -> Vec<TaskBuilder> {
 }
 fn partition_retry_dup_property(journal: &Journal) -> bool {
     (mini_partition_retry_dup().1)(journal)
-}
-fn cloud_az_double_assign_builders() -> Vec<TaskBuilder> {
-    mini_cloud_az_double_assign().0
-}
-fn cloud_az_double_assign_property(journal: &Journal) -> bool {
-    (mini_cloud_az_double_assign().1)(journal)
-}
-fn cloud_instance_flap_builders() -> Vec<TaskBuilder> {
-    mini_cloud_instance_flap().0
-}
-fn cloud_instance_flap_property(journal: &Journal) -> bool {
-    (mini_cloud_instance_flap().1)(journal)
-}
-fn cloud_config_drift_builders() -> Vec<TaskBuilder> {
-    mini_cloud_config_drift().0
-}
-fn cloud_config_drift_property(journal: &Journal) -> bool {
-    (mini_cloud_config_drift().1)(journal)
-}
-fn cloud_quota_retry_storm_builders() -> Vec<TaskBuilder> {
-    mini_cloud_quota_retry_storm().0
-}
-fn cloud_quota_retry_storm_property(journal: &Journal) -> bool {
-    (mini_cloud_quota_retry_storm().1)(journal)
 }
 
 /// Partition faults over a set of directed actor links.

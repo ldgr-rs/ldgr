@@ -86,8 +86,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.1
-      - name: Run release-mode solver scaling gate (10^6 entries, <60 s)
-        run: cargo test -p ledger-explorer --test solver_scaling_gate --release
+      - name: Run release-mode solver scaling gate (10^6-entry closure, <60 s end-to-end)
+        run: cargo test -p ledger-explorer --test solver_scaling_e2e_gate --release
 
   feature-matrix:
     name: Feature matrix

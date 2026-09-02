@@ -5,6 +5,7 @@
 //! certificate surfaces. Callers outside the explorer crate route through
 //! them instead of reaching into implementation modules.
 
+use crate::MaxSatSolver;
 use crate::certs::{CampaignCertificate, CertError, LineagePolicy, ResolvedDependency};
 use crate::ldfi::{self, FaultHypothesis};
 use crate::maxsat;
@@ -16,7 +17,7 @@ use crate::search::{
 use crate::solver::{SolverConfig, SolverError};
 use ledger_format::Hash;
 use ledger_journal::Journal;
-use ledger_sim::{RunConfig, RunResult, RuntimeError, SimFault};
+use ledger_sim::{RunConfig, RunResult, RuntimeError, SimFault, Simulation};
 
 /// Typed failure of a service operation, preserving the source error.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +43,9 @@ pub enum ServiceError {
     /// A journal could not be read.
     #[error("journal error: {0}")]
     Journal(#[from] ledger_journal::JournalError),
+    /// A fault-causation qualification condition failed.
+    #[error(transparent)]
+    Qualify(#[from] QualifyError),
 }
 
 impl From<RuntimeError> for ServiceError {
@@ -116,6 +120,187 @@ pub fn replay_faults<W: Workload + ?Sized>(
     Ok(search::replay_with_faults(
         workload, base, seed, decisions, schedule,
     )?)
+}
+
+/// Typed failure of a fault-causation qualification.
+///
+/// Every variant is one of the six qualification conditions failing; the
+/// error names the condition so callers and gates report the exact breach.
+#[derive(Debug, thiserror::Error)]
+pub enum QualifyError {
+    /// The no-fault baseline run violates: the plant is unconditional, so
+    /// no fault can be its cause.
+    #[error("baseline violates: unconditional plants are not fault-caused")]
+    BaselineViolates,
+    /// The replayed schedule applied no fault: nothing carried the
+    /// violation.
+    #[error("schedule applied no fault: the violation has no injected cause")]
+    NoAppliedFault,
+    /// The replay diverged before the first applied fault.
+    #[error("replay diverged before the first applied fault")]
+    PrefixDivergence,
+    /// The replayed run does not violate: the schedule does not cause the
+    /// finding.
+    #[error("replayed run does not violate: the schedule is not the cause")]
+    NotViolating,
+    /// The final no-fault rerun violates: the plant is unconditional.
+    #[error("final no-fault rerun violates: unconditional plants never count")]
+    FinalRerunViolates,
+}
+
+/// Evidence produced by a successful fault-causation qualification.
+#[derive(Debug, Clone)]
+pub struct CutQualification {
+    /// Schedule injections that took effect in the replay.
+    pub applied: Vec<SimFault>,
+    /// Schedule injections that never fired.
+    pub voided: Vec<SimFault>,
+    /// No divergence before the first applied fault.
+    pub prefix_ok: bool,
+    /// Journal root of the replayed (violating) run.
+    pub replayed_root: Hash,
+}
+
+/// Qualify one fault schedule as the cause of one finding.
+///
+/// Runs the six-conditions evidence chain for one candidate schedule
+/// against the witness run:
+///
+/// 1. the no-fault baseline rerun passes;
+/// 2. the schedule applies at least one fault under strict decision replay;
+/// 3. the replayed run violates under the oracle;
+/// 4. the replay does not diverge before the first applied fault;
+/// 5. a final no-fault rerun passes.
+///
+/// Condition 6 (the same workload, vocabulary, seeds, budget, and oracle
+/// serve every method) is structural and owned by the calling gate. A
+/// passing qualification is the raw material for
+/// `RecordedSolverData::reproduced` and `::baseline_passed`; callers that
+/// record a certificate must set both from this result, never assert them.
+pub fn qualify_cut<W: Workload + ?Sized, O: Oracle + ?Sized>(
+    workload: &W,
+    oracle: &O,
+    witness: &Finding,
+    schedule: Vec<SimFault>,
+) -> Result<CutQualification, ServiceError> {
+    let baseline = {
+        let config = RunConfig::builder()
+            .seed(witness.seed)
+            .policy(ledger_sim::Policy::Random)
+            .max_steps(4096)
+            .build();
+        Simulation::new(config, workload.programs()).run()?
+    };
+    if oracle.check(&baseline).violated {
+        return Err(QualifyError::BaselineViolates.into());
+    }
+    let report = search::replay_with_faults(
+        workload,
+        &witness.run.journal,
+        witness.seed,
+        witness.run.decisions.clone(),
+        schedule,
+    )?;
+    if report.applied.is_empty() {
+        return Err(QualifyError::NoAppliedFault.into());
+    }
+    if !report.prefix_ok {
+        return Err(QualifyError::PrefixDivergence.into());
+    }
+    if !oracle.check(&report.run).violated {
+        return Err(QualifyError::NotViolating.into());
+    }
+    let rerun = {
+        let config = RunConfig::builder()
+            .seed(witness.seed)
+            .policy(ledger_sim::Policy::Random)
+            .max_steps(4096)
+            .build();
+        Simulation::new(config, workload.programs()).run()?
+    };
+    if oracle.check(&rerun).violated {
+        return Err(QualifyError::FinalRerunViolates.into());
+    }
+    Ok(CutQualification {
+        applied: report.applied,
+        voided: report.voided,
+        prefix_ok: report.prefix_ok,
+        replayed_root: report.run.journal.root_hash(),
+    })
+}
+
+/// End-to-end hazard certification for one journal and one verdict.
+///
+/// Chains the stages the Stage-2 scaling criterion names - witness closure
+/// extraction and hazard encoding, solver routing and solve, statement
+/// emission, and journal-anchored validation - into one measured call.
+///
+/// `recorded_witness_cap` bounds the witness list RECORDED in the
+/// statement. The solve always runs over every witness; a statement that
+/// carried hundreds of thousands of witness ids would exceed
+/// `CERT_MAX_BYTES`, so the recorded list is deterministically truncated
+/// (sorted, first `cap`). The cap bounds the record, never the analysis.
+///
+/// The recorded cut is evidence of the hazard structure only: this service
+/// executes no campaign, so `reproduced` and `baseline_passed` stay false
+/// and inclusion-minimal validation will (correctly) refuse the statement.
+/// Pair it with [`qualify_cut`] for fault-causation evidence.
+pub fn certify_hazard(
+    journal: Journal,
+    verdict: &Verdict,
+    run_config_digest: Hash,
+    recorded_witness_cap: usize,
+) -> Result<(Vec<FaultHypothesis>, CampaignCertificate), ServiceError> {
+    let mut solver = MaxSatSolver::default();
+    let (hypotheses, data) = solver.solve_with_certificate(&journal, verdict)?;
+    let mut data = data.ok_or(ServiceError::Cert(CertError::Verification(
+        "a non-empty hazard must record solver data".into(),
+    )))?;
+    if data.witnesses.len() > recorded_witness_cap {
+        let mut witnesses = data.witnesses.clone();
+        witnesses.sort();
+        witnesses.truncate(recorded_witness_cap);
+        data.witnesses = witnesses;
+    }
+    // A statement without findings must carry a zero subject digest, so the
+    // hazard journal rides as the single finding: the subject binds the
+    // journal root the cut was validated against.
+    let root = journal.root_hash();
+    let report = CampaignReport {
+        runs_executed: 1,
+        distinct_roots: 1,
+        findings: vec![Finding {
+            seed: [0; 32],
+            run: ledger_sim::RunResult {
+                journal,
+                decisions: Vec::new(),
+                trace: Vec::new(),
+                registers: Vec::new(),
+                steps: 0,
+                outcome: ledger_sim::RunOutcome::Completed,
+                monitor_issues: Vec::new(),
+                applied_faults: Vec::new(),
+                origins: Vec::new(),
+                journal_error: None,
+                protection: ledger_sim::BeltStatus::NotArmed,
+            },
+            verdict: verdict.clone(),
+        }],
+        variants: Vec::new(),
+        monitors: Vec::new(),
+        memo_hits: 0,
+    };
+    let mut certificate = CampaignCertificate::from_campaign(
+        &report,
+        "hazard-certification",
+        Vec::new(),
+        run_config_digest,
+        None,
+    )?;
+    certificate.solver_data = Some(data);
+    certificate.subject.digest = root;
+    certificate.verify_with_journal(&report.findings[0].run.journal)?;
+    Ok((hypotheses, certificate))
 }
 
 /// Minimize a decision stream under an oracle predicate (delta debugging).

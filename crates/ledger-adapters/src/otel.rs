@@ -305,12 +305,12 @@ pub fn ingest_otel_with_fidelity(
     }
     let mut journal = Journal::new();
     // Preserve causality via parent lookup; first-wins binding for duplicate ids.
-    let mut span_id_to_hash: HashMap<String, Hash> = HashMap::new();
+    let mut span_id_to_hash: HashMap<&str, Hash> = HashMap::new();
     for &idx in &order {
         let span = &spans[idx];
         let observed = span
             .parent_span_id
-            .as_ref()
+            .as_deref()
             .and_then(|pid| span_id_to_hash.get(pid).copied())
             .map(|h| vec![h])
             .unwrap_or_default();
@@ -325,7 +325,7 @@ pub fn ingest_otel_with_fidelity(
                 }),
             )
             .map_err(AdapterError::Journal)?;
-        span_id_to_hash.entry(span.span_id.clone()).or_insert(hash);
+        span_id_to_hash.entry(span.span_id.as_str()).or_insert(hash);
         for event in &span.events {
             journal
                 .append(
@@ -336,7 +336,7 @@ pub fn ingest_otel_with_fidelity(
                         message_id: ledger_format::MessageId::new(1, 0),
                         from: 1,
                         to: 2,
-                        original_content: event.name.clone().into_bytes(),
+                        original_content: event.name.as_bytes().to_vec(),
                     }),
                 )
                 .map_err(AdapterError::Journal)?;

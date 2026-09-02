@@ -1281,3 +1281,149 @@ fn dr0003_pbt_gate() {
         "strict reproduction must pin the finding root"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Corpus-ratio gate: the fault-triggered corpus-v2 registry, DR-0003 rules
+// ---------------------------------------------------------------------------
+
+/// The binding corpus-only efficiency gate.
+///
+/// The counted cases are the fault-triggered corpus-v2 scenarios from the
+/// shared registry (`ledger_explorer::reference::faultdep_scenarios`):
+/// fault-dependent plants whose no-fault baseline passes, so the six
+/// qualification conditions and the paired-seed efficiency measurement are
+/// meaningful for them. The measurement protocol is the pre-registered
+/// DR-0003 protocol: budget `B`, 20 paired seeds, support-ranked LDFI
+/// search versus an independent random draw from the same declared space,
+/// and the same qualification for both methods.
+#[test]
+fn ldfi_corpus_ratio_gate() {
+    let scenarios = ledger_explorer::reference::faultdep_scenarios();
+    assert!(
+        scenarios.len() >= 10,
+        "the fault-triggered registry must hold at least 10 counted scenarios"
+    );
+
+    let mut rows: Vec<(String, usize, f64, f64, f64)> = Vec::new();
+    let mut ratios: Vec<f64> = Vec::new();
+
+    for scenario in &scenarios {
+        let baseline = scenario
+            .baseline()
+            .unwrap_or_else(|error| panic!("{}: baseline failed: {error}", scenario.name));
+        assert!(
+            !scenario.check(&baseline).violated,
+            "{}: the no-fault baseline must pass; unconditional plants never count",
+            scenario.name
+        );
+        let case = Case {
+            name: scenario.name,
+            workload: scenario.workload(),
+            oracle: scenario.oracle(),
+            space: (scenario.fault_space)(),
+            support: scenario
+                .support_provider(&baseline.journal)
+                .expression()
+                .clone(),
+        };
+        let (ldfi_median, random_median, win_rate) = case_aggregate(&case);
+        let speedup = if ldfi_median > 0.0 {
+            random_median / ldfi_median
+        } else {
+            f64::MAX
+        };
+        ratios.push(speedup);
+        rows.push((
+            case.name.to_string(),
+            case.space.len(),
+            ldfi_median,
+            random_median,
+            win_rate,
+        ));
+        println!(
+            "corpus case {}, space {}, ldfi_median {ldfi_median:.2}, random_median {random_median:.2}, win_rate {win_rate:.2}, speedup {speedup:.2}",
+            case.name,
+            case.space.len()
+        );
+    }
+
+    // Geometric mean over the counted fault-triggered scenarios.
+    let corpus_ratio = ratios
+        .iter()
+        .fold(1.0f64, |acc, r| acc * r)
+        .powf(1.0 / ratios.len() as f64);
+
+    // Binding assertions (never weaken).
+    for (name, _, _, _, win) in &rows {
+        assert!(
+            *win >= MIN_WIN_RATE,
+            "{name}: seed win rate {win} below the {MIN_WIN_RATE} floor"
+        );
+    }
+    for (name, _, ldfi, random, _) in &rows {
+        let speedup = random / ldfi;
+        assert!(
+            speedup >= 1.0,
+            "{name}: case speedup {speedup:.2} below 1.0 (random {random:.2} vs ldfi {ldfi:.2})"
+        );
+    }
+    assert!(
+        corpus_ratio >= CORPUS_RATIO_FLOOR,
+        "corpus-only ratio {corpus_ratio:.2} below the {CORPUS_RATIO_FLOOR}x floor"
+    );
+
+    let artifact = artifact_json(&rows, corpus_ratio);
+    println!("corpus-ratio artifact: {artifact}");
+    assert!(
+        artifact.contains("\"corpus_ratio\""),
+        "artifact schema is stable"
+    );
+}
+
+/// The corpus-ratio artifact regeneration test: the same pre-registered
+/// inputs produce byte-identical JSON.
+#[test]
+fn ldfi_corpus_ratio_artifact_is_reproducible() {
+    let scenarios = ledger_explorer::reference::faultdep_scenarios();
+    let mut rows: Vec<(String, usize, f64, f64, f64)> = Vec::new();
+    let mut ratios: Vec<f64> = Vec::new();
+    for scenario in &scenarios {
+        let baseline = scenario
+            .baseline()
+            .unwrap_or_else(|error| panic!("{}: baseline failed: {error}", scenario.name));
+        let case = Case {
+            name: scenario.name,
+            workload: scenario.workload(),
+            oracle: scenario.oracle(),
+            space: (scenario.fault_space)(),
+            support: scenario
+                .support_provider(&baseline.journal)
+                .expression()
+                .clone(),
+        };
+        let (ldfi_median, random_median, win_rate) = case_aggregate(&case);
+        let speedup = if ldfi_median > 0.0 {
+            random_median / ldfi_median
+        } else {
+            f64::MAX
+        };
+        ratios.push(speedup);
+        rows.push((
+            case.name.to_string(),
+            case.space.len(),
+            ldfi_median,
+            random_median,
+            win_rate,
+        ));
+    }
+    let corpus_ratio = ratios
+        .iter()
+        .fold(1.0f64, |acc, r| acc * r)
+        .powf(1.0 / ratios.len() as f64);
+    let first = artifact_json(&rows, corpus_ratio);
+    let second = artifact_json(&rows, corpus_ratio);
+    assert_eq!(
+        first, second,
+        "artifact regeneration must be byte-identical"
+    );
+}

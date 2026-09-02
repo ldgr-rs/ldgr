@@ -50,8 +50,8 @@ pub fn search_input<W, O>(
     attempts: usize,
 ) -> Result<Option<Finding>, SearchError>
 where
-    W: Workload,
-    O: Oracle,
+    W: Workload + ?Sized,
+    O: Oracle + ?Sized,
 {
     search_input_energy(workload_template, oracle, base, generator, None, attempts)
 }
@@ -71,8 +71,8 @@ pub fn search_input_energy<W, O>(
     attempts: usize,
 ) -> Result<Option<Finding>, SearchError>
 where
-    W: Workload,
-    O: Oracle,
+    W: Workload + ?Sized,
+    O: Oracle + ?Sized,
 {
     for attempt in 0..attempts {
         let attempt_seed = SeedTree::new(base.seed()).derive(&format!("input-axis/{attempt}"));
@@ -89,4 +89,49 @@ where
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::SearchError;
+
+    #[test]
+    fn draw_is_deterministic_per_attempt_seed() {
+        let seed: Hash = [7; 32];
+        let first = draw_inputs("gen-a", seed, None).unwrap();
+        let second = draw_inputs("gen-a", seed, None).unwrap();
+        assert_eq!(
+            first, second,
+            "the same attempt seed must redraw identically"
+        );
+        assert_eq!(first.len(), INPUT_AXIS_SAMPLE);
+    }
+
+    #[test]
+    fn generator_streams_are_independent() {
+        let seed: Hash = [7; 32];
+        let a = draw_inputs("gen-a", seed, None).unwrap();
+        let b = draw_inputs("gen-b", seed, None).unwrap();
+        assert_ne!(a, b, "distinct generators must draw distinct streams");
+    }
+
+    #[test]
+    fn power_energy_validates_the_exponent() {
+        let seed: Hash = [7; 32];
+        let error = draw_inputs(
+            "gen-a",
+            seed,
+            Some(&EnergyDistribution::Power { exponent: 0.0 }),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SearchError::Pbt(_)));
+    }
+
+    #[test]
+    fn draws_stay_inside_the_declared_domain() {
+        let seed: Hash = [9; 32];
+        let inputs = draw_inputs("gen-bounds", seed, None).unwrap();
+        assert!(inputs.iter().all(|value| *value < 100));
+    }
 }

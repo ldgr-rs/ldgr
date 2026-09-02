@@ -123,7 +123,7 @@ impl SegmentStore {
     /// demand; a sparse-index scan locates the frame and a full scan
     /// backstops it.
     pub fn get(&self, hash: &Hash) -> Result<Option<Arc<Entry>>, JournalError> {
-        if let Some((_, offset)) = self.writer.index.iter().find(|(id, _)| id == hash) {
+        if let Some((_, offset)) = self.writer.index.iter().rev().find(|(id, _)| id == hash) {
             let payload = frame_payload_at(&self.writer.buffer, *offset)?;
             return decode_frame_payload(payload).map(Some);
         }

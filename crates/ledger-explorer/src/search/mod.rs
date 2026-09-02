@@ -114,10 +114,8 @@ fn find_first_violation<W: Workload, O: Oracle>(
 /// at quiescence, or a mid-run monitor halt all mean the system under test
 /// failed to make progress.
 pub fn effective_verdict(run: &ledger_sim::RunResult, verdict: crate::Verdict) -> crate::Verdict {
-    if run.outcome == ledger_sim::RunOutcome::Completed {
-        return verdict;
-    }
     let reason = match &run.outcome {
+        ledger_sim::RunOutcome::Completed => return verdict,
         ledger_sim::RunOutcome::BudgetExhausted => format!(
             "liveness violation: step budget exhausted after {} steps with tasks pending",
             run.steps
@@ -128,16 +126,13 @@ pub fn effective_verdict(run: &ledger_sim::RunResult, verdict: crate::Verdict) -
         ledger_sim::RunOutcome::MonitorHalt(reason) => {
             format!("monitor halt: {reason}")
         }
-        ledger_sim::RunOutcome::Completed => unreachable!(),
     };
     // Structural witnesses first; a stalled or halted run may have none, so
     // fall back to the journal tail: the last entries show where progress
     // stopped.
     let mut witnesses = crate::oracle::witnesses_from_journal(&run.journal);
     if witnesses.is_empty() {
-        let ids: Vec<ledger_format::Hash> = run.journal.entries().map(|entry| entry.id).collect();
-        let start = ids.len().saturating_sub(8);
-        witnesses = ids[start..].to_vec();
+        witnesses = run.journal.tail_ids(8);
     }
     crate::oracle::Verdict::fail(witnesses, reason)
 }

@@ -31,6 +31,19 @@ pub enum PathError {
     HashMismatch,
 }
 
+impl core::fmt::Display for PathError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RootEscape => f.write_str("path escaped virtual root via leading .."),
+            Self::NulByte => f.write_str("path contains a NUL byte"),
+            Self::TooLong => f.write_str("canonicalized path exceeds maximum byte length"),
+            Self::HashMismatch => f.write_str("decoded path hash does not match canonical bytes"),
+        }
+    }
+}
+
+impl core::error::Error for PathError {}
+
 /// Canonicalizes a raw path byte sequence.
 ///
 /// The separator is `/`. Empty components and `.` are removed; `..` removes

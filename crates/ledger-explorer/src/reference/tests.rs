@@ -1,4 +1,5 @@
 use super::*;
+use crate::search::Workload as _;
 use ledger_sim::{Policy, RunConfig, Simulation};
 
 fn run_with_seed(seed_byte: u8) -> (Journal, bool) {
@@ -40,47 +41,76 @@ fn corpus_scenarios_all_reproduce_and_violate() {
 
 #[test]
 fn every_scenario_exposes_an_explicit_support_model() {
-    let scenarios = all_corpus_scenarios();
-    assert_eq!(
-        scenarios.len(),
-        16,
-        "v1 plus v2 registry holds 16 scenarios"
-    );
-    for scenario in &scenarios {
-        let provider = scenario.support_provider();
+    // v1: evaluate each model on the scenario's own no-fault probe journal;
+    // the expression ids are content hashes of that journal's entries.
+    for scenario in corpus_scenarios() {
+        let probe_seed = [0u8; 32];
+        let journal = match &scenario.runner {
+            CorpusRunner::Tasks { builders, .. } => {
+                let config = RunConfig::builder()
+                    .seed(probe_seed)
+                    .policy(Policy::Random)
+                    .max_steps(4096)
+                    .build();
+                Simulation::with_tasks(config, builders())
+                    .run()
+                    .unwrap_or_else(|error| panic!("{}: probe run failed: {error}", scenario.name))
+                    .journal
+            }
+            CorpusRunner::MiniKv => {
+                let config = RunConfig::builder()
+                    .seed(probe_seed)
+                    .policy(Policy::Random)
+                    .max_steps(4096)
+                    .build();
+                Simulation::new(config, crate::workloads::MiniKvWorkload.programs())
+                    .run()
+                    .unwrap_or_else(|error| panic!("{}: probe run failed: {error}", scenario.name))
+                    .journal
+            }
+        };
+        let provider = scenario.support_provider(&journal);
         assert!(
             provider.version() >= 1,
             "{}: the support provider must carry a version",
             scenario.name
         );
-        let expression = provider.expression();
-        // Every model is one of the three explicit forms; construction
-        // rejects empty sets, so any AllOf or AnyOf here is non-empty.
-        match expression {
-            crate::support::SupportExpr::AllOf(ids) => {
-                assert!(
-                    !ids.is_empty(),
-                    "{}: AllOf must be non-empty",
-                    scenario.name
-                );
-            }
-            crate::support::SupportExpr::AnyOf(branches) => {
-                assert!(
-                    !branches.is_empty(),
-                    "{}: AnyOf must be non-empty",
-                    scenario.name
-                );
-            }
-            crate::support::SupportExpr::Opaque => {}
-        }
-        // The provider digest is stable for the same model.
-        let again = scenario.support_provider();
+        assert_support_shape(scenario.name, provider.expression());
+        let again = scenario.support_provider(&journal);
         assert_eq!(
             provider.digest(),
             again.digest(),
             "{}: the provider digest must be deterministic",
             scenario.name
         );
+    }
+    // Fault-triggered v2: evaluate each model on the scenario's baseline
+    // journal; the derived AllOf sets must be non-empty there.
+    for scenario in super::faultdep_scenarios() {
+        let baseline = scenario
+            .baseline()
+            .unwrap_or_else(|error| panic!("{}: baseline failed: {error}", scenario.name));
+        let provider = scenario.support_provider(&baseline.journal);
+        assert_eq!(
+            provider.version(),
+            super::faultdep::FAULTDEP_SUPPORT_VERSION,
+            "{}: the faultdep provider must carry the faultdep version",
+            scenario.name
+        );
+        assert_support_shape(scenario.name, provider.expression());
+    }
+}
+
+/// Shared shape assertions for one declared support model.
+fn assert_support_shape(name: &str, expression: &crate::support::SupportExpr) {
+    match expression {
+        crate::support::SupportExpr::AllOf(ids) => {
+            assert!(!ids.is_empty(), "{name}: AllOf must be non-empty");
+        }
+        crate::support::SupportExpr::AnyOf(branches) => {
+            assert!(!branches.is_empty(), "{name}: AnyOf must be non-empty");
+        }
+        crate::support::SupportExpr::Opaque => {}
     }
 }
 
