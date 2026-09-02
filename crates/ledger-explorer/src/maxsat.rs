@@ -30,65 +30,79 @@ pub struct MaxSatSolution {
 }
 /// Method tag carried by every MCS lower-bound certificate this module emits.
 pub const LOWER_BOUND_METHOD: &str = "mcs-lower-bound-v1";
-fn collect(journal: &Journal, cur: Hash, path: &mut Vec<Hash>, paths: &mut Vec<Vec<Hash>>) {
+fn collect_memo(
+    journal: &Journal,
+    cur: Hash,
+    memo: &mut BTreeMap<Hash, Vec<Vec<Hash>>>,
+) -> Vec<Vec<Hash>> {
+    if let Some(cached) = memo.get(&cur) {
+        return cached.clone();
+    }
     let Some(entry) = journal.get(&cur) else {
-        return;
+        return Vec::new();
     };
-    let pushed = if is_faultable(entry.data.kind) {
-        path.push(cur);
-        true
-    } else {
-        false
-    };
+    let faultable = is_faultable(entry.data.kind);
+    let mut paths: Vec<Vec<Hash>> = Vec::new();
     if entry.data.parents.is_empty() {
-        if !path.is_empty() {
-            paths.push(path.clone());
+        if faultable {
+            paths.push(vec![cur]);
+        } else {
+            paths.push(Vec::new());
         }
     } else {
         for p in &entry.data.parents {
-            collect(journal, *p, path, paths);
+            for sub in collect_memo(journal, *p, memo) {
+                let mut path = sub;
+                if faultable {
+                    path.push(cur);
+                }
+                paths.push(path);
+            }
         }
     }
-    if pushed {
-        path.pop();
-    }
+    memo.insert(cur, paths.clone());
+    paths
 }
-fn collect_bounded(
+
+fn collect_bounded_memo(
     journal: &Journal,
     cur: Hash,
     depth: usize,
     limit: usize,
-    path: &mut Vec<Hash>,
-    paths: &mut Vec<Vec<Hash>>,
-) {
+    memo: &mut BTreeMap<(Hash, usize), Vec<Vec<Hash>>>,
+) -> Vec<Vec<Hash>> {
     if depth > limit {
-        if !path.is_empty() {
-            paths.push(path.clone());
-        }
-        return;
+        return vec![Vec::new()];
+    }
+    if let Some(cached) = memo.get(&(cur, depth)) {
+        return cached.clone();
     }
     let Some(entry) = journal.get(&cur) else {
-        return;
+        return Vec::new();
     };
-    let pushed = if is_faultable(entry.data.kind) {
-        path.push(cur);
-        true
-    } else {
-        false
-    };
+    let faultable = is_faultable(entry.data.kind);
+    let mut paths: Vec<Vec<Hash>> = Vec::new();
     if entry.data.parents.is_empty() {
-        if !path.is_empty() {
-            paths.push(path.clone());
+        if faultable {
+            paths.push(vec![cur]);
+        } else {
+            paths.push(Vec::new());
         }
     } else {
         for p in &entry.data.parents {
-            collect_bounded(journal, *p, depth + 1, limit, path, paths);
+            for sub in collect_bounded_memo(journal, *p, depth + 1, limit, memo) {
+                let mut path = sub;
+                if faultable {
+                    path.push(cur);
+                }
+                paths.push(path);
+            }
         }
     }
-    if pushed {
-        path.pop();
-    }
+    memo.insert((cur, depth), paths.clone());
+    paths
 }
+
 pub fn encode_hazard(
     journal: &Journal,
     verdict: &Verdict,
@@ -100,12 +114,21 @@ pub fn encode_hazard(
         }
     }
     let mut all: Vec<Vec<Hash>> = Vec::new();
+    let mut memo = BTreeMap::new();
+    let mut bounded_memo = BTreeMap::new();
     for w in &verdict.witnesses {
-        let mut cur = Vec::new();
         if let Some(l) = config.max_horizon {
-            collect_bounded(journal, *w, 0, l, &mut cur, &mut all);
+            for p in collect_bounded_memo(journal, *w, 0, l, &mut bounded_memo) {
+                if !p.is_empty() {
+                    all.push(p);
+                }
+            }
         } else {
-            collect(journal, *w, &mut cur, &mut all);
+            for p in collect_memo(journal, *w, &mut memo) {
+                if !p.is_empty() {
+                    all.push(p);
+                }
+            }
         }
     }
     if all.is_empty() && !verdict.witnesses.is_empty() {
@@ -127,6 +150,7 @@ pub fn encode_hazard(
         }
     }
     hard.sort();
+    hard.dedup();
     let mut distinct: BTreeSet<Hash> = BTreeSet::new();
     for c in &hard {
         for h in c {
@@ -223,71 +247,128 @@ pub fn solve_maxsat_bnb(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverEr
     hard_sets.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
     let mut best_cut = BTreeSet::new();
     let mut best_cost = u64::MAX;
+    // Greedy warm start: a deterministic max-coverage incumbent before the
+    // exact search. On shared-literal encodings (one event covering every
+    // clause) the greedy pick is optimal, and the DFS then prunes every
+    // branch at the root instead of walking an exponential literal chain.
+    greedy_incumbent(&hard_sets, &weights, &mut best_cut, &mut best_cost);
     let mut cur = BTreeSet::new();
-    dfs(
-        &hard_sets,
-        &weights,
-        enc.cardinality.as_ref(),
-        &mut cur,
-        0,
-        &mut best_cut,
-        &mut best_cost,
-    );
-    if best_cost == u64::MAX {
+    let mut state = SearchState {
+        hard: &hard_sets,
+        weights: &weights,
+        cardinality: enc.cardinality.as_ref(),
+        best_cut,
+        best_cost,
+    };
+    state.dfs(&mut cur, 0, 0);
+    if state.best_cost == u64::MAX {
         return Err(SolverError::Unsupported);
     }
-    let cut: Vec<Hash> = best_cut.into_iter().collect();
-    let lower = disjoint_lower(&enc.hard, &weights).min(best_cost);
+    let cut: Vec<Hash> = state.best_cut.into_iter().collect();
+    let lower = disjoint_lower(&enc.hard, &weights).min(state.best_cost);
     Ok(MaxSatSolution {
         cut,
-        total_cost: best_cost,
+        total_cost: state.best_cost,
         lower_bound_proof: LowerBoundProof {
             method: LOWER_BOUND_METHOD,
             unsat_core_cost: lower,
         },
     })
 }
-fn dfs(
+/// Deterministic greedy max-coverage incumbent.
+///
+/// Rounds pick the literal that satisfies the most unsatisfied hard clauses
+/// (ties: cheaper cost first, then hash order), until every clause is
+/// covered or no literal covers anything new. The result seeds the exact
+/// search: on shared-literal encodings the greedy pick is already optimal,
+/// so the DFS prunes every branch at the root instead of walking an
+/// exponential literal chain. The incumbent never worsens the result: the
+/// DFS still runs and only improves on it.
+fn greedy_incumbent(
     hard: &[BTreeSet<Hash>],
-    w: &BTreeMap<Hash, u64>,
-    card: Option<&CardinalityBound>,
-    cur: &mut BTreeSet<Hash>,
-    cur_cost: u64,
+    weights: &BTreeMap<Hash, u64>,
     best_cut: &mut BTreeSet<Hash>,
     best_cost: &mut u64,
 ) {
-    if cur_cost >= *best_cost {
+    let mut uncovered: Vec<&BTreeSet<Hash>> = hard.iter().collect();
+    let mut chosen = BTreeSet::new();
+    let mut cost = 0u64;
+    while !uncovered.is_empty() {
+        let mut coverage: BTreeMap<Hash, usize> = BTreeMap::new();
+        for clause in &uncovered {
+            for literal in clause.iter() {
+                *coverage.entry(*literal).or_default() += 1;
+            }
+        }
+        let weight_of = |h: &Hash| weights.get(h).copied().unwrap_or(1).max(1);
+        let Some((literal, _)) = coverage.into_iter().min_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then(weight_of(&a.0).cmp(&weight_of(&b.0)))
+                .then(a.0.cmp(&b.0))
+        }) else {
+            break;
+        };
+        chosen.insert(literal);
+        cost = cost.saturating_add(weight_of(&literal));
+        uncovered.retain(|clause| !clause.contains(&literal));
+    }
+    if !uncovered.is_empty() {
+        // Some clauses have no faultable literal: leave the exact DFS in
+        // charge of reporting the failure.
         return;
     }
-    if let Some(b) = card
-        && cur.len() > b.max_true
-    {
-        return;
-    }
-    let uncovered = hard.iter().find(|c| !c.iter().any(|h| cur.contains(h)));
-    let Some(clause) = uncovered else {
-        if cur_cost < *best_cost {
-            *best_cost = cur_cost;
-            *best_cut = cur.clone();
+    *best_cut = chosen;
+    *best_cost = cost;
+}
+
+struct SearchState<'a> {
+    hard: &'a [BTreeSet<Hash>],
+    weights: &'a BTreeMap<Hash, u64>,
+    cardinality: Option<&'a CardinalityBound>,
+    best_cut: BTreeSet<Hash>,
+    best_cost: u64,
+}
+
+impl<'a> SearchState<'a> {
+    fn dfs(&mut self, cur: &mut BTreeSet<Hash>, cur_cost: u64, start_clause: usize) {
+        if cur_cost >= self.best_cost {
+            return;
         }
-        return;
-    };
-    let mut lits: Vec<(Hash, u64)> = clause
-        .iter()
-        .map(|h| (*h, w.get(h).copied().unwrap_or(1)))
-        .collect();
-    lits.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-    for (h, wt) in lits {
-        if cur.contains(&h) {
-            continue;
+        if let Some(b) = self.cardinality
+            && cur.len() > b.max_true
+        {
+            return;
         }
-        let nxt = cur_cost.saturating_add(wt);
-        if nxt >= *best_cost {
-            continue;
+        let uncovered = self
+            .hard
+            .iter()
+            .enumerate()
+            .skip(start_clause)
+            .find(|(_, c)| !c.iter().any(|h| cur.contains(h)));
+        let Some((clause_idx, clause)) = uncovered else {
+            if cur_cost < self.best_cost {
+                self.best_cost = cur_cost;
+                self.best_cut = cur.clone();
+            }
+            return;
+        };
+        let mut lits: Vec<(Hash, u64)> = clause
+            .iter()
+            .map(|h| (*h, self.weights.get(h).copied().unwrap_or(1)))
+            .collect();
+        lits.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        for (h, wt) in lits {
+            if cur.contains(&h) {
+                continue;
+            }
+            let nxt = cur_cost.saturating_add(wt);
+            if nxt >= self.best_cost {
+                continue;
+            }
+            cur.insert(h);
+            self.dfs(cur, nxt, clause_idx + 1);
+            cur.remove(&h);
         }
-        cur.insert(h);
-        dfs(hard, w, card, cur, nxt, best_cut, best_cost);
-        cur.remove(&h);
     }
 }
 #[cfg(test)]
