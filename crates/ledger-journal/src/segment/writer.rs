@@ -15,14 +15,14 @@ use std::vec::Vec;
 
 use crate::dag::{Entry, EntryFrame, JournalError, kind_is_fault_relevant};
 use crate::retention::RetentionClass;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 use super::{
-    SAMPLE_INTERVAL, SEGMENT_TARGET_SIZE, SealedSegment, SegmentStore, SegmentWriter, WAL_FILE,
-    prefix_of, segment_file_name, segment_io,
+    SAMPLE_INTERVAL, SealedSegment, SegmentStore, SegmentWriter, WAL_FILE, prefix_of,
+    segment_file_name, segment_io, state,
 };
 
-impl SegmentWriter {
+impl SegmentWriter<state::Open> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -79,41 +79,29 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// Return the current buffer size in bytes.
-    pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
-    /// Return the number of buffered frames.
-    pub fn entry_count(&self) -> u64 {
-        self.index.len() as u64
-    }
-
-    /// Return true when the buffer has reached the target segment size.
-    pub fn should_seal(&self) -> bool {
-        self.buffer.len() >= SEGMENT_TARGET_SIZE
-    }
-
     /// Seal the buffer into an immutable segment file.
     ///
-    /// The frame block is zstd-compressed, a sparse index samples every
-    /// SAMPLE_INTERVAL-th frame, and the file is written atomically (temp
-    /// file plus rename).
-    pub fn seal(self, dir: &Path, segment_id: u64) -> Result<SealedSegment, JournalError> {
+    /// Consumes the open writer and returns the sealed handle. The handle is
+    /// the only source of sealed metadata for the archive path; call
+    /// `into_metadata` to hand it to the store. The file is written
+    /// atomically (temp file plus rename) with a zstd-compressed frame block,
+    /// a sparse index sampling every SAMPLE_INTERVAL-th frame, and a BE
+    /// trailer.
+    pub fn seal(
+        self,
+        dir: &Path,
+        segment_id: u64,
+    ) -> Result<SegmentWriter<state::Sealed>, JournalError> {
         let compressed = zstd::encode_all(&self.buffer[..], 3).map_err(segment_io)?;
         let mut samples = Vec::new();
         let mut hasher = blake3::Hasher::new();
         for (i, (id, offset)) in self.index.iter().enumerate() {
-            hasher.update(id);
+            hasher.update(&id.0);
             if i % SAMPLE_INTERVAL as usize == 0 {
                 samples.push((*offset, prefix_of(id)));
             }
         }
-        let root_hash = *hasher.finalize().as_bytes();
+        let root_hash = EntryHash(*hasher.finalize().as_bytes());
 
         let file_name = segment_file_name(segment_id);
         let tmp_path = dir.join(format!("{file_name}.tmp"));
@@ -122,7 +110,7 @@ impl SegmentWriter {
             ledger_format::cbor::array(&mut header, 4);
             ledger_format::cbor::unsigned(&mut header, self.index.len() as u64);
             ledger_format::cbor::unsigned(&mut header, self.buffer.len() as u64);
-            ledger_format::cbor::bytes(&mut header, &root_hash);
+            ledger_format::cbor::bytes(&mut header, &root_hash.0);
             ledger_format::cbor::unsigned(&mut header, SAMPLE_INTERVAL as u64);
             ledger_format::frame::FRAME_PREFIX_LEN + header.len()
         };
@@ -154,16 +142,25 @@ impl SegmentWriter {
         }
         fs::rename(&tmp_path, dir.join(&file_name)).map_err(segment_io)?;
 
-        Ok(SealedSegment {
+        let fault_relevant = self.fault_relevant;
+        let meta = SealedSegment {
             id: segment_id,
             entry_count: self.index.len() as u64,
             uncompressed_len: self.buffer.len() as u64,
             compressed_len: compressed.len() as u64,
             root_hash,
             sample_interval: SAMPLE_INTERVAL,
-            contains_fault_relevant: self.fault_relevant,
+            contains_fault_relevant: fault_relevant,
             data_offset: data_offset as u64,
             samples,
+        };
+        Ok(SegmentWriter {
+            buffer: Vec::new(),
+            index: Vec::new(),
+            fault_relevant,
+            encode_scratch: Vec::new(),
+            sealed: meta,
+            _state: core::marker::PhantomData,
         })
     }
 }
@@ -245,14 +242,18 @@ impl SegmentStore {
     }
 
     /// Seal the open writer into a segment file and reset the WAL.
+    ///
+    /// Consumes the open writer through its sealed handle; the handle's
+    /// metadata is the only value pushed to the sealed list, so the archive
+    /// path below only ever sees sealed segments.
     pub fn seal_writer(&mut self) -> Result<(), JournalError> {
         if self.writer.is_empty() {
             return Ok(());
         }
         let open_writer = std::mem::take(&mut self.writer);
-        let segment = open_writer.seal(&self.dir, self.next_segment_id)?;
+        let sealed_handle = open_writer.seal(&self.dir, self.next_segment_id)?;
         self.next_segment_id += 1;
-        self.sealed.push(segment);
+        self.sealed.push(sealed_handle.into_metadata());
         self.wal = None;
         // Invariant: the WAL mirrors the open-writer contents. A stale WAL
         // left after a seal would be re-ingested by a later `load`,
@@ -291,11 +292,11 @@ fn encode_entry_payload(entry: &Entry, scratch: &mut Vec<u8>) -> Result<usize, J
 /// `payload` is the canonical `data || vector_clock` bytes, split at
 /// `data_len`. Field order and widths are identical to the framing of
 /// `encode_entry_frame`; a test pins the two byte-for-byte equal.
-fn write_frame(buffer: &mut Vec<u8>, id: &Hash, data_len: usize, payload: &[u8]) {
+fn write_frame(buffer: &mut Vec<u8>, id: &EntryHash, data_len: usize, payload: &[u8]) {
     let payload_len = 32 + 8 + payload.len();
     buffer.reserve(8 + payload_len);
     buffer.extend_from_slice(&(payload_len as u64).to_le_bytes());
-    buffer.extend_from_slice(id);
+    buffer.extend_from_slice(&id.0);
     buffer.extend_from_slice(&(data_len as u64).to_le_bytes());
     buffer.extend_from_slice(payload);
 }
@@ -313,7 +314,7 @@ fn write_header(
     file: &mut impl Write,
     entry_count: u64,
     uncompressed_len: u64,
-    root_hash: &Hash,
+    root_hash: &EntryHash,
     sample_interval: u32,
 ) -> Result<(), JournalError> {
     // v2 outer frame: 16-byte raw prefix (LDGS, version 2, header_len,
@@ -322,7 +323,7 @@ fn write_header(
     ledger_format::cbor::array(&mut header, 4);
     ledger_format::cbor::unsigned(&mut header, entry_count);
     ledger_format::cbor::unsigned(&mut header, uncompressed_len);
-    ledger_format::cbor::bytes(&mut header, root_hash);
+    ledger_format::cbor::bytes(&mut header, &root_hash.0);
     ledger_format::cbor::unsigned(&mut header, sample_interval as u64);
     let header_len = u32::try_from(header.len())
         .map_err(|_| JournalError::SegmentCorrupt("segment header exceeds u32".to_string()))?;

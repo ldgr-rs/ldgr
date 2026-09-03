@@ -13,25 +13,50 @@
 //! order. The digest is a BLAKE3 keyed hash over those bytes with a fixed
 //! domain key, so identity digests are domain-separated from every other hash
 //! in the system. An identity missing required build data is incomplete and
-//! has no digest: [`Self::digest`] returns `None`, and a root comparison must
-//! fail before comparing roots when either side is incomplete.
+//! has no digest: [`Self::digest`] returns `Ok(None)`, and a root comparison
+//! must fail before comparing roots when either side is incomplete.
+//!
+//! Trust boundary: every `String` field and `input_digests` crosses the
+//! host/journal boundary (compile-time build capture and runtime run context
+//! are both host-supplied). Encoding validates each field against
+//! `MAX_IDENTITY_FIELD_BYTES` and the input list against
+//! `MAX_IDENTITY_INPUT_DIGESTS` before any length conversion or allocation,
+//! and fails closed with a typed error. [`ExecutionIdentity::digest`]
+//! returns `Ok(None)` for incomplete identities and `Err` for oversize
+//! fields, so oversize identities surface errors rather than silently
+//! becoming incomparable.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use ledger_format::Hash;
+use crate::dag::JournalError;
+use ledger_format::EntryHash;
 
 /// Domain key for execution-identity digests. Exactly 32 bytes; changing the
 /// key changes every identity digest and is a breaking format change.
 const IDENTITY_DOMAIN_KEY: [u8; 32] = *b"ldgr.execution-identity.v1\0\0\0\0\0\0";
 
 /// Journal format version bound by every identity. Bumped only by an approved
-/// format change (E2 owns format v2).
+/// format change.
 pub const JOURNAL_FORMAT_VERSION: u32 = 1;
 
 /// Crash-semantics version bound by every identity. Bumped only by an approved
-/// crash-semantics change (E2 owns versioned fail-closed recovery).
+/// crash-semantics change.
 pub const CRASH_SEMANTICS_VERSION: u32 = 1;
+
+/// Maximum bytes of one host-supplied identity string field.
+///
+/// Precedent is `MAX_CANONICAL_PATH_BYTES` (4096) in `ledger-format`: long
+/// enough for versions, toolchain ids, triples, profiles, feature lists,
+/// workload ids, backend names, runtime profiles, and revisions, tight enough
+/// to bound the canonical encoding before allocation.
+pub const MAX_IDENTITY_FIELD_BYTES: usize = 4096;
+
+/// Maximum digests in `input_digests`.
+///
+/// Precedent is `MAX_PARENTS_PER_ENTRY` (4096) in `ledger-format`: the same
+/// shape (a bounded list of 32-byte hashes) and the same bound discipline.
+pub const MAX_IDENTITY_INPUT_DIGESTS: usize = 4096;
 
 /// Deterministic resource limits bound by an execution identity.
 ///
@@ -69,32 +94,32 @@ pub struct ExecutionIdentity {
     /// Enabled engine features, comma separated and sorted.
     pub features: String,
     /// Digest of the workspace lockfile baked at compile time.
-    pub lockfile_digest: Option<Hash>,
+    pub lockfile_digest: Option<EntryHash>,
     // Run segment (runtime derived).
     /// SUT repository revision; `None` when no SUT is bound.
     pub sut_revision: Option<String>,
     /// Whether the SUT tree was dirty at execution time.
     pub sut_dirty: bool,
     /// Digest of the SUT artifact when one is bound.
-    pub sut_artifact_digest: Option<Hash>,
+    pub sut_artifact_digest: Option<EntryHash>,
     /// Digest of a guest or component artifact when one is used.
-    pub guest_digest: Option<Hash>,
+    pub guest_digest: Option<EntryHash>,
     /// Workload identifier selecting the instruction programs.
     pub workload_id: String,
     /// Digest of the workload program set.
-    pub program_digest: Hash,
+    pub program_digest: EntryHash,
     /// Digests of every workload input, order independent.
-    pub input_digests: Vec<Hash>,
+    pub input_digests: Vec<EntryHash>,
     /// Backend identifier (`sim`, `wasm`, `tokio`).
     pub backend: String,
     /// Runtime profile description or fingerprint of the executing host.
     pub runtime_profile: String,
     /// Digest of the canonical `RunConfig` bytes.
-    pub run_config_digest: Hash,
+    pub run_config_digest: EntryHash,
     /// Root of the run's seed tree (the config root seed).
-    pub seed_tree_root: Hash,
+    pub seed_tree_root: EntryHash,
     /// Digest of the fault specification; `None` when no faults are bound.
-    pub faultspec_digest: Option<Hash>,
+    pub faultspec_digest: Option<EntryHash>,
     /// Oracle version; `None` when the default oracle is used.
     pub oracle_version: Option<u64>,
     /// Support-provider version; `None` when no provider is bound.
@@ -126,27 +151,45 @@ impl ExecutionIdentity {
     /// Canonical length-prefixed field encoding in declaration order.
     ///
     /// `input_digests` is sorted before encoding so insertion order never
-    /// changes the bytes. The encoding is total: an incomplete identity still
-    /// encodes, it just has no comparable digest.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        encode_opt_str(&self.engine_revision, &mut out);
+    /// changes the bytes. The encoding is total over complete and incomplete
+    /// identities alike when every field fits its cap; oversize host-supplied
+    /// fields fail closed with [`JournalError::InvalidPayload`]. No length is
+    /// converted with `as`, and the output is pre-allocated from a
+    /// checked total bounded by the per-field caps.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, JournalError> {
+        check_str_len("engine_version", &self.engine_version)?;
+        check_str_len("toolchain", &self.toolchain)?;
+        check_str_len("target_triple", &self.target_triple)?;
+        check_str_len("build_profile", &self.build_profile)?;
+        check_str_len("features", &self.features)?;
+        check_str_len("workload_id", &self.workload_id)?;
+        check_str_len("backend", &self.backend)?;
+        check_str_len("runtime_profile", &self.runtime_profile)?;
+        check_opt_str_len("engine_revision", self.engine_revision.as_ref())?;
+        check_opt_str_len("sut_revision", self.sut_revision.as_ref())?;
+        if self.input_digests.len() > MAX_IDENTITY_INPUT_DIGESTS {
+            return Err(JournalError::InvalidPayload(
+                "input_digests exceeds identity limit".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(self.encoded_len_bound());
+        encode_opt_str(&self.engine_revision, &mut out)?;
         encode_bool(self.engine_dirty, &mut out);
-        encode_str(&self.engine_version, &mut out);
-        encode_str(&self.toolchain, &mut out);
-        encode_str(&self.target_triple, &mut out);
-        encode_str(&self.build_profile, &mut out);
-        encode_str(&self.features, &mut out);
+        encode_str(&self.engine_version, &mut out)?;
+        encode_str(&self.toolchain, &mut out)?;
+        encode_str(&self.target_triple, &mut out)?;
+        encode_str(&self.build_profile, &mut out)?;
+        encode_str(&self.features, &mut out)?;
         encode_opt_hash(&self.lockfile_digest, &mut out);
-        encode_opt_str(&self.sut_revision, &mut out);
+        encode_opt_str(&self.sut_revision, &mut out)?;
         encode_bool(self.sut_dirty, &mut out);
         encode_opt_hash(&self.sut_artifact_digest, &mut out);
         encode_opt_hash(&self.guest_digest, &mut out);
-        encode_str(&self.workload_id, &mut out);
+        encode_str(&self.workload_id, &mut out)?;
         encode_hash(&self.program_digest, &mut out);
-        encode_hashes(&self.input_digests, &mut out);
-        encode_str(&self.backend, &mut out);
-        encode_str(&self.runtime_profile, &mut out);
+        encode_hashes(&self.input_digests, &mut out)?;
+        encode_str(&self.backend, &mut out)?;
+        encode_str(&self.runtime_profile, &mut out)?;
         encode_hash(&self.run_config_digest, &mut out);
         encode_hash(&self.seed_tree_root, &mut out);
         encode_opt_hash(&self.faultspec_digest, &mut out);
@@ -155,19 +198,81 @@ impl ExecutionIdentity {
         encode_u32(self.journal_format_version, &mut out);
         encode_u32(self.crash_semantics_version, &mut out);
         encode_u64(self.resource_limits.max_steps, &mut out);
-        out
+        Ok(out)
+    }
+
+    /// Upper bound of the canonical encoding from the per-field caps.
+    ///
+    /// Every variable field contributes its capped length plus its length
+    /// prefix; fixed fields contribute their exact widths. The caller
+    /// pre-allocates exactly this bound after the cap checks above, so a
+    /// hostile identity cannot force an unbounded reservation.
+    fn encoded_len_bound(&self) -> usize {
+        let str_fields = [
+            self.engine_version.len(),
+            self.toolchain.len(),
+            self.target_triple.len(),
+            self.build_profile.len(),
+            self.features.len(),
+            self.workload_id.len(),
+            self.backend.len(),
+            self.runtime_profile.len(),
+        ];
+        let opt_str_fields = [
+            self.engine_revision.as_ref().map_or(0, |s| s.len()),
+            self.sut_revision.as_ref().map_or(0, |s| s.len()),
+        ];
+        // 8-byte length prefix per string, 1-byte presence per option,
+        // 1 byte per bool, 8 bytes per u64-shaped integer, 32 per hash.
+        let mut bound = 2 + 8 * 4 + 9 + 1 + 8 + 7 * 32 + 3 + 8 * 3;
+        for len in str_fields {
+            bound += 8 + len.min(MAX_IDENTITY_FIELD_BYTES);
+        }
+        for len in opt_str_fields {
+            bound += 1 + 8 + len.min(MAX_IDENTITY_FIELD_BYTES);
+        }
+        bound += 8 + self.input_digests.len().min(MAX_IDENTITY_INPUT_DIGESTS) * 32;
+        bound
     }
 
     /// Domain-separated BLAKE3 digest of the canonical identity bytes.
     ///
-    /// Returns `None` when the identity is incomplete. Callers must treat a
-    /// `None` as an identity disagreement before any root comparison.
-    pub fn digest(&self) -> Option<Hash> {
+    /// Returns `Ok(None)` for incomplete identities and `Err` when the
+    /// encoding exceeds the trust-boundary caps. Callers must treat both
+    /// as identity disagreement before any root comparison.
+    pub fn digest(&self) -> Result<Option<EntryHash>, JournalError> {
         if !self.is_complete() {
-            return None;
+            return Ok(None);
         }
-        Some(*blake3::keyed_hash(&IDENTITY_DOMAIN_KEY, &self.canonical_bytes()).as_bytes())
+        let bytes = self.canonical_bytes()?;
+        Ok(Some(EntryHash(
+            *blake3::keyed_hash(&IDENTITY_DOMAIN_KEY, &bytes).as_bytes(),
+        )))
     }
+}
+
+fn check_str_len(field: &str, value: &str) -> Result<(), JournalError> {
+    if value.len() > MAX_IDENTITY_FIELD_BYTES {
+        return Err(JournalError::InvalidPayload(alloc::format!(
+            "identity field {field} exceeds limit"
+        )));
+    }
+    Ok(())
+}
+
+fn check_opt_str_len(field: &str, value: Option<&String>) -> Result<(), JournalError> {
+    if let Some(s) = value {
+        check_str_len(field, s)?;
+    }
+    Ok(())
+}
+
+fn encode_len(len: usize, field: &str, out: &mut Vec<u8>) -> Result<(), JournalError> {
+    let wide = u64::try_from(len).map_err(|_| {
+        JournalError::InvalidPayload(alloc::format!("identity field {field} length exceeds u64"))
+    })?;
+    out.extend_from_slice(&wide.to_le_bytes());
+    Ok(())
 }
 
 fn encode_bool(value: bool, out: &mut Vec<u8>) {
@@ -192,26 +297,29 @@ fn encode_opt_u64(value: Option<u64>, out: &mut Vec<u8>) {
     }
 }
 
-fn encode_str(value: &str, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+fn encode_str(value: &str, out: &mut Vec<u8>) -> Result<(), JournalError> {
+    check_str_len("field", value)?;
+    encode_len(value.len(), "field", out)?;
     out.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
-fn encode_opt_str(value: &Option<String>, out: &mut Vec<u8>) {
+fn encode_opt_str(value: &Option<String>, out: &mut Vec<u8>) -> Result<(), JournalError> {
     match value {
         Some(s) => {
             out.push(1);
-            encode_str(s, out);
+            encode_str(s, out)?;
         }
         None => out.push(0),
     }
+    Ok(())
 }
 
-fn encode_hash(value: &Hash, out: &mut Vec<u8>) {
-    out.extend_from_slice(value);
+fn encode_hash(value: &EntryHash, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.0);
 }
 
-fn encode_opt_hash(value: &Option<Hash>, out: &mut Vec<u8>) {
+fn encode_opt_hash(value: &Option<EntryHash>, out: &mut Vec<u8>) {
     match value {
         Some(h) => {
             out.push(1);
@@ -221,13 +329,19 @@ fn encode_opt_hash(value: &Option<Hash>, out: &mut Vec<u8>) {
     }
 }
 
-fn encode_hashes(values: &[Hash], out: &mut Vec<u8>) {
-    let mut sorted: Vec<Hash> = values.to_vec();
+fn encode_hashes(values: &[EntryHash], out: &mut Vec<u8>) -> Result<(), JournalError> {
+    if values.len() > MAX_IDENTITY_INPUT_DIGESTS {
+        return Err(JournalError::InvalidPayload(
+            "input_digests exceeds identity limit".to_string(),
+        ));
+    }
+    let mut sorted: Vec<EntryHash> = values.to_vec();
     sorted.sort_unstable();
-    out.extend_from_slice(&(sorted.len() as u64).to_le_bytes());
+    encode_len(sorted.len(), "input_digests", out)?;
     for hash in &sorted {
         encode_hash(hash, out);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -246,19 +360,19 @@ mod tests {
             target_triple: "x86_64-unknown-linux-gnu".to_string(),
             build_profile: "debug".to_string(),
             features: "default,solver-cadical".to_string(),
-            lockfile_digest: Some([0x11; 32]),
+            lockfile_digest: Some(EntryHash([0x11; 32])),
             sut_revision: Some("sut-rev-9".to_string()),
             sut_dirty: false,
-            sut_artifact_digest: Some([0x22; 32]),
-            guest_digest: Some([0x33; 32]),
+            sut_artifact_digest: Some(EntryHash([0x22; 32])),
+            guest_digest: Some(EntryHash([0x33; 32])),
             workload_id: "kv".to_string(),
-            program_digest: [0x44; 32],
-            input_digests: vec![[0x55; 32], [0x66; 32]],
+            program_digest: EntryHash([0x44; 32]),
+            input_digests: vec![EntryHash([0x55; 32]), EntryHash([0x66; 32])],
             backend: "sim".to_string(),
             runtime_profile: "cpus=8".to_string(),
-            run_config_digest: [0x77; 32],
-            seed_tree_root: [0x88; 32],
-            faultspec_digest: Some([0x99; 32]),
+            run_config_digest: EntryHash([0x77; 32]),
+            seed_tree_root: EntryHash([0x88; 32]),
+            faultspec_digest: Some(EntryHash([0x99; 32])),
             oracle_version: Some(1),
             support_provider_version: Some(2),
             journal_format_version: JOURNAL_FORMAT_VERSION,
@@ -275,7 +389,10 @@ mod tests {
 
     #[test]
     fn canonical_bytes_are_deterministic() {
-        assert_eq!(sample().canonical_bytes(), sample().canonical_bytes());
+        assert_eq!(
+            sample().canonical_bytes().unwrap(),
+            sample().canonical_bytes().unwrap()
+        );
     }
 
     #[test]
@@ -335,7 +452,7 @@ mod tests {
             (
                 "lockfile_digest",
                 ExecutionIdentity {
-                    lockfile_digest: Some([0x12; 32]),
+                    lockfile_digest: Some(EntryHash([0x12; 32])),
                     ..base.clone()
                 },
             ),
@@ -356,14 +473,14 @@ mod tests {
             (
                 "sut_artifact_digest",
                 ExecutionIdentity {
-                    sut_artifact_digest: Some([0x23; 32]),
+                    sut_artifact_digest: Some(EntryHash([0x23; 32])),
                     ..base.clone()
                 },
             ),
             (
                 "guest_digest",
                 ExecutionIdentity {
-                    guest_digest: Some([0x34; 32]),
+                    guest_digest: Some(EntryHash([0x34; 32])),
                     ..base.clone()
                 },
             ),
@@ -377,14 +494,14 @@ mod tests {
             (
                 "program_digest",
                 ExecutionIdentity {
-                    program_digest: [0x45; 32],
+                    program_digest: EntryHash([0x45; 32]),
                     ..base.clone()
                 },
             ),
             (
                 "input_digests",
                 ExecutionIdentity {
-                    input_digests: vec![[0x55; 32]],
+                    input_digests: vec![EntryHash([0x55; 32])],
                     ..base.clone()
                 },
             ),
@@ -405,21 +522,21 @@ mod tests {
             (
                 "run_config_digest",
                 ExecutionIdentity {
-                    run_config_digest: [0x78; 32],
+                    run_config_digest: EntryHash([0x78; 32]),
                     ..base.clone()
                 },
             ),
             (
                 "seed_tree_root",
                 ExecutionIdentity {
-                    seed_tree_root: [0x89; 32],
+                    seed_tree_root: EntryHash([0x89; 32]),
                     ..base.clone()
                 },
             ),
             (
                 "faultspec_digest",
                 ExecutionIdentity {
-                    faultspec_digest: Some([0x9a; 32]),
+                    faultspec_digest: Some(EntryHash([0x9a; 32])),
                     ..base.clone()
                 },
             ),
@@ -470,7 +587,7 @@ mod tests {
         let a = sample();
         let mut b = sample();
         b.input_digests.reverse();
-        assert_eq!(a.canonical_bytes(), b.canonical_bytes());
+        assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
         assert_eq!(a.digest(), b.digest());
     }
 
@@ -481,7 +598,7 @@ mod tests {
             ..sample()
         };
         assert!(!identity.is_complete());
-        assert_eq!(identity.digest(), None);
+        assert_eq!(identity.digest(), Ok(None));
     }
 
     #[test]
@@ -491,7 +608,7 @@ mod tests {
             ..sample()
         };
         assert!(!identity.is_complete());
-        assert_eq!(identity.digest(), None);
+        assert_eq!(identity.digest(), Ok(None));
     }
 
     #[test]
@@ -513,7 +630,7 @@ mod tests {
             assert!(!identity.is_complete(), "{field} empty must be incomplete");
             assert_eq!(
                 identity.digest(),
-                None,
+                Ok(None),
                 "{field} empty must yield no digest"
             );
         }
@@ -531,14 +648,58 @@ mod tests {
             ..sample()
         };
         assert!(identity.is_complete());
-        assert!(identity.digest().is_some());
+        assert!(identity.digest().expect("complete").is_some());
     }
 
     #[test]
     fn digest_is_domain_separated_from_plain_blake3() {
         let identity = sample();
-        let digest = identity.digest().expect("sample identity is complete");
-        let plain = blake3::hash(&identity.canonical_bytes());
-        assert_ne!(&digest, plain.as_bytes());
+        let digest = identity
+            .digest()
+            .expect("sample identity is complete")
+            .expect("complete identity has a digest");
+        let plain = blake3::hash(&identity.canonical_bytes().unwrap());
+        assert_ne!(digest.0, *plain.as_bytes());
+    }
+
+    #[test]
+    fn oversize_field_fails_closed_with_typed_error() {
+        let mut identity = sample();
+        identity.backend = "x".repeat(MAX_IDENTITY_FIELD_BYTES + 1);
+        let err = identity.canonical_bytes().unwrap_err();
+        assert!(
+            matches!(err, crate::dag::JournalError::InvalidPayload(_)),
+            "oversize field must fail closed, got {err:?}"
+        );
+        assert_eq!(
+            identity.digest(),
+            Err(crate::dag::JournalError::InvalidPayload(
+                "identity field backend exceeds limit".to_string()
+            )),
+            "digest must surface the typed error instead of mapping it to None"
+        );
+    }
+
+    #[test]
+    fn oversize_input_list_fails_closed() {
+        let mut identity = sample();
+        identity.input_digests = vec![EntryHash([0x55; 32]); MAX_IDENTITY_INPUT_DIGESTS + 1];
+        assert!(
+            matches!(
+                identity.canonical_bytes().unwrap_err(),
+                crate::dag::JournalError::InvalidPayload(_)
+            ),
+            "oversize input list must fail closed"
+        );
+        assert!(identity.digest().is_err());
+    }
+
+    #[test]
+    fn at_cap_identity_still_encodes() {
+        let mut identity = sample();
+        identity.backend = "x".repeat(MAX_IDENTITY_FIELD_BYTES);
+        identity.input_digests = vec![EntryHash([0x55; 32]); MAX_IDENTITY_INPUT_DIGESTS];
+        assert!(identity.canonical_bytes().is_ok());
+        assert!(identity.digest().expect("at-cap").is_some());
     }
 }

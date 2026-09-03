@@ -10,9 +10,10 @@ use ledger_format::ActorId;
 use ledger_journal::VectorClock;
 use std::hint::black_box;
 
-fn build_clock(actors: ActorId) -> VectorClock {
+fn build_clock(actors: u32) -> VectorClock {
     let mut clock = VectorClock::new();
     for actor in 1..=actors {
+        let actor = ActorId(actor);
         clock = clock.incremented(actor);
     }
     clock
@@ -23,7 +24,7 @@ fn bench_vc_incremented(c: &mut Criterion) {
     for &actors in &[10, 1_000, 10_000] {
         let clock = build_clock(actors);
         group.bench_function(format!("{actors}_actors"), |b| {
-            b.iter(|| black_box(clock.incremented(1)));
+            b.iter(|| black_box(clock.incremented(ActorId(1))));
         });
     }
     group.finish();

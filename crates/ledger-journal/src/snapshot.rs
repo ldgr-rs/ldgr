@@ -14,7 +14,7 @@ use alloc::format;
 use alloc::string::ToString;
 #[cfg(any(feature = "std", test))]
 use ledger_format::CborValue;
-use ledger_format::{ActorId, Hash, cbor};
+use ledger_format::{ActorId, EntryHash, cbor};
 
 /// Default snapshot interval in entries per actor.
 pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 100_000;
@@ -27,11 +27,11 @@ pub struct Snapshot {
     /// Sequence number at snapshot time.
     pub sequence: u64,
     /// Content address of the corresponding journal entry.
-    pub entry_id: Hash,
+    pub entry_id: EntryHash,
     /// Vector clock at snapshot time.
     pub vector_clock: VectorClock,
     /// BLAKE3 hash of `state_data`, used for corruption detection.
-    pub state_hash: Hash,
+    pub state_hash: EntryHash,
     /// Opaque serialized state bytes.
     pub state_data: Vec<u8>,
 }
@@ -41,11 +41,11 @@ impl Snapshot {
     pub fn new(
         actor: ActorId,
         sequence: u64,
-        entry_id: Hash,
+        entry_id: EntryHash,
         vector_clock: VectorClock,
         state_data: Vec<u8>,
     ) -> Self {
-        let state_hash = *blake3::hash(&state_data).as_bytes();
+        let state_hash = EntryHash(*blake3::hash(&state_data).as_bytes());
         Self {
             actor,
             sequence,
@@ -58,7 +58,7 @@ impl Snapshot {
 
     /// Validate the state hash against the recorded payload.
     pub fn validate(&self) -> Result<(), JournalError> {
-        let recomputed = *blake3::hash(&self.state_data).as_bytes();
+        let recomputed = EntryHash(*blake3::hash(&self.state_data).as_bytes());
         if recomputed != self.state_hash {
             return Err(JournalError::SnapshotHashMismatch);
         }
@@ -72,11 +72,11 @@ impl Snapshot {
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         cbor::array(&mut out, 6);
-        cbor::unsigned(&mut out, self.actor as u64);
+        cbor::unsigned(&mut out, u64::from(self.actor.0));
         cbor::unsigned(&mut out, self.sequence);
-        cbor::bytes(&mut out, &self.entry_id);
+        cbor::bytes(&mut out, &self.entry_id.0);
         cbor::bytes(&mut out, &self.vector_clock.encode());
-        cbor::bytes(&mut out, &self.state_hash);
+        cbor::bytes(&mut out, &self.state_hash.0);
         cbor::bytes(&mut out, &self.state_data);
         out
     }
@@ -103,9 +103,9 @@ impl Snapshot {
             ));
         }
         let actor = match &items[0] {
-            CborValue::Unsigned(actor) => u32::try_from(*actor).map_err(|_| {
+            CborValue::Unsigned(actor) => ActorId(u32::try_from(*actor).map_err(|_| {
                 JournalError::SnapshotStoreError("snapshot actor exceeds u32".into())
-            })?,
+            })?),
             _ => {
                 return Err(JournalError::SnapshotStoreError(
                     "snapshot actor is not an unsigned integer".into(),
@@ -150,12 +150,12 @@ impl Snapshot {
 }
 
 #[cfg(any(feature = "std", test))]
-fn decode_hash(value: &CborValue, field: &str) -> Result<Hash, JournalError> {
+fn decode_hash(value: &CborValue, field: &str) -> Result<EntryHash, JournalError> {
     match value {
         CborValue::Bytes(bytes) if bytes.len() == 32 => {
-            let mut hash = Hash::default();
-            hash.copy_from_slice(bytes);
-            Ok(hash)
+            let mut raw = [0u8; 32];
+            raw.copy_from_slice(bytes);
+            Ok(EntryHash(raw))
         }
         _ => Err(JournalError::SnapshotStoreError(format!(
             "snapshot {field} is not a 32-byte hash"
@@ -178,9 +178,9 @@ fn decode_vector_clock(bytes: &[u8]) -> Result<VectorClock, JournalError> {
     let mut entries = BTreeMap::new();
     for (key, val) in pairs {
         let actor = match key {
-            CborValue::Unsigned(actor) => u32::try_from(actor).map_err(|_| {
+            CborValue::Unsigned(actor) => ActorId(u32::try_from(actor).map_err(|_| {
                 JournalError::SnapshotStoreError("vector clock actor exceeds u32".into())
-            })?,
+            })?),
             _ => {
                 return Err(JournalError::SnapshotStoreError(
                     "vector clock key is not an unsigned integer".into(),
@@ -289,11 +289,17 @@ mod tests {
     use super::*;
     use crate::dag::Journal;
     use alloc::vec;
-    use ledger_format::{EntryKind, EntryPayload};
+    use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 
     #[test]
     fn snapshot_hash_detects_corruption() {
-        let snapshot = Snapshot::new(1, 7, Hash::default(), VectorClock::new(), vec![1, 2, 3, 4]);
+        let snapshot = Snapshot::new(
+            ActorId(1),
+            7,
+            EntryHash([0u8; 32]),
+            VectorClock::new(),
+            vec![1, 2, 3, 4],
+        );
         snapshot.validate().unwrap();
 
         let mut tampered = snapshot.clone();
@@ -310,28 +316,28 @@ mod tests {
         let entry_id = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(1),
                 }),
             )
             .unwrap();
         let mut manager = SnapshotManager::new(1);
         manager.record_snapshot(Snapshot::new(
-            1,
+            ActorId(1),
             1,
             entry_id,
             VectorClock::new(),
             vec![9, 9],
         ));
-        manager.load(&journal, 1).unwrap();
+        manager.load(&journal, ActorId(1)).unwrap();
 
         let mut missing = manager.clone();
-        missing.snapshots.get_mut(&1).unwrap()[0].entry_id = Hash::default();
+        missing.snapshots.get_mut(&ActorId(1)).unwrap()[0].entry_id = EntryHash([0u8; 32]);
         assert!(matches!(
-            missing.load(&journal, 1),
+            missing.load(&journal, ActorId(1)),
             Err(JournalError::MissingParent(_))
         ));
     }
@@ -339,17 +345,17 @@ mod tests {
     #[test]
     fn interval_defaults_to_one_hundred_thousand() {
         let manager = SnapshotManager::default();
-        assert!(!manager.should_snapshot(1, 99_999));
-        assert!(manager.should_snapshot(1, 100_000));
+        assert!(!manager.should_snapshot(ActorId(1), 99_999));
+        assert!(manager.should_snapshot(ActorId(1), 100_000));
     }
 
     #[test]
     fn canonical_bytes_round_trip() {
         let snapshot = Snapshot::new(
-            1,
+            ActorId(1),
             7,
-            Hash::default(),
-            VectorClock::from_map([(1, 3), (9, 2)]),
+            EntryHash([0u8; 32]),
+            VectorClock::from_map([(ActorId(1), 3), (ActorId(9), 2)]),
             vec![1, 2, 3, 4],
         );
         let bytes = snapshot.to_canonical_bytes();
@@ -361,10 +367,10 @@ mod tests {
     #[test]
     fn canonical_bytes_are_deterministic() {
         let snapshot = Snapshot::new(
-            2,
+            ActorId(2),
             3,
-            Hash::default(),
-            VectorClock::from_map([(9, 1), (2, 1)]),
+            EntryHash([0u8; 32]),
+            VectorClock::from_map([(ActorId(9), 1), (ActorId(2), 1)]),
             vec![9, 9, 9],
         );
         assert_eq!(snapshot.to_canonical_bytes(), snapshot.to_canonical_bytes());
@@ -372,7 +378,13 @@ mod tests {
 
     #[test]
     fn canonical_bytes_reject_wrong_field_count() {
-        let snapshot = Snapshot::new(1, 1, Hash::default(), VectorClock::new(), vec![]);
+        let snapshot = Snapshot::new(
+            ActorId(1),
+            1,
+            EntryHash([0u8; 32]),
+            VectorClock::new(),
+            vec![],
+        );
         let mut bytes = snapshot.to_canonical_bytes();
         bytes[0] = 0x80; // six-item array becomes an empty array
         assert!(matches!(
@@ -385,6 +397,6 @@ mod tests {
     fn load_without_snapshot_returns_none() {
         let journal = Journal::new();
         let manager = SnapshotManager::default();
-        assert!(manager.load(&journal, 3).unwrap().is_none());
+        assert!(manager.load(&journal, ActorId(3)).unwrap().is_none());
     }
 }

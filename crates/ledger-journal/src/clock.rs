@@ -138,7 +138,7 @@ impl VectorClock {
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         cbor::map(out, self.0.size());
         for (actor, value) in self.0.iter() {
-            cbor::unsigned(out, *actor as u64);
+            cbor::unsigned(out, u64::from(actor.0));
             cbor::unsigned(out, *value);
         }
     }
@@ -183,8 +183,8 @@ mod tests {
                 if let ledger_format::CborValue::Map(entries) = value {
                     for (key, val) in entries {
                         let actor = match key {
-                            ledger_format::CborValue::Unsigned(v) => v as ActorId,
-                            _ => 0,
+                            ledger_format::CborValue::Unsigned(v) => ActorId(v as u32),
+                            _ => ActorId(0),
                         };
                         let count = match val {
                             ledger_format::CborValue::Unsigned(v) => v,
@@ -200,58 +200,62 @@ mod tests {
 
     #[test]
     fn merge_is_commutative() {
-        let a = VectorClock::from_actor(1, 3).merge(&VectorClock::from_actor(2, 5));
-        let b = VectorClock::from_actor(2, 5).merge(&VectorClock::from_actor(1, 3));
+        let a =
+            VectorClock::from_actor(ActorId(1), 3).merge(&VectorClock::from_actor(ActorId(2), 5));
+        let b =
+            VectorClock::from_actor(ActorId(2), 5).merge(&VectorClock::from_actor(ActorId(1), 3));
         assert_eq!(a, b);
     }
 
     #[test]
     fn merge_is_associative() {
-        let a = VectorClock::from_actor(1, 2);
-        let b = VectorClock::from_actor(2, 4);
-        let c = VectorClock::from_actor(3, 1);
+        let a = VectorClock::from_actor(ActorId(1), 2);
+        let b = VectorClock::from_actor(ActorId(2), 4);
+        let c = VectorClock::from_actor(ActorId(3), 1);
         assert_eq!(a.merge(&b).merge(&c), a.merge(&b.merge(&c)));
     }
 
     #[test]
     fn merge_takes_component_maximum() {
-        let a = VectorClock::from_actor(1, 3).merge(&VectorClock::from_actor(2, 1));
-        let b = VectorClock::from_actor(1, 1).merge(&VectorClock::from_actor(2, 5));
+        let a =
+            VectorClock::from_actor(ActorId(1), 3).merge(&VectorClock::from_actor(ActorId(2), 1));
+        let b =
+            VectorClock::from_actor(ActorId(1), 1).merge(&VectorClock::from_actor(ActorId(2), 5));
         let merged = a.merge(&b);
-        assert_eq!(merged.get(1), 3);
-        assert_eq!(merged.get(2), 5);
+        assert_eq!(merged.get(ActorId(1)), 3);
+        assert_eq!(merged.get(ActorId(2)), 5);
     }
 
     #[test]
     fn merge_does_not_mutate_inputs() {
-        let a = VectorClock::from_actor(1, 3);
-        let b = VectorClock::from_actor(1, 7);
+        let a = VectorClock::from_actor(ActorId(1), 3);
+        let b = VectorClock::from_actor(ActorId(1), 7);
         let merged = a.merge(&b);
-        assert_eq!(a.get(1), 3);
-        assert_eq!(b.get(1), 7);
-        assert_eq!(merged.get(1), 7);
+        assert_eq!(a.get(ActorId(1)), 3);
+        assert_eq!(b.get(ActorId(1)), 7);
+        assert_eq!(merged.get(ActorId(1)), 7);
     }
 
     #[test]
     fn incremented_does_not_mutate_receiver() {
-        let a = VectorClock::from_actor(1, 3);
-        let b = a.incremented(1);
-        assert_eq!(a.get(1), 3);
-        assert_eq!(b.get(1), 4);
+        let a = VectorClock::from_actor(ActorId(1), 3);
+        let b = a.incremented(ActorId(1));
+        assert_eq!(a.get(ActorId(1)), 3);
+        assert_eq!(b.get(ActorId(1)), 4);
     }
 
     #[test]
     fn happens_before_orders_dependent_clocks() {
-        let base = VectorClock::from_actor(1, 2);
-        let later = base.incremented(1);
+        let base = VectorClock::from_actor(ActorId(1), 2);
+        let later = base.incremented(ActorId(1));
         assert!(base.happens_before(&later));
         assert!(!later.happens_before(&base));
     }
 
     #[test]
     fn happens_before_rejects_unrelated_clocks() {
-        let a = VectorClock::from_actor(1, 5);
-        let b = VectorClock::from_actor(2, 5);
+        let a = VectorClock::from_actor(ActorId(1), 5);
+        let b = VectorClock::from_actor(ActorId(2), 5);
         assert!(!a.happens_before(&b));
         assert!(!b.happens_before(&a));
         assert!(a.concurrent_with(&b));
@@ -259,7 +263,7 @@ mod tests {
 
     #[test]
     fn equal_clocks_are_not_strictly_ordered() {
-        let a = VectorClock::from_actor(1, 2);
+        let a = VectorClock::from_actor(ActorId(1), 2);
         let b = a.compact();
         assert_eq!(a, b);
         assert!(!a.happens_before(&b));
@@ -269,7 +273,8 @@ mod tests {
 
     #[test]
     fn encode_round_trips_through_iter() {
-        let clock = VectorClock::from_actor(1, 2).merge(&VectorClock::from_actor(9, 4));
+        let clock =
+            VectorClock::from_actor(ActorId(1), 2).merge(&VectorClock::from_actor(ActorId(9), 4));
         let bytes = clock.encode();
         assert!(!bytes.is_empty());
         assert_eq!(decode_clock(&bytes), clock.iter().collect());
@@ -277,27 +282,31 @@ mod tests {
 
     #[test]
     fn encode_emits_ascending_actor_keys() {
-        let clock = VectorClock::from_actor(9, 1)
-            .merge(&VectorClock::from_actor(2, 1))
-            .merge(&VectorClock::from_actor(7, 1))
-            .merge(&VectorClock::from_actor(1, 1));
+        let clock = VectorClock::from_actor(ActorId(9), 1)
+            .merge(&VectorClock::from_actor(ActorId(2), 1))
+            .merge(&VectorClock::from_actor(ActorId(7), 1))
+            .merge(&VectorClock::from_actor(ActorId(1), 1));
         let decoded = decode_clock(&clock.encode());
         let keys: Vec<ActorId> = decoded.keys().copied().collect();
-        assert_eq!(keys, vec![1, 2, 7, 9]);
+        assert_eq!(keys, vec![ActorId(1), ActorId(2), ActorId(7), ActorId(9)]);
     }
 
     #[test]
     fn merge_with_empty_yields_equal_content() {
-        let a = VectorClock::from_actor(1, 3).merge(&VectorClock::new());
-        let b = VectorClock::new().merge(&VectorClock::from_actor(1, 3));
+        let a = VectorClock::from_actor(ActorId(1), 3).merge(&VectorClock::new());
+        let b = VectorClock::new().merge(&VectorClock::from_actor(ActorId(1), 3));
         assert_eq!(a, b);
-        assert_eq!(a.get(1), 3);
-        assert_eq!(a.iter().collect::<BTreeMap<_, _>>(), [(1, 3)].into());
+        assert_eq!(a.get(ActorId(1)), 3);
+        assert_eq!(
+            a.iter().collect::<BTreeMap<_, _>>(),
+            [(ActorId(1), 3)].into()
+        );
     }
 
     #[test]
     fn len_counts_active_actors() {
-        let clock = VectorClock::from_actor(1, 2).merge(&VectorClock::from_actor(9, 4));
+        let clock =
+            VectorClock::from_actor(ActorId(1), 2).merge(&VectorClock::from_actor(ActorId(9), 4));
         assert_eq!(clock.len(), 2);
         assert_eq!(VectorClock::new().len(), 0);
     }

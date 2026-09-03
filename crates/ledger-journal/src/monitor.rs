@@ -14,7 +14,7 @@ use hashbrown::HashMap;
 
 use crate::clock::VectorClock;
 use crate::dag::{Journal, JournalError};
-use ledger_format::{ActorId, EntryKind, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind};
 
 /// A correctness defect found while auditing a journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,14 +31,14 @@ pub enum MonitorIssue {
     /// An entry references a parent that is not present in the journal.
     MissingParent {
         /// The entry with the dangling reference.
-        entry_id: Hash,
+        entry_id: EntryHash,
         /// The absent parent hash.
-        parent: Hash,
+        parent: EntryHash,
     },
     /// An observed-value entry lacks a parent of the required kind.
     ParentKindMismatch {
         /// The entry whose parents were checked.
-        entry_id: Hash,
+        entry_id: EntryHash,
         /// The kind of parent the entry requires.
         expected_kind: &'static str,
         /// The kind of the nearest non-matching parent.
@@ -47,7 +47,7 @@ pub enum MonitorIssue {
     /// The stored vector clock does not equal the recomputed clock.
     VectorClockMismatch {
         /// The entry whose clock is wrong.
-        entry_id: Hash,
+        entry_id: EntryHash,
         /// The clock re-derived from the parents.
         expected: VectorClock,
         /// The clock stored in the entry.
@@ -81,7 +81,7 @@ pub struct VerificationReport {
     /// Distinct actors verified.
     pub actors_count: usize,
     /// Root DAG hash.
-    pub root_hash: Hash,
+    pub root_hash: EntryHash,
 }
 
 /// Monitor that verifies structural integrity and causal fidelity of a Journal.
@@ -99,11 +99,11 @@ impl JournalCorrectnessMonitor {
 
         for entry in journal.entries() {
             let expected = actor_seqs.get(&entry.data.actor).copied().unwrap_or(0);
-            if entry.data.sequence != expected {
+            if entry.data.sequence.0 != expected {
                 issues.push(MonitorIssue::NonMonotonicSequence {
                     actor: entry.data.actor,
                     expected,
-                    actual: entry.data.sequence,
+                    actual: entry.data.sequence.0,
                 });
             }
             actor_seqs.insert(entry.data.actor, expected + 1);
@@ -430,12 +430,12 @@ fn issue_to_error(issue: &MonitorIssue) -> JournalError {
             actual_kind,
         } => JournalError::InvariantViolation(format!(
             "entry {:02x?} requires a {expected_kind} parent, found {actual_kind}",
-            &entry_id[..4]
+            &entry_id.0[..4]
         )),
         MonitorIssue::VectorClockMismatch { entry_id, .. } => {
             JournalError::InvariantViolation(format!(
                 "entry {:02x?} vector clock does not match recomputation",
-                &entry_id[..4]
+                &entry_id.0[..4]
             ))
         }
         MonitorIssue::ReplayDivergence { position } => JournalError::InvariantViolation(format!(
@@ -446,7 +446,8 @@ fn issue_to_error(issue: &MonitorIssue) -> JournalError {
             boundary_entries,
             journal_entries,
         } => JournalError::InvariantViolation(format!(
-            "actor {actor} boundary reported {boundary_entries} entries, journal holds {journal_entries}"
+            "actor {} boundary reported {boundary_entries} entries, journal holds {journal_entries}",
+            actor.0
         )),
     }
 }
@@ -456,7 +457,7 @@ mod tests {
     use super::*;
     use crate::clock::VectorClock;
     use crate::dag::{Entry, JournalState};
-    use ledger_format::{EntryData, EntryPayload};
+    use ledger_format::{EntryData, EntryHash, EntryPayload, SequenceNumber};
     use std::sync::Arc;
 
     /// Builds a valid v2 typed payload for the kind in tests that only need
@@ -465,19 +466,19 @@ mod tests {
         use ledger_format::*;
         match kind {
             EntryKind::Outcome => EntryPayload::Outcome(OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(value),
             }),
             EntryKind::Send => EntryPayload::Send(SendFrame {
-                message_id: MessageId::new(1, value),
-                from: 1,
-                to: value as u32,
+                message_id: MessageId::new(ActorId(1), value),
+                from: ActorId(1),
+                to: ActorId(value as u32),
                 original_content: value.to_le_bytes().to_vec(),
             }),
             EntryKind::Recv => EntryPayload::Recv(RecvFrame {
-                message_id: MessageId::new(1, value),
-                from: 1,
-                to: value as u32,
+                message_id: MessageId::new(ActorId(1), value),
+                from: ActorId(1),
+                to: ActorId(value as u32),
                 observed_content: value.to_le_bytes().to_vec(),
             }),
             EntryKind::FsWrite => EntryPayload::FsWrite(FsWritePayload::Allocate {
@@ -506,7 +507,7 @@ mod tests {
                 value: CanonicalValue::Unsigned(value),
             }),
             _other => EntryPayload::Outcome(OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(value),
             }),
         }
@@ -518,7 +519,7 @@ mod tests {
         journal
             .append(
                 EntryKind::InputStep,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::InputStep, 1),
             )
@@ -526,7 +527,7 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 2),
             )
@@ -541,12 +542,17 @@ mod tests {
     fn valid_observed_value_parents_pass_fidelity() {
         let mut journal = Journal::new();
         let send = journal
-            .append(EntryKind::Send, 1, [], scalar_payload(EntryKind::Send, 1))
+            .append(
+                EntryKind::Send,
+                ActorId(1),
+                [],
+                scalar_payload(EntryKind::Send, 1),
+            )
             .unwrap();
         journal
             .append(
                 EntryKind::Recv,
-                2,
+                ActorId(2),
                 [send],
                 scalar_payload(EntryKind::Recv, 2),
             )
@@ -554,7 +560,7 @@ mod tests {
         let fs_write = journal
             .append(
                 EntryKind::FsWrite,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::FsWrite, 3),
             )
@@ -562,7 +568,7 @@ mod tests {
         journal
             .append(
                 EntryKind::FsRead,
-                2,
+                ActorId(2),
                 [fs_write],
                 scalar_payload(EntryKind::FsRead, 4),
             )
@@ -570,7 +576,7 @@ mod tests {
         let timer_fire = journal
             .append(
                 EntryKind::TimerFire,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::TimerFire, 5),
             )
@@ -578,7 +584,7 @@ mod tests {
         journal
             .append(
                 EntryKind::Wake,
-                2,
+                ActorId(2),
                 [timer_fire],
                 scalar_payload(EntryKind::Wake, 6),
             )
@@ -592,7 +598,7 @@ mod tests {
         let outcome = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 1),
             )
@@ -600,7 +606,7 @@ mod tests {
         let recv = journal
             .append(
                 EntryKind::Recv,
-                2,
+                ActorId(2),
                 [outcome],
                 scalar_payload(EntryKind::Recv, 2),
             )
@@ -623,7 +629,7 @@ mod tests {
         let outcome = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 1),
             )
@@ -631,7 +637,7 @@ mod tests {
         let fs_read = journal
             .append(
                 EntryKind::FsRead,
-                1,
+                ActorId(1),
                 [outcome],
                 scalar_payload(EntryKind::FsRead, 2),
             )
@@ -654,7 +660,7 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 1),
             )
@@ -662,7 +668,7 @@ mod tests {
         let second = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 2),
             )
@@ -672,10 +678,10 @@ mod tests {
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
-                actor: 1,
-                parents: vec![Hash::default()],
+                actor: ActorId(1),
+                parents: vec![EntryHash([0u8; 32])].into_iter().collect(),
                 vector_clock: Vec::new(),
-                sequence: 1,
+                sequence: SequenceNumber(1),
                 payload: scalar_payload(EntryKind::Outcome, 2),
             },
             journal.get(&second).unwrap().vector_clock.clone(),
@@ -684,7 +690,7 @@ mod tests {
         let state = Arc::new(JournalState {
             base: Arc::new(HashMap::from([(tampered.id, Arc::new(tampered.clone()))])),
             overlay: HashMap::new(),
-            heads: HashMap::from([(1, tampered.id)]),
+            heads: HashMap::from([(ActorId(1), tampered.id)]),
             order: Arc::new(vec![tampered.id]),
             overlay_order: Vec::new(),
         });
@@ -697,7 +703,7 @@ mod tests {
         assert!(issues.iter().any(|issue| matches!(
             issue,
             MonitorIssue::MissingParent { entry_id, parent }
-                if *entry_id == tampered.id && *parent == Hash::default()
+                if *entry_id == tampered.id && *parent == EntryHash([0u8; 32])
         )));
     }
 
@@ -707,10 +713,10 @@ mod tests {
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
-                actor: 1,
-                parents: Vec::new(),
+                actor: ActorId(1),
+                parents: Default::default(),
                 vector_clock: Vec::new(),
-                sequence: 0,
+                sequence: SequenceNumber(0),
                 payload: scalar_payload(EntryKind::Outcome, 1),
             },
             VectorClock::new(),
@@ -719,7 +725,7 @@ mod tests {
         let state = Arc::new(JournalState {
             base: Arc::new(HashMap::from([(entry.id, Arc::new(entry.clone()))])),
             overlay: HashMap::new(),
-            heads: HashMap::from([(1, entry.id)]),
+            heads: HashMap::from([(ActorId(1), entry.id)]),
             order: Arc::new(vec![entry.id]),
             overlay_order: Vec::new(),
         });
@@ -738,11 +744,11 @@ mod tests {
             } => {
                 assert_eq!(*entry_id, entry.id);
                 assert_eq!(
-                    expected.get(1),
+                    expected.get(ActorId(1)),
                     1,
                     "recomputed clock must increment actor 1"
                 );
-                assert_eq!(actual.get(1), 0, "stored clock never incremented");
+                assert_eq!(actual.get(ActorId(1)), 0, "stored clock never incremented");
             }
             other => panic!("expected VectorClockMismatch, got {other:?}"),
         }
@@ -754,7 +760,7 @@ mod tests {
         original
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 1),
             )
@@ -762,7 +768,7 @@ mod tests {
         original
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [],
                 scalar_payload(EntryKind::Outcome, 2),
             )
@@ -773,7 +779,12 @@ mod tests {
 
         let mut divergent = original.fork();
         divergent
-            .append(EntryKind::Send, 3, [], scalar_payload(EntryKind::Send, 3))
+            .append(
+                EntryKind::Send,
+                ActorId(3),
+                [],
+                scalar_payload(EntryKind::Send, 3),
+            )
             .unwrap();
         assert!(matches!(
             JournalCorrectnessMonitor::verify_replay_fidelity(&original, &divergent),
@@ -790,7 +801,7 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 1),
             )
@@ -798,7 +809,7 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 scalar_payload(EntryKind::Outcome, 2),
             )
@@ -806,44 +817,53 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [],
                 scalar_payload(EntryKind::Outcome, 3),
             )
             .unwrap();
 
         // Exact counts must pass.
-        let exact = JournalCorrectnessMonitor::check_coverage(&journal, &[(1, 2), (2, 1)]);
+        let exact = JournalCorrectnessMonitor::check_coverage(
+            &journal,
+            &[(ActorId(1), 2), (ActorId(2), 1)],
+        );
         assert!(exact.is_empty(), "exact coverage must pass: {exact:?}");
 
         // A reported shortfall (boundary says 1, journal holds 2) must flag actor 1.
-        let shortfall = JournalCorrectnessMonitor::check_coverage(&journal, &[(1, 1), (2, 1)]);
+        let shortfall = JournalCorrectnessMonitor::check_coverage(
+            &journal,
+            &[(ActorId(1), 1), (ActorId(2), 1)],
+        );
         assert!(shortfall.iter().any(|issue| matches!(
             issue,
             MonitorIssue::CoverageMismatch {
-                actor: 1,
+                actor: ActorId(1),
                 boundary_entries: 1,
                 journal_entries: 2
             }
         )));
 
         // A reported surplus (boundary says 3, journal holds 1) must flag actor 2.
-        let surplus = JournalCorrectnessMonitor::check_coverage(&journal, &[(1, 2), (2, 3)]);
+        let surplus = JournalCorrectnessMonitor::check_coverage(
+            &journal,
+            &[(ActorId(1), 2), (ActorId(2), 3)],
+        );
         assert!(surplus.iter().any(|issue| matches!(
             issue,
             MonitorIssue::CoverageMismatch {
-                actor: 2,
+                actor: ActorId(2),
                 boundary_entries: 3,
                 journal_entries: 1
             }
         )));
 
         // An unreported actor that nonetheless has entries is a leak.
-        let missing = JournalCorrectnessMonitor::check_coverage(&journal, &[(1, 2)]);
+        let missing = JournalCorrectnessMonitor::check_coverage(&journal, &[(ActorId(1), 2)]);
         assert!(missing.iter().any(|issue| matches!(
             issue,
             MonitorIssue::CoverageMismatch {
-                actor: 2,
+                actor: ActorId(2),
                 boundary_entries: 0,
                 journal_entries: 1
             }
@@ -854,13 +874,14 @@ mod tests {
     fn coverage_issues_are_deterministically_ordered() {
         let mut journal = Journal::new();
         for actor in 1..=5u32 {
+            let actor = ActorId(actor);
             for _ in 0..2 {
                 journal
                     .append(
                         EntryKind::Outcome,
                         actor,
                         [],
-                        scalar_payload(EntryKind::Outcome, actor as u64),
+                        scalar_payload(EntryKind::Outcome, u64::from(actor.0)),
                     )
                     .unwrap();
             }
@@ -869,7 +890,7 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                6,
+                ActorId(6),
                 [],
                 scalar_payload(EntryKind::Outcome, 7),
             )
@@ -877,36 +898,37 @@ mod tests {
 
         // Every reported count disagrees with the journal, so all six actors
         // emit a CoverageMismatch and both HashMap collection paths run.
-        let boundary: Vec<(ActorId, u64)> =
-            (1..=5u32).map(|actor| (actor, actor as u64 + 5)).collect();
+        let boundary: Vec<(ActorId, u64)> = (1..=5u32)
+            .map(|actor| (ActorId(actor), u64::from(actor) + 5))
+            .collect();
         let expected: Vec<MonitorIssue> = vec![
             MonitorIssue::CoverageMismatch {
-                actor: 1,
+                actor: ActorId(1),
                 boundary_entries: 6,
                 journal_entries: 2,
             },
             MonitorIssue::CoverageMismatch {
-                actor: 2,
+                actor: ActorId(2),
                 boundary_entries: 7,
                 journal_entries: 2,
             },
             MonitorIssue::CoverageMismatch {
-                actor: 3,
+                actor: ActorId(3),
                 boundary_entries: 8,
                 journal_entries: 2,
             },
             MonitorIssue::CoverageMismatch {
-                actor: 4,
+                actor: ActorId(4),
                 boundary_entries: 9,
                 journal_entries: 2,
             },
             MonitorIssue::CoverageMismatch {
-                actor: 5,
+                actor: ActorId(5),
                 boundary_entries: 10,
                 journal_entries: 2,
             },
             MonitorIssue::CoverageMismatch {
-                actor: 6,
+                actor: ActorId(6),
                 boundary_entries: 0,
                 journal_entries: 1,
             },
@@ -931,10 +953,10 @@ mod tests {
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
-                actor: 1,
-                parents: vec![Hash::default()],
+                actor: ActorId(1),
+                parents: vec![EntryHash([0u8; 32])].into_iter().collect(),
                 vector_clock: Vec::new(),
-                sequence: 0,
+                sequence: SequenceNumber(0),
                 payload: scalar_payload(EntryKind::Outcome, 1),
             },
             VectorClock::new(),
@@ -944,13 +966,13 @@ mod tests {
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Recv,
-                actor: 2,
-                parents: vec![broken.id],
+                actor: ActorId(2),
+                parents: vec![broken.id].into_iter().collect(),
                 vector_clock: Vec::new(),
-                sequence: 0,
+                sequence: SequenceNumber(0),
                 payload: scalar_payload(EntryKind::Outcome, 2),
             },
-            VectorClock::new().incremented(2),
+            VectorClock::new().incremented(ActorId(2)),
         )
         .unwrap();
         let state = Arc::new(JournalState {
@@ -959,7 +981,7 @@ mod tests {
                 (recv.id, Arc::new(recv.clone())),
             ])),
             overlay: HashMap::new(),
-            heads: HashMap::from([(1, broken.id), (2, recv.id)]),
+            heads: HashMap::from([(ActorId(1), broken.id), (ActorId(2), recv.id)]),
             order: Arc::new(vec![recv.id, broken.id]),
             overlay_order: Vec::new(),
         });
@@ -974,7 +996,7 @@ mod tests {
             vec![
                 MonitorIssue::MissingParent {
                     entry_id: broken.id,
-                    parent: Hash::default(),
+                    parent: EntryHash([0u8; 32]),
                 },
                 MonitorIssue::ParentKindMismatch {
                     entry_id: recv.id,

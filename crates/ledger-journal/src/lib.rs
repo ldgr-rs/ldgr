@@ -49,12 +49,11 @@ pub use snapshot_store::SnapshotStore;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
-    use ledger_format::{EntryKind, EntryPayload};
+    use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 
     fn outcome(value: u64) -> EntryPayload {
         EntryPayload::Outcome(ledger_format::OutcomePayload {
-            schema: [0x00; 32],
+            schema: EntryHash([0x00; 32]),
             value: ledger_format::CanonicalValue::Unsigned(value),
         })
     }
@@ -65,7 +64,7 @@ mod tests {
         let first = journal
             .append(
                 EntryKind::InputStep,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::InputStep(ledger_format::InputStepPayload {
                     generator: 0,
@@ -75,11 +74,11 @@ mod tests {
             )
             .unwrap();
         let second = journal
-            .append(EntryKind::Outcome, 1, [], outcome(2))
+            .append(EntryKind::Outcome, ActorId(1), [], outcome(2))
             .unwrap();
         let entry = journal.get(&second).unwrap();
-        assert_eq!(entry.data.parents, vec![first]);
-        assert_eq!(entry.vector_clock.get(1), 2);
+        assert_eq!(entry.data.parents.as_slice(), [first].as_slice());
+        assert_eq!(entry.vector_clock.get(ActorId(1)), 2);
     }
 
     #[test]
@@ -88,7 +87,7 @@ mod tests {
         journal
             .append(
                 EntryKind::InputStep,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::InputStep(ledger_format::InputStepPayload {
                     generator: 0,
@@ -98,7 +97,7 @@ mod tests {
             )
             .unwrap();
         journal
-            .append(EntryKind::Outcome, 1, [], outcome(2))
+            .append(EntryKind::Outcome, ActorId(1), [], outcome(2))
             .unwrap();
 
         let report = JournalCorrectnessMonitor::verify(&journal).unwrap();
@@ -112,7 +111,7 @@ mod tests {
         let mut original = Journal::new();
         for i in 0..10 {
             original
-                .append(EntryKind::Outcome, 1, [], outcome(i))
+                .append(EntryKind::Outcome, ActorId(1), [], outcome(i))
                 .unwrap();
         }
         let fork = original.fork();

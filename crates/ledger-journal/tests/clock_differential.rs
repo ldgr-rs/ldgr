@@ -41,7 +41,7 @@ fn encode_ref(clock: &BTreeMap<ActorId, u64>) -> Vec<u8> {
     let mut out = Vec::with_capacity(clock.len() * 2);
     cbor::map(&mut out, clock.len());
     for (&actor, &value) in clock {
-        cbor::unsigned(&mut out, actor as u64);
+        cbor::unsigned(&mut out, u64::from(actor.0));
         cbor::unsigned(&mut out, value);
     }
     out
@@ -68,7 +68,7 @@ proptest! {
         for (op, param) in ops {
             let (impl_clock, ref_clock) = match op {
                 0 => {
-                    let actor = (param as ActorId % ACTOR_UNIVERSE) + 1;
+                    let actor = ActorId((u32::from(param) % ACTOR_UNIVERSE) + 1);
                     let base_impl = impl_pool.last().unwrap();
                     let base_ref = ref_pool.last().unwrap();
                     (base_impl.incremented(actor), increment_ref(base_ref, actor))
@@ -90,11 +90,13 @@ proptest! {
                 "encoded bytes diverge from the reference"
             );
             assert_eq!(impl_clock.len(), ref_clock.len());
-            for actor in 1..=ACTOR_UNIVERSE as ActorId {
+            for raw in 1..=ACTOR_UNIVERSE {
+                let actor = ActorId(raw);
                 assert_eq!(
                     impl_clock.get(actor),
                     ref_clock.get(&actor).copied().unwrap_or(0),
-                    "get diverges for actor {actor}"
+                    "get diverges for actor {}",
+                    actor.0
                 );
             }
 

@@ -22,7 +22,7 @@ use crate::retention::RetentionClass;
 use crate::segment::{SealedSegment, SegmentStore};
 use crate::snapshot::{DEFAULT_SNAPSHOT_INTERVAL, Snapshot, SnapshotManager};
 use crate::snapshot_store::SnapshotStore;
-use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 
 /// A journal that is both in-memory and durably persisted.
 ///
@@ -96,8 +96,8 @@ impl PersistentJournal {
             if id != entry.id {
                 return Err(JournalError::InvariantViolation(format!(
                     "entry replayed as {:02x?} but persisted as {:02x?}",
-                    &id[..4],
-                    &entry.id[..4]
+                    &id.0[..4],
+                    &entry.id.0[..4]
                 )));
             }
             let replayed = journal.get(&id).ok_or_else(|| {
@@ -106,7 +106,7 @@ impl PersistentJournal {
             if replayed.vector_clock != entry.vector_clock {
                 return Err(JournalError::InvariantViolation(format!(
                     "entry {:02x?} vector clock diverges on reload",
-                    &id[..4]
+                    &id.0[..4]
                 )));
             }
         }
@@ -185,9 +185,9 @@ impl PersistentJournal {
         &mut self,
         kind: EntryKind,
         actor: ActorId,
-        observed_parents: impl IntoIterator<Item = Hash>,
+        observed_parents: impl IntoIterator<Item = EntryHash>,
         payload: EntryPayload,
-    ) -> Result<Hash, JournalError> {
+    ) -> Result<EntryHash, JournalError> {
         let snapshot_state = self.journal.clone();
         let id = self
             .journal
@@ -205,10 +205,10 @@ impl PersistentJournal {
             self.journal = snapshot_state;
             return Err(err);
         }
-        if self.snapshots.should_snapshot(actor, entry.data.sequence) {
+        if self.snapshots.should_snapshot(actor, entry.data.sequence.0) {
             let snapshot = Snapshot::new(
                 actor,
-                entry.data.sequence,
+                entry.data.sequence.0,
                 id,
                 entry.vector_clock.clone(),
                 Vec::new(),
@@ -228,7 +228,7 @@ impl PersistentJournal {
     ///
     /// Failure semantics match [`Self::append`]: a journal validation or store
     /// error leaves both sides consistent.
-    pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<Hash>, JournalError> {
+    pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<EntryHash>, JournalError> {
         let snapshot_state = self.journal.clone();
         let mut frames = Vec::with_capacity(batch.len());
         let ids = self.journal.append_batch_with_frames(batch, &mut frames)?;
@@ -248,11 +248,11 @@ impl PersistentJournal {
             };
             if self
                 .snapshots
-                .should_snapshot(entry.data.actor, entry.data.sequence)
+                .should_snapshot(entry.data.actor, entry.data.sequence.0)
             {
                 let snapshot = Snapshot::new(
                     entry.data.actor,
-                    entry.data.sequence,
+                    entry.data.sequence.0,
                     *id,
                     entry.vector_clock.clone(),
                     Vec::new(),
@@ -265,12 +265,12 @@ impl PersistentJournal {
     }
 
     /// Look up an entry by content address in the in-memory journal.
-    pub fn get(&self, id: &Hash) -> Option<&Entry> {
+    pub fn get(&self, id: &EntryHash) -> Option<&Entry> {
         self.journal.get(id)
     }
 
     /// Return the root hash over the ordered entry ids.
-    pub fn root_hash(&self) -> Hash {
+    pub fn root_hash(&self) -> EntryHash {
         self.journal.root_hash()
     }
 
@@ -349,13 +349,13 @@ fn journal_io(err: std::io::Error) -> JournalError {
 mod tests {
     use super::*;
     use crate::clock::VectorClock;
-    use ledger_format::EntryData;
+    use ledger_format::{EntryData, SequenceNumber};
     use std::vec;
     use std::vec::Vec;
 
     fn outcome(value: u64) -> EntryPayload {
         EntryPayload::Outcome(ledger_format::OutcomePayload {
-            schema: [0x00; 32],
+            schema: EntryHash([0x00; 32]),
             value: ledger_format::CanonicalValue::Unsigned(value),
         })
     }
@@ -367,15 +367,20 @@ mod tests {
         dir
     }
 
-    fn raw_entry(actor: ActorId, sequence: u64, parents: Vec<Hash>, clock: VectorClock) -> Entry {
+    fn raw_entry(
+        actor: ActorId,
+        sequence: u64,
+        parents: Vec<EntryHash>,
+        clock: VectorClock,
+    ) -> Entry {
         Entry::new(
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
                 actor,
-                parents,
+                parents: parents.into_iter().collect(),
                 vector_clock: Vec::new(),
-                sequence,
+                sequence: SequenceNumber(sequence),
                 payload: outcome(sequence),
             },
             clock,
@@ -388,12 +393,17 @@ mod tests {
         let dir = temp_dir("missing-parent");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
-            let first = raw_entry(1, 0, Vec::new(), VectorClock::from_map([(1, 1)]));
-            let orphan = raw_entry(
-                2,
+            let first = raw_entry(
+                ActorId(1),
                 0,
-                vec![[0xab; 32]],
-                VectorClock::from_map([(1, 1), (2, 1)]),
+                Vec::new(),
+                VectorClock::from_map([(ActorId(1), 1)]),
+            );
+            let orphan = raw_entry(
+                ActorId(2),
+                0,
+                vec![EntryHash([0xab; 32])],
+                VectorClock::from_map([(ActorId(1), 1), (ActorId(2), 1)]),
             );
             store.append(&first).unwrap();
             store.append(&orphan).unwrap();
@@ -415,13 +425,13 @@ mod tests {
                 EntryData {
                     format_version: ledger_format::FORMAT_VERSION,
                     kind: EntryKind::Outcome,
-                    actor: 1,
-                    parents: Vec::new(),
+                    actor: ActorId(1),
+                    parents: Default::default(),
                     vector_clock: Vec::new(),
-                    sequence: 0,
+                    sequence: SequenceNumber(0),
                     payload: outcome(0),
                 },
-                VectorClock::from_map([(1, 7)]),
+                VectorClock::from_map([(ActorId(1), 7)]),
             )
             .unwrap();
             store.append(&entry).unwrap();
@@ -453,7 +463,7 @@ mod tests {
         for round in 0..groups {
             steps.push(Step {
                 kind: EntryKind::TimerSet,
-                actor: 1,
+                actor: ActorId(1),
                 payload: EntryPayload::TimerSet {
                     timer_id: round as u64,
                     deadline_ticks: round as u64,
@@ -463,7 +473,7 @@ mod tests {
             });
             steps.push(Step {
                 kind: EntryKind::TimerFire,
-                actor: 1,
+                actor: ActorId(1),
                 payload: EntryPayload::TimerFire {
                     timer_id: round as u64,
                     deadline_ticks: round as u64,
@@ -473,7 +483,7 @@ mod tests {
             });
             steps.push(Step {
                 kind: EntryKind::Wake,
-                actor: 1,
+                actor: ActorId(1),
                 payload: EntryPayload::Wake(ledger_format::WakePayload::TimerReady {
                     timer_id: round as u64,
                 }),
@@ -482,11 +492,11 @@ mod tests {
             });
             steps.push(Step {
                 kind: EntryKind::Send,
-                actor: 2,
+                actor: ActorId(2),
                 payload: EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, round as u64),
-                    from: 2,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(2), round as u64),
+                    from: ActorId(2),
+                    to: ActorId(1),
                     original_content: (round as u64).to_le_bytes().to_vec(),
                 }),
                 observed_backs: vec![3],
@@ -494,11 +504,11 @@ mod tests {
             });
             steps.push(Step {
                 kind: EntryKind::Recv,
-                actor: 2,
+                actor: ActorId(2),
                 payload: EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(2, round as u64),
-                    from: 2,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(2), round as u64),
+                    from: ActorId(2),
+                    to: ActorId(1),
                     observed_content: (round as u64).to_le_bytes().to_vec(),
                 }),
                 observed_backs: vec![1],
@@ -508,10 +518,10 @@ mod tests {
         steps
     }
 
-    fn apply_sequential(journal: &mut Journal, steps: &[Step]) -> Vec<Hash> {
+    fn apply_sequential(journal: &mut Journal, steps: &[Step]) -> Vec<EntryHash> {
         let mut ids = Vec::with_capacity(steps.len());
         for step in steps {
-            let mut observed: Vec<Hash> = step
+            let mut observed: Vec<EntryHash> = step
                 .observed_backs
                 .iter()
                 .filter_map(|back| back.checked_sub(1).and_then(|i| ids.get(i).copied()))
@@ -600,7 +610,7 @@ mod tests {
         let dir = temp_dir("store-failure-rollback");
         let mut journal = PersistentJournal::create(&dir).unwrap();
         let id1 = journal
-            .append(EntryKind::Outcome, 1, Vec::new(), outcome(1))
+            .append(EntryKind::Outcome, ActorId(1), Vec::new(), outcome(1))
             .unwrap();
         assert_eq!(journal.len(), 1);
 
@@ -611,7 +621,7 @@ mod tests {
             let _ = std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o400));
         }
 
-        let res = journal.append(EntryKind::Outcome, 1, vec![id1], outcome(2));
+        let res = journal.append(EntryKind::Outcome, ActorId(1), vec![id1], outcome(2));
 
         #[cfg(unix)]
         {
@@ -625,7 +635,7 @@ mod tests {
                 1,
                 "in-memory journal must roll back on store error"
             );
-            assert_eq!(journal.journal().head_for_actor(1), Some(id1));
+            assert_eq!(journal.journal().head_for_actor(ActorId(1)), Some(id1));
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

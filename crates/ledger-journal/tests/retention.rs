@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use ledger_format::{EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::{Journal, JournalError, PersistentJournal, RetentionClass, SegmentStore};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -44,20 +44,20 @@ fn append_mixed_stream(journal: &mut PersistentJournal) {
                 (1, 0) => (
                     EntryKind::Outcome,
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: ledger_format::CanonicalValue::Unsigned(value),
                     }),
                 ),
                 (1, 5) => (
                     EntryKind::Fault,
                     EntryPayload::Fault(ledger_format::FaultPayload::DropMessage {
-                        message_id: ledger_format::MessageId::new(1, value),
+                        message_id: ledger_format::MessageId::new(ActorId(1), value),
                     }),
                 ),
                 (2, 10) => (
                     EntryKind::Assert,
                     EntryPayload::Assert(ledger_format::AssertPayload {
-                        predicate: [0x00; 32],
+                        predicate: EntryHash([0x00; 32]),
                         passed: true,
                         detail: ledger_format::CanonicalValue::Unsigned(value),
                     }),
@@ -65,14 +65,14 @@ fn append_mixed_stream(journal: &mut PersistentJournal) {
                 _ => (
                     EntryKind::Send,
                     EntryPayload::Send(ledger_format::SendFrame {
-                        message_id: ledger_format::MessageId::new(1, value),
-                        from: 1,
-                        to: 2,
+                        message_id: ledger_format::MessageId::new(ActorId(1), value),
+                        from: ActorId(1),
+                        to: ActorId(2),
                         original_content: value.to_le_bytes().to_vec(),
                     }),
                 ),
             };
-            journal.append(kind, 1, [], payload).unwrap();
+            journal.append(kind, ActorId(1), [], payload).unwrap();
         }
         journal.force_seal().unwrap();
     }
@@ -87,12 +87,12 @@ fn append_warm_stream(journal: &mut PersistentJournal) {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, i),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), i),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: i.to_le_bytes().to_vec(),
                 }),
             )
@@ -102,10 +102,10 @@ fn append_warm_stream(journal: &mut PersistentJournal) {
     journal
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: ledger_format::CanonicalValue::Unsigned(1000),
             }),
         )
@@ -114,7 +114,7 @@ fn append_warm_stream(journal: &mut PersistentJournal) {
         journal
             .append(
                 EntryKind::FsWrite,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::FsWrite(ledger_format::FsWritePayload::Allocate {
                     path_ref: ledger_format::PathRef {
@@ -130,12 +130,12 @@ fn append_warm_stream(journal: &mut PersistentJournal) {
         journal
             .append(
                 EntryKind::Recv,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(1, i),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), i),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     observed_content: i.to_le_bytes().to_vec(),
                 }),
             )
@@ -250,12 +250,12 @@ fn raising_retention_reextracts() {
         let id = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, i),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), i),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: i.to_le_bytes().to_vec(),
                 }),
             )
@@ -331,8 +331,8 @@ fn warm_is_nonlossy_determinism() {
         "warm retention must not change the determinism root"
     );
     assert_eq!(warm.len(), hot.len());
-    let warm_ids: Vec<Hash> = warm.entries().map(|entry| entry.id).collect();
-    let hot_ids: Vec<Hash> = hot.entries().map(|entry| entry.id).collect();
+    let warm_ids: Vec<EntryHash> = warm.entries().map(|entry| entry.id).collect();
+    let hot_ids: Vec<EntryHash> = hot.entries().map(|entry| entry.id).collect();
     assert_eq!(warm_ids, hot_ids, "append order must be identical");
     let _ = fs::remove_dir_all(&warm_dir);
     let _ = fs::remove_dir_all(&hot_dir);

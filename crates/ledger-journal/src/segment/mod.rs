@@ -5,15 +5,29 @@
 //! the ambient filesystem directly; simulation code must route I/O through
 //! `SimFs` instead.
 //!
-//! Sealed segment file layout:
+//! Sealed segment file layout (see `writer::write_header` and
+//! `writer::write_trailer` for the writers and `recovery::parse_segment_bytes`
+//! for the reader; the constants below name the exact values):
 //!
 //! ```text
-//! [magic "LDGR" 4 bytes][version u32][entry_count u64][uncompressed_len u64]
-//! [root_hash 32 bytes]
-//! [zstd-compressed frame block]
-//! [sparse index: index_len x (offset u64 BE, prefix u32 BE)]
-//! [trailer: index_len u32 BE][sample_interval u32 BE][compressed_len u64 BE]
+//! [outer prefix 16 bytes: magic "LDGS" 4 bytes]
+//! [format_version u32 LE = 2 4 bytes]
+//! [header_len u32 LE 4 bytes][flags u32 LE = 0 4 bytes]
+//! [CBOR header header_len bytes: array(4) of
+//!  entry_count unsigned, uncompressed_len unsigned,
+//!  root_hash bytes(32), sample_interval unsigned]
+//! [zstd-compressed frame block compressed_len bytes, level 3]
+//! [sparse index: index_len x (offset u64 BE, prefix u32 BE), 12 bytes each]
+//! [trailer 16 bytes: index_len u32 BE]
+//! [sample_interval u32 BE][compressed_len u64 BE]
 //! ```
+//!
+//! `data_offset` is `FRAME_PREFIX_LEN (16) + header_len`. The sparse index
+//! samples every `SAMPLE_INTERVAL (32)`-th frame; `offset` is the
+//! uncompressed-block offset and `prefix` is the little-endian u32 of the
+//! entry id bytes 0..4. `parse_segment_bytes` requires
+//! `data_offset + compressed_len + index_len * 12 + TRAILER_LEN (16)` to equal
+//! the file length exactly.
 //!
 //! Each frame is length-delimited: a u64 little-endian payload length
 //! followed by the entry id (32 bytes), a u64 little-endian data length, the
@@ -44,7 +58,7 @@ use std::vec::Vec;
 use crate::clock::VectorClock;
 use crate::dag::{Entry, JournalError};
 use crate::retention::RetentionClass;
-use ledger_format::{CborValue, EntryData, Hash};
+use ledger_format::{ActorId, CborValue, EntryData, EntryHash};
 
 mod indexing;
 mod recovery;
@@ -90,7 +104,7 @@ pub struct SealedSegment {
     /// Size of the zstd-compressed block in bytes.
     pub compressed_len: u64,
     /// Root hash over the ordered entry ids.
-    pub root_hash: Hash,
+    pub root_hash: EntryHash,
     /// Sparse-index sampling interval in frames.
     pub sample_interval: u32,
     /// True when any frame carries a Fault, Outcome, or Assert kind.
@@ -112,7 +126,12 @@ impl SealedSegment {
 }
 
 /// Typestate markers governing segment storage lifecycles.
+/// Only [`SegmentWriter`] in [`Open`] accepts appends; [`Sealed`] is the
+/// immutable handle returned by seal and the only source of sealed metadata
+/// for the archive path.
 pub mod state {
+    use super::SealedSegment;
+
     /// Typestate marker indicating that the segment writer is open and accepting frame appends.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Open;
@@ -120,20 +139,109 @@ pub mod state {
     /// Typestate marker indicating that the segment is sealed and immutable.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Sealed;
+
+    mod private {
+        pub trait SealedTrait {}
+        impl SealedTrait for super::Open {}
+        impl SealedTrait for super::Sealed {}
+    }
+
+    /// Storage bound to a writer state.
+    ///
+    /// Open writers carry no sealed metadata; sealed writers carry exactly
+    /// the verified [`SealedSegment`] produced by seal. The associated type
+    /// keeps the sealed handle infallible without an `Option` plus unwrap.
+    pub trait WriterState:
+        private::SealedTrait + Clone + Copy + PartialEq + Eq + core::fmt::Debug
+    {
+        /// Per-state sealed storage.
+        type SealedStore: Clone + core::fmt::Debug;
+    }
+
+    impl WriterState for Open {
+        type SealedStore = ();
+    }
+
+    impl WriterState for Sealed {
+        type SealedStore = SealedSegment;
+    }
 }
 
 /// In-memory accumulation buffer for an open segment.
+///
+/// Typestate: append and seal exist only on `SegmentWriter<Open>`; read-only
+/// sealed accessors exist only on `SegmentWriter<Sealed>`. `seal` consumes
+/// the open writer and returns the sealed handle; the archive path consumes
+/// the handle via `into_metadata`, so an open buffer can never be archived.
 #[derive(Debug, Clone)]
-pub struct SegmentWriter<S = state::Open> {
+pub struct SegmentWriter<S: state::WriterState = state::Open> {
     buffer: Vec<u8>,
-    index: Vec<(Hash, u64)>,
+    index: Vec<(EntryHash, u64)>,
     fault_relevant: bool,
     /// Reused canonical-encode buffer for slice appends.
     ///
     /// Cleared per entry; one allocation serves every framed entry of a
-    /// slice.
+    /// slice. Empty on sealed handles.
     encode_scratch: Vec<u8>,
+    sealed: S::SealedStore,
     _state: core::marker::PhantomData<S>,
+}
+
+impl SegmentWriter<state::Open> {
+    /// Length of the open buffer in bytes.
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// True when the open buffer holds no frames.
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Number of buffered frames.
+    pub fn entry_count(&self) -> u64 {
+        self.index.len() as u64
+    }
+
+    /// True when the buffer reached the seal target.
+    pub fn should_seal(&self) -> bool {
+        self.buffer.len() >= SEGMENT_TARGET_SIZE
+    }
+}
+
+impl SegmentWriter<state::Sealed> {
+    /// Borrow the sealed metadata produced by seal.
+    pub fn metadata(&self) -> &SealedSegment {
+        &self.sealed
+    }
+
+    /// Consume the sealed handle into its metadata for the archive path.
+    ///
+    /// The store pushes the returned value into its sealed list; retention
+    /// archives only these values, never an open writer.
+    pub fn into_metadata(self) -> SealedSegment {
+        self.sealed
+    }
+
+    /// Ordinal of the sealed segment.
+    pub fn id(&self) -> u64 {
+        self.sealed.id
+    }
+
+    /// Number of entries in the sealed segment.
+    pub fn entry_count(&self) -> u64 {
+        self.sealed.entry_count
+    }
+
+    /// True when the sealed segment carries fault-relevant kinds.
+    pub fn contains_fault_relevant(&self) -> bool {
+        self.sealed.contains_fault_relevant
+    }
+
+    /// True when the sealed segment holds no entries (never for sealed output).
+    pub fn is_empty(&self) -> bool {
+        self.sealed.entry_count == 0
+    }
 }
 
 impl Default for SegmentWriter<state::Open> {
@@ -143,6 +251,7 @@ impl Default for SegmentWriter<state::Open> {
             index: Vec::new(),
             fault_relevant: false,
             encode_scratch: Vec::new(),
+            sealed: (),
             _state: core::marker::PhantomData,
         }
     }
@@ -178,7 +287,7 @@ pub struct SegmentStore {
     sealed: Vec<SealedSegment>,
     archived: Vec<ArchivedSegment>,
     retention: RetentionClass,
-    writer: SegmentWriter,
+    writer: SegmentWriter<state::Open>,
     wal: Option<BufWriter<File>>,
     next_segment_id: u64,
     decompressed: RefCell<Option<(u64, Arc<Vec<u8>>)>>,
@@ -250,8 +359,8 @@ fn segment_file_name(id: u64) -> String {
     format!("segment-{id:06}.seg")
 }
 
-fn prefix_of(hash: &Hash) -> u32 {
-    u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])
+fn prefix_of(hash: &EntryHash) -> u32 {
+    u32::from_le_bytes([hash.0[0], hash.0[1], hash.0[2], hash.0[3]])
 }
 
 fn segment_io(err: io::Error) -> JournalError {
@@ -362,8 +471,9 @@ fn decode_frame_payload(payload: &[u8]) -> Result<Arc<Entry>, JournalError> {
             "frame payload too short".to_string(),
         ));
     }
-    let mut id = Hash::default();
-    id.copy_from_slice(&payload[0..32]);
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(&payload[0..32]);
+    let id = EntryHash(raw);
     let data_len = read_u64_le_at(payload, 32);
     // Checked span math: a hostile data length yields SegmentCorrupt, never
     // a wrapping-index panic.
@@ -383,7 +493,7 @@ fn decode_frame_payload(payload: &[u8]) -> Result<Arc<Entry>, JournalError> {
     let mut reencoded = Vec::with_capacity(data_bytes.len() + vc_bytes.len());
     reencoded.extend_from_slice(data_bytes);
     reencoded.extend_from_slice(vc_bytes);
-    let recomputed = *blake3::hash(&reencoded).as_bytes();
+    let recomputed = EntryHash(*blake3::hash(&reencoded).as_bytes());
     if recomputed != id {
         return Err(JournalError::SegmentCorrupt(
             "entry hash mismatch; data or clock corrupted".to_string(),
@@ -407,9 +517,9 @@ fn decode_vector_clock(bytes: &[u8]) -> Result<VectorClock, JournalError> {
         CborValue::Map(pairs) => {
             for (key, val) in pairs {
                 let actor = match key {
-                    CborValue::Unsigned(actor) => u32::try_from(actor).map_err(|_| {
+                    CborValue::Unsigned(actor) => ActorId(u32::try_from(actor).map_err(|_| {
                         JournalError::SegmentCorrupt("vector clock actor exceeds u32".to_string())
-                    })?,
+                    })?),
                     _ => {
                         return Err(JournalError::SegmentCorrupt(
                             "vector clock key is not an unsigned integer".to_string(),
@@ -453,7 +563,7 @@ mod tests {
     const HEADER_LEN: usize = 56;
     use crate::clock::VectorClock;
     use crate::dag::{BatchEntry, Journal};
-    use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
+    use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, SequenceNumber, StreamId};
     use std::io::{Seek, SeekFrom, Write};
     use std::vec;
 
@@ -487,7 +597,7 @@ mod tests {
 
     #[test]
     fn writer_seal_round_trip_via_store() {
-        let entries = build_entries(500, 1, 0);
+        let entries = build_entries(500, ActorId(1), 0);
         let dir = temp_dir("round-trip");
         let mut store = SegmentStore::new(&dir).unwrap();
         for entry in &entries {
@@ -501,13 +611,13 @@ mod tests {
             assert!(found.is_some(), "entry must survive seal and load");
             assert_eq!(found.unwrap().data, entry.data);
         }
-        assert!(reloaded.get(&Hash::default()).unwrap().is_none());
+        assert!(reloaded.get(&EntryHash([0u8; 32])).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn get_via_sparse_index() {
-        let entries = build_entries(10_000, 1, 0);
+        let entries = build_entries(10_000, ActorId(1), 0);
         let dir = temp_dir("sparse");
         let mut store = SegmentStore::new(&dir).unwrap();
         for entry in &entries {
@@ -533,12 +643,12 @@ mod tests {
                 EntryData {
                     format_version: ledger_format::FORMAT_VERSION,
                     kind: EntryKind::RngDraw,
-                    actor: 1,
-                    parents: Vec::new(),
+                    actor: ActorId(1),
+                    parents: Default::default(),
                     vector_clock: Vec::new(),
-                    sequence: sequence as u64,
+                    sequence: SequenceNumber(sequence as u64),
                     payload: EntryPayload::RngDraw(ledger_format::RngDrawPayload {
-                        stream: 0,
+                        stream: StreamId(0),
                         draw_index: 0,
                         // Just under the 17 MiB entry cap; five entries cross
                         // the 64 MiB seal target.
@@ -583,7 +693,7 @@ mod tests {
 
     #[test]
     fn partial_tail_truncation_recovery() {
-        let entries = build_entries(200, 1, 0);
+        let entries = build_entries(200, ActorId(1), 0);
         let dir = temp_dir("wal-recovery");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -615,8 +725,8 @@ mod tests {
 
     #[test]
     fn recovered_tail_survives_append_and_reopen() {
-        let entries = build_entries(200, 1, 0);
-        let more = build_entries(50, 2, 0);
+        let entries = build_entries(200, ActorId(1), 0);
+        let more = build_entries(50, ActorId(2), 0);
         let dir = temp_dir("wal-recover-append");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -661,16 +771,16 @@ mod tests {
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: EntryKind::Outcome,
-                actor: 1,
-                parents: Vec::new(),
+                actor: ActorId(1),
+                parents: Default::default(),
                 vector_clock: Vec::new(),
-                sequence: 0,
+                sequence: SequenceNumber(0),
                 payload: EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(1),
                 }),
             },
-            VectorClock::default().incremented(1),
+            VectorClock::default().incremented(ActorId(1)),
         )
         .unwrap();
         store.append(&entry).unwrap();
@@ -682,7 +792,7 @@ mod tests {
 
     #[test]
     fn corrupt_last_segment_is_truncated_on_load() {
-        let entries = build_entries(300, 1, 0);
+        let entries = build_entries(300, ActorId(1), 0);
         let dir = temp_dir("truncate-last");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -709,7 +819,7 @@ mod tests {
 
     #[test]
     fn manifest_round_trip() {
-        let entries = build_entries(400, 2, 0);
+        let entries = build_entries(400, ActorId(2), 0);
         let dir = temp_dir("manifest");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -727,9 +837,9 @@ mod tests {
 
     #[test]
     fn multi_segment_manifest_round_trip() {
-        let first = build_entries(300, 1, 0);
-        let second = build_entries(200, 2, 0);
-        let third = build_entries(100, 3, 0);
+        let first = build_entries(300, ActorId(1), 0);
+        let second = build_entries(200, ActorId(2), 0);
+        let third = build_entries(100, ActorId(3), 0);
         let dir = temp_dir("manifest-multi");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -766,8 +876,8 @@ mod tests {
 
     #[test]
     fn open_then_append_preserves_recovered_tail() {
-        let entries = build_entries(5, 1, 0);
-        let tail = build_entries(3, 1, 5);
+        let entries = build_entries(5, ActorId(1), 0);
+        let tail = build_entries(3, ActorId(1), 5);
         let dir = temp_dir("wal-tail");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -794,8 +904,8 @@ mod tests {
 
     #[test]
     fn seal_then_reopen_has_no_duplicate_replay() {
-        let entries = build_entries(10, 1, 0);
-        let tail = build_entries(4, 1, 10);
+        let entries = build_entries(10, ActorId(1), 0);
+        let tail = build_entries(4, ActorId(1), 10);
         let dir = temp_dir("seal-reopen");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -822,7 +932,7 @@ mod tests {
 
     #[test]
     fn crash_right_after_seal_reopens_cleanly() {
-        let entries = build_entries(10, 1, 0);
+        let entries = build_entries(10, ActorId(1), 0);
         let dir = temp_dir("seal-crash");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -854,7 +964,7 @@ mod tests {
                 0 => (
                     EntryKind::Outcome,
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: ledger_format::CanonicalValue::Unsigned(value),
                     }),
                 ),
@@ -868,22 +978,22 @@ mod tests {
                 2 => (
                     EntryKind::Send,
                     EntryPayload::Send(ledger_format::SendFrame {
-                        message_id: ledger_format::MessageId::new(1, value),
-                        from: 1,
-                        to: 2,
+                        message_id: ledger_format::MessageId::new(ActorId(1), value),
+                        from: ActorId(1),
+                        to: ActorId(2),
                         original_content: value.to_le_bytes().to_vec(),
                     }),
                 ),
                 _ => (
                     EntryKind::Fault,
                     EntryPayload::Fault(ledger_format::FaultPayload::Partition {
-                        src: 1,
-                        dst: 2,
+                        src: ActorId(1),
+                        dst: ActorId(2),
                         enabled: true,
                     }),
                 ),
             };
-            let actor = (i % 2) as u32 + 1;
+            let actor = ActorId((i % 2) as u32 + 1);
             let id = journal.append(kind, actor, [], payload).unwrap();
             out.push(journal.get(&id).unwrap().clone());
         }
@@ -920,8 +1030,8 @@ mod tests {
         let mut frames = Vec::new();
         source.append_batch_with_frames(batch, &mut frames).unwrap();
         // The journal must reproduce exactly these ids in append order.
-        let frame_ids: Vec<Hash> = frames.iter().map(|frame| frame.id).collect();
-        let journal_ids: Vec<Hash> = entries.iter().map(|entry| entry.id).collect();
+        let frame_ids: Vec<EntryHash> = frames.iter().map(|frame| frame.id).collect();
+        let journal_ids: Vec<EntryHash> = entries.iter().map(|entry| entry.id).collect();
         assert_eq!(frame_ids, journal_ids);
 
         let mut framed = SegmentWriter::new();
@@ -990,7 +1100,7 @@ mod tests {
             assert!(
                 found.is_some(),
                 "{:02x?} must survive recovery",
-                &entry.id[..4]
+                &entry.id.0[..4]
             );
             let found = found.unwrap();
             assert_eq!(found.id, entry.id);
@@ -1138,7 +1248,7 @@ mod tests {
     fn crash_window_sealed_and_wal_duplicate_is_deduplicated() {
         // Simulate the window where seal made the segment durable but the
         // WAL was not yet removed: both contain identical frames.
-        let entries = build_entries(8, 1, 0);
+        let entries = build_entries(8, ActorId(1), 0);
         let dir = temp_dir("crash-window-dedup");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
@@ -1170,7 +1280,7 @@ mod tests {
 
     #[test]
     fn parse_segment_bytes_rejects_unsupported_version() {
-        let entries = build_entries(4, 1, 0);
+        let entries = build_entries(4, ActorId(1), 0);
         let dir = temp_dir("version-reject");
         let mut store = SegmentStore::new(&dir).unwrap();
         for entry in &entries {
@@ -1179,8 +1289,8 @@ mod tests {
         store.seal_writer().unwrap();
         let seg_path = dir.join(segment_file_name(0));
         let mut bytes = fs::read(&seg_path).unwrap();
-        // Bump version field to 99.
-        bytes[4..8].copy_from_slice(&99u32.to_be_bytes());
+        // Bump outer version field (LE u32 at bytes 4..8) to 99.
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
         let err = parse_segment_bytes(&bytes, 0).unwrap_err();
         assert!(
             matches!(err, JournalError::SegmentCorrupt(_)),
@@ -1200,6 +1310,70 @@ mod tests {
         assert!(
             !tmp_path.exists(),
             "archive.ldgr.tmp must be removed on recovery"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seal_returns_sealed_handle_with_read_methods() {
+        let entries = build_entries(64, ActorId(1), 0);
+        let dir = temp_dir("typestate-seal");
+        fs::create_dir_all(&dir).unwrap();
+        let mut open = SegmentWriter::new();
+        for entry in &entries {
+            open.append(entry).unwrap();
+        }
+        assert_eq!(open.entry_count(), 64);
+        assert!(!open.is_empty());
+        let sealed = open.seal(&dir, 7).unwrap();
+        // Sealed handle exposes read-only metadata; append does not exist
+        // on this type (compile-time enforcement).
+        assert_eq!(sealed.id(), 7);
+        assert_eq!(sealed.entry_count(), 64);
+        assert!(!sealed.is_empty());
+        let meta = sealed.into_metadata();
+        assert_eq!(meta.id, 7);
+        assert_eq!(meta.entry_count, 64);
+        assert_eq!(meta.sample_interval, super::SAMPLE_INTERVAL);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sealed_file_matches_documented_layout() {
+        // Pins the documented sealed layout: 16-byte outer prefix (LDGS,
+        // version 2 LE, header_len LE, flags 0), CBOR header, compressed
+        // block, BE sparse index, and 16-byte BE trailer.
+        let entries = build_entries(40, ActorId(1), 0);
+        let dir = temp_dir("layout-pin");
+        let mut store = SegmentStore::new(&dir).unwrap();
+        for entry in &entries {
+            store.append(entry).unwrap();
+        }
+        store.seal_writer().unwrap();
+        let bytes = fs::read(dir.join(segment_file_name(0))).unwrap();
+        assert_eq!(&bytes[0..4], b"LDGS");
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+        let header_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 0);
+        let segment = &store.segments()[0];
+        assert_eq!(
+            segment.data_offset,
+            (ledger_format::frame::FRAME_PREFIX_LEN + header_len) as u64
+        );
+        let trailer = &bytes[bytes.len() - super::TRAILER_LEN..];
+        let index_len = u32::from_be_bytes(trailer[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            u32::from_be_bytes(trailer[4..8].try_into().unwrap()),
+            segment.sample_interval
+        );
+        let compressed_len = u64::from_be_bytes(trailer[8..16].try_into().unwrap());
+        assert_eq!(compressed_len, segment.compressed_len);
+        assert_eq!(
+            bytes.len() as u64,
+            segment.data_offset
+                + compressed_len
+                + (index_len * super::INDEX_ENTRY_LEN) as u64
+                + super::TRAILER_LEN as u64
         );
         let _ = fs::remove_dir_all(&dir);
     }

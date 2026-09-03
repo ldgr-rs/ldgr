@@ -21,7 +21,7 @@ use hashbrown::HashSet;
 use crate::archive::ArchiveStore;
 use crate::dag::JournalError;
 use crate::retention::RetentionClass;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 use super::{
     ArchivedSegment, INDEX_ENTRY_LEN, MANIFEST_FILE, MIN_FRAME_PAYLOAD, SealedSegment,
@@ -68,13 +68,15 @@ impl SegmentStore {
         }
 
         // Prefer manifest ids; fall back to the sorted union of loose-file
-        // ids and archive ordinals.
+        // ids and archive ordinals. The union uses a HashSet so discovery
+        // stays O(segments) instead of O(segments^2) via Vec::contains.
         let ids: Vec<u64> = if !manifest_entries.is_empty() {
             manifest_entries.iter().map(|entry| entry.id).collect()
         } else {
             let mut ids = self.discover_segment_ids()?;
+            let mut known: HashSet<u64> = ids.iter().copied().collect();
             for ordinal in archived_bytes.keys() {
-                if !ids.contains(ordinal) {
+                if known.insert(*ordinal) {
                     ids.push(*ordinal);
                 }
             }
@@ -84,6 +86,12 @@ impl SegmentStore {
         self.next_segment_id = ids.last().copied().map_or(0, |id| id + 1);
 
         let count = ids.len();
+        // O(segments) fault-flag lookup; the prior per-id linear find was
+        // O(segments^2) on stores with many sealed segments.
+        let fault_flags: hashbrown::HashMap<u64, bool> = manifest_entries
+            .iter()
+            .map(|entry| (entry.id, entry.fault_relevant))
+            .collect();
         let mut loaded = Vec::new();
         for (i, id) in ids.into_iter().enumerate() {
             let is_archived = archived_bytes.contains_key(&id);
@@ -103,16 +111,15 @@ impl SegmentStore {
                     )));
                 }
             };
-            segment.contains_fault_relevant = manifest_entries
-                .iter()
-                .find(|entry| entry.id == id)
-                .is_some_and(|entry| entry.fault_relevant);
+            segment.contains_fault_relevant = fault_flags.get(&id).copied().unwrap_or(false);
             loaded.push(segment);
         }
         self.sealed = loaded;
 
+        // O(segments) sealed-membership test via a HashSet.
+        let sealed_ids: HashSet<u64> = self.sealed.iter().map(|segment| segment.id).collect();
         for (ordinal, bytes) in archived_bytes {
-            if self.sealed.iter().any(|segment| segment.id == ordinal) {
+            if sealed_ids.contains(&ordinal) {
                 self.archived.push(ArchivedSegment { id: ordinal, bytes });
             }
         }
@@ -120,12 +127,14 @@ impl SegmentStore {
 
         // Persisted retention: the manifest class when known. When the
         // manifest is absent or legacy but an archive exists, infer the class
-        // from how much of the store is archived.
+        // from how much of the store is archived. HashSet keeps the check
+        // O(segments).
         if !self.archived.is_empty() && retention == RetentionClass::Hot {
+            let archived_ids: HashSet<u64> = self.archived.iter().map(|a| a.id).collect();
             let all_archived = self
                 .sealed
                 .iter()
-                .all(|segment| self.archived.iter().any(|a| a.id == segment.id));
+                .all(|segment| archived_ids.contains(&segment.id));
             retention = if all_archived {
                 RetentionClass::Cold
             } else {
@@ -189,7 +198,7 @@ impl SegmentStore {
         // Collect them before replaying the WAL so a crash window that
         // left both a sealed segment and its WAL prefix does not double
         // replay.
-        let sealed_ids: HashSet<Hash> = self
+        let sealed_ids: HashSet<EntryHash> = self
             .entries_in_append_order()?
             .into_iter()
             .map(|entry| entry.id)
@@ -330,13 +339,14 @@ pub(crate) fn parse_segment_bytes(
         ledger_format::CborValue::Unsigned(v) => *v,
         _ => return Ok(None),
     };
-    let mut root_hash = Hash::default();
+    let mut root_raw = [0u8; 32];
     match &header[2] {
         ledger_format::CborValue::Bytes(b) if b.len() == 32 => {
-            root_hash.copy_from_slice(b);
+            root_raw.copy_from_slice(b);
         }
         _ => return Ok(None),
     }
+    let root_hash = EntryHash(root_raw);
     let header_sample_interval = match &header[3] {
         ledger_format::CborValue::Unsigned(v) if *v <= u32::MAX as u64 => *v as u32,
         _ => return Ok(None),
@@ -398,7 +408,7 @@ pub(crate) fn parse_segment_bytes(
             }
             sample_pos += 1;
         }
-        hasher.update(&entry.id);
+        hasher.update(&entry.id.0);
         decoded += 1;
         offset = next;
     }
@@ -407,7 +417,7 @@ pub(crate) fn parse_segment_bytes(
             "segment {id} entry count mismatch: header says {entry_count}, decoded {decoded}"
         )));
     }
-    if *hasher.finalize().as_bytes() != root_hash {
+    if EntryHash(*hasher.finalize().as_bytes()) != root_hash {
         return Err(JournalError::SegmentCorrupt(format!(
             "segment {id} root hash mismatch after full decode"
         )));

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::dag::{Entry, JournalError};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 use super::{
     SealedSegment, SegmentStore, decode_frame_payload, frame_payload_at, next_frame, prefix_of,
@@ -53,7 +53,7 @@ impl SegmentStore {
     fn get_from_sealed(
         &self,
         segment: &SealedSegment,
-        hash: &Hash,
+        hash: &EntryHash,
     ) -> Result<Option<Arc<Entry>>, JournalError> {
         let block = self.decompressed_block(segment)?;
         if let Some(offset) = locate_in_block(&block, &segment.samples, hash)? {
@@ -122,7 +122,7 @@ impl SegmentStore {
     /// The open writer is consulted first. Sealed segments decompress on
     /// demand; a sparse-index scan locates the frame and a full scan
     /// backstops it.
-    pub fn get(&self, hash: &Hash) -> Result<Option<Arc<Entry>>, JournalError> {
+    pub fn get(&self, hash: &EntryHash) -> Result<Option<Arc<Entry>>, JournalError> {
         if let Some((_, offset)) = self.writer.index.iter().rev().find(|(id, _)| id == hash) {
             let payload = frame_payload_at(&self.writer.buffer, *offset)?;
             return decode_frame_payload(payload).map(Some);
@@ -139,7 +139,7 @@ impl SegmentStore {
 fn locate_in_block(
     block: &[u8],
     samples: &[(u64, u32)],
-    hash: &Hash,
+    hash: &EntryHash,
 ) -> Result<Option<u64>, JournalError> {
     let prefix = prefix_of(hash);
     for (i, &(sample_offset, sample_prefix)) in samples.iter().enumerate() {
@@ -160,7 +160,7 @@ fn scan_window(
     block: &[u8],
     start: u64,
     end: u64,
-    hash: &Hash,
+    hash: &EntryHash,
 ) -> Result<Option<u64>, JournalError> {
     let mut offset = start as usize;
     let end = end as usize;
@@ -168,7 +168,7 @@ fn scan_window(
         let Some((next, payload)) = next_frame(block, offset)? else {
             break;
         };
-        if payload.len() >= 32 && payload[0..32] == *hash {
+        if payload.len() >= 32 && payload[0..32] == hash.0 {
             return Ok(Some(offset as u64));
         }
         offset = next;

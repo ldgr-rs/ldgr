@@ -26,7 +26,7 @@ use std::vec::Vec;
 
 use crate::dag::JournalError;
 use crate::snapshot::Snapshot;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 /// Name of the snapshot store file inside a journal directory.
 const SNAPSHOT_FILE: &str = "snapshots.ldgr";
@@ -46,7 +46,7 @@ const HEADER_LEN: usize = 4 + 4 + 32;
 #[derive(Debug)]
 pub struct SnapshotStore {
     file: File,
-    chain: Hash,
+    chain: EntryHash,
 }
 
 impl SnapshotStore {
@@ -82,9 +82,9 @@ impl SnapshotStore {
     pub fn append(&mut self, snapshot: &Snapshot) -> Result<(), JournalError> {
         let record = snapshot.to_canonical_bytes();
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.chain);
+        hasher.update(&self.chain.0);
         hasher.update(&record);
-        let next = *hasher.finalize().as_bytes();
+        let next = EntryHash(*hasher.finalize().as_bytes());
 
         self.file
             .write_all(&(record.len() as u64).to_le_bytes())
@@ -93,7 +93,7 @@ impl SnapshotStore {
         self.file
             .seek(SeekFrom::Start(CHAIN_OFFSET as u64))
             .map_err(snapshot_io)?;
-        self.file.write_all(&next).map_err(snapshot_io)?;
+        self.file.write_all(&next.0).map_err(snapshot_io)?;
         self.file.seek(SeekFrom::End(0)).map_err(snapshot_io)?;
         self.file.flush().map_err(snapshot_io)?;
         self.chain = next;
@@ -128,7 +128,9 @@ impl SnapshotStore {
                 "unsupported snapshot format version".into(),
             ));
         }
-        let recorded_chain: Hash = bytes[8..HEADER_LEN].try_into().map_or([0; 32], |b| b);
+        let recorded_chain: EntryHash = bytes[8..HEADER_LEN]
+            .try_into()
+            .map_or(EntryHash([0; 32]), EntryHash);
 
         let mut chain = initial_chain();
         let mut snapshots = Vec::new();
@@ -146,9 +148,9 @@ impl SnapshotStore {
             let record = &bytes[offset..offset + len];
             offset += len;
             let mut hasher = blake3::Hasher::new();
-            hasher.update(&chain);
+            hasher.update(&chain.0);
             hasher.update(record);
-            chain = *hasher.finalize().as_bytes();
+            chain = EntryHash(*hasher.finalize().as_bytes());
             snapshots.push(Snapshot::from_canonical_bytes(record)?);
         }
         if chain != recorded_chain {
@@ -159,19 +161,19 @@ impl SnapshotStore {
 }
 
 /// The chain hash of an empty record stream.
-fn initial_chain() -> Hash {
-    *blake3::hash(b"").as_bytes()
+fn initial_chain() -> EntryHash {
+    EntryHash(*blake3::hash(b"").as_bytes())
 }
 
-fn write_header(file: &mut impl Write, chain: &Hash) -> Result<(), JournalError> {
+fn write_header(file: &mut impl Write, chain: &EntryHash) -> Result<(), JournalError> {
     file.write_all(SNAPSHOT_MAGIC).map_err(snapshot_io)?;
     file.write_all(&SNAPSHOT_FORMAT_VERSION.to_be_bytes())
         .map_err(snapshot_io)?;
-    file.write_all(chain).map_err(snapshot_io)?;
+    file.write_all(&chain.0).map_err(snapshot_io)?;
     Ok(())
 }
 
-fn read_header_chain(file: &mut File) -> Result<Hash, JournalError> {
+fn read_header_chain(file: &mut File) -> Result<EntryHash, JournalError> {
     let mut header = [0u8; HEADER_LEN];
     file.read_exact(&mut header).map_err(snapshot_io)?;
     if &header[0..4] != SNAPSHOT_MAGIC {
@@ -185,7 +187,9 @@ fn read_header_chain(file: &mut File) -> Result<Hash, JournalError> {
             "unsupported snapshot format version".into(),
         ));
     }
-    Ok(header[8..HEADER_LEN].try_into().map_or([0; 32], |b| b))
+    Ok(header[8..HEADER_LEN]
+        .try_into()
+        .map_or(EntryHash([0; 32]), EntryHash))
 }
 
 fn snapshot_io(err: std::io::Error) -> JournalError {

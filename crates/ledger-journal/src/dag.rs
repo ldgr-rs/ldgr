@@ -5,10 +5,13 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::clock::VectorClock;
-use ledger_format::{ActorId, EntryData, EntryKind, EntryPayload, Hash};
+use ledger_format::{
+    ActorId, EntryData, EntryHash, EntryKind, EntryPayload, SequenceNumber,
+    limits::MAX_PARENTS_PER_ENTRY,
+};
 
 /// Entries added to the overlay before it is frozen back into the base.
 ///
@@ -22,7 +25,7 @@ const OVERLAY_THRESHOLD: usize = 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalError {
     /// A referenced parent is not present in the journal.
-    MissingParent(Hash),
+    MissingParent(EntryHash),
     /// A per-actor sequence number is not monotonic.
     NonMonotonicSequence {
         /// The actor whose sequence is not monotonic.
@@ -52,7 +55,7 @@ pub enum JournalError {
 impl fmt::Display for JournalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingParent(hash) => write!(f, "missing parent {:02x?}", &hash[..4]),
+            Self::MissingParent(hash) => write!(f, "missing parent {:02x?}", &hash.0[..4]),
             Self::NonMonotonicSequence {
                 actor,
                 expected,
@@ -60,7 +63,8 @@ impl fmt::Display for JournalError {
             } => {
                 write!(
                     f,
-                    "actor {actor} expected sequence {expected}, got {actual}"
+                    "actor {} expected sequence {expected}, got {actual}",
+                    actor.0
                 )
             }
             Self::InvariantViolation(msg) => write!(f, "journal invariant violated: {msg}"),
@@ -73,14 +77,13 @@ impl fmt::Display for JournalError {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for JournalError {}
+impl core::error::Error for JournalError {}
 
 /// An immutable, content-addressed journal entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// BLAKE3 content address over the canonical encoding.
-    pub id: Hash,
+    pub id: EntryHash,
     /// The journal entry data covered by the content hash.
     pub data: EntryData,
     /// Happens-before summary at the time the entry was appended.
@@ -98,7 +101,7 @@ impl Entry {
             .try_canonical_bytes()
             .map_err(|err| JournalError::InvalidPayload(err.to_string()))?;
         encoded.extend_from_slice(&vector_clock.encode());
-        let id = *blake3::hash(&encoded).as_bytes();
+        let id = EntryHash(*blake3::hash(&encoded).as_bytes());
         Ok(Self {
             id,
             data,
@@ -136,7 +139,7 @@ impl Entry {
             .map_err(|err| JournalError::InvalidPayload(err.to_string()))?;
         let data_len = scratch.len();
         vector_clock.encode_into(scratch);
-        let id = *blake3::hash(&*scratch).as_bytes();
+        let id = EntryHash(*blake3::hash(&*scratch).as_bytes());
         Ok((
             Self {
                 id,
@@ -156,15 +159,15 @@ impl Entry {
 #[derive(Debug, Clone)]
 pub(crate) struct JournalState {
     /// Frozen, content-addressed entry map shared by all forks.
-    pub(crate) base: Arc<HashMap<Hash, Arc<Entry>>>,
+    pub(crate) base: Arc<HashMap<EntryHash, Arc<Entry>>>,
     /// Branch-local entries appended since the last freeze.
-    pub(crate) overlay: HashMap<Hash, Arc<Entry>>,
+    pub(crate) overlay: HashMap<EntryHash, Arc<Entry>>,
     /// Branch-local per-actor head map (most recent entry per actor).
-    pub(crate) heads: HashMap<ActorId, Hash>,
+    pub(crate) heads: HashMap<ActorId, EntryHash>,
     /// Frozen append order for the base entries.
-    pub(crate) order: Arc<Vec<Hash>>,
+    pub(crate) order: Arc<Vec<EntryHash>>,
     /// Branch-local append order for overlay entries.
-    pub(crate) overlay_order: Vec<Hash>,
+    pub(crate) overlay_order: Vec<EntryHash>,
 }
 
 impl JournalState {
@@ -207,7 +210,7 @@ pub struct BatchEntry {
     ///
     /// Order is preserved. Duplicates of already-listed parents are dropped
     /// exactly as in [`Journal::append`].
-    pub observed_parents: Vec<Hash>,
+    pub observed_parents: Vec<EntryHash>,
     /// Append the previous batch entry's id as a trailing observed parent.
     ///
     /// "Previous" is the immediately preceding entry of the same
@@ -251,7 +254,7 @@ impl BatchEntry {
 #[derive(Debug, Clone)]
 pub struct EntryFrame {
     /// Content address of the encoded entry.
-    pub id: Hash,
+    pub id: EntryHash,
     /// Byte length of the canonical `EntryData` prefix of `payload`.
     pub data_len: usize,
     /// Canonical `data || vector_clock` bytes.
@@ -274,12 +277,54 @@ pub(crate) fn kind_is_fault_relevant(kind: &EntryKind) -> bool {
 }
 
 /// Overlay-then-base entry lookup on an exclusively borrowed state.
-fn state_lookup<'a>(state: &'a JournalState, id: &Hash) -> Option<&'a Entry> {
+fn state_lookup<'a>(state: &'a JournalState, id: &EntryHash) -> Option<&'a Entry> {
     state
         .overlay
         .get(id)
         .or_else(|| state.base.get(id))
         .map(Arc::as_ref)
+}
+
+/// Assemble ordered parents with O(n) dedup preserving first occurrence.
+///
+/// Head first, then observed in order, then the optional chained id last.
+/// A `HashSet` bounded by `MAX_PARENTS_PER_ENTRY` replaces the prior
+/// `Vec::contains` scan, which was O(parents) per insert. Fails closed with
+/// `InvalidPayload` when the deduped set would exceed the format cap, so a
+/// hostile observed list cannot force an unbounded allocation nor mint an
+/// entry the decoder would reject.
+fn assemble_parents(
+    head: Option<EntryHash>,
+    observed: impl IntoIterator<Item = EntryHash>,
+    chain: Option<EntryHash>,
+) -> Result<Vec<EntryHash>, JournalError> {
+    let mut seen = HashSet::new();
+    let mut parents = Vec::new();
+    if let Some(previous) = head {
+        seen.insert(previous);
+        parents.push(previous);
+    }
+    for parent in observed {
+        if seen.insert(parent) {
+            if parents.len() >= MAX_PARENTS_PER_ENTRY {
+                return Err(JournalError::InvalidPayload(
+                    "parent count exceeds format limit".to_string(),
+                ));
+            }
+            parents.push(parent);
+        }
+    }
+    if let Some(chained) = chain
+        && seen.insert(chained)
+    {
+        if parents.len() >= MAX_PARENTS_PER_ENTRY {
+            return Err(JournalError::InvalidPayload(
+                "parent count exceeds format limit".to_string(),
+            ));
+        }
+        parents.push(chained);
+    }
+    Ok(parents)
 }
 
 /// An append-only in-memory journal view. Forks share immutable entries.
@@ -340,44 +385,36 @@ impl Journal {
         &mut self,
         kind: EntryKind,
         actor: ActorId,
-        observed_parents: impl IntoIterator<Item = Hash>,
+        observed_parents: impl IntoIterator<Item = EntryHash>,
         payload: EntryPayload,
-    ) -> Result<Hash, JournalError> {
+    ) -> Result<EntryHash, JournalError> {
         let previous_head = self.state.heads.get(&actor).copied();
-        let mut parents = Vec::new();
-        if let Some(previous) = previous_head {
-            parents.push(previous);
-        }
-        let observed = observed_parents.into_iter();
-        if observed.size_hint().1 != Some(0) {
-            for parent in observed {
-                if !parents.contains(&parent) {
-                    parents.push(parent);
-                }
-            }
-        }
+        let parents_vec = assemble_parents(previous_head, observed_parents, None)?;
         let (sequence, head_entry) = match previous_head {
             Some(head) => {
                 let entry = self.get(&head).ok_or(JournalError::MissingParent(head))?;
-                (entry.data.sequence.saturating_add(1), Some(entry))
+                (
+                    SequenceNumber(entry.data.sequence.0.saturating_add(1)),
+                    Some(entry),
+                )
             }
-            None => (0, None),
+            None => (SequenceNumber(0), None),
         };
 
         // Merge all parents in one pass; a single parent clones its clock
         // directly as the fast path.
         let mut clock = VectorClock::default();
-        if parents.len() == 1 {
+        if parents_vec.len() == 1 {
             if let Some(entry) = head_entry {
                 clock = entry.vector_clock.clone();
             } else {
                 let entry = self
-                    .get(&parents[0])
-                    .ok_or(JournalError::MissingParent(parents[0]))?;
+                    .get(&parents_vec[0])
+                    .ok_or(JournalError::MissingParent(parents_vec[0]))?;
                 clock = entry.vector_clock.clone();
             }
-        } else if !parents.is_empty() {
-            for parent in &parents {
+        } else if !parents_vec.is_empty() {
+            for parent in &parents_vec {
                 let entry = self
                     .get(parent)
                     .ok_or(JournalError::MissingParent(*parent))?;
@@ -390,7 +427,7 @@ impl Journal {
             format_version: ledger_format::FORMAT_VERSION,
             kind,
             actor,
-            parents,
+            parents: parents_vec.into_iter().collect(),
             vector_clock: Vec::new(),
             sequence,
             payload,
@@ -425,7 +462,7 @@ impl Journal {
     /// leaves earlier appends untouched.
     ///
     /// An empty batch changes nothing and does not claim shared state.
-    pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<Hash>, JournalError> {
+    pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<EntryHash>, JournalError> {
         self.append_batch_impl(batch, None)
     }
 
@@ -440,7 +477,7 @@ impl Journal {
         &mut self,
         batch: Vec<BatchEntry>,
         frames: &mut Vec<EntryFrame>,
-    ) -> Result<Vec<Hash>, JournalError> {
+    ) -> Result<Vec<EntryHash>, JournalError> {
         frames.reserve(batch.len());
         self.append_batch_impl(batch, Some(frames))
     }
@@ -449,7 +486,7 @@ impl Journal {
         &mut self,
         batch: Vec<BatchEntry>,
         mut frames: Option<&mut Vec<EntryFrame>>,
-    ) -> Result<Vec<Hash>, JournalError> {
+    ) -> Result<Vec<EntryHash>, JournalError> {
         let count = batch.len();
         let mut ids = Vec::with_capacity(count);
         if count == 0 {
@@ -468,30 +505,18 @@ impl Journal {
             // Parent assembly mirrors `append` exactly: actor head first,
             // then observed parents in order, deduplicated against the
             // parents already listed. The chained reference resolves after
-            // those and lands last.
-            let mut parents = Vec::with_capacity(
-                spec.observed_parents.len()
-                    + usize::from(previous_head.is_some())
-                    + usize::from(spec.chain_previous),
-            );
-            if let Some(previous) = previous_head {
-                parents.push(previous);
-            }
-            for parent in spec.observed_parents.iter() {
-                if !parents.contains(parent) {
-                    parents.push(*parent);
-                }
-            }
-            if spec.chain_previous
-                && let Some(previous_id) = ids.last().copied()
-                && !parents.contains(&previous_id)
-            {
-                parents.push(previous_id);
-            }
+            // those and lands last. O(n) via the shared HashSet helper.
+            let chain = if spec.chain_previous {
+                ids.last().copied()
+            } else {
+                None
+            };
+            let parents_vec =
+                assemble_parents(previous_head, spec.observed_parents.iter().copied(), chain)?;
 
             // Sequence probe. The head must exist exactly as in `append`;
             // a missing head fails before any clock work.
-            let head_info: Option<(u64, VectorClock)> = match previous_head {
+            let head_info: Option<(SequenceNumber, VectorClock)> = match previous_head {
                 Some(head) => {
                     let entry =
                         state_lookup(state, &head).ok_or(JournalError::MissingParent(head))?;
@@ -500,24 +525,26 @@ impl Journal {
                 None => None,
             };
             let sequence = match &head_info {
-                Some((previous_sequence, _)) => previous_sequence.saturating_add(1),
-                None => 0,
+                Some((previous_sequence, _)) => {
+                    SequenceNumber(previous_sequence.0.saturating_add(1))
+                }
+                None => SequenceNumber(0),
             };
 
             // Clock merge mirrors `append`: a single parent clones its
             // clock directly as the fast path, several parents merge in
             // parent order, none starts from the empty clock.
             let mut clock = VectorClock::default();
-            if parents.len() == 1 {
+            if parents_vec.len() == 1 {
                 if previous_head.is_some() {
                     clock = head_info.map_or_else(VectorClock::new, |(_, c)| c);
                 } else {
-                    let entry = state_lookup(state, &parents[0])
-                        .ok_or(JournalError::MissingParent(parents[0]))?;
+                    let entry = state_lookup(state, &parents_vec[0])
+                        .ok_or(JournalError::MissingParent(parents_vec[0]))?;
                     clock = entry.vector_clock.clone();
                 }
-            } else if !parents.is_empty() {
-                for parent in &parents {
+            } else if !parents_vec.is_empty() {
+                for parent in &parents_vec {
                     let entry =
                         state_lookup(state, parent).ok_or(JournalError::MissingParent(*parent))?;
                     clock = clock.merge(&entry.vector_clock);
@@ -529,7 +556,7 @@ impl Journal {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: spec.kind,
                 actor: spec.actor,
-                parents,
+                parents: parents_vec.into_iter().collect(),
                 vector_clock: Vec::new(),
                 sequence,
                 payload: spec.payload,
@@ -568,7 +595,7 @@ impl Journal {
     /// Look up an entry by content address.
     ///
     /// The branch-local overlay is searched before the frozen base.
-    pub fn get(&self, id: &Hash) -> Option<&Entry> {
+    pub fn get(&self, id: &EntryHash) -> Option<&Entry> {
         self.state
             .overlay
             .get(id)
@@ -577,7 +604,7 @@ impl Journal {
     }
 
     /// Look up an entry Arc by content address.
-    pub(crate) fn get_arc(&self, id: &Hash) -> Option<Arc<Entry>> {
+    pub(crate) fn get_arc(&self, id: &EntryHash) -> Option<Arc<Entry>> {
         self.state
             .overlay
             .get(id)
@@ -595,7 +622,7 @@ impl Journal {
     }
 
     /// Return up to `count` trailing entry ids in chronological order.
-    pub fn tail_ids(&self, count: usize) -> Vec<Hash> {
+    pub fn tail_ids(&self, count: usize) -> Vec<EntryHash> {
         let total = self.state.order.len() + self.state.overlay_order.len();
         let skip = total.saturating_sub(count);
         self.state
@@ -614,12 +641,12 @@ impl Journal {
     }
 
     /// Return the head entry hash for a specific actor.
-    pub fn head_for_actor(&self, actor: ActorId) -> Option<Hash> {
+    pub fn head_for_actor(&self, actor: ActorId) -> Option<EntryHash> {
         self.state.heads.get(&actor).copied()
     }
 
     /// Return a root hash for the current ordered view.
-    pub fn root_hash(&self) -> Hash {
+    pub fn root_hash(&self) -> EntryHash {
         let mut hasher = blake3::Hasher::new();
         for id in self
             .state
@@ -627,9 +654,9 @@ impl Journal {
             .iter()
             .chain(self.state.overlay_order.iter())
         {
-            hasher.update(id);
+            hasher.update(&id.0);
         }
-        *hasher.finalize().as_bytes()
+        EntryHash(*hasher.finalize().as_bytes())
     }
 
     /// Return the frozen base order vector.
@@ -637,7 +664,7 @@ impl Journal {
     /// Only the base is returned; the overlay order lives separately and is
     /// chained by callers that need the full view. The name makes the
     /// partial view explicit.
-    pub fn base_order(&self) -> &[Hash] {
+    pub fn base_order(&self) -> &[EntryHash] {
         &self.state.order
     }
 }
@@ -645,16 +672,17 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::EntryPayload;
+    use alloc::vec;
+    use ledger_format::{ActorId, EntryHash, EntryPayload, SequenceNumber};
 
     #[test]
     fn append_rejects_non_canonical_payload_without_hashing() {
         let mut journal = Journal::new();
         let bad_payload = EntryPayload::Outcome(ledger_format::OutcomePayload {
-            schema: [0x00; 32],
+            schema: EntryHash([0x00; 32]),
             value: ledger_format::CanonicalValue::Float(f64::NAN),
         });
-        let result = journal.append(EntryKind::Outcome, 1, [], bad_payload);
+        let result = journal.append(EntryKind::Outcome, ActorId(1), [], bad_payload);
         assert!(matches!(result, Err(JournalError::InvalidPayload(_))));
         assert!(journal.is_empty());
     }
@@ -664,10 +692,10 @@ mod tests {
         let mut journal = Journal::new();
         // NaN is rejected by CanonicalValue before hashing.
         let bad_payload = EntryPayload::Outcome(ledger_format::OutcomePayload {
-            schema: [0x00; 32],
+            schema: EntryHash([0x00; 32]),
             value: ledger_format::CanonicalValue::Float(f64::NAN),
         });
-        let result = journal.append(EntryKind::Outcome, 1, [], bad_payload);
+        let result = journal.append(EntryKind::Outcome, ActorId(1), [], bad_payload);
         assert!(matches!(result, Err(JournalError::InvalidPayload(_))));
         assert!(journal.is_empty());
     }
@@ -681,7 +709,7 @@ mod tests {
                 journal
                     .append(
                         EntryKind::InputStep,
-                        1,
+                        ActorId(1),
                         [],
                         EntryPayload::InputStep(ledger_format::InputStepPayload {
                             generator: 0,
@@ -702,10 +730,10 @@ mod tests {
                 fork_a
                     .append(
                         EntryKind::Outcome,
-                        1,
+                        ActorId(1),
                         [],
                         EntryPayload::Outcome(ledger_format::OutcomePayload {
-                            schema: [0x00; 32],
+                            schema: EntryHash([0x00; 32]),
                             value: ledger_format::CanonicalValue::Unsigned(i),
                         }),
                     )
@@ -718,10 +746,10 @@ mod tests {
                 fork_b
                     .append(
                         EntryKind::Outcome,
-                        1,
+                        ActorId(1),
                         [],
                         EntryPayload::Outcome(ledger_format::OutcomePayload {
-                            schema: [0x00; 32],
+                            schema: EntryHash([0x00; 32]),
                             value: ledger_format::CanonicalValue::Unsigned(i + 1000),
                         }),
                     )
@@ -767,10 +795,10 @@ mod tests {
         for i in 0..extra {
             fork.append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(i as u64),
                 }),
             )
@@ -795,10 +823,10 @@ mod tests {
         for i in 0..extra {
             fork.append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(i as u64),
                 }),
             )
@@ -823,10 +851,10 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(0),
                 }),
             )
@@ -835,16 +863,122 @@ mod tests {
         let id = fork
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(1),
                 }),
             )
             .unwrap();
         let entry = fork.get(&id).unwrap();
-        assert_eq!(entry.data.sequence, 1);
-        assert_eq!(entry.vector_clock.get(1), 2);
+        assert_eq!(entry.data.sequence, SequenceNumber(1));
+        assert_eq!(entry.vector_clock.get(ActorId(1)), 2);
+    }
+
+    fn outcome_payload(value: u64) -> EntryPayload {
+        EntryPayload::Outcome(ledger_format::OutcomePayload {
+            schema: EntryHash([0x00; 32]),
+            value: ledger_format::CanonicalValue::Unsigned(value),
+        })
+    }
+
+    #[test]
+    fn wide_entry_dedups_in_order_without_quadratic_scan() {
+        // Regression for the O(n^2) `parents.contains` dedup: a wide entry
+        // with duplicate observed parents must keep first-occurrence order,
+        // drop duplicates once, and stay within the format cap.
+        let mut journal = Journal::new();
+        let mut bases = Vec::new();
+        for i in 0..512 {
+            bases.push(
+                journal
+                    .append(
+                        EntryKind::Outcome,
+                        ActorId((i % 8) as u32 + 10),
+                        [],
+                        outcome_payload(i),
+                    )
+                    .unwrap(),
+            );
+        }
+        // Observed list doubles every base (1024 items, 512 unique) plus head
+        // and chain duplicates.
+        let mut observed = Vec::with_capacity(1026);
+        observed.extend(bases.iter().copied());
+        observed.extend(bases.iter().copied());
+        observed.push(bases[0]);
+        let head = journal.head_for_actor(ActorId(10)).unwrap();
+        observed.push(head);
+        let wide = journal
+            .append(
+                EntryKind::Outcome,
+                ActorId(99),
+                observed,
+                outcome_payload(9999),
+            )
+            .unwrap();
+        let entry = journal.get(&wide).unwrap();
+        // Actor 99 has no head, so parents are exactly the deduped observed
+        // list in first-occurrence order (the 512 bases).
+        assert_eq!(entry.data.parents.len(), 512);
+        assert_eq!(entry.data.parents.as_slice(), bases.as_slice());
+        let mut seen = HashSet::new();
+        for parent in &entry.data.parents {
+            assert!(seen.insert(*parent), "parents must be deduped");
+        }
+        // Batch path assembles identically.
+        let mut journal_b = Journal::new();
+        let mut bases_b = Vec::new();
+        for i in 0..512 {
+            bases_b.push(
+                journal_b
+                    .append(
+                        EntryKind::Outcome,
+                        ActorId((i % 8) as u32 + 10),
+                        [],
+                        outcome_payload(i),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(bases_b, bases);
+        let mut observed_b = Vec::with_capacity(1026);
+        observed_b.extend(bases_b.iter().copied());
+        observed_b.extend(bases_b.iter().copied());
+        observed_b.push(bases_b[0]);
+        observed_b.push(journal_b.head_for_actor(ActorId(10)).unwrap());
+        let batch_ids = journal_b
+            .append_batch(vec![BatchEntry {
+                kind: EntryKind::Outcome,
+                actor: ActorId(99),
+                observed_parents: observed_b,
+                chain_previous: false,
+                payload: outcome_payload(9999),
+            }])
+            .unwrap();
+        assert_eq!(batch_ids[0], wide);
+        assert_eq!(
+            journal_b.get(&wide).unwrap().data.parents.as_slice(),
+            entry.data.parents.as_slice()
+        );
+    }
+
+    #[test]
+    fn parent_count_over_cap_fails_closed() {
+        let mut journal = Journal::new();
+        let mut observed = Vec::new();
+        for i in 0..(MAX_PARENTS_PER_ENTRY + 1) {
+            let mut raw = [0u8; 32];
+            raw[0..8].copy_from_slice(&(i as u64).to_le_bytes());
+            raw[8] = 0xab;
+            observed.push(EntryHash(raw));
+        }
+        let result = journal.append(EntryKind::Outcome, ActorId(1), observed, outcome_payload(0));
+        assert!(
+            matches!(result, Err(JournalError::InvalidPayload(_))),
+            "parent overflow must fail closed, got {result:?}"
+        );
+        assert!(journal.is_empty());
     }
 }

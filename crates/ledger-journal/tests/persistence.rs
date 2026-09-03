@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use ledger_format::{EntryKind, EntryPayload, GenId, Hash, InputKey};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, StreamId};
 use ledger_journal::{Journal, PersistentJournal, VectorClock};
 
 const WAL_FILE: &str = "wal.bin";
@@ -25,12 +25,12 @@ fn temp_dir(name: &str) -> PathBuf {
 /// Each entry observes its own actor's previous entry and one other actor's
 /// previous entry, so the DAG is deeply cross-linked. Kinds, payloads, and
 /// timer/RNG-style variety are rotated per entry.
-fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<Hash> {
+fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<EntryHash> {
     const ACTORS: usize = 4;
-    let mut last: Vec<Option<Hash>> = vec![None; ACTORS];
+    let mut last: Vec<Option<EntryHash>> = vec![None; ACTORS];
     let mut ids = Vec::with_capacity(count);
     for i in 0..count {
-        let actor = (i % ACTORS) as u32 + 1;
+        let actor = ActorId((i % ACTORS) as u32 + 1);
         let kind = match i % 6 {
             0 => EntryKind::Outcome,
             1 => EntryKind::InputStep,
@@ -43,7 +43,7 @@ fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<Hash> {
         // v2 payloads are kind-specific; the payload derives from the kind.
         let payload = match kind {
             EntryKind::Outcome => EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: if i % 3 == 0 {
                     ledger_format::CanonicalValue::Unsigned(value)
                 } else {
@@ -51,12 +51,12 @@ fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<Hash> {
                 },
             }),
             EntryKind::InputStep => EntryPayload::InputStep(ledger_format::InputStepPayload {
-                generator: (i as GenId) % 3,
-                replay: i as InputKey,
+                generator: (i as u64) % 3,
+                replay: i as u64,
                 value: ledger_format::CanonicalValue::Unsigned(value),
             }),
             EntryKind::RngDraw => EntryPayload::RngDraw(ledger_format::RngDrawPayload {
-                stream: (i % 7) as u32,
+                stream: StreamId((i % 7) as u32),
                 draw_index: value,
                 content: vec![(i % 251) as u8; 8 + (i % 16)],
             }),
@@ -67,24 +67,24 @@ fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<Hash> {
             EntryKind::Send => EntryPayload::Send(ledger_format::SendFrame {
                 message_id: ledger_format::MessageId::new(actor, value),
                 from: actor,
-                to: (actor % 4) + 1,
+                to: ActorId((actor.0 % 4) + 1),
                 original_content: value.to_le_bytes().to_vec(),
             }),
             _ => EntryPayload::Assert(ledger_format::AssertPayload {
-                predicate: [0x00; 32],
+                predicate: EntryHash([0x00; 32]),
                 passed: i % 2 == 0,
                 detail: ledger_format::CanonicalValue::Unsigned(value),
             }),
         };
         let mut observed = Vec::new();
-        if let Some(hash) = last[actor as usize - 1] {
+        if let Some(hash) = last[actor.0 as usize - 1] {
             observed.push(hash);
         }
-        if let Some(hash) = last[actor as usize % ACTORS] {
+        if let Some(hash) = last[actor.0 as usize % ACTORS] {
             observed.push(hash);
         }
         let id = journal.append(kind, actor, observed, payload).unwrap();
-        last[actor as usize - 1] = Some(id);
+        last[actor.0 as usize - 1] = Some(id);
         ids.push(id);
     }
     ids
@@ -93,7 +93,7 @@ fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<Hash> {
 /// Snapshot of the append-order entry stream used for equality checks.
 #[derive(Debug)]
 struct EntryStream {
-    ids: Vec<Hash>,
+    ids: Vec<EntryHash>,
     data_bytes: Vec<Vec<u8>>,
     clocks: Vec<VectorClock>,
 }
@@ -230,10 +230,10 @@ fn corrupt_sealed_tail_is_dropped_and_buffered_tail_reconstructs() {
             journal
                 .append(
                     EntryKind::Outcome,
-                    7,
+                    ActorId(7),
                     [],
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: ledger_format::CanonicalValue::Unsigned(100 + i),
                     }),
                 )
@@ -244,10 +244,10 @@ fn corrupt_sealed_tail_is_dropped_and_buffered_tail_reconstructs() {
             reference
                 .append(
                     EntryKind::Outcome,
-                    7,
+                    ActorId(7),
                     [],
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: ledger_format::CanonicalValue::Unsigned(100 + i),
                     }),
                 )

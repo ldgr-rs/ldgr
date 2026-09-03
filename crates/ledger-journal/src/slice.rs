@@ -5,27 +5,28 @@ use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 
 use crate::dag::{Journal, JournalError, JournalState};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 impl Journal {
     /// Return the joint backward causal closure of multiple target entries.
-    pub fn causal_slice(&self, targets: &[Hash]) -> Result<Vec<Hash>, JournalError> {
+    pub fn causal_slice(&self, targets: &[EntryHash]) -> Result<Vec<EntryHash>, JournalError> {
         for target in targets {
             if self.get(target).is_none() {
                 return Err(JournalError::MissingParent(*target));
             }
         }
+        // Bounded HashSet closure: each id is inserted once, so the walk is
+        // O(entries + edges). Parents push unconditionally; duplicates are
+        // dropped by the insert at pop time, which avoids a second lookup
+        // per edge.
         let mut seen = HashSet::new();
-        let mut stack: Vec<Hash> = targets.to_vec();
+        seen.reserve(targets.len());
+        let mut stack: Vec<EntryHash> = targets.to_vec();
         while let Some(id) = stack.pop() {
             if seen.insert(id)
                 && let Some(entry) = self.get(&id)
             {
-                for parent in &entry.data.parents {
-                    if !seen.contains(parent) {
-                        stack.push(*parent);
-                    }
-                }
+                stack.extend(entry.data.parents.iter().copied());
             }
         }
         Ok(self
@@ -38,7 +39,7 @@ impl Journal {
     }
 
     /// Return the forward impact cone of a set of source entries.
-    pub fn forward_cone(&self, sources: &[Hash]) -> Vec<Hash> {
+    pub fn forward_cone(&self, sources: &[EntryHash]) -> Vec<EntryHash> {
         let mut affected = HashSet::new();
         for src in sources {
             affected.insert(*src);
@@ -67,15 +68,18 @@ impl Journal {
     /// adds the entries that consume the sliced boundary events, and the
     /// result is re-closed backward so every parent is present and the slice
     /// is replayable.
-    pub fn causal_slice_forward(&self, targets: &[Hash]) -> Result<Vec<Hash>, JournalError> {
+    pub fn causal_slice_forward(
+        &self,
+        targets: &[EntryHash],
+    ) -> Result<Vec<EntryHash>, JournalError> {
         let backward = self.causal_slice(targets)?;
         let forward = self.forward_cone(&backward);
         self.causal_slice(&forward)
     }
 
     /// Construct a subgraph Journal containing only the requested hashes (in topological order).
-    pub fn subgraph(&self, hashes: &[Hash]) -> Result<Self, JournalError> {
-        let set: HashSet<Hash> = hashes.iter().copied().collect();
+    pub fn subgraph(&self, hashes: &[EntryHash]) -> Result<Self, JournalError> {
+        let set: HashSet<EntryHash> = hashes.iter().copied().collect();
         let mut sub_entries = HashMap::new();
         let mut sub_heads = HashMap::new();
         let mut sub_order = Vec::new();
@@ -110,7 +114,7 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::{EntryKind, EntryPayload};
+    use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 
     #[test]
     fn causal_slice_forward_includes_consumers_of_boundary_inputs() {
@@ -118,10 +122,10 @@ mod tests {
         let boundary = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(1),
                 }),
             )
@@ -129,10 +133,10 @@ mod tests {
         let witness = journal
             .append(
                 EntryKind::Assert,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(0),
                 }),
             )
@@ -140,10 +144,10 @@ mod tests {
         let consumer = journal
             .append(
                 EntryKind::Recv,
-                2,
+                ActorId(2),
                 [boundary],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(1),
                 }),
             )

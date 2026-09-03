@@ -39,7 +39,7 @@
 // ledger-lint:allow:fs:: (bench harness measures the host storage layer, which ambient fs writes by design; same as persistent.rs and segment/)
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload, OutcomePayload};
+use ledger_format::{ActorId, CanonicalValue, EntryHash, EntryKind, EntryPayload, OutcomePayload};
 use ledger_journal::{BatchEntry, Journal, PersistentJournal, SegmentWriter};
 use std::hint::black_box;
 
@@ -69,10 +69,10 @@ fn bench_append_throughput(c: &mut Criterion) {
                             journal
                                 .append(
                                     EntryKind::Outcome,
-                                    1,
+                                    ActorId(1),
                                     [],
                                     EntryPayload::Outcome(OutcomePayload {
-                                        schema: [0x00; 32],
+                                        schema: EntryHash([0x00; 32]),
                                         value: CanonicalValue::Unsigned(i),
                                     }),
                                 )
@@ -95,9 +95,9 @@ fn build_chunked_batches(count: u64) -> Vec<Vec<BatchEntry>> {
     for i in 0..count {
         current.push(BatchEntry::new(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             EntryPayload::Outcome(OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(i),
             }),
         ));
@@ -165,10 +165,10 @@ fn bench_append_durable(c: &mut Criterion) {
                             journal
                                 .append(
                                     EntryKind::Outcome,
-                                    1,
+                                    ActorId(1),
                                     [],
                                     EntryPayload::Outcome(OutcomePayload {
-                                        schema: [0x00; 32],
+                                        schema: EntryHash([0x00; 32]),
                                         value: CanonicalValue::Unsigned(i),
                                     }),
                                 )
@@ -214,10 +214,10 @@ fn build_journal(entries: u64) -> Journal {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(i),
                 }),
             )
@@ -239,10 +239,10 @@ fn bench_fork_cost(c: &mut Criterion) {
                     black_box(
                         fork.append(
                             EntryKind::Outcome,
-                            1,
+                            ActorId(1),
                             [],
                             EntryPayload::Outcome(OutcomePayload {
-                                schema: [0x00; 32],
+                                schema: EntryHash([0x00; 32]),
                                 value: CanonicalValue::Unsigned(i),
                             }),
                         )

@@ -29,6 +29,11 @@ impl SegmentStore {
     /// Warm archives segments that are neither fault-relevant nor in the
     /// newest `KEEP_TAIL`; cold archives everything. The archive is rebuilt
     /// only when records must be removed; a pure append extends the chain.
+    ///
+    /// Archive input is sealed only: every archived id originates from a
+    /// `SegmentWriter<Sealed>` handle converted via `into_metadata` (see
+    /// `seal_writer`) or from verified `parse_segment_bytes` output. Open
+    /// writers never reach this path.
     pub fn retain(&mut self) -> Result<(), JournalError> {
         let existing = ArchiveStore::load(&self.dir)?;
         let mut archive_map: BTreeMap<u64, Vec<u8>> = existing.into_iter().collect();
@@ -90,8 +95,11 @@ impl SegmentStore {
                 bytes: Arc::new(bytes),
             })
             .collect();
+        // O(segments) membership via a HashSet; the prior linear `any` per
+        // pending record was O(segments^2).
+        let mut archived_ids: hashbrown::HashSet<u64> = new_archived.iter().map(|a| a.id).collect();
         for (ordinal, bytes) in pending_append {
-            if !new_archived.iter().any(|archived| archived.id == ordinal) {
+            if archived_ids.insert(ordinal) {
                 new_archived.push(ArchivedSegment {
                     id: ordinal,
                     bytes: Arc::new(bytes),
@@ -101,12 +109,9 @@ impl SegmentStore {
         new_archived.sort_by_key(|archived| archived.id);
         self.archived = new_archived;
 
+        let loose_remove: hashbrown::HashSet<u64> = self.archived.iter().map(|a| a.id).collect();
         for segment in &self.sealed {
-            if self
-                .archived
-                .iter()
-                .any(|archived| archived.id == segment.id)
-            {
+            if loose_remove.contains(&segment.id) {
                 let path = self.dir.join(segment.file_name());
                 match fs::remove_file(&path) {
                     Ok(()) => {}
@@ -165,6 +170,10 @@ impl SegmentStore {
                 .map_err(segment_io)?;
             file.write_all(&(self.sealed.len() as u64).to_be_bytes())
                 .map_err(segment_io)?;
+            // O(segments) archived-membership test; the prior per-segment
+            // linear scan was O(segments^2) on large stores.
+            let archived_ids: hashbrown::HashSet<u64> =
+                self.archived.iter().map(|a| a.id).collect();
             for segment in &self.sealed {
                 file.write_all(&segment.id.to_be_bytes())
                     .map_err(segment_io)?;
@@ -178,8 +187,8 @@ impl SegmentStore {
                     .map_err(segment_io)?;
                 file.write_all(&(segment.samples.len() as u64).to_be_bytes())
                     .map_err(segment_io)?;
-                file.write_all(&segment.root_hash).map_err(segment_io)?;
-                let archived = u8::from(self.archived.iter().any(|a| a.id == segment.id));
+                file.write_all(&segment.root_hash.0).map_err(segment_io)?;
+                let archived = u8::from(archived_ids.contains(&segment.id));
                 let flags = archived | (u8::from(segment.contains_fault_relevant) << 1);
                 file.write_all(&[flags]).map_err(segment_io)?;
             }
@@ -208,19 +217,17 @@ impl SegmentStore {
         let mut version = [0u8; 4];
         file.read_exact(&mut version).map_err(segment_io)?;
         let version = u32::from_be_bytes(version);
-        if version != 1 && version != 2 {
+        if version != 2 {
             return Err(JournalError::SegmentCorrupt(
                 "unsupported manifest version".to_string(),
             ));
         }
-        let retention = if version >= 2 {
+        let retention = {
             let mut byte = [0u8; 1];
             file.read_exact(&mut byte).map_err(segment_io)?;
             RetentionClass::from_u8(byte[0]).ok_or_else(|| {
                 JournalError::SegmentCorrupt("invalid retention class in manifest".to_string())
             })?
-        } else {
-            RetentionClass::Hot
         };
         let mut count = [0u8; 8];
         file.read_exact(&mut count).map_err(segment_io)?;
@@ -235,12 +242,10 @@ impl SegmentStore {
             // Skip the 68 metadata bytes to reach the next record.
             file.seek(SeekFrom::Current(MANIFEST_RECORD_META_LEN as i64))
                 .map_err(segment_io)?;
-            let flags = if version >= 2 {
+            let flags = {
                 let mut flags = [0u8; 1];
                 file.read_exact(&mut flags).map_err(segment_io)?;
                 flags[0]
-            } else {
-                0
             };
             entries.push(ManifestEntry {
                 id,

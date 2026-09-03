@@ -6,14 +6,21 @@
 //! the retention class re-extracts archived segments back to loose files, so
 //! nothing is ever lost.
 //!
-//! File layout:
+//! File layout (see `ARCHIVE_MAGIC`, `ARCHIVE_FORMAT_VERSION`, `HEADER_LEN`,
+//! and `RECORD_PREFIX_LEN` for the exact constants):
 //!
 //! ```text
-//! [magic "LDAR" 4 bytes][version u32 BE][record_count u64 BE]
-//! [chain hash 32 bytes]
-//! [record: ordinal u64 LE][len u64 LE][segment file bytes]
+//! [magic "LDAR" 4 bytes][version u32 BE = 1 4 bytes]
+//! [record_count u64 BE 8 bytes][chain hash 32 bytes]
+//! [record: ordinal u64 LE 8 bytes][len u64 LE 8 bytes]
+//! [segment file bytes len bytes]
 //! [record: ...]
 //! ```
+//!
+//! Total header is `HEADER_LEN (48)` bytes; each record prefix is
+//! `RECORD_PREFIX_LEN (16)` bytes. The chain hash covers
+//! `chain || ordinal LE || len LE || record bytes` per record from
+//! `initial_chain` (BLAKE3 of empty).
 //!
 //! The chain hash is a running BLAKE3 hash over the whole record stream.
 //! Each append advances the chain and rewrites the header. The header
@@ -31,7 +38,7 @@ use std::string::ToString;
 use std::vec::Vec;
 
 use crate::dag::JournalError;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 /// Name of the archive file inside a journal directory.
 pub const ARCHIVE_FILE: &str = "archive.ldgr";
@@ -52,7 +59,7 @@ const RECORD_PREFIX_LEN: usize = 16;
 #[derive(Debug)]
 pub struct ArchiveStore {
     file: File,
-    chain: Hash,
+    chain: EntryHash,
     record_count: u64,
 }
 
@@ -96,11 +103,11 @@ impl ArchiveStore {
         segment_bytes: &[u8],
     ) -> Result<(), JournalError> {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&self.chain);
+        hasher.update(&self.chain.0);
         hasher.update(&segment_ordinal.to_le_bytes());
         hasher.update(&(segment_bytes.len() as u64).to_le_bytes());
         hasher.update(segment_bytes);
-        let next = *hasher.finalize().as_bytes();
+        let next = EntryHash(*hasher.finalize().as_bytes());
 
         self.file
             .write_all(&segment_ordinal.to_le_bytes())
@@ -112,7 +119,7 @@ impl ArchiveStore {
         self.file
             .seek(SeekFrom::Start(CHAIN_OFFSET as u64))
             .map_err(archive_io)?;
-        self.file.write_all(&next).map_err(archive_io)?;
+        self.file.write_all(&next.0).map_err(archive_io)?;
         self.file
             .seek(SeekFrom::Start(RECORD_COUNT_OFFSET as u64))
             .map_err(archive_io)?;
@@ -148,9 +155,9 @@ impl ArchiveStore {
             return Err(JournalError::ArchiveHashMismatch);
         }
         let record_count = u64::from_be_bytes(bytes[8..16].try_into().map_or([0; 8], |b| b));
-        let recorded_chain: Hash = bytes[CHAIN_OFFSET..HEADER_LEN]
+        let recorded_chain: EntryHash = bytes[CHAIN_OFFSET..HEADER_LEN]
             .try_into()
-            .map_or([0; 32], |b| b);
+            .map_or(EntryHash([0; 32]), EntryHash);
 
         let mut chain = initial_chain();
         let mut records = Vec::new();
@@ -173,11 +180,11 @@ impl ArchiveStore {
             let record = &bytes[offset..offset + len];
             offset += len;
             let mut hasher = blake3::Hasher::new();
-            hasher.update(&chain);
+            hasher.update(&chain.0);
             hasher.update(&ordinal.to_le_bytes());
             hasher.update(&(len as u64).to_le_bytes());
             hasher.update(record);
-            chain = *hasher.finalize().as_bytes();
+            chain = EntryHash(*hasher.finalize().as_bytes());
             records.push((ordinal, record.to_vec()));
         }
         if chain != recorded_chain {
@@ -202,11 +209,11 @@ impl ArchiveStore {
             write_header(&mut file, records.len() as u64, &chain)?;
             for (ordinal, bytes) in records {
                 let mut hasher = blake3::Hasher::new();
-                hasher.update(&chain);
+                hasher.update(&chain.0);
                 hasher.update(&ordinal.to_le_bytes());
                 hasher.update(&(bytes.len() as u64).to_le_bytes());
                 hasher.update(bytes);
-                chain = *hasher.finalize().as_bytes();
+                chain = EntryHash(*hasher.finalize().as_bytes());
                 file.write_all(&ordinal.to_le_bytes()).map_err(archive_io)?;
                 file.write_all(&(bytes.len() as u64).to_le_bytes())
                     .map_err(archive_io)?;
@@ -223,25 +230,25 @@ impl ArchiveStore {
 }
 
 /// The chain hash of an empty record stream.
-fn initial_chain() -> Hash {
-    *blake3::hash(b"").as_bytes()
+fn initial_chain() -> EntryHash {
+    EntryHash(*blake3::hash(b"").as_bytes())
 }
 
 fn write_header(
     file: &mut impl Write,
     record_count: u64,
-    chain: &Hash,
+    chain: &EntryHash,
 ) -> Result<(), JournalError> {
     file.write_all(ARCHIVE_MAGIC).map_err(archive_io)?;
     file.write_all(&ARCHIVE_FORMAT_VERSION.to_be_bytes())
         .map_err(archive_io)?;
     file.write_all(&record_count.to_be_bytes())
         .map_err(archive_io)?;
-    file.write_all(chain).map_err(archive_io)?;
+    file.write_all(&chain.0).map_err(archive_io)?;
     Ok(())
 }
 
-fn read_header(file: &mut File) -> Result<(Hash, u64), JournalError> {
+fn read_header(file: &mut File) -> Result<(EntryHash, u64), JournalError> {
     let mut header = [0u8; HEADER_LEN];
     file.read_exact(&mut header).map_err(archive_io)?;
     if &header[0..4] != ARCHIVE_MAGIC {
@@ -252,9 +259,9 @@ fn read_header(file: &mut File) -> Result<(Hash, u64), JournalError> {
         return Err(JournalError::ArchiveHashMismatch);
     }
     let record_count = u64::from_be_bytes(header[8..16].try_into().map_or([0; 8], |b| b));
-    let chain: Hash = header[CHAIN_OFFSET..HEADER_LEN]
+    let chain: EntryHash = header[CHAIN_OFFSET..HEADER_LEN]
         .try_into()
-        .map_or([0; 32], |b| b);
+        .map_or(EntryHash([0; 32]), EntryHash);
     Ok((chain, record_count))
 }
 

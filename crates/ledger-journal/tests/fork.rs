@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
-use ledger_format::{EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::PersistentJournal;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -22,16 +22,16 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn build(journal: &mut PersistentJournal, count: u64) -> Vec<Hash> {
+fn build(journal: &mut PersistentJournal, count: u64) -> Vec<EntryHash> {
     let mut ids = Vec::with_capacity(count as usize);
     for i in 0..count {
         let id = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(i),
                 }),
             )
@@ -41,7 +41,7 @@ fn build(journal: &mut PersistentJournal, count: u64) -> Vec<Hash> {
     ids
 }
 
-fn entry_ids(journal: &PersistentJournal) -> Vec<Hash> {
+fn entry_ids(journal: &PersistentJournal) -> Vec<EntryHash> {
     journal.entries().map(|entry| entry.id).collect()
 }
 
@@ -144,7 +144,7 @@ fn fork_preserves_prefix() {
     };
 
     let reopened_fork = PersistentJournal::open(&fork_dir).unwrap();
-    let expected: Vec<Hash> = parent_ids.iter().chain(&tail_ids).copied().collect();
+    let expected: Vec<EntryHash> = parent_ids.iter().chain(&tail_ids).copied().collect();
     assert_eq!(entry_ids(&reopened_fork), expected);
 
     let reopened_parent = PersistentJournal::open(&parent_dir).unwrap();
@@ -209,7 +209,7 @@ fn fork_covers_unsealed_parent_tail() {
         build(&mut fork, 10)
     };
     let reopened_fork = PersistentJournal::open(&fork_dir).unwrap();
-    let expected: Vec<Hash> = all_parent_ids.iter().chain(&tail_ids).copied().collect();
+    let expected: Vec<EntryHash> = all_parent_ids.iter().chain(&tail_ids).copied().collect();
     assert_eq!(
         entry_ids(&reopened_fork),
         expected,
