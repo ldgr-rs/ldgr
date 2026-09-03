@@ -53,7 +53,7 @@
 
 use ledger_explorer::minimizer::{causal_slice_forward, ddmin};
 use ledger_explorer::oracle::{ExactlyOnceValueOracle, Oracle};
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
+use ledger_format::{CanonicalValue, EntryHash, EntryKind, EntryPayload};
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, Simulation};
 
 /// Total noise inputs journaled on actor 0.
@@ -103,7 +103,7 @@ fn run_for_check(journal: ledger_journal::Journal) -> RunResult {
 /// Oracle check over one candidate entry set: rebuild the subgraph journal
 /// and ask the exactly-once value oracle. Subgraph rebuilds that fail count
 /// as non-failing candidates, mirroring `minimize_full`'s ddmin closure.
-fn candidate_violates(source: &ledger_journal::Journal, candidate: &[Hash]) -> bool {
+fn candidate_violates(source: &ledger_journal::Journal, candidate: &[EntryHash]) -> bool {
     source
         .subgraph(candidate)
         .map(|journal| {
@@ -115,7 +115,7 @@ fn candidate_violates(source: &ledger_journal::Journal, candidate: &[Hash]) -> b
 }
 
 /// The entry ids of the duplicated apply pair in a journal.
-fn duplicate_pair_ids(journal: &ledger_journal::Journal) -> Vec<Hash> {
+fn duplicate_pair_ids(journal: &ledger_journal::Journal) -> Vec<EntryHash> {
     journal
         .entries()
         .filter(|entry| {
@@ -131,7 +131,7 @@ fn duplicate_pair_ids(journal: &ledger_journal::Journal) -> Vec<Hash> {
 }
 
 /// The id of the last numeric Outcome entry in journal order.
-fn numeric_outcome_id(journal: &ledger_journal::Journal) -> Option<Hash> {
+fn numeric_outcome_id(journal: &ledger_journal::Journal) -> Option<EntryHash> {
     journal
         .entries()
         .filter(|entry| {
@@ -152,7 +152,7 @@ fn numeric_outcome_id(journal: &ledger_journal::Journal) -> Option<Hash> {
 fn minimize_removes_90_percent_of_an_entangled_million_entry_failure() {
     let programs = failing_programs();
     let config = RunConfig::builder()
-        .seed([1; 32])
+        .seed(EntryHash([1; 32]))
         .policy(Policy::Random)
         .max_steps(2_000_000)
         .build();
@@ -272,17 +272,17 @@ fn minimize_removes_90_percent_of_an_entangled_million_entry_failure() {
             .iter()
             .copied()
             .filter(|id| id != retained)
-            .collect::<Vec<Hash>>();
+            .collect::<Vec<EntryHash>>();
         assert!(
             !candidate_violates(&run.journal, &reduced_ids),
             "removing the retained dependency {:02x?} must flip the verdict to pass",
-            &retained[..4]
+            &retained.0[..4]
         );
     }
     // (5b) Adding back SAMPLED removed events keeps the verdict failing:
     // the witness and the first four removed entries are asserted here, a
     // five-entry sample of the removed set.
-    let mut removed_sample: Vec<Hash> = vec![witness];
+    let mut removed_sample: Vec<EntryHash> = vec![witness];
     removed_sample.extend(
         run.journal
             .entries()
@@ -300,7 +300,7 @@ fn minimize_removes_90_percent_of_an_entangled_million_entry_failure() {
         assert!(
             candidate_violates(&run.journal, &extended),
             "adding back the sampled removed event {:02x?} must keep the verdict failing",
-            &removed[..4]
+            &removed.0[..4]
         );
     }
     // (5c) The noise alone never violates: strip the pair and the outcome.
@@ -309,7 +309,7 @@ fn minimize_removes_90_percent_of_an_entangled_million_entry_failure() {
         .entries()
         .map(|entry| entry.id)
         .filter(|id| !pair.contains(id) && *id != witness)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     assert!(
         !candidate_violates(&run.journal, &noise_ids),
         "the noise-only journal must pass the exactly-once oracle"

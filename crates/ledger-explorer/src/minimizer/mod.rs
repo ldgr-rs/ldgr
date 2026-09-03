@@ -14,7 +14,7 @@ pub use memo::{MemoError, MemoizedReplay};
 pub use pipeline::{MinimizedRepro, minimize_full};
 
 use crate::pbt::gen_id;
-use ledger_format::{EntryKind, EntryPayload, Hash};
+use ledger_format::{EntryHash, EntryKind, EntryPayload};
 use ledger_journal::{Journal, JournalError};
 use thiserror::Error;
 
@@ -57,7 +57,7 @@ const CANDIDATE_REPLAY_BATCH: usize = 8;
 
 /// Return the length of `candidate` when it is a leading run of `source`'s
 /// append order; `None` otherwise.
-fn source_prefix_len(source: &Journal, candidate: &[Hash]) -> Option<usize> {
+fn source_prefix_len(source: &Journal, candidate: &[EntryHash]) -> Option<usize> {
     if candidate.is_empty() {
         return Some(0);
     }
@@ -79,7 +79,7 @@ fn source_prefix_len(source: &Journal, candidate: &[Hash]) -> Option<usize> {
 fn candidate_journal(
     memo: &mut MemoizedReplay,
     source: &Journal,
-    candidate: &[Hash],
+    candidate: &[EntryHash],
 ) -> Result<Journal, MinimizeError> {
     if let Some(prefix_len) = source_prefix_len(source, candidate)
         && prefix_len > 0

@@ -28,10 +28,12 @@ use ledger_explorer::oracle::{
     DifferentialOracle, HistoryOperation, HistoryOracle, KeyValueSpec, Oracle, Verdict,
 };
 use ledger_explorer::search::Workload;
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, Simulation};
 
-fn config(seed: [u8; 32]) -> RunConfig {
+fn config(seed: EntryHash) -> RunConfig {
     RunConfig::builder()
         .seed(seed)
         .policy(Policy::Random)
@@ -39,7 +41,7 @@ fn config(seed: [u8; 32]) -> RunConfig {
         .build()
 }
 
-fn run(programs: Vec<Vec<Instruction>>, seed: [u8; 32]) -> RunResult {
+fn run(programs: Vec<Vec<Instruction>>, seed: EntryHash) -> RunResult {
     Simulation::new(config(seed), programs)
         .run()
         .expect("simulation must run")
@@ -57,7 +59,12 @@ fn program(outcome_value: u64, final_register: u64) -> Vec<Vec<Instruction>> {
 }
 
 /// The shared corpus: pinned seeds both implementations must agree on.
-const CORPUS: [[u8; 32]; 4] = [[0; 32], [1; 32], [2; 32], [3; 32]];
+const CORPUS: [EntryHash; 4] = [
+    EntryHash([0; 32]),
+    EntryHash([1; 32]),
+    EntryHash([2; 32]),
+    EntryHash([3; 32]),
+];
 
 /// PAIRED IMPLEMENTATION A: the writer reaches the reader through a relay.
 ///
@@ -154,7 +161,9 @@ fn kv_history(run: &RunResult) -> Vec<HistoryOperation> {
                 EntryPayload::Send(ledger_format::SendFrame {
                     original_content, ..
                 }),
-            ) if entry.data.actor == 0 && original_content.as_slice() == 42u64.to_le_bytes() => {
+            ) if entry.data.actor == ActorId(0)
+                && original_content.as_slice() == 42u64.to_le_bytes() =>
+            {
                 Some(HistoryOperation::Write {
                     key: "k".into(),
                     value: 42,
@@ -167,7 +176,7 @@ fn kv_history(run: &RunResult) -> Vec<HistoryOperation> {
                     value: CanonicalValue::Unsigned(value),
                     ..
                 }),
-            ) if entry.data.actor == 2 => Some(HistoryOperation::Read {
+            ) if entry.data.actor == ActorId(2) => Some(HistoryOperation::Read {
                 key: "k".into(),
                 value: *value,
                 witness: entry.id,
@@ -194,8 +203,8 @@ fn outcome_value(run: &RunResult) -> Option<u64> {
 #[test]
 fn identical_runs_compare_equal() {
     let programs = program(7, 8);
-    let left = run(programs.clone(), [3; 32]);
-    let right = run(programs, [3; 32]);
+    let left = run(programs.clone(), EntryHash([3; 32]));
+    let right = run(programs, EntryHash([3; 32]));
     let verdict = DifferentialOracle::compare(&left, &right);
     assert_eq!(verdict, Verdict::pass());
 }
@@ -204,8 +213,8 @@ fn identical_runs_compare_equal() {
 fn diverging_outputs_are_located_not_just_hash_mismatched() {
     // Same final register (8), different journaled outputs (7 vs 9): only the
     // observable-output check can locate this divergence.
-    let left = run(program(7, 8), [3; 32]);
-    let right = run(program(9, 8), [3; 32]);
+    let left = run(program(7, 8), EntryHash([3; 32]));
+    let right = run(program(9, 8), EntryHash([3; 32]));
 
     let register_verdict = DifferentialOracle::compare(&left, &right);
     assert!(register_verdict.violated, "the divergence must be reported");
@@ -227,8 +236,8 @@ fn diverging_outputs_are_located_not_just_hash_mismatched() {
 
 #[test]
 fn diverging_registers_still_fail_first() {
-    let left = run(program(7, 7), [3; 32]);
-    let right = run(program(9, 9), [3; 32]);
+    let left = run(program(7, 7), EntryHash([3; 32]));
+    let right = run(program(9, 9), EntryHash([3; 32]));
     let verdict = DifferentialOracle::compare(&left, &right);
     assert!(verdict.violated);
     assert!(
@@ -267,8 +276,8 @@ fn schedule_divergence_is_detected_on_a_race_workload() {
             ],
         ]
     };
-    let first = run(relay(), [5; 32]);
-    let second = run(relay(), [6; 32]);
+    let first = run(relay(), EntryHash([5; 32]));
+    let second = run(relay(), EntryHash([6; 32]));
     let same = DifferentialOracle::compare(&first, &first.clone());
     assert_eq!(same, Verdict::pass(), "a run must equal itself");
 

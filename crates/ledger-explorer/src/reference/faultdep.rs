@@ -31,6 +31,7 @@ use crate::oracle::{Oracle, PropertyOracle};
 use crate::search::replay_with_faults;
 use crate::search::{FaultReplayError, FaultReplayReport, Finding, Workload};
 use crate::support::{StaticSupportProvider, SupportExpr, all_of_ids};
+use ledger_format::EntryHash;
 use ledger_journal::Journal;
 use ledger_sim::{Policy, RunConfig, RunResult, RuntimeError, SimFault, Simulation};
 
@@ -44,7 +45,7 @@ pub struct FaultDepScenario {
     /// Manifest file stem under `corpora/bug-corpus-v2/`.
     pub name: &'static str,
     /// Pinned base seed. The no-fault baseline at this seed must pass.
-    pub base_seed: [u8; 32],
+    pub base_seed: EntryHash,
     /// Bug-class label.
     pub class: ScenarioClass,
     /// The program workload under test.
@@ -64,7 +65,7 @@ pub struct FaultDepScenario {
 
 /// Build the gate run config: Random policy over the pinned seed with an
 /// optional fault schedule.
-fn scenario_config(seed: [u8; 32], faults: Vec<SimFault>) -> RunConfig {
+fn scenario_config(seed: EntryHash, faults: Vec<SimFault>) -> RunConfig {
     RunConfig::builder()
         .seed(seed)
         .policy(Policy::Random)
@@ -162,7 +163,7 @@ impl FaultDepScenario {
 // ---------------------------------------------------------------------------
 
 /// The no-fault baseline journal of one workload at one seed.
-fn probe_journal(seed: [u8; 32], workload: &dyn Workload) -> Journal {
+fn probe_journal(seed: EntryHash, workload: &dyn Workload) -> Journal {
     Simulation::new(scenario_config(seed, Vec::new()), workload.programs())
         .run()
         .expect("probe run must execute")
@@ -171,7 +172,7 @@ fn probe_journal(seed: [u8; 32], workload: &dyn Workload) -> Journal {
 
 /// The last `FsWrite` entry of `actor` in journal order: the critical
 /// write of every scenario, which the read-back observes.
-fn last_fs_write(baseline: &Journal, actor: u32) -> ledger_format::Hash {
+fn last_fs_write(baseline: &Journal, actor: ledger_format::ActorId) -> ledger_format::EntryHash {
     baseline
         .entries()
         .filter(|entry| {
@@ -179,7 +180,7 @@ fn last_fs_write(baseline: &Journal, actor: u32) -> ledger_format::Hash {
         })
         .last()
         .map(|entry| entry.id)
-        .unwrap_or_else(|| panic!("probe journal must contain an FsWrite of actor {actor}"))
+        .unwrap_or_else(|| panic!("probe journal must contain an FsWrite of actor {actor:?}"))
 }
 
 /// Push `count` unsynced decoy writes in front of a workload's critical
@@ -196,10 +197,13 @@ fn push_decoys(program: &mut Vec<ledger_sim::Instruction>, count: usize, prefix:
 
 /// Declared vocabulary: one Corrupt and one CrashState candidate per
 /// `FsWrite` of the baseline. Storage-semantics faults are the fault class
-/// whose causal targets the flat-parent hazard can see: the faulted write is
-/// an ancestor of the read-back outcome, so a hazard cut names the faulted
-/// write and the replay reproduces.
-fn write_fault_space(seed: [u8; 32], workload: &dyn Workload) -> Vec<SimFault> {
+/// whose causal targets the typed support hazard sees: the faulted write is
+/// declared in the explicit `SupportExpr` (`AllOf` over the critical write,
+/// alternative decoy branches preserved as separate `AnyOf` groups), so a
+/// hazard cut names the faulted write and the replay reproduces. Parent edges
+/// alone never imply support; the encoding traverses the declared support
+/// instead of flattening parents.
+fn write_fault_space(seed: EntryHash, workload: &dyn Workload) -> Vec<SimFault> {
     let journal = probe_journal(seed, workload);
     journal
         .entries()
@@ -228,7 +232,7 @@ fn final_value_oracle(expected: u64, name: &'static str) -> Box<dyn Oracle> {
     })
 }
 
-fn support_last_fs_write(journal: &Journal, actor: u32) -> SupportExpr {
+fn support_last_fs_write(journal: &Journal, actor: ledger_format::ActorId) -> SupportExpr {
     all_of_ids(std::iter::once(last_fs_write(journal, actor)))
 }
 
@@ -519,152 +523,152 @@ fn canary_promote() -> Box<dyn Workload> {
 
 fn az_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::Corrupt {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         xor_mask: 1,
     }]
 }
 
 fn az_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn az_space() -> Vec<SimFault> {
-    write_fault_space([20; 32], az_double_assign().as_ref())
+    write_fault_space(EntryHash([20; 32]), az_double_assign().as_ref())
 }
 
 fn flap_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::CrashState {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         state: 0,
     }]
 }
 
 fn flap_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn flap_space() -> Vec<SimFault> {
-    write_fault_space([21; 32], instance_flap().as_ref())
+    write_fault_space(EntryHash([21; 32]), instance_flap().as_ref())
 }
 
 fn drift_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::Corrupt {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         xor_mask: 0xFF,
     }]
 }
 
 fn drift_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn drift_space() -> Vec<SimFault> {
-    write_fault_space([22; 32], config_drift().as_ref())
+    write_fault_space(EntryHash([22; 32]), config_drift().as_ref())
 }
 
 fn quota_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::CrashState {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         state: 1,
     }]
 }
 
 fn quota_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn quota_space() -> Vec<SimFault> {
-    write_fault_space([23; 32], quota_retry_storm().as_ref())
+    write_fault_space(EntryHash([23; 32]), quota_retry_storm().as_ref())
 }
 
 fn heartbeat_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::Corrupt {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         xor_mask: 1,
     }]
 }
 
 fn heartbeat_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn heartbeat_space() -> Vec<SimFault> {
-    write_fault_space([24; 32], lease_heartbeat().as_ref())
+    write_fault_space(EntryHash([24; 32]), lease_heartbeat().as_ref())
 }
 
 fn publish_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::CrashState {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         state: 2,
     }]
 }
 
 fn publish_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn publish_space() -> Vec<SimFault> {
-    write_fault_space([25; 32], config_publish().as_ref())
+    write_fault_space(EntryHash([25; 32]), config_publish().as_ref())
 }
 
 fn dedup_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::CrashState {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         state: 2,
     }]
 }
 
 fn dedup_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn dedup_space() -> Vec<SimFault> {
-    write_fault_space([26; 32], quota_dedup_sector().as_ref())
+    write_fault_space(EntryHash([26; 32]), quota_dedup_sector().as_ref())
 }
 
 fn drain_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::CrashState {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         state: 0,
     }]
 }
 
 fn drain_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn drain_space() -> Vec<SimFault> {
-    write_fault_space([27; 32], drain_completion().as_ref())
+    write_fault_space(EntryHash([27; 32]), drain_completion().as_ref())
 }
 
 fn dual_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::Corrupt {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         xor_mask: 0xFF,
     }]
 }
 
 fn dual_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn dual_space() -> Vec<SimFault> {
-    write_fault_space([28; 32], dual_region_commit().as_ref())
+    write_fault_space(EntryHash([28; 32]), dual_region_commit().as_ref())
 }
 
 fn canary_trigger(baseline: &Journal) -> Vec<SimFault> {
     vec![SimFault::Corrupt {
-        write: last_fs_write(baseline, 0),
+        write: last_fs_write(baseline, ledger_format::ActorId(0)),
         xor_mask: 1,
     }]
 }
 
 fn canary_support(journal: &Journal) -> SupportExpr {
-    support_last_fs_write(journal, 0)
+    support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
 fn canary_space() -> Vec<SimFault> {
-    write_fault_space([29; 32], canary_promote().as_ref())
+    write_fault_space(EntryHash([29; 32]), canary_promote().as_ref())
 }
 
 // ---------------------------------------------------------------------------
@@ -676,7 +680,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
     vec![
         FaultDepScenario {
             name: "mini-cloud-az-double-assign",
-            base_seed: [20; 32],
+            base_seed: EntryHash([20; 32]),
             class: ScenarioClass::CloudInfra,
             workload: az_double_assign,
             oracle: || final_value_oracle(43, "the placement ledger must hold grant 43"),
@@ -686,7 +690,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-instance-flap",
-            base_seed: [21; 32],
+            base_seed: EntryHash([21; 32]),
             class: ScenarioClass::CloudInfra,
             workload: instance_flap,
             oracle: || final_value_oracle(777, "registration marker must read back"),
@@ -696,7 +700,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-config-drift",
-            base_seed: [22; 32],
+            base_seed: EntryHash([22; 32]),
             class: ScenarioClass::CloudInfra,
             workload: config_drift,
             oracle: || final_value_oracle(9, "fleet must read back the reconciled config"),
@@ -706,7 +710,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-quota-retry-storm",
-            base_seed: [23; 32],
+            base_seed: EntryHash([23; 32]),
             class: ScenarioClass::CloudInfra,
             workload: quota_retry_storm,
             oracle: || final_value_oracle(1, "the dedup marker must read back"),
@@ -716,7 +720,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-lease-heartbeat",
-            base_seed: [24; 32],
+            base_seed: EntryHash([24; 32]),
             class: ScenarioClass::CloudInfra,
             workload: lease_heartbeat,
             oracle: || final_value_oracle(7, "monitor must read back the fresh lease epoch"),
@@ -726,7 +730,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-config-publish",
-            base_seed: [25; 32],
+            base_seed: EntryHash([25; 32]),
             class: ScenarioClass::CloudInfra,
             workload: config_publish,
             oracle: || final_value_oracle(9, "current-version pointer must be durable"),
@@ -736,7 +740,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-quota-dedup-sector",
-            base_seed: [26; 32],
+            base_seed: EntryHash([26; 32]),
             class: ScenarioClass::CloudInfra,
             workload: quota_dedup_sector,
             oracle: || final_value_oracle(88, "dedup marker must read back intact"),
@@ -746,7 +750,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-drain-completion",
-            base_seed: [27; 32],
+            base_seed: EntryHash([27; 32]),
             class: ScenarioClass::CloudInfra,
             workload: drain_completion,
             oracle: || final_value_oracle(7, "completion marker must read back"),
@@ -756,7 +760,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-dual-region-commit",
-            base_seed: [28; 32],
+            base_seed: EntryHash([28; 32]),
             class: ScenarioClass::CloudInfra,
             workload: dual_region_commit,
             oracle: || final_value_oracle(5, "quorum must read back the region-b commit"),
@@ -766,7 +770,7 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
         },
         FaultDepScenario {
             name: "mini-cloud-canary-promote",
-            base_seed: [29; 32],
+            base_seed: EntryHash([29; 32]),
             class: ScenarioClass::CloudInfra,
             workload: canary_promote,
             oracle: || final_value_oracle(43, "promotion verdict must read back"),

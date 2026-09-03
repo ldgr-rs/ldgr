@@ -1,10 +1,10 @@
 use super::MemoizedReplay;
 use super::candidate_journal;
-use super::ddmin::{causal_slice_forward, ddmin, minimize_schedule};
+use super::ddmin::{causal_slice_forward_all, ddmin, minimize_schedule};
 use super::input::minimize_input;
 use crate::oracle::Oracle;
 use crate::search::{Finding, Workload, replay_prefix};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::Journal;
 use ledger_sim::RunResult;
 
@@ -74,13 +74,12 @@ where
         .journal
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
 
-    // Causal slice from the first witness, closed forward over boundary
+    // Causal slice from all witnesses, closed forward over boundary
     // inputs so the slice is self-contained for replay.
-    let witness = finding.verdict.witnesses.first().copied();
-    let (slice, slice_journal) = match witness {
-        Some(target) => match causal_slice_forward(&finding.run.journal, target) {
+    let (slice, slice_journal) = if !finding.verdict.witnesses.is_empty() {
+        match causal_slice_forward_all(&finding.run.journal, &finding.verdict.witnesses) {
             Ok(ids) if !ids.is_empty() => {
                 let journal = finding.run.journal.subgraph(&ids)?;
                 if oracle.check(&run_for_check(journal.clone())).violated {
@@ -90,8 +89,9 @@ where
                 }
             }
             _ => (all_ids.clone(), finding.run.journal.clone()),
-        },
-        None => (all_ids.clone(), finding.run.journal.clone()),
+        }
+    } else {
+        (all_ids.clone(), finding.run.journal.clone())
     };
     let slice_kept = slice.len();
 

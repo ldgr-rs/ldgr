@@ -3,6 +3,7 @@
 use crate::oracle::HistoryOperation;
 use crate::pbt::gen_id;
 use crate::search::Workload;
+use ledger_format::ActorId;
 use ledger_format::{EntryKind, EntryPayload};
 use ledger_sim::{Instruction, RunResult};
 
@@ -44,13 +45,13 @@ impl Workload for MiniKvWorkload {
         run.journal
             .entries()
             .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
-                (EntryKind::Send, EntryPayload::Send(frame)) if frame.to == 1 => {
+                (EntryKind::Send, EntryPayload::Send(frame)) if frame.to == ActorId(1) => {
                     let value = u64::from_le_bytes(
                         frame.original_content[..8]
                             .try_into()
                             .expect("8-byte payload"),
                     );
-                    if entry.data.actor == 0 && value == 42 {
+                    if entry.data.actor == ActorId(0) && value == 42 {
                         Some(HistoryOperation::Write {
                             key: "k".into(),
                             value: 42,
@@ -60,7 +61,9 @@ impl Workload for MiniKvWorkload {
                         None
                     }
                 }
-                (EntryKind::Outcome, EntryPayload::Outcome(outcome)) if entry.data.actor == 2 => {
+                (EntryKind::Outcome, EntryPayload::Outcome(outcome))
+                    if entry.data.actor == ActorId(2) =>
+                {
                     let value = match outcome.value {
                         ledger_format::CanonicalValue::Unsigned(v) => v,
                         _ => return None,
@@ -112,13 +115,14 @@ impl Workload for MiniKvWorkload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledger_format::EntryHash;
     use ledger_sim::{Policy, RunConfig, Simulation};
 
     #[test]
     fn with_inputs_journals_input_steps_with_real_keys() {
         let workload = MiniKvWorkload.with_inputs(&[7, 8, 9]);
         let config = RunConfig::builder()
-            .seed([6; 32])
+            .seed(EntryHash([6; 32]))
             .policy(Policy::Random)
             .max_steps(256)
             .build();

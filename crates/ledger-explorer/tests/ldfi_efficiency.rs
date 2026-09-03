@@ -49,6 +49,8 @@ use ledger_explorer::Verdict;
 use ledger_explorer::reference::ReferenceReplayError;
 use ledger_explorer::reference::{CorpusScenario, corpus_scenarios};
 use ledger_explorer::search::Workload;
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{CanonicalValue, EntryPayload};
 use ledger_sim::{Instruction, RunConfig, RunResult, SeedTree, SimFault, Simulation};
 use rand_core::Rng;
@@ -76,14 +78,14 @@ const SPARSE_LEGS: [&str; 2] = [
 
 /// The find-phase seed derivation, shared by both sides so the attempt
 /// streams differ only in the fault draws.
-fn attempt_seed(base: [u8; 32], attempt: usize) -> [u8; 32] {
+fn attempt_seed(base: EntryHash, attempt: usize) -> EntryHash {
     let mut seed = base;
-    seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+    seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
     seed
 }
 
 /// Draw 0..=2 distinct faults from the declared space on one seeded stream.
-fn draw_faults_from(seed: [u8; 32], label: &str, space: &[SimFault]) -> Vec<SimFault> {
+fn draw_faults_from(seed: EntryHash, label: &str, space: &[SimFault]) -> Vec<SimFault> {
     let mut rng = SeedTree::new(seed).rng(label);
     let count = (rng.next_u64() as usize) % 3;
     let mut chosen: Vec<SimFault> = Vec::new();
@@ -99,7 +101,7 @@ fn draw_faults_from(seed: [u8; 32], label: &str, space: &[SimFault]) -> Vec<SimF
 }
 
 /// LDFI find-phase fault draw (the historical sampler).
-fn draw_faults(space: &[SimFault], base: [u8; 32], attempt: usize) -> Vec<SimFault> {
+fn draw_faults(space: &[SimFault], base: EntryHash, attempt: usize) -> Vec<SimFault> {
     draw_faults_from(base, &format!("efficiency-faults/{attempt}"), space)
 }
 
@@ -107,7 +109,7 @@ fn draw_faults(space: &[SimFault], base: [u8; 32], attempt: usize) -> Vec<SimFau
 /// every LDFI stream, same 0..=2 distribution over the same space.
 fn draw_random_baseline_faults(
     space: &[SimFault],
-    base: [u8; 32],
+    base: EntryHash,
     attempt: usize,
 ) -> Vec<SimFault> {
     draw_faults_from(base, &format!("efficiency-random-search/{attempt}"), space)
@@ -117,7 +119,7 @@ fn draw_random_baseline_faults(
 /// leg shares a control stream with another leg or with any LDFI stream.
 fn draw_control_schedule(
     space: &[SimFault],
-    base: [u8; 32],
+    base: EntryHash,
     leg: &str,
     attempt: usize,
 ) -> Vec<SimFault> {
@@ -144,7 +146,7 @@ enum Harness<'a> {
 }
 
 impl Harness<'_> {
-    fn execute(&self, seed: [u8; 32], faults: Vec<SimFault>) -> RunResult {
+    fn execute(&self, seed: EntryHash, faults: Vec<SimFault>) -> RunResult {
         match self {
             Harness::Corpus(scenario) => scenario
                 .run(seed, faults)
@@ -177,7 +179,7 @@ impl Harness<'_> {
     /// the schedule is not replayable; callers treat that as not reproduced.
     fn replay_faults(
         &self,
-        found_seed: [u8; 32],
+        found_seed: EntryHash,
         witness: &RunResult,
         schedule: Vec<SimFault>,
     ) -> Option<RunResult> {
@@ -239,18 +241,18 @@ impl Row {
 }
 
 /// A fault-draw sampler: (space, base seed, attempt) -> schedule.
-type FaultDraw = dyn Fn(&[SimFault], [u8; 32], usize) -> Vec<SimFault>;
+type FaultDraw = dyn Fn(&[SimFault], EntryHash, usize) -> Vec<SimFault>;
 
 /// Shared search loop for both the random baseline and LDFI phase 1: the
 /// identical seed derivation and fault-count distribution, each side on its
 /// OWN stream, so the two costs are independent draws of the same sampler.
 fn search_with_sampler(
     harness: &Harness,
-    base: [u8; 32],
+    base: EntryHash,
     space: &[SimFault],
     budget: usize,
     faults: &FaultDraw,
-) -> Option<(RunResult, Verdict, [u8; 32], usize)> {
+) -> Option<(RunResult, Verdict, EntryHash, usize)> {
     for attempt in 0..budget {
         let seed = attempt_seed(base, attempt);
         let schedule = faults(space, base, attempt);
@@ -268,7 +270,7 @@ fn search_with_sampler(
 /// spent; 0 with `None` verdict means no reproduction within budget.
 fn replay_until_reproduction(
     harness: &Harness,
-    found_seed: [u8; 32],
+    found_seed: EntryHash,
     witness: &RunResult,
     verdict: &Verdict,
     solver: &mut dyn ledger_explorer::solver::FaultSolver,
@@ -319,9 +321,9 @@ fn replay_until_reproduction(
 fn random_control_reproduce(
     harness: &Harness,
     name: &str,
-    base: [u8; 32],
+    base: EntryHash,
     space: &[SimFault],
-    found_seed: [u8; 32],
+    found_seed: EntryHash,
     witness: &RunResult,
 ) -> usize {
     for attempt in 0..RANDOM_CONTROL_BUDGET {
@@ -339,7 +341,7 @@ fn random_control_reproduce(
 fn measure(
     name: &str,
     harness: &Harness,
-    base: [u8; 32],
+    base: EntryHash,
     space: &[SimFault],
     search_budget: usize,
     solver: &mut dyn ledger_explorer::solver::FaultSolver,
@@ -603,9 +605,9 @@ fn outcome_value(journal: &ledger_journal::Journal) -> Option<u64> {
 fn probe_event_ids(
     workload: &dyn Workload,
     kind: ledger_format::EntryKind,
-) -> Vec<ledger_format::Hash> {
+) -> Vec<ledger_format::EntryHash> {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(ledger_sim::Policy::Random)
         .max_steps(4096)
         .build();
@@ -630,8 +632,8 @@ fn sparse_critical_send_fault_space() -> Vec<SimFault> {
         for dst in 0..tasks {
             if src != dst {
                 space.push(SimFault::Partition {
-                    src: src as u32,
-                    dst: dst as u32,
+                    src: ActorId(src as u32),
+                    dst: ActorId(dst as u32),
                 });
             }
         }
@@ -717,7 +719,7 @@ fn ldfi_efficiency_gate() {
         rows.push(measure(
             "synthetic-corrupt-torn-write",
             &harness,
-            [21; 32],
+            EntryHash([21; 32]),
             &space,
             SEARCH_BUDGET,
             &mut ledger_explorer::solver::HittingSetSolver::new(),
@@ -729,7 +731,10 @@ fn ldfi_efficiency_gate() {
         let workload = RelayStaleRead;
         let mut space: Vec<SimFault> = [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
             .iter()
-            .map(|&(src, dst)| SimFault::Partition { src, dst })
+            .map(|&(src, dst)| SimFault::Partition {
+                src: ActorId(src),
+                dst: ActorId(dst),
+            })
             .collect();
         for send in probe_event_ids(&workload, ledger_format::EntryKind::Send) {
             space.push(SimFault::Drop(send));
@@ -742,7 +747,7 @@ fn ldfi_efficiency_gate() {
         rows.push(measure(
             "synthetic-relay-stale-read",
             &harness,
-            [31; 32],
+            EntryHash([31; 32]),
             &space,
             SEARCH_BUDGET,
             &mut ledger_explorer::solver::HittingSetSolver::new(),
@@ -765,7 +770,7 @@ fn ldfi_efficiency_gate() {
         rows.push(measure(
             "synthetic-sparse-critical-send",
             &harness,
-            [41; 32],
+            EntryHash([41; 32]),
             &space,
             SPARSE_SEARCH_BUDGET,
             &mut ledger_explorer::solver::HittingSetSolver::new(),
@@ -791,7 +796,7 @@ fn ldfi_efficiency_gate() {
         rows.push(measure(
             "synthetic-sparse-torn-durable-write",
             &harness,
-            [51; 32],
+            EntryHash([51; 32]),
             &space,
             SPARSE_SEARCH_BUDGET,
             &mut ledger_explorer::solver::HittingSetSolver::with_horizon(2),

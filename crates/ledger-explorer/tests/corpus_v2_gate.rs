@@ -34,6 +34,7 @@ use ledger_explorer::reference::{
 };
 use ledger_explorer::services::qualify_cut;
 use ledger_explorer::solver::HittingSetSolver;
+use ledger_format::EntryHash;
 use ledger_format::RunManifest;
 use std::collections::HashSet;
 use std::fs;
@@ -136,7 +137,7 @@ fn qualify_scenario(
         &report,
         "corpus-v2-faultdep",
         Vec::new(),
-        [9u8; 32],
+        EntryHash([9u8; 32]),
         None,
     )
     .unwrap_or_else(|error| panic!("{name}: certificate construction failed: {error}"));

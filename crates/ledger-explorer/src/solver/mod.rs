@@ -30,7 +30,7 @@ pub use hitting_set::{
 };
 pub use maxsat::MaxSatSolver;
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use std::collections::BTreeSet;
 
 use crate::ldfi::FaultableEvent;
@@ -38,12 +38,12 @@ use crate::ldfi::FaultableEvent;
 /// Compute minimal hitting sets over derivation paths.
 ///
 /// Deterministic: sorts inputs and prunes supersets.
-fn compute_minimal_hitting_sets(paths: &[Vec<FaultableEvent>]) -> Vec<BTreeSet<Hash>> {
-    let mut candidate_sets: Vec<BTreeSet<Hash>> = vec![BTreeSet::new()];
+fn compute_minimal_hitting_sets(paths: &[Vec<FaultableEvent>]) -> Vec<BTreeSet<EntryHash>> {
+    let mut candidate_sets: Vec<BTreeSet<EntryHash>> = vec![BTreeSet::new()];
 
     for path in paths {
-        let path_hashes: BTreeSet<Hash> = path.iter().map(|event| event.event).collect();
-        let mut next_candidates: Vec<BTreeSet<Hash>> = Vec::new();
+        let path_hashes: BTreeSet<EntryHash> = path.iter().map(|event| event.event).collect();
+        let mut next_candidates: Vec<BTreeSet<EntryHash>> = Vec::new();
 
         for current in candidate_sets {
             if current.iter().any(|hash| path_hashes.contains(hash)) {
@@ -63,13 +63,13 @@ fn compute_minimal_hitting_sets(paths: &[Vec<FaultableEvent>]) -> Vec<BTreeSet<H
     candidate_sets
 }
 
-fn prune_supersets(mut sets: Vec<BTreeSet<Hash>>) -> Vec<BTreeSet<Hash>> {
+fn prune_supersets(mut sets: Vec<BTreeSet<EntryHash>>) -> Vec<BTreeSet<EntryHash>> {
     // Deduplicate and order by size so smaller sets prune larger supersets early.
     sets.sort();
     sets.dedup();
     sets.sort_by_key(|set| set.len());
 
-    let mut minimal: Vec<BTreeSet<Hash>> = Vec::new();
+    let mut minimal: Vec<BTreeSet<EntryHash>> = Vec::new();
     for set in sets {
         if minimal.iter().any(|existing| existing.is_subset(&set)) {
             continue;

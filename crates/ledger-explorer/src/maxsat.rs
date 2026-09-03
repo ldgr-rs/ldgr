@@ -3,18 +3,18 @@
 //! Self-contained deterministic branch-and-bound; CaDiCaL wired via solver-cadical feature.
 use crate::oracle::Verdict;
 use crate::solver::{SolverConfig, SolverError, event_fault_cost, is_faultable};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::{Journal, JournalError};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CardinalityBound {
-    pub literals: Vec<Hash>,
+    pub literals: Vec<EntryHash>,
     pub max_true: usize,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HazardEncoding {
-    pub hard: Vec<Vec<Hash>>,
-    pub soft: Vec<(Vec<Hash>, u64)>,
+    pub hard: Vec<Vec<EntryHash>>,
+    pub soft: Vec<(Vec<EntryHash>, u64)>,
     pub cardinality: Option<CardinalityBound>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub struct LowerBoundProof {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaxSatSolution {
-    pub cut: Vec<Hash>,
+    pub cut: Vec<EntryHash>,
     pub total_cost: u64,
     pub lower_bound_proof: LowerBoundProof,
 }
@@ -32,9 +32,9 @@ pub struct MaxSatSolution {
 pub const LOWER_BOUND_METHOD: &str = "mcs-lower-bound-v1";
 fn collect_memo(
     journal: &Journal,
-    cur: Hash,
-    memo: &mut BTreeMap<Hash, Vec<Vec<Hash>>>,
-) -> Vec<Vec<Hash>> {
+    cur: EntryHash,
+    memo: &mut BTreeMap<EntryHash, Vec<Vec<EntryHash>>>,
+) -> Vec<Vec<EntryHash>> {
     if let Some(cached) = memo.get(&cur) {
         return cached.clone();
     }
@@ -42,7 +42,7 @@ fn collect_memo(
         return Vec::new();
     };
     let faultable = is_faultable(entry.data.kind);
-    let mut paths: Vec<Vec<Hash>> = Vec::new();
+    let mut paths: Vec<Vec<EntryHash>> = Vec::new();
     if entry.data.parents.is_empty() {
         if faultable {
             paths.push(vec![cur]);
@@ -66,12 +66,14 @@ fn collect_memo(
 
 fn collect_bounded_memo(
     journal: &Journal,
-    cur: Hash,
+    cur: EntryHash,
     depth: usize,
     limit: usize,
-    memo: &mut BTreeMap<(Hash, usize), Vec<Vec<Hash>>>,
-) -> Vec<Vec<Hash>> {
+    memo: &mut BTreeMap<(EntryHash, usize), Vec<Vec<EntryHash>>>,
+    truncated: &mut bool,
+) -> Vec<Vec<EntryHash>> {
     if depth > limit {
+        *truncated = true;
         return vec![Vec::new()];
     }
     if let Some(cached) = memo.get(&(cur, depth)) {
@@ -81,7 +83,7 @@ fn collect_bounded_memo(
         return Vec::new();
     };
     let faultable = is_faultable(entry.data.kind);
-    let mut paths: Vec<Vec<Hash>> = Vec::new();
+    let mut paths: Vec<Vec<EntryHash>> = Vec::new();
     if entry.data.parents.is_empty() {
         if faultable {
             paths.push(vec![cur]);
@@ -90,7 +92,7 @@ fn collect_bounded_memo(
         }
     } else {
         for p in &entry.data.parents {
-            for sub in collect_bounded_memo(journal, *p, depth + 1, limit, memo) {
+            for sub in collect_bounded_memo(journal, *p, depth + 1, limit, memo, truncated) {
                 let mut path = sub;
                 if faultable {
                     path.push(cur);
@@ -113,12 +115,13 @@ pub fn encode_hazard(
             return Err(SolverError::Journal(JournalError::MissingParent(*w)));
         }
     }
-    let mut all: Vec<Vec<Hash>> = Vec::new();
+    let mut all: Vec<Vec<EntryHash>> = Vec::new();
     let mut memo = BTreeMap::new();
     let mut bounded_memo = BTreeMap::new();
+    let mut truncated = false;
     for w in &verdict.witnesses {
         if let Some(l) = config.max_horizon {
-            for p in collect_bounded_memo(journal, *w, 0, l, &mut bounded_memo) {
+            for p in collect_bounded_memo(journal, *w, 0, l, &mut bounded_memo, &mut truncated) {
                 if !p.is_empty() {
                     all.push(p);
                 }
@@ -131,33 +134,35 @@ pub fn encode_hazard(
             }
         }
     }
-    if all.is_empty() && !verdict.witnesses.is_empty() {
-        let mut fb: Vec<(Hash, u64)> = Vec::new();
-        for e in journal.entries() {
-            if is_faultable(e.data.kind) {
-                fb.push((e.id, event_fault_cost(journal, &e.id)));
-            }
-        }
-        if let Some((id, _)) = fb.iter().max_by_key(|(_, c)| *c) {
-            all.push(vec![*id]);
-        }
+    // Typed hazard walk over explicit support semantics. Each parent-derived
+    // path becomes one `AllOf` branch under a single `AnyOf`, so alternative
+    // groups stay separate and never flatten into one clause. A horizon cut
+    // joins an `Opaque` branch and forces `is_strong` to false.
+    let support =
+        crate::support::support_from_paths(&all, truncated && config.max_horizon.is_some());
+    let support_clauses = crate::support::hard_clauses_from_support(&support);
+    if support_clauses.is_empty() && !verdict.witnesses.is_empty() {
+        return Err(SolverError::EmptyProvenance);
     }
-    let mut hard: Vec<Vec<Hash>> = Vec::new();
-    for p in &all {
-        let s: BTreeSet<Hash> = p.iter().copied().collect();
+    let mut hard: Vec<Vec<EntryHash>> = Vec::new();
+    for p in &support_clauses {
+        let s: BTreeSet<EntryHash> = p.iter().copied().collect();
         if !s.is_empty() {
             hard.push(s.into_iter().collect());
         }
     }
+    if hard.is_empty() && !verdict.witnesses.is_empty() {
+        return Err(SolverError::EmptyProvenance);
+    }
     hard.sort();
     hard.dedup();
-    let mut distinct: BTreeSet<Hash> = BTreeSet::new();
+    let mut distinct: BTreeSet<EntryHash> = BTreeSet::new();
     for c in &hard {
         for h in c {
             distinct.insert(*h);
         }
     }
-    let mut soft: Vec<(Vec<Hash>, u64)> = Vec::new();
+    let mut soft: Vec<(Vec<EntryHash>, u64)> = Vec::new();
     for h in distinct.iter() {
         soft.push((vec![*h], event_fault_cost(journal, h)));
     }
@@ -172,13 +177,72 @@ pub fn encode_hazard(
         cardinality,
     })
 }
-pub(crate) fn clause_min_cost(c: &[Hash], w: &BTreeMap<Hash, u64>) -> u64 {
+
+/// Encode a hazard from an explicit support expression, preserving groups.
+///
+/// Each `AllOf` becomes one hard clause; each `AnyOf` branch contributes its
+/// own clauses without flattening into a single clause. Only faultable
+/// entries present in `journal` are kept; an expression with no surviving
+/// clause fails closed with [`SolverError::EmptyProvenance`]. `Opaque`
+/// support never backs a strong claim and yields no clause.
+pub fn encode_hazard_with_support(
+    journal: &Journal,
+    verdict: &Verdict,
+    config: &SolverConfig,
+    support: &crate::support::SupportExpr,
+) -> Result<HazardEncoding, SolverError> {
+    for w in &verdict.witnesses {
+        if journal.get(w).is_none() {
+            return Err(SolverError::Journal(JournalError::MissingParent(*w)));
+        }
+    }
+    let mut hard: Vec<Vec<EntryHash>> = Vec::new();
+    for mut clause in crate::support::hard_clauses_from_support(support) {
+        clause.retain(|h| journal.get(h).is_some_and(|e| is_faultable(e.data.kind)));
+        if clause.is_empty() {
+            continue;
+        }
+        clause.sort();
+        hard.push(clause);
+    }
+    hard.sort();
+    hard.dedup();
+    if hard.is_empty() && !verdict.witnesses.is_empty() {
+        return Err(SolverError::EmptyProvenance);
+    }
+    // A violated verdict with no witnesses names no provenance to cut, even
+    // under an explicit support model that names nothing present.
+    if hard.is_empty() && verdict.violated {
+        return Err(SolverError::EmptyProvenance);
+    }
+    let mut distinct: BTreeSet<EntryHash> = BTreeSet::new();
+    for c in &hard {
+        for h in c {
+            distinct.insert(*h);
+        }
+    }
+    let mut soft: Vec<(Vec<EntryHash>, u64)> = Vec::new();
+    for h in distinct.iter() {
+        soft.push((vec![*h], event_fault_cost(journal, h)));
+    }
+    soft.sort_by(|a, b| a.0.cmp(&b.0));
+    let cardinality = config.max_faults.map(|lim| CardinalityBound {
+        literals: distinct.into_iter().collect(),
+        max_true: lim,
+    });
+    Ok(HazardEncoding {
+        hard,
+        soft,
+        cardinality,
+    })
+}
+pub(crate) fn clause_min_cost(c: &[EntryHash], w: &BTreeMap<EntryHash, u64>) -> u64 {
     c.iter()
         .filter_map(|h| w.get(h).copied())
         .min()
         .unwrap_or(1)
 }
-pub(crate) fn disjoint_lower(hard: &[Vec<Hash>], w: &BTreeMap<Hash, u64>) -> u64 {
+pub(crate) fn disjoint_lower(hard: &[Vec<EntryHash>], w: &BTreeMap<EntryHash, u64>) -> u64 {
     let mut s = hard.to_vec();
     s.sort_by(|a, b| {
         clause_min_cost(a, w)
@@ -215,6 +279,26 @@ pub fn solve_maxsat(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverError>
     }
 }
 
+/// Deterministic clause-count budget for the branch-and-bound search.
+///
+/// Bounds the number of hard clauses the exact search will attempt. Larger
+/// encodings fail closed with [`SolverError::BudgetExhausted`] instead of
+/// walking an exponential space. Deterministic: counts clauses, never time.
+/// Sized at 2M so the Stage-2 scaling gate (10^6 clauses on the fan-in
+/// closure, where the greedy incumbent keeps the search linear) passes in
+/// every profile; genuinely exponential shapes still fail closed.
+pub const MAXSAT_BNB_MAX_CLAUSES: usize = 2_000_000;
+/// Deterministic cost-unit budget for the branch-and-bound search.
+///
+/// Bounds the sum of soft weights (total unit copies) the exact search will
+/// attempt. Larger cost spaces fail closed. Deterministic: sums weights.
+pub const MAXSAT_BNB_MAX_COST_UNITS: u64 = 10_000_000;
+/// Deterministic node budget for the branch-and-bound DFS.
+///
+/// Bounds the number of DFS node visits. Exhaustion fails closed with
+/// [`SolverError::BudgetExhausted`]. No wall-clock timeout is used.
+pub const MAXSAT_BNB_MAX_NODES: usize = 10_000_000;
+
 /// Pure-Rust deterministic branch-and-bound engine, compiled in every build.
 ///
 /// Exists so runtime routing (`crate::solver::select_solver`) and the
@@ -222,6 +306,25 @@ pub fn solve_maxsat(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverError>
 /// feature is on. Deterministic: sorted clause and literal orders fix the
 /// search order, so the same encoding yields byte-identical solutions.
 pub fn solve_maxsat_bnb(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverError> {
+    solve_maxsat_bnb_with_budget(
+        enc,
+        MAXSAT_BNB_MAX_CLAUSES,
+        MAXSAT_BNB_MAX_COST_UNITS,
+        MAXSAT_BNB_MAX_NODES,
+    )
+}
+
+/// Branch-and-bound with explicit deterministic budgets.
+///
+/// `max_clauses` bounds the hard-clause count, `max_cost_units` bounds the
+/// summed soft weights, and `max_nodes` bounds DFS node visits. Any breach
+/// fails closed with [`SolverError::BudgetExhausted`].
+pub fn solve_maxsat_bnb_with_budget(
+    enc: &HazardEncoding,
+    max_clauses: usize,
+    max_cost_units: u64,
+    max_nodes: usize,
+) -> Result<MaxSatSolution, SolverError> {
     if enc.hard.is_empty() {
         return Ok(MaxSatSolution {
             cut: Vec::new(),
@@ -232,17 +335,26 @@ pub fn solve_maxsat_bnb(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverEr
             },
         });
     }
-    let mut weights: BTreeMap<Hash, u64> = BTreeMap::new();
+    if enc.hard.len() > max_clauses {
+        return Err(SolverError::BudgetExhausted(
+            "hard clause count exceeds budget",
+        ));
+    }
+    let mut weights: BTreeMap<EntryHash, u64> = BTreeMap::new();
     for (lits, w) in &enc.soft {
         for h in lits {
             weights.insert(*h, *w);
         }
     }
-    let mut hard_sets: Vec<BTreeSet<Hash>> = enc
+    let total_cost_units: u64 = weights.values().copied().sum();
+    if total_cost_units > max_cost_units {
+        return Err(SolverError::BudgetExhausted("cost units exceed budget"));
+    }
+    let mut hard_sets: Vec<BTreeSet<EntryHash>> = enc
         .hard
         .iter()
         .map(|c| c.iter().copied().collect())
-        .filter(|s: &BTreeSet<Hash>| !s.is_empty())
+        .filter(|s: &BTreeSet<EntryHash>| !s.is_empty())
         .collect();
     hard_sets.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
     let mut best_cut = BTreeSet::new();
@@ -259,12 +371,14 @@ pub fn solve_maxsat_bnb(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverEr
         cardinality: enc.cardinality.as_ref(),
         best_cut,
         best_cost,
+        nodes_visited: 0,
+        max_nodes,
     };
-    state.dfs(&mut cur, 0, 0);
+    state.dfs(&mut cur, 0, 0)?;
     if state.best_cost == u64::MAX {
         return Err(SolverError::Unsupported);
     }
-    let cut: Vec<Hash> = state.best_cut.into_iter().collect();
+    let cut: Vec<EntryHash> = state.best_cut.into_iter().collect();
     let lower = disjoint_lower(&enc.hard, &weights).min(state.best_cost);
     Ok(MaxSatSolution {
         cut,
@@ -285,22 +399,22 @@ pub fn solve_maxsat_bnb(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverEr
 /// exponential literal chain. The incumbent never worsens the result: the
 /// DFS still runs and only improves on it.
 fn greedy_incumbent(
-    hard: &[BTreeSet<Hash>],
-    weights: &BTreeMap<Hash, u64>,
-    best_cut: &mut BTreeSet<Hash>,
+    hard: &[BTreeSet<EntryHash>],
+    weights: &BTreeMap<EntryHash, u64>,
+    best_cut: &mut BTreeSet<EntryHash>,
     best_cost: &mut u64,
 ) {
-    let mut uncovered: Vec<&BTreeSet<Hash>> = hard.iter().collect();
+    let mut uncovered: Vec<&BTreeSet<EntryHash>> = hard.iter().collect();
     let mut chosen = BTreeSet::new();
     let mut cost = 0u64;
     while !uncovered.is_empty() {
-        let mut coverage: BTreeMap<Hash, usize> = BTreeMap::new();
+        let mut coverage: BTreeMap<EntryHash, usize> = BTreeMap::new();
         for clause in &uncovered {
             for literal in clause.iter() {
                 *coverage.entry(*literal).or_default() += 1;
             }
         }
-        let weight_of = |h: &Hash| weights.get(h).copied().unwrap_or(1).max(1);
+        let weight_of = |h: &EntryHash| weights.get(h).copied().unwrap_or(1).max(1);
         let Some((literal, _)) = coverage.into_iter().min_by(|a, b| {
             b.1.cmp(&a.1)
                 .then(weight_of(&a.0).cmp(&weight_of(&b.0)))
@@ -322,22 +436,33 @@ fn greedy_incumbent(
 }
 
 struct SearchState<'a> {
-    hard: &'a [BTreeSet<Hash>],
-    weights: &'a BTreeMap<Hash, u64>,
+    hard: &'a [BTreeSet<EntryHash>],
+    weights: &'a BTreeMap<EntryHash, u64>,
     cardinality: Option<&'a CardinalityBound>,
-    best_cut: BTreeSet<Hash>,
+    best_cut: BTreeSet<EntryHash>,
     best_cost: u64,
+    nodes_visited: usize,
+    max_nodes: usize,
 }
 
 impl<'a> SearchState<'a> {
-    fn dfs(&mut self, cur: &mut BTreeSet<Hash>, cur_cost: u64, start_clause: usize) {
+    fn dfs(
+        &mut self,
+        cur: &mut BTreeSet<EntryHash>,
+        cur_cost: u64,
+        start_clause: usize,
+    ) -> Result<(), SolverError> {
+        self.nodes_visited = self.nodes_visited.saturating_add(1);
+        if self.nodes_visited > self.max_nodes {
+            return Err(SolverError::BudgetExhausted("branch-and-bound node budget"));
+        }
         if cur_cost >= self.best_cost {
-            return;
+            return Ok(());
         }
         if let Some(b) = self.cardinality
             && cur.len() > b.max_true
         {
-            return;
+            return Ok(());
         }
         let uncovered = self
             .hard
@@ -350,9 +475,9 @@ impl<'a> SearchState<'a> {
                 self.best_cost = cur_cost;
                 self.best_cut = cur.clone();
             }
-            return;
+            return Ok(());
         };
-        let mut lits: Vec<(Hash, u64)> = clause
+        let mut lits: Vec<(EntryHash, u64)> = clause
             .iter()
             .map(|h| (*h, self.weights.get(h).copied().unwrap_or(1)))
             .collect();
@@ -366,19 +491,21 @@ impl<'a> SearchState<'a> {
                 continue;
             }
             cur.insert(h);
-            self.dfs(cur, nxt, clause_idx + 1);
+            self.dfs(cur, nxt, clause_idx + 1)?;
             cur.remove(&h);
         }
+        Ok(())
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::solver::{FaultSolver, HittingSetSolver, SolverConfig};
+    use ledger_format::ActorId;
     use ledger_format::EntryKind;
     use ledger_format::{CanonicalValue, EntryPayload};
     use ledger_journal::Journal;
-    fn cost_of(j: &Journal, hs: &[Hash]) -> u64 {
+    fn cost_of(j: &Journal, hs: &[EntryHash]) -> u64 {
         hs.iter().map(|h| event_fault_cost(j, h)).sum()
     }
     #[test]
@@ -387,12 +514,12 @@ mod tests {
         let a = j
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -400,12 +527,12 @@ mod tests {
         let b = j
             .append(
                 EntryKind::Send,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 2,
-                    to: 3,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(2),
+                    to: ActorId(3),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -413,10 +540,10 @@ mod tests {
         let w = j
             .append(
                 EntryKind::Outcome,
-                3,
+                ActorId(3),
                 [a, b],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -424,9 +551,9 @@ mod tests {
         let v = Verdict::fail(vec![w], "two supports");
         let e = encode_hazard(&j, &v, &SolverConfig::default()).unwrap();
         assert_eq!(e.hard.len(), 2);
-        let d: BTreeSet<Hash> = e.hard.iter().flat_map(|c| c.iter().copied()).collect();
+        let d: BTreeSet<EntryHash> = e.hard.iter().flat_map(|c| c.iter().copied()).collect();
         assert!(d.contains(&a) && d.contains(&b));
-        let s: BTreeSet<Hash> = e.soft.iter().flat_map(|(l, _)| l.iter().copied()).collect();
+        let s: BTreeSet<EntryHash> = e.soft.iter().flat_map(|(l, _)| l.iter().copied()).collect();
         assert_eq!(s, d);
         for (l, wt) in &e.soft {
             assert_eq!(l.len(), 1);
@@ -439,12 +566,12 @@ mod tests {
         let shared = j
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 99u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -452,12 +579,12 @@ mod tests {
         let ba = j
             .append(
                 EntryKind::Recv,
-                2,
+                ActorId(2),
                 [shared],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     observed_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -465,12 +592,12 @@ mod tests {
         let bb = j
             .append(
                 EntryKind::Recv,
-                3,
+                ActorId(3),
                 [shared],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(3, 0),
-                    from: 1,
-                    to: 3,
+                    message_id: ledger_format::MessageId::new(ActorId(3), 0),
+                    from: ActorId(1),
+                    to: ActorId(3),
                     observed_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -478,10 +605,10 @@ mod tests {
         let w = j
             .append(
                 EntryKind::Outcome,
-                4,
+                ActorId(4),
                 [ba, bb],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -495,7 +622,7 @@ mod tests {
         assert_eq!(sol.total_cost, brute);
         assert_eq!(cost_of(&j, &sol.cut), sol.total_cost);
         for elem in sol.cut.clone() {
-            let sub: Vec<Hash> = sol.cut.iter().copied().filter(|h| *h != elem).collect();
+            let sub: Vec<EntryHash> = sol.cut.iter().copied().filter(|h| *h != elem).collect();
             assert!(
                 !e.hard.iter().all(|c| c.iter().any(|h| sub.contains(h))),
                 "cut must be minimal"
@@ -508,12 +635,12 @@ mod tests {
         let a = j
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -521,12 +648,12 @@ mod tests {
         let b = j
             .append(
                 EntryKind::Send,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 2,
-                    to: 3,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(2),
+                    to: ActorId(3),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -534,10 +661,10 @@ mod tests {
         let w = j
             .append(
                 EntryKind::Outcome,
-                3,
+                ActorId(3),
                 [a, b],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -552,12 +679,12 @@ mod tests {
         let shared = j2
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 99u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -565,12 +692,12 @@ mod tests {
         let ba = j2
             .append(
                 EntryKind::Recv,
-                2,
+                ActorId(2),
                 [shared],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     observed_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -578,12 +705,12 @@ mod tests {
         let bb = j2
             .append(
                 EntryKind::Recv,
-                3,
+                ActorId(3),
                 [shared],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(3, 0),
-                    from: 1,
-                    to: 3,
+                    message_id: ledger_format::MessageId::new(ActorId(3), 0),
+                    from: ActorId(1),
+                    to: ActorId(3),
                     observed_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -591,10 +718,10 @@ mod tests {
         let w2 = j2
             .append(
                 EntryKind::Outcome,
-                4,
+                ActorId(4),
                 [ba, bb],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -610,12 +737,12 @@ mod tests {
         let s1 = j
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -623,12 +750,12 @@ mod tests {
         let s2 = j
             .append(
                 EntryKind::Send,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 2,
-                    to: 3,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(2),
+                    to: ActorId(3),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -636,10 +763,10 @@ mod tests {
         let w = j
             .append(
                 EntryKind::Outcome,
-                3,
+                ActorId(3),
                 [s1, s2],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -653,12 +780,100 @@ mod tests {
         assert_eq!(sol1, sol2);
         let mut b1 = Vec::new();
         for h in &sol1.cut {
-            b1.extend_from_slice(h);
+            b1.extend_from_slice(&h.0);
         }
         let mut b2 = Vec::new();
         for h in &sol2.cut {
-            b2.extend_from_slice(h);
+            b2.extend_from_slice(&h.0);
         }
         assert_eq!(b1, b2);
+    }
+    #[test]
+    fn empty_provenance_fails_closed_without_fallback() {
+        let mut j = Journal::new();
+        for value in 0..2u64 {
+            j.append(
+                EntryKind::Send,
+                ActorId(1),
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
+                    original_content: value.to_le_bytes().to_vec(),
+                }),
+            )
+            .unwrap();
+        }
+        let witness = j
+            .append(
+                EntryKind::Outcome,
+                ActorId(2),
+                [],
+                EntryPayload::Outcome(ledger_format::OutcomePayload {
+                    schema: EntryHash([0x00; 32]),
+                    value: CanonicalValue::Unsigned(0),
+                }),
+            )
+            .unwrap();
+        let v = Verdict::fail(vec![witness], "no provenance");
+        let error = encode_hazard(&j, &v, &SolverConfig::default()).expect_err("encode must fail");
+        assert_eq!(error, SolverError::EmptyProvenance);
+    }
+    #[test]
+    fn support_alternative_groups_stay_separate() {
+        use crate::support::{SupportExpr, hard_clauses_from_support};
+        let a = EntryHash([0xA0; 32]);
+        let b = EntryHash([0xB0; 32]);
+        let c = EntryHash([0xC0; 32]);
+        let d = EntryHash([0xD0; 32]);
+        let branch_a = SupportExpr::all_of([a, b].into_iter().collect()).unwrap();
+        let branch_b = SupportExpr::all_of([c, d].into_iter().collect()).unwrap();
+        let any = SupportExpr::any_of(vec![branch_a, branch_b]).unwrap();
+        assert!(any.is_strong());
+        let clauses = hard_clauses_from_support(&any);
+        assert_eq!(clauses.len(), 2, "AnyOf branches must not flatten");
+        assert!(clauses.contains(&vec![a, b]));
+        assert!(clauses.contains(&vec![c, d]));
+        let with_opaque = SupportExpr::any_of(vec![
+            SupportExpr::all_of([a].into_iter().collect()).unwrap(),
+            SupportExpr::Opaque,
+        ])
+        .unwrap();
+        assert!(!with_opaque.is_strong());
+    }
+    #[test]
+    fn solve_budget_exhaustion_fails_closed() {
+        // Deterministic budgets count clauses, cost units, and DFS nodes,
+        // never wall-clock time. Each breach fails with `BudgetExhausted`.
+        let encoding = HazardEncoding {
+            hard: vec![vec![EntryHash([1u8; 32])], vec![EntryHash([2u8; 32])]],
+            soft: vec![
+                (vec![EntryHash([1u8; 32])], 2),
+                (vec![EntryHash([2u8; 32])], 2),
+            ],
+            cardinality: None,
+        };
+        let clause_error = solve_maxsat_bnb_with_budget(&encoding, 1, 1_000_000, 1_000_000)
+            .expect_err("clause budget must fail");
+        assert_eq!(
+            clause_error,
+            SolverError::BudgetExhausted("hard clause count exceeds budget")
+        );
+        let cost_error = solve_maxsat_bnb_with_budget(&encoding, 4096, 1, 1_000_000)
+            .expect_err("cost budget must fail");
+        assert_eq!(
+            cost_error,
+            SolverError::BudgetExhausted("cost units exceed budget")
+        );
+        let node_error = solve_maxsat_bnb_with_budget(&encoding, 4096, 1_000_000, 0)
+            .expect_err("node budget must fail");
+        assert_eq!(
+            node_error,
+            SolverError::BudgetExhausted("branch-and-bound node budget")
+        );
+        // Generous budgets still solve deterministically.
+        let ok = solve_maxsat_bnb_with_budget(&encoding, 4096, 1_000_000, 1_000_000).unwrap();
+        assert_eq!(ok.total_cost, 4);
     }
 }

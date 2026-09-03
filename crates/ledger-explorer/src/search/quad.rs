@@ -6,7 +6,7 @@ use super::{
 use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
 use crate::oracle::Oracle;
 use crate::pbt::EnergyDistribution;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, SeedTree, SimFault, Simulation};
 use std::collections::HashSet;
 
@@ -47,7 +47,9 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
     mutation: &QuadMutation,
     attempts: usize,
 ) -> Result<CampaignReport, SearchError> {
-    let mut distinct_roots: HashSet<Hash> = HashSet::new();
+    // Explicit per-campaign clause cache scope; see `run_campaign`.
+    let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
+    let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
     let base_seed = base.seed();
@@ -60,7 +62,7 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
 
     for attempt in 0..attempts {
         let mut seed = base.seed();
-        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let mut config = base.clone().with_seed(seed);
 
         if mutation.policies.is_empty() {
@@ -68,7 +70,7 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
         } else {
             let digest = SeedTree::new(base_seed).derive(&format!("quad-policy/{attempt}"));
             let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&digest[..8]);
+            bytes.copy_from_slice(&digest.0[..8]);
             let draw = u64::from_le_bytes(bytes) as usize;
             config = config.with_policy(mutation.policies[draw % mutation.policies.len()]);
         }
@@ -114,6 +116,7 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
             config.fault_schedule(),
             input_hash,
             None,
+            Some(config.seed()),
         );
         if let Some(entry) = memo.get(&key) {
             distinct_roots.insert(entry.journal_root);
@@ -168,14 +171,16 @@ pub fn run_swarm_campaign<W: Workload, O: Oracle>(
     base: RunConfig,
     attempts: usize,
 ) -> Result<CampaignReport, SearchError> {
-    let mut distinct_roots: HashSet<Hash> = HashSet::new();
+    // Explicit per-campaign clause cache scope; see `run_campaign`.
+    let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
+    let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
     let base_seed = base.seed();
 
     for attempt in 0..attempts {
         let mut seed = base.seed();
-        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let swarm = draw_swarm(
             base_seed,
             &format!("swarm/{attempt}"),

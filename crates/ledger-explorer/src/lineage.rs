@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::Journal;
 
 use crate::solver::SolverConfig;
@@ -21,13 +21,13 @@ use crate::solver_state::fingerprint;
 #[derive(Debug, Clone)]
 pub struct LineageIndex {
     /// Causal closure (all entries visited up to horizon) or faultable union.
-    pub closure: BTreeSet<Hash>,
+    pub closure: BTreeSet<EntryHash>,
     /// Derivation paths as faultable hash sequences.
-    pub paths: Vec<Vec<Hash>>,
+    pub paths: Vec<Vec<EntryHash>>,
     /// Journal length at last build/refresh.
     pub journal_len_at_build: usize,
     /// Fingerprint of the solver configuration at last build.
-    pub config_fingerprint: Hash,
+    pub config_fingerprint: EntryHash,
     /// Entries visited by the last build or refresh walk. This is the
     /// intended-work measure: a differential refresh walks only witnesses
     /// absent from the cached closure, so this stays small relative to the
@@ -35,16 +35,19 @@ pub struct LineageIndex {
     pub walked_entries: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_bounded_hash(
     journal: &Journal,
-    current: Hash,
+    current: EntryHash,
     depth: usize,
     max_depth: usize,
-    current_path: &mut Vec<Hash>,
-    paths: &mut Vec<Vec<Hash>>,
-    closure: &mut BTreeSet<Hash>,
+    current_path: &mut Vec<EntryHash>,
+    paths: &mut Vec<Vec<EntryHash>>,
+    closure: &mut BTreeSet<EntryHash>,
+    truncated: &mut bool,
 ) {
     if depth > max_depth {
+        *truncated = true;
         if !current_path.is_empty() {
             paths.push(current_path.clone());
         }
@@ -74,6 +77,7 @@ fn collect_bounded_hash(
                 current_path,
                 paths,
                 closure,
+                truncated,
             );
         }
     }
@@ -84,10 +88,10 @@ fn collect_bounded_hash(
 
 fn collect_hash(
     journal: &Journal,
-    current: Hash,
-    current_path: &mut Vec<Hash>,
-    paths: &mut Vec<Vec<Hash>>,
-    closure: &mut BTreeSet<Hash>,
+    current: EntryHash,
+    current_path: &mut Vec<EntryHash>,
+    paths: &mut Vec<Vec<EntryHash>>,
+    closure: &mut BTreeSet<EntryHash>,
 ) {
     let Some(entry) = journal.get(&current) else {
         return;
@@ -115,12 +119,13 @@ fn collect_hash(
 
 fn collect_lineage(
     journal: &Journal,
-    witnesses: &[Hash],
+    witnesses: &[EntryHash],
     config: &SolverConfig,
     walked: &mut usize,
-) -> (BTreeSet<Hash>, Vec<Vec<Hash>>) {
+) -> (BTreeSet<EntryHash>, Vec<Vec<EntryHash>>) {
     let mut closure = BTreeSet::new();
-    let mut paths = Vec::new();
+    let mut raw_paths = Vec::new();
+    let mut truncated = false;
     for witness in witnesses {
         let mut current_path = Vec::new();
         if let Some(h) = config.max_horizon {
@@ -130,21 +135,51 @@ fn collect_lineage(
                 0,
                 h,
                 &mut current_path,
-                &mut paths,
+                &mut raw_paths,
                 &mut closure,
+                &mut truncated,
             );
         } else {
             collect_hash(
                 journal,
                 *witness,
                 &mut current_path,
-                &mut paths,
+                &mut raw_paths,
                 &mut closure,
             );
         }
     }
     *walked = closure.len();
-    paths.sort();
+    // Typed hazard walk over explicit support semantics. Each raw parent path
+    // becomes one `AllOf` branch under a single `AnyOf`; a horizon cut joins
+    // an `Opaque` branch. The hard-clause walk then preserves every
+    // alternative group instead of flattening them into one clause.
+    let bounded_cut = truncated && config.max_horizon.is_some();
+    let support = crate::support::support_from_paths(&raw_paths, bounded_cut);
+    let mut paths = crate::support::hard_clauses_from_support(&support);
+    // An `Opaque`-only support yields no clause: the bounded walk proved
+    // nothing, so the caller fails closed with `EmptyProvenance` instead of
+    // ranking an unrelated event.
+    if paths.is_empty() {
+        raw_paths.sort();
+        raw_paths.dedup();
+        let mut filtered: Vec<Vec<EntryHash>> = Vec::new();
+        for p in &raw_paths {
+            let s: BTreeSet<EntryHash> = p.iter().copied().collect();
+            if !s.is_empty() {
+                filtered.push(s.into_iter().collect());
+            }
+        }
+        filtered.sort();
+        filtered.dedup();
+        paths = filtered;
+    } else {
+        for clause in &mut paths {
+            clause.sort();
+        }
+        paths.sort();
+        paths.dedup();
+    }
     (closure, paths)
 }
 
@@ -156,12 +191,54 @@ impl LineageIndex {
     /// solver's cache keys use.
     pub fn build(
         journal: &Journal,
-        witnesses: &[Hash],
+        witnesses: &[EntryHash],
         config: &SolverConfig,
         resolved_engine: SolverEngine,
     ) -> Self {
         let mut walked = 0usize;
         let (closure, paths) = collect_lineage(journal, witnesses, config, &mut walked);
+        Self {
+            closure,
+            paths,
+            journal_len_at_build: journal.len(),
+            config_fingerprint: fingerprint(config, resolved_engine),
+            walked_entries: walked,
+        }
+    }
+
+    /// Build lineage directly from an explicit support expression.
+    ///
+    /// Each `AllOf` becomes one path; each `AnyOf` branch stays separate so
+    /// alternative groups never flatten. Only faultable entries present in
+    /// `journal` are kept. The closure joins the witnesses and the surviving
+    /// support ids in deterministic `BTreeSet` order.
+    pub fn build_with_support(
+        journal: &Journal,
+        witnesses: &[EntryHash],
+        config: &SolverConfig,
+        resolved_engine: SolverEngine,
+        support: &crate::support::SupportExpr,
+    ) -> Self {
+        let mut closure: BTreeSet<EntryHash> = witnesses.iter().copied().collect();
+        let mut paths = Vec::new();
+        for mut clause in crate::support::hard_clauses_from_support(support) {
+            clause.retain(|h| {
+                journal
+                    .get(h)
+                    .is_some_and(|e| crate::solver::is_faultable(e.data.kind))
+            });
+            if clause.is_empty() {
+                continue;
+            }
+            clause.sort();
+            for h in &clause {
+                closure.insert(*h);
+            }
+            paths.push(clause);
+        }
+        paths.sort();
+        paths.dedup();
+        let walked = closure.len();
         Self {
             closure,
             paths,
@@ -183,7 +260,7 @@ impl LineageIndex {
     pub fn refresh(
         &mut self,
         journal: &Journal,
-        witnesses: &[Hash],
+        witnesses: &[EntryHash],
         config: &SolverConfig,
         resolved_engine: SolverEngine,
     ) -> bool {
@@ -202,7 +279,7 @@ impl LineageIndex {
         }
         // Append-only: only witnesses not yet in the cached closure can
         // contribute new lineage.
-        let new_witnesses: Vec<Hash> = witnesses
+        let new_witnesses: Vec<EntryHash> = witnesses
             .iter()
             .filter(|w| !self.closure.contains(*w))
             .copied()
@@ -221,6 +298,7 @@ impl LineageIndex {
         self.closure.extend(new_closure);
         self.paths.extend(new_paths);
         self.paths.sort();
+        self.paths.dedup();
         self.journal_len_at_build = new_len;
         self.config_fingerprint = new_fp;
         self.walked_entries = walked;
@@ -228,12 +306,12 @@ impl LineageIndex {
     }
 
     /// Borrow derivation paths.
-    pub fn paths(&self) -> &[Vec<Hash>] {
+    pub fn paths(&self) -> &[Vec<EntryHash>] {
         &self.paths
     }
 
     /// Borrow closure.
-    pub fn closure(&self) -> &BTreeSet<Hash> {
+    pub fn closure(&self) -> &BTreeSet<EntryHash> {
         &self.closure
     }
 }
@@ -241,7 +319,7 @@ impl LineageIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
+    use ledger_format::{ActorId, CanonicalValue, EntryKind, EntryPayload};
     use ledger_journal::Journal;
 
     fn test_config_bounded() -> SolverConfig {
@@ -258,12 +336,12 @@ mod tests {
         let send = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -271,10 +349,10 @@ mod tests {
         let witness = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [send],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -296,12 +374,12 @@ mod tests {
         let send_a = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -309,10 +387,10 @@ mod tests {
         let witness_a = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [send_a],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -324,12 +402,12 @@ mod tests {
         let send_b = journal
             .append(
                 EntryKind::Send,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 2,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(2),
+                    to: ActorId(2),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -337,10 +415,10 @@ mod tests {
         let witness_b = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [send_b, witness_a],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -362,12 +440,12 @@ mod tests {
         let send_a = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -375,12 +453,12 @@ mod tests {
         let recv_a = journal
             .append(
                 EntryKind::Recv,
-                1,
+                ActorId(1),
                 [send_a],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     observed_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -388,10 +466,10 @@ mod tests {
         let witness = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [recv_a],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -402,12 +480,12 @@ mod tests {
         let send_b = journal
             .append(
                 EntryKind::Send,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 2,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(2),
+                    to: ActorId(2),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -416,10 +494,10 @@ mod tests {
         let witness2 = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [send_b, recv_a],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -444,12 +522,12 @@ mod tests {
         let send = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -457,10 +535,10 @@ mod tests {
         let witness = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [send],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )

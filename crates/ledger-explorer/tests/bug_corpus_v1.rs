@@ -18,6 +18,8 @@ use ledger_explorer::oracle::{AssertionOracle, HistoryOperation, HistoryOracle, 
 use ledger_explorer::reference::corpus_scenarios;
 use ledger_explorer::search::{Workload, search};
 use ledger_explorer::solver::HittingSetSolver;
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{CanonicalValue, CrashOperation, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SimFs, Simulation};
@@ -70,11 +72,11 @@ impl Workload for Bug01StaleRead {
                 (
                     EntryKind::Send,
                     EntryPayload::Send(ledger_format::SendFrame {
-                        to: 1,
+                        to: ActorId(1),
                         original_content,
                         ..
                     }),
-                ) if entry.data.actor == 0
+                ) if entry.data.actor == ActorId(0)
                     && original_content.as_slice() == 42u64.to_le_bytes() =>
                 {
                     Some(HistoryOperation::Write {
@@ -89,7 +91,7 @@ impl Workload for Bug01StaleRead {
                         value: CanonicalValue::Unsigned(value),
                         ..
                     }),
-                ) if entry.data.actor == 2 => Some(HistoryOperation::Read {
+                ) if entry.data.actor == ActorId(2) => Some(HistoryOperation::Read {
                     key: "k".into(),
                     value: *value,
                     witness: entry.id,
@@ -103,7 +105,7 @@ impl Workload for Bug01StaleRead {
 #[test]
 fn mini_kv_stale_read_reproduced_from_seed() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -120,11 +122,14 @@ fn mini_kv_stale_read_reproduced_from_seed() {
 fn storage_crash_discards_unsynced_dirty_write() {
     let mut fs = SimFs::new();
     let mut journal = Journal::new();
-    fs.write(&mut journal, 1, "wal.log", 100).unwrap();
-    fs.fsync(&mut journal, 1).unwrap();
-    fs.write(&mut journal, 1, "wal.log", 200).unwrap(); // Unsynced
+    fs.write(&mut journal, ActorId(1), "wal.log", 100).unwrap();
+    fs.fsync(&mut journal, ActorId(1)).unwrap();
+    fs.write(&mut journal, ActorId(1), "wal.log", 200).unwrap(); // Unsynced
     fs.crash();
-    assert_eq!(fs.read(&mut journal, 1, "wal.log").unwrap(), Some(100));
+    assert_eq!(
+        fs.read(&mut journal, ActorId(1), "wal.log").unwrap(),
+        Some(100)
+    );
 }
 
 #[test]
@@ -132,7 +137,7 @@ fn storage_torn_write_preserves_only_prefix() {
     let mut fs = SimFs::new();
     let mut journal = Journal::new();
     let write_id = fs
-        .write(&mut journal, 1, "record.bin", 0xDEAD_BEEF)
+        .write(&mut journal, ActorId(1), "record.bin", 0xDEAD_BEEF)
         .unwrap();
     fs.apply_crash_operation(&CrashOperation::TornWrite {
         write_entry: write_id,
@@ -142,7 +147,7 @@ fn storage_torn_write_preserves_only_prefix() {
     // The LE u64 0xDEAD_BEEF is eight bytes; persisting the first four
     // keeps the high half, which still decodes to 0xDEAD_BEEF.
     assert_eq!(
-        fs.read(&mut journal, 1, "record.bin").unwrap(),
+        fs.read(&mut journal, ActorId(1), "record.bin").unwrap(),
         Some(0xDEAD_BEEF)
     );
 }
@@ -151,14 +156,19 @@ fn storage_torn_write_preserves_only_prefix() {
 fn storage_bit_flip_corruption_detected() {
     let mut fs = SimFs::new();
     let mut journal = Journal::new();
-    let write_id = fs.write(&mut journal, 1, "data.bin", 0b1111).unwrap();
+    let write_id = fs
+        .write(&mut journal, ActorId(1), "data.bin", 0b1111)
+        .unwrap();
     fs.apply_crash_operation(&CrashOperation::BitFlip {
         write_entry: write_id,
         offset: 0,
         bit: 1,
     })
     .unwrap();
-    assert_eq!(fs.read(&mut journal, 1, "data.bin").unwrap(), Some(0b1101));
+    assert_eq!(
+        fs.read(&mut journal, ActorId(1), "data.bin").unwrap(),
+        Some(0b1101)
+    );
 }
 
 // Two-phase commit workload with planted coordinator failure: the workload
@@ -188,7 +198,7 @@ impl Workload for Bug05TwoPhaseCommit {
 #[test]
 fn two_phase_commit_workload_has_no_assertion_violation() {
     let config = RunConfig::builder()
-        .seed([5; 32])
+        .seed(EntryHash([5; 32]))
         .policy(Policy::Random)
         .max_steps(64)
         .build();
@@ -224,7 +234,7 @@ impl Workload for Bug06PartitionDrop {
 #[test]
 fn net_partition_drop_journals_send_entry() {
     let config = RunConfig::builder()
-        .seed([6; 32])
+        .seed(EntryHash([6; 32]))
         .policy(Policy::Random)
         .max_steps(10)
         .build();
@@ -256,7 +266,7 @@ fn vector_clock_monotonicity_increases() {
     let e1 = j
         .append(
             EntryKind::InputStep,
-            1,
+            ActorId(1),
             [],
             EntryPayload::InputStep(ledger_format::InputStepPayload {
                 generator: 0,
@@ -268,10 +278,10 @@ fn vector_clock_monotonicity_increases() {
     let e2 = j
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(2),
             }),
         )
@@ -284,7 +294,7 @@ fn vector_clock_monotonicity_increases() {
 #[test]
 fn ldfi_minimal_hitting_set_breaks_race_path() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -303,7 +313,7 @@ fn ldfi_minimal_hitting_set_breaks_race_path() {
 
 #[test]
 fn seed_tree_streams_are_independent() {
-    let tree = ledger_sim::SeedTree::new([42; 32]);
+    let tree = ledger_sim::SeedTree::new(EntryHash([42; 32]));
     let s1 = tree.draw_u64("net", 0);
     let s2 = tree.draw_u64("fs", 0);
     assert_ne!(s1, s2);
@@ -321,7 +331,7 @@ fn ddmin_reaches_single_granularity() {
 #[test]
 fn replay_same_seed_identical_root() {
     let config = RunConfig::builder()
-        .seed([12; 32])
+        .seed(EntryHash([12; 32]))
         .policy(Policy::Random)
         .max_steps(64)
         .build();

@@ -1,4 +1,4 @@
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::{Journal, JournalError};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -12,14 +12,14 @@ pub enum MemoError {
     /// batch; the supplied and rebuilt roots stay inspectable.
     #[error(
         "memoized replay prefix mismatch: caller supplied {:02x?}, journal state is {:02x?}",
-        &caller[..8],
-        &state[..8]
+        &caller.0[..8],
+        &state.0[..8]
     )]
     PrefixMismatch {
         /// Prefix root supplied by the caller.
-        caller: Hash,
+        caller: EntryHash,
         /// Prefix root rebuilt from the source journal.
-        state: Hash,
+        state: EntryHash,
     },
     /// The first batch entry is not present in the source journal.
     #[error("memoized replay batch entry is not in the source journal")]
@@ -32,12 +32,12 @@ pub enum MemoError {
     Subgraph(#[from] JournalError),
 }
 
-fn hash_batch(next_batch: &[Hash]) -> Hash {
+fn hash_batch(next_batch: &[EntryHash]) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     for id in next_batch {
-        hasher.update(id);
+        hasher.update(&id.0);
     }
-    *hasher.finalize().as_bytes()
+    EntryHash(*hasher.finalize().as_bytes())
 }
 
 /// Memoized replay keyed by `(prefix_root_hash, next_entry_batch_hash)`.
@@ -51,15 +51,15 @@ fn hash_batch(next_batch: &[Hash]) -> Hash {
 #[derive(Debug, Default)]
 pub struct MemoizedReplay {
     /// `(prefix_root, batch_hash)` to the replayed journal.
-    cache: HashMap<(Hash, Hash), Journal>,
+    cache: HashMap<(EntryHash, EntryHash), Journal>,
     /// Verified prefix roots by `(source_root, prefix_len)`, so repeat calls
     /// with the same prefix verify in O(1) instead of rebuilding it.
-    prefix_roots: HashMap<(Hash, usize), Hash>,
+    prefix_roots: HashMap<(EntryHash, usize), EntryHash>,
     /// Source append order by source root, so batch location is O(1) per call.
-    orders: HashMap<Hash, std::sync::Arc<Vec<Hash>>>,
+    orders: HashMap<EntryHash, std::sync::Arc<Vec<EntryHash>>>,
     /// Batch content hashes by `(source_root, batch_start, batch_len)`, so a
     /// repeated batch is not re-hashed on every call.
-    batch_hashes: HashMap<(Hash, usize, usize), Hash>,
+    batch_hashes: HashMap<(EntryHash, usize, usize), EntryHash>,
     hits: usize,
     misses: usize,
 }
@@ -78,8 +78,8 @@ impl MemoizedReplay {
     /// wrong answer.
     pub fn replay(
         &mut self,
-        prefix_root_hash: Hash,
-        next_batch: &[Hash],
+        prefix_root_hash: EntryHash,
+        next_batch: &[EntryHash],
         source: &Journal,
     ) -> Result<Journal, MemoError> {
         let source_root = source.root_hash();
@@ -94,9 +94,9 @@ impl MemoizedReplay {
     /// an error, so an inconsistent root can never produce a wrong answer.
     pub fn replay_with_root(
         &mut self,
-        source_root: Hash,
-        prefix_root_hash: Hash,
-        next_batch: &[Hash],
+        source_root: EntryHash,
+        prefix_root_hash: EntryHash,
+        next_batch: &[EntryHash],
         source: &Journal,
     ) -> Result<Journal, MemoError> {
         let order = self

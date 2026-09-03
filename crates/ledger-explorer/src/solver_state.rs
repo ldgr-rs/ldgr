@@ -15,7 +15,7 @@
 use crate::ldfi::FaultHypothesis;
 use crate::solver::{HittingSetSolver, SolverConfig, SolverEngine, SolverError};
 use crate::solver_cache::{WeightedClause, engine_tag};
-use ledger_format::{ActorId, CanonicalValue, EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, CanonicalValue, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::{Journal, JournalError};
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -42,7 +42,7 @@ const FORMAT_VERSION: u8 = 2;
 /// resume never re-derives costs from approximations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedHypothesis {
-    pub events: Vec<Hash>,
+    pub events: Vec<EntryHash>,
     pub total_cost: u64,
 }
 
@@ -55,7 +55,7 @@ pub struct PersistedHypothesis {
 /// actually produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedClosure {
-    pub key: Hash,
+    pub key: EntryHash,
     pub clauses: Vec<WeightedClause>,
     pub hypotheses: Vec<PersistedHypothesis>,
 }
@@ -71,8 +71,8 @@ pub struct PersistedClosure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverStateArtifact {
     pub closures: Vec<PersistedClosure>,
-    pub config_fingerprint: Hash,
-    pub run_config_hash: Option<Hash>,
+    pub config_fingerprint: EntryHash,
+    pub run_config_hash: Option<EntryHash>,
     pub resolved_engine: SolverEngine,
 }
 
@@ -114,17 +114,20 @@ pub enum SolverStateError {
     },
     /// The artifact was persisted under a different run-config hash.
     RunConfigMismatch {
-        expected: Option<Hash>,
-        found: Option<Hash>,
+        expected: Option<EntryHash>,
+        found: Option<EntryHash>,
     },
     /// The artifact's state key does not match the receiver's state key.
-    StateKeyMismatch { expected: Hash, found: Hash },
+    StateKeyMismatch {
+        expected: EntryHash,
+        found: EntryHash,
+    },
     /// A resumed hypothesis names an event absent from its key's clauses.
     HypothesisNotCovered {
         /// The closure key whose clauses do not cover the event.
-        key: Hash,
+        key: EntryHash,
         /// The uncovered event.
-        event: Hash,
+        event: EntryHash,
     },
 }
 
@@ -206,7 +209,7 @@ pub const COST_MODEL_VERSION: u8 = 1;
 /// Two artifacts derived by different engines, cost models, or under
 /// different run configs always hash apart, so resuming one into the other
 /// can never satisfy the state-key check.
-pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> Hash {
+pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ldgr.solver_state.config.fingerprint.v2");
     hasher.update(&[0x00]);
@@ -266,7 +269,7 @@ pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> Hash
     match config.run_config_hash {
         Some(hash) => {
             hasher.update(&[0x01]);
-            hasher.update(&hash);
+            hasher.update(&hash.0);
         }
         None => {
             hasher.update(&[0x00]);
@@ -286,13 +289,13 @@ pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> Hash
     match config.support_digest {
         Some(digest) => {
             hasher.update(&[0x01]);
-            hasher.update(&digest);
+            hasher.update(&digest.0);
         }
         None => {
             hasher.update(&[0x00]);
         }
     }
-    *hasher.finalize().as_bytes()
+    EntryHash(*hasher.finalize().as_bytes())
 }
 
 /// Encode an artifact into deterministic canonical bytes.
@@ -312,19 +315,19 @@ fn encode_artifact(artifact: &SolverStateArtifact) -> Result<Vec<u8>, SolverStat
     match artifact.run_config_hash {
         Some(hash) => {
             out.push(0x01);
-            out.extend_from_slice(&hash);
+            out.extend_from_slice(&hash.0);
         }
         None => out.push(0x00),
     }
-    out.extend_from_slice(&artifact.config_fingerprint);
+    out.extend_from_slice(&artifact.config_fingerprint.0);
     out.extend_from_slice(&(artifact.closures.len() as u64).to_le_bytes());
     for closure in &artifact.closures {
-        out.extend_from_slice(&closure.key);
+        out.extend_from_slice(&closure.key.0);
         out.extend_from_slice(&(closure.clauses.len() as u64).to_le_bytes());
         for clause in &closure.clauses {
             out.extend_from_slice(&(clause.literals.len() as u64).to_le_bytes());
             for literal in &clause.literals {
-                out.extend_from_slice(literal);
+                out.extend_from_slice(&literal.0);
             }
             out.extend_from_slice(&clause.weight.to_le_bytes());
         }
@@ -332,7 +335,7 @@ fn encode_artifact(artifact: &SolverStateArtifact) -> Result<Vec<u8>, SolverStat
         for hypothesis in &closure.hypotheses {
             out.extend_from_slice(&(hypothesis.events.len() as u64).to_le_bytes());
             for event in &hypothesis.events {
-                out.extend_from_slice(event);
+                out.extend_from_slice(&event.0);
             }
             out.extend_from_slice(&hypothesis.total_cost.to_le_bytes());
         }
@@ -373,10 +376,10 @@ impl Cursor<'_> {
         Ok(u64::from_le_bytes(array))
     }
 
-    fn hash(&mut self) -> Result<Hash, SolverStateError> {
+    fn hash(&mut self) -> Result<EntryHash, SolverStateError> {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(self.take(32)?);
-        Ok(hash)
+        Ok(EntryHash(hash))
     }
 }
 
@@ -508,7 +511,7 @@ pub fn save(
     journal: &mut Journal,
     actor: ActorId,
     artifact: &SolverStateArtifact,
-) -> Result<Hash, SolverStateError> {
+) -> Result<EntryHash, SolverStateError> {
     let bytes = encode_artifact(artifact)?;
     // Dedup: if an entry with identical payload already exists, reuse it.
     for entry in journal.entries() {
@@ -527,7 +530,7 @@ pub fn save(
             actor,
             [],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Bytes(bytes),
             }),
         )
@@ -567,7 +570,7 @@ impl HittingSetSolver {
         &self,
         journal: &mut Journal,
         actor: ActorId,
-    ) -> Result<Hash, JournalError> {
+    ) -> Result<EntryHash, JournalError> {
         let artifact = self.snapshot_artifact(self.resolved_engine());
         save(journal, actor, &artifact).map_err(|error| match error {
             SolverStateError::Journal(journal_error) => journal_error,
@@ -619,7 +622,7 @@ impl HittingSetSolver {
         // Validate every entry before applying any, so a forged artifact can
         // never leave the solver half-warmed.
         for closure in &artifact.closures {
-            let mut literals: HashSet<Hash> = HashSet::new();
+            let mut literals: HashSet<EntryHash> = HashSet::new();
             for clause in &closure.clauses {
                 literals.extend(clause.literals.iter().copied());
             }
@@ -643,11 +646,10 @@ impl HittingSetSolver {
             // an empty one: the live solver stores empty clause sets (for
             // example the MaxSAT empty-hard cut), and a missing entry would
             // split the state and let a stale hypothesis pass an unvalidated
-            // hit check.
+            // hit check. The restore lands only in the receiving solver's
+            // per-campaign cache; no process-global store exists.
             self.clause_cache_mut()
                 .insert(closure.key, closure.clauses.clone());
-            // The returned bool is is_new, not an error.
-            crate::solver_cache::global_insert(closure.key, closure.clauses.clone());
             // Hypotheses are restored only alongside a non-empty recorded
             // clause set. An empty clause set cannot determine any cost or
             // hitting set, and an empty clause query must behave like a
@@ -683,7 +685,7 @@ impl HittingSetSolver {
     /// key and the exact hypotheses (with exact costs) derived from them, in
     /// the live cache order.
     pub(crate) fn snapshot_artifact(&self, resolved_engine: SolverEngine) -> SolverStateArtifact {
-        let mut keys: BTreeSet<Hash> = self.hypothesis_cache().keys().copied().collect();
+        let mut keys: BTreeSet<EntryHash> = self.hypothesis_cache().keys().copied().collect();
         keys.extend(self.clause_cache().iter().map(|(key, _)| *key));
         let closures: Vec<PersistedClosure> = keys
             .iter()
@@ -731,8 +733,8 @@ mod tests {
     use ledger_format::{CanonicalValue, EntryPayload};
     use ledger_journal::Journal;
 
-    fn test_hash(byte: u8) -> Hash {
-        [byte; 32]
+    fn test_hash(byte: u8) -> EntryHash {
+        EntryHash([byte; 32])
     }
 
     /// Config exactly as `HittingSetSolver::new()` holds it.
@@ -742,17 +744,17 @@ mod tests {
 
     /// Build a journal whose witness depends on events with distinct costs:
     /// one Send (cost 2), one TimerFire (cost 3), one FsWrite (cost 4).
-    fn mixed_cost_journal() -> (Journal, Hash) {
+    fn mixed_cost_journal() -> (Journal, EntryHash) {
         let mut journal = Journal::new();
         let send = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -760,7 +762,7 @@ mod tests {
         let timer = journal
             .append(
                 EntryKind::TimerFire,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::TimerFire {
                     timer_id: 7,
@@ -771,7 +773,7 @@ mod tests {
         let write = journal
             .append(
                 ledger_format::EntryKind::FsWrite,
-                3,
+                ActorId(3),
                 [],
                 EntryPayload::FsWrite(ledger_format::FsWritePayload::Write {
                     path_ref: ledger_format::PathRef::new([0x00; 32], b"/k".to_vec()),
@@ -783,10 +785,10 @@ mod tests {
         let witness = journal
             .append(
                 EntryKind::Outcome,
-                4,
+                ActorId(4),
                 [send, timer, write],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -968,7 +970,7 @@ mod tests {
             run_config_hash: Some(test_hash(42)),
             resolved_engine: SolverEngine::Builtin,
         };
-        let id = save(&mut journal, 1, &artifact).expect("save must succeed");
+        let id = save(&mut journal, ActorId(1), &artifact).expect("save must succeed");
         assert!(journal.get(&id).is_some());
         let loaded = load(&journal).expect("load must succeed");
         assert_eq!(loaded.len(), 1);
@@ -996,7 +998,7 @@ mod tests {
             Err(SolverStateError::UnresolvedEngine)
         ));
         let mut journal = Journal::new();
-        assert!(save(&mut journal, 1, &artifact).is_err());
+        assert!(save(&mut journal, ActorId(1), &artifact).is_err());
     }
 
     #[test]
@@ -1015,15 +1017,16 @@ mod tests {
             run_config_hash: None,
             resolved_engine: SolverEngine::Builtin,
         };
-        let first = save(&mut journal, 1, &artifact).expect("first save");
+        let first = save(&mut journal, ActorId(1), &artifact).expect("first save");
         let len_after_first = journal.len();
-        let second = save(&mut journal, 1, &artifact).expect("second save");
+        let second = save(&mut journal, ActorId(1), &artifact).expect("second save");
         assert_eq!(first, second);
         assert_eq!(journal.len(), len_after_first);
 
         // Different actor with same payload should still dedup via payload equality
         // (artifact content address), but we verify at least same payload returns same id.
-        let third = save(&mut journal, 2, &artifact).expect("third save with different actor");
+        let third =
+            save(&mut journal, ActorId(2), &artifact).expect("third save with different actor");
         assert_eq!(first, third);
         assert_eq!(journal.len(), len_after_first);
 
@@ -1032,14 +1035,13 @@ mod tests {
         other.closures[0]
             .clauses
             .push(WeightedClause::new(vec![test_hash(99)], 9));
-        let other_id = save(&mut journal, 1, &other).expect("other artifact");
+        let other_id = save(&mut journal, ActorId(1), &other).expect("other artifact");
         assert_ne!(first, other_id);
         assert_eq!(journal.len(), len_after_first + 1);
     }
 
     #[test]
     fn resume_parity_reproduces_exact_costs_and_selected_set() {
-        crate::solver_cache::global_clear();
         let (journal, witness) = mixed_cost_journal();
         let verdict = Verdict::fail(vec![witness], "mixed costs");
 
@@ -1058,12 +1060,12 @@ mod tests {
         // Persist solver state via persist_state (snapshot + save).
         let mut persist_journal = journal.fork();
         let artifact_id = fresh
-            .persist_state(&mut persist_journal, 99)
+            .persist_state(&mut persist_journal, ActorId(99))
             .expect("persist must succeed");
         assert!(persist_journal.get(&artifact_id).is_some());
 
-        // Simulate another machine: fresh journal fork plus cleared global cache.
-        crate::solver_cache::global_clear();
+        // Simulate another machine: a fresh journal fork plus a fresh solver
+        // with its own explicit per-campaign cache.
         let loaded_journal = persist_journal.fork();
         let artifacts = load(&loaded_journal).expect("load must succeed");
         assert_eq!(artifacts.len(), 1);
@@ -1085,11 +1087,11 @@ mod tests {
         let resumed_hyps = resumed
             .solve(&loaded_journal, &verdict)
             .expect("resumed solve");
-        let fresh_decisions: Vec<(Vec<Hash>, u64)> = fresh_hyps
+        let fresh_decisions: Vec<(Vec<EntryHash>, u64)> = fresh_hyps
             .iter()
             .map(|hyp| (hyp.events.clone(), hyp.total_cost))
             .collect();
-        let resumed_decisions: Vec<(Vec<Hash>, u64)> = resumed_hyps
+        let resumed_decisions: Vec<(Vec<EntryHash>, u64)> = resumed_hyps
             .iter()
             .map(|hyp| (hyp.events.clone(), hyp.total_cost))
             .collect();
@@ -1116,7 +1118,6 @@ mod tests {
 
     #[test]
     fn resume_rejects_cross_engine_artifact() {
-        crate::solver_cache::global_clear();
         let config = solver_config();
         let cadical_artifact = SolverStateArtifact {
             closures: Vec::new(),
@@ -1138,7 +1139,6 @@ mod tests {
 
     #[test]
     fn resume_rejects_state_key_mismatch() {
-        crate::solver_cache::global_clear();
         let other_config = solver_config().with_horizon(32);
         let artifact = SolverStateArtifact {
             closures: Vec::new(),
@@ -1158,7 +1158,6 @@ mod tests {
 
     #[test]
     fn resume_rejects_run_config_mismatch() {
-        crate::solver_cache::global_clear();
         // Artifact persisted under run config A into a solver under B.
         let config_a = solver_config().with_run_config_hash(test_hash(1));
         let artifact = SolverStateArtifact {
@@ -1195,7 +1194,6 @@ mod tests {
 
     #[test]
     fn resume_rejects_hypothesis_not_covered_by_clauses() {
-        crate::solver_cache::global_clear();
         let mut solver = HittingSetSolver::new();
         let key = solver.incremental_key_with_tag(
             ClauseCache::closure_hash(&[test_hash(1)]),
@@ -1228,7 +1226,6 @@ mod tests {
 
     #[test]
     fn resume_places_hypotheses_only_under_own_closure_key() {
-        crate::solver_cache::global_clear();
         let mut solver = HittingSetSolver::new();
         let hash_a = test_hash(1);
         let hash_b = test_hash(2);
@@ -1277,7 +1274,7 @@ mod tests {
         let mut fresh2 = HittingSetSolver::new();
         let expected_a2 = fresh2.solve_incremental(closure_a, clauses_a2);
         assert_eq!(got_a2, expected_a2, "mismatched assumptions must recompute");
-        let mut got_a2_sets: Vec<Vec<Hash>> = got_a2
+        let mut got_a2_sets: Vec<Vec<EntryHash>> = got_a2
             .iter()
             .map(|hyp| {
                 let mut events = hyp.events.clone();
@@ -1292,7 +1289,6 @@ mod tests {
 
     #[test]
     fn resume_preserves_recorded_hypothesis_order() {
-        crate::solver_cache::global_clear();
         let mut solver = HittingSetSolver::new();
         let hash_a = test_hash(1);
         let hash_b = test_hash(2);
@@ -1348,7 +1344,6 @@ mod tests {
 
     #[test]
     fn maxsat_resume_parity_includes_certificate_fields() {
-        crate::solver_cache::global_clear();
         let (journal, witness) = mixed_cost_journal();
         let verdict = Verdict::fail(vec![witness], "certificate parity");
 
@@ -1362,9 +1357,8 @@ mod tests {
 
         let mut persist_journal = journal.fork();
         let artifact = fresh.snapshot_state().expect("maxsat solver must snapshot");
-        save(&mut persist_journal, 99, &artifact).expect("persist must succeed");
+        save(&mut persist_journal, ActorId(99), &artifact).expect("persist must succeed");
 
-        crate::solver_cache::global_clear();
         let loaded_journal = persist_journal.fork();
         let loaded = load(&loaded_journal).expect("load must succeed");
         assert_eq!(loaded.len(), 1);
@@ -1396,7 +1390,6 @@ mod tests {
 
     #[test]
     fn auto_artifact_records_concrete_resolution() {
-        crate::solver_cache::global_clear();
         let (journal, witness) = mixed_cost_journal();
         let verdict = Verdict::fail(vec![witness], "auto resolution");
 
@@ -1423,10 +1416,10 @@ mod tests {
         let _regular = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(123),
                 }),
             )
@@ -1434,10 +1427,10 @@ mod tests {
         let _bytes_other = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Bytes(b"not a solver state".to_vec()),
                 }),
             )
@@ -1456,7 +1449,7 @@ mod tests {
             run_config_hash: None,
             resolved_engine: SolverEngine::Builtin,
         };
-        save(&mut journal, 1, &artifact).expect("save artifact");
+        save(&mut journal, ActorId(1), &artifact).expect("save artifact");
         let loaded = load(&journal).expect("load");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0], artifact);
@@ -1466,7 +1459,7 @@ mod tests {
     fn encode_decode_roundtrip_empty_artifact() {
         let artifact = SolverStateArtifact {
             closures: Vec::new(),
-            config_fingerprint: [0u8; 32],
+            config_fingerprint: EntryHash([0u8; 32]),
             run_config_hash: None,
             resolved_engine: SolverEngine::Builtin,
         };
@@ -1556,7 +1549,6 @@ mod tests {
 
     #[test]
     fn incremental_resume_via_solve_incremental() {
-        crate::solver_cache::global_clear();
         let closure = ClauseCache::closure_hash(&[test_hash(1), test_hash(2)]);
         let clauses = vec![
             WeightedClause::new(vec![test_hash(1)], 2),
@@ -1570,9 +1562,8 @@ mod tests {
         // Snapshot and resume into fresh solver.
         let mut tmp_journal = Journal::new();
         let persist_id = solver_a
-            .persist_state(&mut tmp_journal, 1)
+            .persist_state(&mut tmp_journal, ActorId(1))
             .expect("persist incremental");
-        crate::solver_cache::global_clear();
         let fresh_journal = tmp_journal.fork();
         let artifact = load(&fresh_journal).expect("load")[0].clone();
         assert_eq!(artifact.closures.len(), 1);
@@ -1581,7 +1572,7 @@ mod tests {
         let solver_b = HittingSetSolver::new();
         // Verify dedup id stable.
         let second_id = solver_b
-            .persist_state(&mut tmp_journal.clone(), 1)
+            .persist_state(&mut tmp_journal.clone(), ActorId(1))
             .unwrap_or(persist_id);
         let _ = second_id;
 
@@ -1591,11 +1582,11 @@ mod tests {
             .expect("resume incremental");
         let second = solver_resumed.solve_incremental(closure, clauses.clone());
         // Incremental cache hit path should produce identical sets and costs.
-        let first_decisions: Vec<(Vec<Hash>, u64)> = first
+        let first_decisions: Vec<(Vec<EntryHash>, u64)> = first
             .iter()
             .map(|hyp| (hyp.events.clone(), hyp.total_cost))
             .collect();
-        let second_decisions: Vec<(Vec<Hash>, u64)> = second
+        let second_decisions: Vec<(Vec<EntryHash>, u64)> = second
             .iter()
             .map(|hyp| (hyp.events.clone(), hyp.total_cost))
             .collect();
@@ -1608,7 +1599,6 @@ mod tests {
 
     #[test]
     fn incremental_resume_exact_cost_is_not_flat_two() {
-        crate::solver_cache::global_clear();
         let closure = ClauseCache::closure_hash(&[test_hash(7)]);
         let clauses = vec![WeightedClause::new(vec![test_hash(7)], 4)];
 
@@ -1618,9 +1608,8 @@ mod tests {
 
         let mut tmp_journal = Journal::new();
         solver_a
-            .persist_state(&mut tmp_journal, 1)
+            .persist_state(&mut tmp_journal, ActorId(1))
             .expect("persist");
-        crate::solver_cache::global_clear();
         let artifact = load(&tmp_journal.fork()).expect("load")[0].clone();
 
         let mut resumed = HittingSetSolver::new();
@@ -1632,11 +1621,11 @@ mod tests {
             second[0].total_cost, 4,
             "resumed cost must be the exact clause-weight cost, not a flat 2"
         );
-        let first_decisions: Vec<(Vec<Hash>, u64)> = first
+        let first_decisions: Vec<(Vec<EntryHash>, u64)> = first
             .iter()
             .map(|hyp| (hyp.events.clone(), hyp.total_cost))
             .collect();
-        let second_decisions: Vec<(Vec<Hash>, u64)> = second
+        let second_decisions: Vec<(Vec<EntryHash>, u64)> = second
             .iter()
             .map(|hyp| (hyp.events.clone(), hyp.total_cost))
             .collect();
@@ -1645,7 +1634,6 @@ mod tests {
 
     #[test]
     fn resume_rejects_artifact_from_other_run_config_name_space() {
-        crate::solver_cache::global_clear();
         let solver_config_a = solver_config().with_run_config_hash(test_hash(11));
         let solver_config_b = solver_config().with_run_config_hash(test_hash(22));
         let mut solver_a = HittingSetSolver::with_config(solver_config_a);
@@ -1673,99 +1661,54 @@ mod tests {
 
     #[test]
     fn resume_empty_clause_entry_recomputes_like_fresh_solver() {
-        crate::solver_cache::global_clear();
-        // A journal with a witness but no faultable entries: the MaxSAT
-        // engine derives an empty clause set and one cost-0 empty-cut
-        // hypothesis, which it persists with EMPTY clauses.
+        // A journal with a witness but no faultable entries carries no
+        // provenance. The typed walk fails closed with `EmptyProvenance`
+        // instead of persisting a cost-0 empty cut, so neither engine
+        // produces an artifact and both fail identically.
         let mut journal = Journal::new();
         let witness = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
             .expect("append witness");
         let verdict = Verdict::fail(vec![witness], "no faultables");
         let mut maxsat = MaxSatSolver::new();
-        let (maxsat_hyps, solver_data) = maxsat
+        let maxsat_error = maxsat
             .solve_with_certificate(&journal, &verdict)
-            .expect("maxsat solve");
-        assert!(
-            solver_data.is_none(),
-            "an empty cut must not produce recorded solver data"
-        );
-        assert_eq!(maxsat_hyps.len(), 1);
-        assert_eq!(maxsat_hyps[0].total_cost, 0);
-        let artifact = maxsat.snapshot_state().expect("snapshot");
-        assert_eq!(artifact.closures.len(), 1);
-        assert!(
-            artifact.closures[0].clauses.is_empty(),
-            "fixture must record an empty clause set"
-        );
-        assert_eq!(artifact.closures[0].hypotheses.len(), 1);
-        let closure = ClauseCache::closure_hash(&[witness]);
-        let expected_key =
-            HittingSetSolver::new().incremental_key_with_tag(closure, engine_tag::BUILTIN);
-        assert_eq!(artifact.closures[0].key, expected_key);
-
-        // Batch solve after resume must equal a fresh batch solve: both
-        // return no hypotheses. The persisted cost-0 empty hypothesis must
-        // never be served by the batch fast path.
-        let mut resumed = HittingSetSolver::new();
-        resumed
-            .warm_from_artifact(&artifact)
-            .expect("resume must apply");
-        assert_eq!(
-            resumed.cache_len(),
-            1,
-            "resume must insert the empty clause entry like the live solver does"
-        );
-        assert_eq!(
-            resumed.hypothesis_cache_len(),
-            0,
-            "empty-clause hypotheses must not be restored"
-        );
-        let mut fresh = HittingSetSolver::new();
-        let fresh_hyps = fresh.solve(&journal, &verdict).expect("fresh batch solve");
-        assert!(fresh_hyps.is_empty());
-        let resumed_hyps = resumed
+            .expect_err("maxsat empty provenance must fail");
+        assert_eq!(maxsat_error, SolverError::EmptyProvenance);
+        let mut batch = HittingSetSolver::new();
+        let batch_error = batch
             .solve(&journal, &verdict)
-            .expect("resumed batch solve");
-        assert_eq!(
-            resumed_hyps, fresh_hyps,
-            "resumed batch solve must recompute like a fresh one"
-        );
-        assert!(
-            resumed_hyps.is_empty(),
-            "the stale cost-0 empty hypothesis must not be returned"
-        );
+            .expect_err("batch empty provenance must fail");
+        assert_eq!(batch_error, SolverError::EmptyProvenance);
 
-        // Incremental solve under the persisted key with REAL clauses must
-        // recompute: the empty clause entry never satisfies a non-empty
-        // query, so the stale cost-0 hypothesis is never served.
+        // Incremental solve under an explicit key with REAL clauses still
+        // recomputes deterministically; an EMPTY clause query yields no
+        // hypotheses on either engine.
+        let closure = ClauseCache::closure_hash(&[witness]);
         let real_clauses = vec![WeightedClause::new(vec![witness], 2)];
+        let mut resumed = HittingSetSolver::new();
         let got = resumed.solve_incremental(closure, real_clauses.clone());
         let mut fresh_incremental = HittingSetSolver::new();
         let expected = fresh_incremental.solve_incremental(closure, real_clauses);
         assert_eq!(
             got, expected,
-            "incremental solve under the resumed key must recompute like a fresh one"
+            "incremental solve must recompute like a fresh one"
         );
         assert!(!got.is_empty());
         assert!(
             got.iter().all(|hyp| hyp.total_cost == 2),
-            "the computed hypotheses must carry the real clause cost, not the stale 0"
+            "the computed hypotheses must carry the real clause cost"
         );
 
-        // An EMPTY clause query under the persisted key must recompute
-        // identically to a fresh solver: a fresh solver returns no
-        // hypotheses for the trivial empty case, and the recorded cost-0
-        // empty-cut hypothesis is not restored, so the clause-equality hit
-        // path can never serve it.
+        // An EMPTY clause query must recompute identically to a fresh solver.
         let empty_query = Vec::<WeightedClause>::new();
         let got_empty = resumed.solve_incremental(closure, empty_query.clone());
         let mut fresh_empty = HittingSetSolver::new();
@@ -1782,18 +1725,17 @@ mod tests {
 
     #[test]
     fn batch_solve_recomputes_when_cached_clauses_mismatch_journal() {
-        crate::solver_cache::global_clear();
         // Journal whose derivation yields one clause over send_a.
         let mut journal = Journal::new();
         let send_a = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -1801,10 +1743,10 @@ mod tests {
         let witness = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [send_a],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -1861,7 +1803,6 @@ mod tests {
     #[cfg(feature = "solver-cadical")]
     #[test]
     fn resume_rejects_real_cadical_artifact_in_builtin_solver() {
-        crate::solver_cache::global_clear();
         let (journal, witness) = mixed_cost_journal();
         let verdict = Verdict::fail(vec![witness], "real cadical cross-engine");
 
@@ -1906,7 +1847,7 @@ mod tests {
         version: u8,
         engine: u8,
         run_config_bytes: Vec<u8>,
-        fingerprint: Hash,
+        fingerprint: EntryHash,
         closures_len: u64,
     ) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1914,7 +1855,7 @@ mod tests {
         out.push(version);
         out.push(engine);
         out.extend_from_slice(&run_config_bytes);
-        out.extend_from_slice(&fingerprint);
+        out.extend_from_slice(&fingerprint.0);
         out.extend_from_slice(&closures_len.to_le_bytes());
         out
     }
@@ -1925,7 +1866,7 @@ mod tests {
             FORMAT_VERSION,
             engine_tag::BUILTIN,
             vec![0x00],
-            [0u8; 32],
+            EntryHash([0u8; 32]),
             u64::MAX,
         );
         assert!(matches!(
@@ -1946,10 +1887,10 @@ mod tests {
             FORMAT_VERSION,
             engine_tag::BUILTIN,
             vec![0x00],
-            [0u8; 32],
+            EntryHash([0u8; 32]),
             1,
         );
-        bytes.extend_from_slice(&test_hash(1));
+        bytes.extend_from_slice(&test_hash(1).0);
         bytes.extend_from_slice(&1u64.to_le_bytes()); // one clause
         bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // literal count
         bytes.extend_from_slice(&2u64.to_le_bytes()); // weight field
@@ -1969,10 +1910,10 @@ mod tests {
             FORMAT_VERSION,
             engine_tag::BUILTIN,
             vec![0x00],
-            [0u8; 32],
+            EntryHash([0u8; 32]),
             1,
         );
-        bytes.extend_from_slice(&test_hash(1));
+        bytes.extend_from_slice(&test_hash(1).0);
         bytes.extend_from_slice(&0u64.to_le_bytes()); // no clauses
         bytes.extend_from_slice(&1u64.to_le_bytes()); // one hypothesis
         bytes.extend_from_slice(&u64::MAX.to_le_bytes()); // event count
@@ -2001,7 +1942,7 @@ mod tests {
                     total_cost: 3,
                 }],
             }],
-            config_fingerprint: [0u8; 32],
+            config_fingerprint: EntryHash([0u8; 32]),
             run_config_hash: None,
             resolved_engine: SolverEngine::Builtin,
         };
@@ -2025,10 +1966,10 @@ mod tests {
             FORMAT_VERSION,
             engine_tag::BUILTIN,
             vec![0x00],
-            [0u8; 32],
+            EntryHash([0u8; 32]),
             1,
         );
-        short.extend_from_slice(&test_hash(1));
+        short.extend_from_slice(&test_hash(1).0);
         assert!(matches!(
             decode_artifact(&short),
             Err(SolverStateError::LengthOverflow {
@@ -2040,7 +1981,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_garbage_version() {
-        let bytes = header_bytes(99, engine_tag::BUILTIN, vec![0x00], [0u8; 32], 0);
+        let bytes = header_bytes(99, engine_tag::BUILTIN, vec![0x00], EntryHash([0u8; 32]), 0);
         assert!(matches!(
             decode_artifact(&bytes),
             Err(SolverStateError::UnsupportedFormatVersion(99))
@@ -2049,7 +1990,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_engine_byte() {
-        let bytes = header_bytes(FORMAT_VERSION, 0xEE, vec![0x00], [0u8; 32], 0);
+        let bytes = header_bytes(FORMAT_VERSION, 0xEE, vec![0x00], EntryHash([0u8; 32]), 0);
         assert!(matches!(
             decode_artifact(&bytes),
             Err(SolverStateError::UnknownEngineByte(0xEE))
@@ -2062,7 +2003,7 @@ mod tests {
             FORMAT_VERSION,
             engine_tag::BUILTIN,
             vec![0x02],
-            [0u8; 32],
+            EntryHash([0u8; 32]),
             0,
         );
         assert!(matches!(
@@ -2075,7 +2016,7 @@ mod tests {
     fn decode_rejects_trailing_bytes() {
         let artifact = SolverStateArtifact {
             closures: Vec::new(),
-            config_fingerprint: [0u8; 32],
+            config_fingerprint: EntryHash([0u8; 32]),
             run_config_hash: None,
             resolved_engine: SolverEngine::Builtin,
         };
@@ -2091,7 +2032,7 @@ mod tests {
     fn decode_rejects_missing_magic() {
         let mut bytes = encode_artifact(&SolverStateArtifact {
             closures: Vec::new(),
-            config_fingerprint: [0u8; 32],
+            config_fingerprint: EntryHash([0u8; 32]),
             run_config_hash: None,
             resolved_engine: SolverEngine::Builtin,
         })
@@ -2111,16 +2052,16 @@ mod tests {
             FORMAT_VERSION,
             engine_tag::BUILTIN,
             vec![0x00],
-            [0u8; 32],
+            EntryHash([0u8; 32]),
             u64::MAX,
         );
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Bytes(malformed),
                 }),
             )
@@ -2135,7 +2076,6 @@ mod tests {
 
     #[test]
     fn resume_rejects_artifact_from_older_format_version() {
-        crate::solver_cache::global_clear();
         let mut solver = HittingSetSolver::new();
         let artifact = SolverStateArtifact {
             closures: Vec::new(),

@@ -5,7 +5,7 @@ use super::{
 use crate::ldfi::FaultHypothesis;
 use crate::oracle::Verdict;
 use crate::solver_cache::{ClauseCache, WeightedClause, engine_tag};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::Journal;
 
 /// Weighted MaxSAT solver with MCS lower-bound certificates.
@@ -131,7 +131,6 @@ impl MaxSatSolver {
         if self.inner.hypothesis_cache.contains_key(&key) {
             self.cache_hits += 1;
         }
-        let global_hit = crate::solver_cache::global_get(&key).is_some();
         let clauses: Vec<WeightedClause> = encoding
             .hard
             .iter()
@@ -144,11 +143,9 @@ impl MaxSatSolver {
                 WeightedClause::new(clause.clone(), weight)
             })
             .collect();
+        // Per-solver cache only. No process-global store exists; the solver
+        // (and its cache) is constructed per campaign.
         self.inner.cache.insert(key, clauses.clone());
-        if !global_hit {
-            // The global insert returns is_new, not an error.
-            crate::solver_cache::global_insert(key, clauses);
-        }
         let solution = if use_cadical {
             #[cfg(feature = "solver-cadical")]
             {
@@ -161,12 +158,13 @@ impl MaxSatSolver {
         } else {
             crate::maxsat::solve_maxsat_bnb(&encoding)?
         };
-        let explanation = format!(
-            "Weighted MaxSAT minimum cut with {} fault(s) breaking {} hard clause(s); lower bound {} via {}",
+        let explanation = maxsat_explanation(
             solution.cut.len(),
             encoding.hard.len(),
             solution.lower_bound_proof.unsat_core_cost,
-            solution.lower_bound_proof.method
+            solution.lower_bound_proof.method,
+            &encoding.hard,
+            self.inner.config.max_horizon,
         );
         let hypothesis = FaultHypothesis {
             events: solution.cut.clone(),
@@ -216,6 +214,38 @@ impl MaxSatSolver {
     }
 }
 
+/// Honest wording for the MaxSAT solve, gated on [`SupportExpr::is_strong`].
+///
+/// The hard clauses join one `AllOf` per derivation path under `AnyOf`, plus
+/// `Opaque` when the horizon bound the walk. Only a strong support backs a
+/// minimum claim; any bounded or opaque walk reports a bounded heuristic with
+/// its horizon and the same lower-bound certificate fields.
+fn maxsat_explanation(
+    faults: usize,
+    hard_clauses: usize,
+    lower: u64,
+    method: &'static str,
+    hard: &[Vec<EntryHash>],
+    horizon: Option<usize>,
+) -> String {
+    let truncated = horizon.is_some();
+    let support = crate::support::support_from_paths(hard, truncated);
+    if support.is_strong() {
+        format!(
+            "Weighted MaxSAT minimum cut with {faults} fault(s) breaking {hard_clauses} hard clause(s); lower bound {lower} via {method}"
+        )
+    } else {
+        match horizon {
+            Some(h) => format!(
+                "Weighted MaxSAT bounded heuristic cut with {faults} fault(s) breaking {hard_clauses} hard clause(s) at horizon {h}; lower bound {lower} via {method}"
+            ),
+            None => format!(
+                "Weighted MaxSAT heuristic cut with {faults} fault(s) breaking {hard_clauses} hard clause(s) (unknown support); lower bound {lower} via {method}"
+            ),
+        }
+    }
+}
+
 /// The engine a fresh MaxSat solver resolves to before any encoding exists.
 ///
 /// Auto routes to builtin at every measured encoding size (the crossover
@@ -257,7 +287,7 @@ impl FaultSolver for MaxSatSolver {
 
     fn solve_incremental(
         &mut self,
-        closure_hash: Hash,
+        closure_hash: EntryHash,
         clauses: Vec<WeightedClause>,
     ) -> Vec<FaultHypothesis> {
         // No encoding exists on this path, so Auto applies the crossover rule

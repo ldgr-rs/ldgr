@@ -7,12 +7,14 @@ use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::{FaultReplayError, Workload, replay_with_faults, search};
 use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::{MiniKvWorkload, TwoPhaseCommitWorkload};
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{EntryKind, EntryPayload};
 use ledger_sim::{Policy, RunConfig, SimFault, Simulation};
 
 fn find_stale_read() -> ledger_explorer::search::Finding {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -117,7 +119,7 @@ fn drop_injection_forks_journal_not_mutates_base() {
 #[test]
 fn voided_fault_is_data_not_error() {
     let finding = find_stale_read();
-    let ghost = [0xAB; 32];
+    let ghost = EntryHash([0xAB; 32]);
     let report = replay_with_faults(
         &MiniKvWorkload,
         &finding.run.journal,
@@ -224,7 +226,10 @@ fn partition_injection_changes_schedule() {
         &finding.run.journal,
         finding.seed,
         finding.run.decisions.clone(),
-        vec![SimFault::Partition { src: 0, dst: 1 }],
+        vec![SimFault::Partition {
+            src: ActorId(0),
+            dst: ActorId(1),
+        }],
     ) {
         Ok(report) => {
             assert_ne!(
@@ -238,7 +243,10 @@ fn partition_injection_changes_schedule() {
                 .seed(finding.seed)
                 .policy(Policy::Random)
                 .max_steps(256)
-                .fault_schedule(vec![SimFault::Partition { src: 0, dst: 1 }])
+                .fault_schedule(vec![SimFault::Partition {
+                    src: ActorId(0),
+                    dst: ActorId(1),
+                }])
                 .build();
             let faulted = Simulation::new(config, MiniKvWorkload.programs())
                 .run()
@@ -256,7 +264,7 @@ fn partition_injection_changes_schedule() {
 #[test]
 fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     let config = RunConfig::builder()
-        .seed([4; 32])
+        .seed(EntryHash([4; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -269,7 +277,10 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     // probe reports are the exact targets the final schedule must hit.
     let probe_config = config
         .clone()
-        .with_fault_schedule(vec![SimFault::Partition { src: 0, dst: 1 }]);
+        .with_fault_schedule(vec![SimFault::Partition {
+            src: ActorId(0),
+            dst: ActorId(1),
+        }]);
     let probe = Simulation::new(probe_config, TwoPhaseCommitWorkload.programs())
         .run()
         .expect("probe run must execute");
@@ -277,11 +288,11 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
         .journal
         .entries()
         .find(|entry| {
-            entry.data.actor == 0
+            entry.data.actor == ActorId(0)
                 && matches!(entry.data.kind, EntryKind::Send)
                 && matches!(
                     &entry.data.payload,
-                    EntryPayload::Send(ledger_format::SendFrame { to: 1, .. })
+                    EntryPayload::Send(ledger_format::SendFrame { to: ActorId(1), .. })
                 )
         })
         .map(|entry| entry.id)
@@ -289,7 +300,9 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     let write = probe
         .journal
         .entries()
-        .find(|entry| matches!(entry.data.kind, EntryKind::FsWrite) && entry.data.actor == 2)
+        .find(|entry| {
+            matches!(entry.data.kind, EntryKind::FsWrite) && entry.data.actor == ActorId(2)
+        })
         .map(|entry| entry.id)
         .expect("participant B journals an FsWrite");
 
@@ -331,7 +344,7 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
     let send_entry = probe.journal.get(&send).expect("send entry must exist");
     let send_dst = match &send_entry.data.payload {
         EntryPayload::Send(ledger_format::SendFrame { to, .. }) => *to,
-        _ => u32::MAX,
+        _ => ledger_format::ActorId(u32::MAX),
     };
     let replay_schedule: Vec<SimFault> = schedule
         .into_iter()
@@ -353,7 +366,7 @@ fn hypothesis_emits_all_fault_classes_and_replay_applies_them() {
         faulted.journal.entries().any(|entry| matches!(
             &entry.data.payload,
             EntryPayload::Fault(ledger_format::FaultPayload::Partition {
-                src: 0,
+                src: ledger_format::ActorId(0),
                 dst,
                 ..
             }) if *dst == send_dst

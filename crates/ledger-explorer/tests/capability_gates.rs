@@ -26,7 +26,8 @@ use ledger_explorer::solver::{
 };
 use ledger_explorer::solver_cache::{ClauseCache, WeightedClause};
 use ledger_explorer::support::{StaticSupportProvider, SupportExpr, all_of_ids};
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
+use ledger_format::ActorId;
+use ledger_format::{CanonicalValue, EntryHash, EntryKind, EntryPayload};
 use ledger_sim::{BeltStatus, RunOutcome, RunResult};
 
 // ---------------------------------------------------------------------------
@@ -34,9 +35,9 @@ use ledger_sim::{BeltStatus, RunOutcome, RunResult};
 // ---------------------------------------------------------------------------
 
 /// Build a parent chain journal and return it plus the tail Outcome hash.
-fn chain_with_outcome(n: usize) -> (Journal, Hash) {
+fn chain_with_outcome(n: usize) -> (Journal, EntryHash) {
     let mut journal = Journal::new();
-    let mut prev: Option<Hash> = None;
+    let mut prev: Option<EntryHash> = None;
     for i in 0..n {
         let kind = if i % 2 == 0 {
             EntryKind::Send
@@ -47,12 +48,12 @@ fn chain_with_outcome(n: usize) -> (Journal, Hash) {
             Some(p) => journal
                 .append(
                     kind,
-                    1,
+                    ActorId(1),
                     [p],
                     EntryPayload::Recv(ledger_format::RecvFrame {
-                        message_id: ledger_format::MessageId::new(1, 0),
-                        from: 1,
-                        to: 1,
+                        message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                        from: ActorId(1),
+                        to: ActorId(1),
                         observed_content: (i as u64).to_le_bytes().to_vec(),
                     }),
                 )
@@ -60,12 +61,12 @@ fn chain_with_outcome(n: usize) -> (Journal, Hash) {
             None => journal
                 .append(
                     kind,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Recv(ledger_format::RecvFrame {
-                        message_id: ledger_format::MessageId::new(1, 0),
-                        from: 1,
-                        to: 1,
+                        message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                        from: ActorId(1),
+                        to: ActorId(1),
                         observed_content: (i as u64).to_le_bytes().to_vec(),
                     }),
                 )
@@ -76,10 +77,10 @@ fn chain_with_outcome(n: usize) -> (Journal, Hash) {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             prev.into_iter().collect::<Vec<_>>(),
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(u64::MAX),
             }),
         )
@@ -94,7 +95,7 @@ fn scaled_horizon(closure_len: usize) -> usize {
 }
 
 /// Verdict over one witness entry.
-fn verdict_for(witness: Hash) -> Verdict {
+fn verdict_for(witness: EntryHash) -> Verdict {
     Verdict {
         violated: true,
         witnesses: vec![witness],
@@ -195,7 +196,7 @@ fn incremental_solver_state_survives_snapshot_and_warm() {
     );
 
     let warm_hyps = solve_with(&mut warmed, &journal, &verdict).expect("warm solve must run");
-    let cut_of = |hyps: &[FaultHypothesis]| -> Vec<(Vec<Hash>, u64)> {
+    let cut_of = |hyps: &[FaultHypothesis]| -> Vec<(Vec<EntryHash>, u64)> {
         hyps.iter()
             .map(|h| (h.events.clone(), h.total_cost))
             .collect()
@@ -264,12 +265,12 @@ fn differential_lineage_refresh_walks_only_new_witnesses() {
         let id = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: (i as u64).to_le_bytes().to_vec(),
                 }),
             )
@@ -290,17 +291,17 @@ fn differential_lineage_refresh_walks_only_new_witnesses() {
     // genuine roots: append auto-links to the actor's previous head, so
     // actor 1 entries would chain onto the long tail and their lineage
     // would be the whole journal (not the differential case).
-    let mut sub_prev: Option<Hash> = None;
+    let mut sub_prev: Option<EntryHash> = None;
     for i in 0..8 {
         let id = journal
             .append(
                 EntryKind::Send,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 2,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(2),
+                    to: ActorId(1),
                     original_content: (3000 + i as u64).to_le_bytes().to_vec(),
                 }),
             )
@@ -310,10 +311,10 @@ fn differential_lineage_refresh_walks_only_new_witnesses() {
     let new_witness = journal
         .append(
             EntryKind::Outcome,
-            2,
+            ActorId(2),
             sub_prev.into_iter().collect::<Vec<_>>(),
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(u64::MAX - 1),
             }),
         )
@@ -352,12 +353,12 @@ fn samc_prepruning_is_selective_and_deterministic() {
     let send_a = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -365,12 +366,12 @@ fn samc_prepruning_is_selective_and_deterministic() {
     let send_b = journal
         .append(
             EntryKind::Send,
-            2,
+            ActorId(2),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(2, 0),
-                from: 2,
-                to: 3,
+                message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                from: ActorId(2),
+                to: ActorId(3),
                 original_content: 2u64.to_le_bytes().to_vec(),
             }),
         )
@@ -378,10 +379,10 @@ fn samc_prepruning_is_selective_and_deterministic() {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            3,
+            ActorId(3),
             [send_a, send_b],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -417,12 +418,12 @@ fn samc_prepruning_is_selective_and_deterministic() {
     let child = journal
         .append(
             EntryKind::Recv,
-            1,
+            ActorId(1),
             [send_a],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(1),
                 observed_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -481,7 +482,7 @@ fn run_scaling_chain(n: usize) -> (usize, usize, usize, usize, bool, bool, Durat
     // Typed-support derivation: the provider declares AllOf over the
     // witness's faultable Send ancestors, and its version and digest fold
     // into the solver configuration.
-    let send_ids: BTreeSet<Hash> = journal
+    let send_ids: BTreeSet<EntryHash> = journal
         .entries()
         .filter(|entry| entry.data.kind == EntryKind::Send)
         .map(|entry| entry.id)
@@ -515,7 +516,7 @@ fn run_scaling_chain(n: usize) -> (usize, usize, usize, usize, bool, bool, Durat
     // Statement emission and journal-anchored validation.
     let run = run_result_for(journal);
     let finding = Finding {
-        seed: [7; 32],
+        seed: EntryHash([7; 32]),
         run,
         verdict,
     };
@@ -531,7 +532,7 @@ fn run_scaling_chain(n: usize) -> (usize, usize, usize, usize, bool, bool, Durat
         &report,
         "capability-gate-builder",
         Vec::new(),
-        [9u8; 32],
+        EntryHash([9u8; 32]),
         None,
     )
     .expect("certificate emission must succeed");

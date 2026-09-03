@@ -4,6 +4,7 @@ use ledger_explorer::certs::MAX_EVENT_COST;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::run_campaign;
 use ledger_explorer::workloads::MiniKvWorkload;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig};
 
 fn temp_cert_path(name: &str) -> std::path::PathBuf {
@@ -16,14 +17,14 @@ fn temp_cert_path(name: &str) -> std::path::PathBuf {
 #[test]
 fn certificate_write_and_verify_roundtrip() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
     let workload = MiniKvWorkload;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
     let report = run_campaign(&workload, &oracle, config.clone(), 10).unwrap();
-    let digest = *blake3::hash(&config.seed()).as_bytes();
+    let digest = EntryHash(*blake3::hash(&config.seed().0).as_bytes());
     let builder = "test-builder-certificate-emission";
     let path = temp_cert_path("roundtrip");
     report
@@ -52,7 +53,7 @@ fn certificate_write_and_verify_roundtrip() {
 #[test]
 fn from_campaign_is_deterministic() {
     let config = RunConfig::builder()
-        .seed([3; 32])
+        .seed(EntryHash([3; 32]))
         .policy(Policy::Random)
         .max_steps(64)
         .build();
@@ -63,7 +64,7 @@ fn from_campaign_is_deterministic() {
         5,
     )
     .unwrap();
-    let digest = [7u8; 32];
+    let digest = EntryHash([7u8; 32]);
     let builder = "helper-builder";
     let cert_a = ledger_explorer::CampaignCertificate::from_campaign(
         &report,
@@ -94,7 +95,7 @@ fn from_campaign_is_deterministic() {
 #[test]
 fn recorded_solver_data_from_real_cut_verifies() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -122,7 +123,7 @@ fn recorded_solver_data_from_real_cut_verifies() {
         &report,
         "test-builder-solver-data",
         Vec::new(),
-        [2u8; 32],
+        EntryHash([2u8; 32]),
         None,
     )
     .unwrap();

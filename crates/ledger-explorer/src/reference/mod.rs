@@ -91,7 +91,7 @@ fn outcome_values(journal: &Journal) -> Vec<u64> {
 }
 
 /// Collect the `Outcome` values journaled by one actor, in journal order.
-fn outcome_by_actor(journal: &Journal, actor: u32) -> Vec<u64> {
+fn outcome_by_actor(journal: &Journal, actor: ledger_format::ActorId) -> Vec<u64> {
     journal
         .entries()
         .filter_map(|entry| {

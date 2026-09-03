@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -66,7 +66,7 @@ impl CoverageBuilder {
     }
 
     /// Record a root hash for one run.
-    pub fn record(&mut self, root: Hash, run_index: usize, finding: bool) {
+    pub fn record(&mut self, root: EntryHash, run_index: usize, finding: bool) {
         let hex = ledger_format::hash_to_hex(&root);
         self.records.push(RootRecord {
             root_hex: hex,
@@ -261,11 +261,12 @@ pub fn to_jacoco(report: &CoverageReport) -> Result<String, CovError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledger_format::ActorId;
     use ledger_journal::Journal;
     use ledger_sim::RunResult;
 
-    fn hash_of(byte: u8) -> Hash {
-        [byte; 32]
+    fn hash_of(byte: u8) -> EntryHash {
+        EntryHash([byte; 32])
     }
 
     #[test]
@@ -444,10 +445,10 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                0,
+                ActorId(0),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -470,9 +471,9 @@ mod tests {
             runs_executed: 5,
             distinct_roots: 3,
             findings: vec![Finding {
-                seed: [1u8; 32],
+                seed: EntryHash([1u8; 32]),
                 run,
-                verdict: Verdict::fail(vec![[1u8; 32]], "test"),
+                verdict: Verdict::fail(vec![EntryHash([1u8; 32])], "test"),
             }],
             variants: vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()],
             monitors: Vec::new(),

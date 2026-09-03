@@ -2,7 +2,7 @@
 
 use crate::oracle::Verdict;
 use crate::solver::{FaultSolver, SolverError};
-use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
+use ledger_format::{EntryHash, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::SimFault;
 use std::collections::HashSet;
@@ -10,7 +10,7 @@ use std::collections::HashSet;
 /// A single faultable boundary event.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FaultableEvent {
-    pub event: Hash,
+    pub event: EntryHash,
     pub kind: EntryKind,
     /// Cost weight for injecting this fault.
     pub cost: u64,
@@ -19,7 +19,7 @@ pub struct FaultableEvent {
 /// A candidate fault hypothesis (cut) that breaks derivation paths of an oracle outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultHypothesis {
-    pub events: Vec<Hash>,
+    pub events: Vec<EntryHash>,
     pub total_cost: u64,
     pub explanation: String,
 }
@@ -50,7 +50,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<S
     let mut seen = HashSet::new();
     let mut seen_classes = HashSet::new();
     let push = |schedule: &mut Vec<SimFault>,
-                seen_classes: &mut HashSet<(u8, Hash)>,
+                seen_classes: &mut HashSet<(u8, EntryHash)>,
                 injection: SimFault| {
         let key = injection_key(&injection);
         if seen_classes.insert(key) {
@@ -82,7 +82,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<S
                         &mut seen_classes,
                         SimFault::Partition {
                             src: entry.data.actor,
-                            dst: *to as ActorId,
+                            dst: *to,
                         },
                     );
                 }
@@ -169,7 +169,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<S
 /// Entry-targeted injections key on the entry id; a partition keys on the
 /// directed link. The class tag keeps distinct injection classes for the same
 /// target (drop, delay, partition, corrupt, crash-state) all executable.
-fn injection_key(injection: &SimFault) -> (u8, Hash) {
+fn injection_key(injection: &SimFault) -> (u8, EntryHash) {
     match injection {
         SimFault::Drop(id) => (0, *id),
         SimFault::Delay { send, .. } => (1, *send),
@@ -178,9 +178,9 @@ fn injection_key(injection: &SimFault) -> (u8, Hash) {
         SimFault::CrashState { write, .. } => (4, *write),
         SimFault::Partition { src, dst } => {
             let mut hasher = blake3::Hasher::new();
-            hasher.update(&src.to_le_bytes());
-            hasher.update(&dst.to_le_bytes());
-            (5, *hasher.finalize().as_bytes())
+            hasher.update(&src.0.to_le_bytes());
+            hasher.update(&dst.0.to_le_bytes());
+            (5, EntryHash(*hasher.finalize().as_bytes()))
         }
     }
 }
@@ -189,7 +189,7 @@ fn injection_key(injection: &SimFault) -> (u8, Hash) {
 ///
 /// A `Recv` observes a `Send`, but its parent list also carries block or
 /// wake dependencies. Search the parents for the `Send` kind specifically.
-fn send_parent(parents: &[Hash], journal: &Journal) -> Option<Hash> {
+fn send_parent(parents: &[EntryHash], journal: &Journal) -> Option<EntryHash> {
     parents.iter().copied().find(|parent| {
         journal
             .get(parent)
@@ -197,7 +197,7 @@ fn send_parent(parents: &[Hash], journal: &Journal) -> Option<Hash> {
     })
 }
 
-fn fs_write_parent(parents: &[Hash], journal: &Journal) -> Option<Hash> {
+fn fs_write_parent(parents: &[EntryHash], journal: &Journal) -> Option<EntryHash> {
     parents.iter().copied().find(|parent| {
         journal
             .get(parent)
@@ -209,63 +209,61 @@ fn fs_write_parent(parents: &[Hash], journal: &Journal) -> Option<Hash> {
 mod tests {
     use super::*;
     use crate::solver::HittingSetSolver;
+    use ledger_format::ActorId;
     use ledger_format::CanonicalValue;
     #[test]
-    fn fallback_cut_is_a_proper_subset_of_faultable_events() {
+    fn empty_provenance_fails_closed_with_typed_error() {
         // Faultable Sends on actor 1 and a witness outcome on actor 2 with no
-        // faultable ancestors: backward provenance yields no paths, so the
-        // fallback must rank a single high-cost event rather than every
-        // faultable event.
+        // faultable ancestors: backward provenance yields no paths. The typed
+        // hazard walk must fail closed with `EmptyProvenance` instead of
+        // ranking an unrelated single max-cost event. The support for an
+        // empty path set is `Opaque`, so no minimum claim is possible.
+        use crate::solver::SolverError;
+        use crate::support::{SupportExpr, support_from_paths};
         let mut journal = Journal::new();
-        let mut sends = Vec::new();
         for value in 0..4u64 {
-            sends.push(
-                journal
-                    .append(
-                        EntryKind::Send,
-                        1,
-                        [],
-                        EntryPayload::Send(ledger_format::SendFrame {
-                            message_id: ledger_format::MessageId::new(1, 0),
-                            from: 1,
-                            to: 2,
-                            original_content: value.to_le_bytes().to_vec(),
-                        }),
-                    )
-                    .expect("append must succeed"),
-            );
+            journal
+                .append(
+                    EntryKind::Send,
+                    ActorId(1),
+                    [],
+                    EntryPayload::Send(ledger_format::SendFrame {
+                        message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                        from: ActorId(1),
+                        to: ActorId(2),
+                        original_content: value.to_le_bytes().to_vec(),
+                    }),
+                )
+                .expect("append must succeed");
         }
         let outcome = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
             .expect("append must succeed");
 
         let verdict = Verdict::fail(vec![outcome], "planted");
+        let empty: Vec<Vec<ledger_format::EntryHash>> = Vec::new();
+        let support = support_from_paths(&empty, false);
+        assert_eq!(support, SupportExpr::Opaque);
+        assert!(
+            !support.is_strong(),
+            "empty provenance cannot back a minimum claim"
+        );
         let mut solver = HittingSetSolver::new();
-        let hypotheses = solve_with(&mut solver, &journal, &verdict).expect("solve must succeed");
-        assert!(
-            !hypotheses.is_empty(),
-            "the fallback must seed at least one hypothesis"
-        );
-        let cut = &hypotheses[0];
-        assert!(!cut.events.is_empty());
-        assert!(
-            cut.events.len() < sends.len(),
-            "the fallback cut must be a proper subset of the faultable events"
-        );
-        for id in &cut.events {
-            assert!(
-                sends.contains(id),
-                "the cut must draw from the faultable events"
-            );
-        }
+        let error = solve_with(&mut solver, &journal, &verdict).expect_err("solve must fail");
+        assert_eq!(error, SolverError::EmptyProvenance);
+        // The MaxSAT encoding fails the same way: no hard clause exists.
+        let config = crate::solver::SolverConfig::default();
+        let encode_error = crate::maxsat::encode_hazard(&journal, &verdict, &config)
+            .expect_err("encode must fail");
+        assert_eq!(encode_error, SolverError::EmptyProvenance);
     }
 
     #[test]
@@ -274,12 +272,12 @@ mod tests {
         let send = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -287,10 +285,10 @@ mod tests {
         let outcome = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [send],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )

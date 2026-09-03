@@ -1,6 +1,6 @@
 use super::Workload;
-use crate::diagnosis::first_divergence;
-use ledger_format::Hash;
+use crate::diagnosis::{Divergence, first_divergence};
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, RunResult, SimFault, Simulation};
 
 /// Strict replay for reproduction gates.
@@ -10,7 +10,7 @@ use ledger_sim::{Policy, RunConfig, RunResult, SimFault, Simulation};
 /// [`replay_prefix`] for lenient minimization-only prefix replay.
 pub fn replay<W: Workload + ?Sized>(
     workload: &W,
-    seed: Hash,
+    seed: EntryHash,
     decisions: Vec<usize>,
 ) -> Result<RunResult, ledger_sim::RuntimeError> {
     // Strict alias: every reproduction path is strict. Lenient is only via
@@ -25,7 +25,7 @@ pub fn replay<W: Workload + ?Sized>(
 /// Callers needing to distinguish violations should match on the typed error.
 pub fn replay_strict<W: Workload + ?Sized>(
     workload: &W,
-    seed: Hash,
+    seed: EntryHash,
     decisions: Vec<usize>,
 ) -> Result<RunResult, ledger_sim::RuntimeError> {
     let config = RunConfig::builder()
@@ -43,7 +43,7 @@ pub fn replay_strict<W: Workload + ?Sized>(
 /// reproduction. Use [`replay_strict`] to validate a reproduction gate.
 pub fn replay_prefix<W: Workload + ?Sized>(
     workload: &W,
-    seed: Hash,
+    seed: EntryHash,
     decisions: Vec<usize>,
 ) -> Result<RunResult, ledger_sim::RuntimeError> {
     let config = RunConfig::builder()
@@ -115,7 +115,10 @@ fn journaled_crash_operations(run: &ledger_sim::RunResult) -> Vec<ledger_format:
 }
 
 /// Look up the canonical path of the `FsWrite` entry `write_id` in `run`.
-fn write_path_of(run: &ledger_sim::RunResult, write_id: ledger_format::Hash) -> Option<String> {
+fn write_path_of(
+    run: &ledger_sim::RunResult,
+    write_id: ledger_format::EntryHash,
+) -> Option<String> {
     run.journal.entries().find_map(|entry| {
         if entry.id != write_id {
             return None;
@@ -140,7 +143,7 @@ fn write_path_of(run: &ledger_sim::RunResult, write_id: ledger_format::Hash) -> 
 pub fn replay_with_faults<W: Workload + ?Sized>(
     workload: &W,
     base: &ledger_journal::Journal,
-    seed: Hash,
+    seed: EntryHash,
     decisions: Vec<usize>,
     schedule: Vec<SimFault>,
 ) -> Result<FaultReplayReport, FaultReplayError> {
@@ -158,7 +161,7 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
             }
             other => FaultReplayError::Runtime(Box::new(other)),
         })?;
-    let applied_set: std::collections::HashSet<&Hash> = run.applied_faults.iter().collect();
+    let applied_set: std::collections::HashSet<&EntryHash> = run.applied_faults.iter().collect();
     let mut seen_applied = std::collections::HashSet::new();
     let mut applied = Vec::new();
     let mut voided = Vec::new();
@@ -239,18 +242,51 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
     })
 }
 
-pub fn diff(left: &RunResult, right: &RunResult) -> Option<(Hash, Hash)> {
-    first_divergence(&left.journal, &right.journal).map(|(left, right)| {
-        (
-            left.map_or([0; 32], |entry| entry.id),
-            right.map_or([0; 32], |entry| entry.id),
-        )
-    })
+/// Outcome of comparing two runs journal by journal.
+///
+/// `Identical` means the vector-clock ordered streams match exactly.
+/// `Diverged` carries the first differing entry ids. `Truncated` means one
+/// run is a strict prefix of the other; the longer side's first extra id is
+/// carried (`None` on the shorter side). Callers must handle `Truncated`
+/// explicitly instead of collapsing it to identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalDiff {
+    Identical,
+    Diverged {
+        left: EntryHash,
+        right: EntryHash,
+    },
+    Truncated {
+        left: Option<EntryHash>,
+        right: Option<EntryHash>,
+    },
+}
+
+impl JournalDiff {
+    /// Whether the compared runs match exactly.
+    pub fn is_identical(&self) -> bool {
+        matches!(self, Self::Identical)
+    }
+}
+
+pub fn diff(left: &RunResult, right: &RunResult) -> JournalDiff {
+    match first_divergence(&left.journal, &right.journal) {
+        Divergence::Identical => JournalDiff::Identical,
+        Divergence::Diverged { left, right } => JournalDiff::Diverged {
+            left: left.id,
+            right: right.id,
+        },
+        Divergence::Truncated { left, right } => JournalDiff::Truncated {
+            left: left.map(|entry| entry.id),
+            right: right.map(|entry| entry.id),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledger_format::ActorId;
     use ledger_sim::{Instruction, ReplayViolation, RuntimeError};
 
     struct TwoDone;
@@ -294,7 +330,7 @@ mod tests {
 
     #[test]
     fn replay_strict_valid_matches_lenient_root() {
-        let seed = [13; 32];
+        let seed = EntryHash([13; 32]);
         let workload = MiniKv;
         let base = {
             let config = RunConfig::builder()
@@ -315,7 +351,7 @@ mod tests {
 
     #[test]
     fn replay_strict_rejects_out_of_range() {
-        let seed = [7; 32];
+        let seed = EntryHash([7; 32]);
         let workload = TwoDone;
         let err = replay_strict(&workload, seed, vec![99]).expect_err("out of range");
         match err {
@@ -337,7 +373,7 @@ mod tests {
 
     #[test]
     fn replay_strict_rejects_exhausted() {
-        let seed = [9; 32];
+        let seed = EntryHash([9; 32]);
         let workload = TwoDone;
         let err = replay_strict(&workload, seed, vec![0]).expect_err("exhausted");
         match err {
@@ -354,7 +390,7 @@ mod tests {
 
     #[test]
     fn replay_strict_rejects_trailing() {
-        let seed = [11; 32];
+        let seed = EntryHash([11; 32]);
         let workload = TwoDone;
         let base = {
             let config = RunConfig::builder()
@@ -381,7 +417,7 @@ mod tests {
 
     #[test]
     fn replay_prefix_is_lenient_minimization_only() {
-        let seed = [17; 32];
+        let seed = EntryHash([17; 32]);
         let workload = TwoDone;
         // Empty prefix still completes via seeded fallback, proving it cannot
         // satisfy a reproduction gate that requires exact replay.
@@ -399,7 +435,7 @@ mod tests {
         // A fault that partitions the only ready task's link at step 4
         // causes ready_len to shrink from 2 to 1; lenient replay would
         // normalize 1 % 1 = 0, but strict must surface OutOfRange.
-        let seed = [17; 32];
+        let seed = EntryHash([17; 32]);
         struct DriftWorkload;
         impl Workload for DriftWorkload {
             fn programs(&self) -> Vec<Vec<Instruction>> {
@@ -457,7 +493,10 @@ mod tests {
             &base_journal,
             seed,
             out_of_range,
-            vec![SimFault::Partition { src: 0, dst: 1 }],
+            vec![SimFault::Partition {
+                src: ActorId(0),
+                dst: ActorId(1),
+            }],
         )
         .expect_err("fault replay with out-of-range must be strict violation");
         assert!(

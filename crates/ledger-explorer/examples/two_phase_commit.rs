@@ -3,12 +3,13 @@
 use ledger_explorer::oracle::AssertionOracle;
 use ledger_explorer::search::run_campaign;
 use ledger_explorer::workloads::TwoPhaseCommitWorkload;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig};
 
 fn main() {
     println!("=== Ledger Engine: Two-Phase Commit Exploration ===");
     let config = RunConfig::builder()
-        .seed([100; 32])
+        .seed(EntryHash([100; 32]))
         .policy(Policy::Bandit {
             exploration_constant: 1.414,
             pct_mix: ledger_sim::Probability::new(0.1).unwrap(),

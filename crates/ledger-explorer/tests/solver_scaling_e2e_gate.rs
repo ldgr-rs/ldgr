@@ -21,6 +21,8 @@
 //! `certify_hazard` with `services::qualify_cut` for that.
 
 use ledger_explorer::services::certify_hazard;
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{EntryKind, EntryPayload, MessageId, RecvFrame, SendFrame};
 use ledger_journal::Journal;
 use ledger_sim::RunResult;
@@ -34,17 +36,17 @@ const PATHS: [usize; 4] = [500, 5_000, 50_000, 1_000_000];
 const RECORDED_WITNESS_CAP: usize = 1024;
 
 /// Build the fan-in hazard fixture: (journal, verdict, gate-send id).
-fn build_fan_in(paths: usize) -> (Journal, ledger_explorer::Verdict, ledger_format::Hash) {
+fn build_fan_in(paths: usize) -> (Journal, ledger_explorer::Verdict, ledger_format::EntryHash) {
     let mut journal = Journal::new();
     let gate = journal
         .append(
             EntryKind::Send,
-            0,
+            ActorId(0),
             [],
             EntryPayload::Send(SendFrame {
-                message_id: MessageId::new(0, 0),
-                from: 0,
-                to: 1,
+                message_id: MessageId::new(ActorId(0), 0),
+                from: ActorId(0),
+                to: ActorId(1),
                 original_content: vec![0],
             }),
         )
@@ -55,12 +57,12 @@ fn build_fan_in(paths: usize) -> (Journal, ledger_explorer::Verdict, ledger_form
         let witness = journal
             .append(
                 EntryKind::Recv,
-                actor,
+                ActorId(actor),
                 [gate],
                 EntryPayload::Recv(RecvFrame {
-                    message_id: MessageId::new(actor, index as u64),
-                    from: 0,
-                    to: actor,
+                    message_id: MessageId::new(ActorId(actor), index as u64),
+                    from: ActorId(0),
+                    to: ActorId(actor),
                     observed_content: vec![0],
                 }),
             )
@@ -89,10 +91,13 @@ fn hazard_certification_scales_to_one_million_entries() {
         );
 
         let start = std::time::Instant::now();
-        let (hypotheses, certificate) =
-            certify_hazard(journal, &verdict, [7u8; 32], RECORDED_WITNESS_CAP).unwrap_or_else(
-                |error| panic!("paths={paths}: end-to-end certification failed: {error}"),
-            );
+        let (hypotheses, certificate) = certify_hazard(
+            journal,
+            &verdict,
+            EntryHash([7u8; 32]),
+            RECORDED_WITNESS_CAP,
+        )
+        .unwrap_or_else(|error| panic!("paths={paths}: end-to-end certification failed: {error}"));
         let duration = start.elapsed();
 
         // The shared witness literal is the unique minimal cut.
@@ -149,11 +154,21 @@ fn hazard_certification_scales_to_one_million_entries() {
 #[test]
 fn hazard_certification_is_deterministic() {
     let (journal, verdict, gate) = build_fan_in(500);
-    let (first, cert_a) =
-        certify_hazard(journal, &verdict, [7u8; 32], RECORDED_WITNESS_CAP).expect("first run");
+    let (first, cert_a) = certify_hazard(
+        journal,
+        &verdict,
+        EntryHash([7u8; 32]),
+        RECORDED_WITNESS_CAP,
+    )
+    .expect("first run");
     let (journal, verdict, _) = build_fan_in(500);
-    let (second, cert_b) =
-        certify_hazard(journal, &verdict, [7u8; 32], RECORDED_WITNESS_CAP).expect("second run");
+    let (second, cert_b) = certify_hazard(
+        journal,
+        &verdict,
+        EntryHash([7u8; 32]),
+        RECORDED_WITNESS_CAP,
+    )
+    .expect("second run");
     assert_eq!(first[0].events, second[0].events, "cut must be stable");
     assert_eq!(
         first[0].total_cost, second[0].total_cost,
@@ -182,7 +197,7 @@ fn hazard_certification_is_deterministic() {
         reason: "negative control".to_string(),
     };
     let (journal, _, _) = build_fan_in(500);
-    let no_finding = certify_hazard(journal, &empty, [7u8; 32], RECORDED_WITNESS_CAP);
+    let no_finding = certify_hazard(journal, &empty, EntryHash([7u8; 32]), RECORDED_WITNESS_CAP);
     assert!(
         no_finding.is_err(),
         "an empty hazard must not produce a statement"

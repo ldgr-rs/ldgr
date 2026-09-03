@@ -1,6 +1,8 @@
 use super::*;
 use crate::oracle::{AssertionOracle, HistoryOperation, Oracle, PropertyOracle};
 use crate::search::{Finding, Workload};
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{CanonicalValue, EntryPayload};
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, Simulation};
 use std::error::Error as _;
@@ -65,7 +67,7 @@ fn no_input_equals_42() -> PropertyOracle<impl Fn(&Journal) -> bool> {
 
 fn input_journal_finding() -> Finding {
     let base = RunConfig::builder()
-        .seed([10; 32])
+        .seed(EntryHash([10; 32]))
         .policy(Policy::Random)
         .max_steps(512)
         .build();
@@ -148,10 +150,10 @@ fn chain_journal(values: &[u64]) -> Journal {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(*value),
                 }),
             )
@@ -182,7 +184,7 @@ fn memoized_replay_hits_on_identical_batch() {
     let ids = source
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     let empty = Journal::new().root_hash();
 
     let mut memo = MemoizedReplay::new();
@@ -208,7 +210,7 @@ fn memoized_replay_misses_on_distinct_batches() {
     let ids = source
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     let empty = Journal::new().root_hash();
 
     let mut memo = MemoizedReplay::new();
@@ -229,7 +231,7 @@ fn memoized_replay_returns_correct_journal_for_multi_batch_sequence() {
     let ids = source
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     let empty = Journal::new().root_hash();
 
     let mut memo = MemoizedReplay::new();
@@ -260,7 +262,7 @@ fn memoized_replay_rejects_tampered_prefix_root() {
     let ids = source
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     let empty = Journal::new().root_hash();
 
     let mut memo = MemoizedReplay::new();
@@ -284,11 +286,11 @@ fn memoized_replay_rejects_tampered_prefix_root() {
         "the rebuilt journal state must be preserved"
     );
 
-    let bogus = memo.replay([0xAB; 32], &ids[..2], &source);
+    let bogus = memo.replay(EntryHash([0xAB; 32]), &ids[..2], &source);
     let MemoError::PrefixMismatch { caller, .. } = bogus.unwrap_err() else {
         panic!("bogus initial state must be the typed mismatch");
     };
-    assert_eq!(caller, [0xAB; 32]);
+    assert_eq!(caller, EntryHash([0xAB; 32]));
     assert_eq!(memo.stats(), (0, 2), "no tampered key may hit the cache");
 }
 
@@ -299,7 +301,11 @@ fn memoized_replay_rejects_unknown_batch_entry() {
     let source = chain_journal(&(0..4).collect::<Vec<_>>());
     let mut memo = MemoizedReplay::new();
     let err = memo
-        .replay(Journal::new().root_hash(), &[[0x42; 32]], &source)
+        .replay(
+            Journal::new().root_hash(),
+            &[EntryHash([0x42; 32])],
+            &source,
+        )
         .unwrap_err();
     assert!(matches!(err, MemoError::UnknownBatchEntry), "got {err:?}");
 }
@@ -312,7 +318,7 @@ fn memoized_replay_rejects_non_contiguous_batch() {
     let ids = source
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     let mut memo = MemoizedReplay::new();
     let err = memo
         .replay(Journal::new().root_hash(), &[ids[0], ids[2]], &source)
@@ -325,7 +331,7 @@ fn memoized_replay_rejects_non_contiguous_batch() {
 /// the chain, never folded into a message-only string.
 #[test]
 fn minimize_error_keeps_journal_source() {
-    let err = MinimizeError::from(JournalError::MissingParent([0x7E; 32]));
+    let err = MinimizeError::from(JournalError::MissingParent(EntryHash([0x7E; 32])));
     let MinimizeError::Subgraph(source) = &err else {
         panic!("expected Subgraph, got {err:?}");
     };
@@ -344,7 +350,7 @@ fn minimize_error_keeps_journal_source() {
 /// journal source, and the pipeline converts it without losing the type.
 #[test]
 fn memo_error_keeps_journal_source() {
-    let err = MemoError::from(JournalError::MissingParent([0x7E; 32]));
+    let err = MemoError::from(JournalError::MissingParent(EntryHash([0x7E; 32])));
     assert!(matches!(err, MemoError::Subgraph(_)), "got {err:?}");
     let wrapped = MinimizeError::from(err);
     assert!(matches!(wrapped, MinimizeError::Memo(_)), "got {wrapped:?}");
@@ -356,7 +362,7 @@ fn memoized_replay_fast_forwards_repeated_batches() {
     let ids = source
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     let empty = Journal::new().root_hash();
 
     let mut memo = MemoizedReplay::new();
@@ -376,10 +382,10 @@ fn candidate_journal_fast_forwards_source_prefix_runs() {
     source
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -388,10 +394,10 @@ fn candidate_journal_fast_forwards_source_prefix_runs() {
         source
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(value),
                 }),
             )
@@ -400,7 +406,7 @@ fn candidate_journal_fast_forwards_source_prefix_runs() {
     let ids = source
         .entries()
         .map(|entry| entry.id)
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
 
     let mut memo = MemoizedReplay::new();
     let early = candidate_journal(&mut memo, &source, &ids[..13]).unwrap();
@@ -430,12 +436,12 @@ fn minimize_slice_forward_closure_preserves_violation() {
     let boundary = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(1),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -443,10 +449,10 @@ fn minimize_slice_forward_closure_preserves_violation() {
     let witness = journal
         .append(
             EntryKind::Assert,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Assert(ledger_format::AssertPayload {
-                predicate: [0x00; 32],
+                predicate: EntryHash([0x00; 32]),
                 passed: 0 != 0,
                 detail: CanonicalValue::Unsigned(0),
             }),
@@ -455,12 +461,12 @@ fn minimize_slice_forward_closure_preserves_violation() {
     let consumer = journal
         .append(
             EntryKind::Recv,
-            2,
+            ActorId(2),
             [boundary],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(2, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 observed_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -490,7 +496,7 @@ fn minimize_slice_forward_closure_preserves_violation() {
 #[test]
 fn minimize_full_reduces_inputs_when_generator_is_set() {
     let base = RunConfig::builder()
-        .seed([10; 32])
+        .seed(EntryHash([10; 32]))
         .policy(Policy::Random)
         .max_steps(512)
         .build();
@@ -570,7 +576,7 @@ fn quad_power_campaign_finding_minimizes_inputs_under_recorded_schedule() {
     const HIGH_BAND_FLOOR: u64 = 80;
 
     let base = RunConfig::builder()
-        .seed([12; 32])
+        .seed(EntryHash([12; 32]))
         .policy(Policy::Random)
         .max_steps(512)
         .build();

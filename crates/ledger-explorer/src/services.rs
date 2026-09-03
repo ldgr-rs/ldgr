@@ -15,7 +15,7 @@ use crate::search::{
     self, CampaignReport, FaultReplayError, FaultReplayReport, Finding, SearchError, Workload,
 };
 use crate::solver::{SolverConfig, SolverError};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::Journal;
 use ledger_sim::{RunConfig, RunResult, RuntimeError, SimFault, Simulation};
 
@@ -77,7 +77,7 @@ pub fn search_first<W: Workload, O: Oracle>(
 /// Strictly replay a recorded decision stream against a workload.
 pub fn replay_strict<W: Workload + ?Sized>(
     workload: &W,
-    seed: Hash,
+    seed: EntryHash,
     decisions: Vec<usize>,
 ) -> Result<RunResult, ServiceError> {
     Ok(search::replay_strict(workload, seed, decisions)?)
@@ -87,7 +87,7 @@ pub fn replay_strict<W: Workload + ?Sized>(
 /// reproduction gate.
 pub fn replay_prefix<W: Workload + ?Sized>(
     workload: &W,
-    seed: Hash,
+    seed: EntryHash,
     decisions: Vec<usize>,
 ) -> Result<RunResult, ServiceError> {
     Ok(search::replay_prefix(workload, seed, decisions)?)
@@ -113,7 +113,7 @@ pub fn schedule_from_hypothesis(hypothesis: &FaultHypothesis, journal: &Journal)
 pub fn replay_faults<W: Workload + ?Sized>(
     workload: &W,
     base: &Journal,
-    seed: Hash,
+    seed: EntryHash,
     decisions: Vec<usize>,
     schedule: Vec<SimFault>,
 ) -> Result<FaultReplayReport, ServiceError> {
@@ -158,7 +158,7 @@ pub struct CutQualification {
     /// No divergence before the first applied fault.
     pub prefix_ok: bool,
     /// Journal root of the replayed (violating) run.
-    pub replayed_root: Hash,
+    pub replayed_root: EntryHash,
 }
 
 /// Qualify one fault schedule as the cause of one finding.
@@ -248,7 +248,7 @@ pub fn qualify_cut<W: Workload + ?Sized, O: Oracle + ?Sized>(
 pub fn certify_hazard(
     journal: Journal,
     verdict: &Verdict,
-    run_config_digest: Hash,
+    run_config_digest: EntryHash,
     recorded_witness_cap: usize,
 ) -> Result<(Vec<FaultHypothesis>, CampaignCertificate), ServiceError> {
     let mut solver = MaxSatSolver::default();
@@ -270,7 +270,7 @@ pub fn certify_hazard(
         runs_executed: 1,
         distinct_roots: 1,
         findings: vec![Finding {
-            seed: [0; 32],
+            seed: EntryHash([0; 32]),
             run: ledger_sim::RunResult {
                 journal,
                 decisions: Vec::new(),
@@ -328,8 +328,8 @@ pub fn emit_statement(
     report: &CampaignReport,
     builder_id: &str,
     dependencies: Vec<ResolvedDependency>,
-    run_config_digest: Hash,
-    execution_identity: Option<Hash>,
+    run_config_digest: EntryHash,
+    execution_identity: Option<EntryHash>,
 ) -> Result<CampaignCertificate, ServiceError> {
     Ok(CampaignCertificate::from_campaign(
         report,

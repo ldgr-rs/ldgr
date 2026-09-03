@@ -8,6 +8,8 @@ use ledger_explorer::services::{
 };
 use ledger_explorer::solver::SolverConfig;
 use ledger_explorer::{CampaignReport, CertError, Finding, Oracle, PropertyOracle, Workload};
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SimFault, Simulation};
@@ -41,10 +43,10 @@ impl Workload for OutcomeWorkload {
     }
 }
 
-fn seed_bytes(seed: u64) -> [u8; 32] {
+fn seed_bytes(seed: u64) -> EntryHash {
     let mut out = [0u8; 32];
     out[0..8].copy_from_slice(&seed.to_le_bytes());
-    out
+    EntryHash(out)
 }
 
 fn config(seed: u64) -> RunConfig {
@@ -224,7 +226,7 @@ fn minimize_decisions_reduces_a_monotone_predicate() {
 fn emit_parse_validate_round_trip() {
     let report: CampaignReport =
         run_campaign(&OutcomeWorkload(99), &final_is(7), config(7), 1).expect("campaign must run");
-    let certificate = emit_statement(&report, "builder", Vec::new(), [1u8; 32], None)
+    let certificate = emit_statement(&report, "builder", Vec::new(), EntryHash([1u8; 32]), None)
         .expect("statement must emit");
     let json = certificate.to_json().expect("serialize");
     let parsed = parse_statement(&json).expect("statement must parse");
@@ -235,7 +237,7 @@ fn emit_parse_validate_round_trip() {
     lineage_only
         .append(
             EntryKind::Epoch,
-            0,
+            ActorId(0),
             [],
             EntryPayload::Epoch(ledger_format::EpochPayload { epoch: 0 }),
         )
@@ -249,8 +251,14 @@ fn emit_parse_validate_round_trip() {
         })
         .collect();
     let lineage_only = CampaignReport { findings, ..report };
-    let err = emit_statement(&lineage_only, "builder", Vec::new(), [1u8; 32], None)
-        .expect_err("lineage-only journals must be rejected");
+    let err = emit_statement(
+        &lineage_only,
+        "builder",
+        Vec::new(),
+        EntryHash([1u8; 32]),
+        None,
+    )
+    .expect_err("lineage-only journals must be rejected");
     assert!(
         matches!(err, ServiceError::Cert(CertError::Verification(_))),
         "typed cert error: {err:?}"
@@ -267,10 +275,11 @@ fn emit_parse_validate_round_trip() {
 fn validate_cut_against_journal_rejects_zero_digest_binding() {
     let report: CampaignReport =
         run_campaign(&OutcomeWorkload(99), &final_is(99), config(8), 1).expect("campaign must run");
-    let mut certificate = emit_statement(&report, "builder", Vec::new(), [1u8; 32], None)
-        .expect("statement must emit");
+    let mut certificate =
+        emit_statement(&report, "builder", Vec::new(), EntryHash([1u8; 32]), None)
+            .expect("statement must emit");
     // A zero subject digest never binds to any journal in journal mode.
-    certificate.subject.digest = [0u8; 32];
+    certificate.subject.digest = EntryHash([0u8; 32]);
     let journal = Journal::new();
     let err =
         validate_cut_against_journal(&certificate, &journal).expect_err("zero digest rejected");
@@ -288,7 +297,7 @@ fn validate_inclusion_minimal_cut_refuses_campaign_statements() {
         !report.findings.is_empty(),
         "the mismatched oracle must produce a finding"
     );
-    let certificate = emit_statement(&report, "builder", Vec::new(), [1u8; 32], None)
+    let certificate = emit_statement(&report, "builder", Vec::new(), EntryHash([1u8; 32]), None)
         .expect("statement must emit");
     let journal = report.findings[0].run.journal.clone();
     // The operation names the third distinct check: inclusion-minimal

@@ -13,30 +13,71 @@ fn entries_in_vc_order(journal: &Journal) -> Vec<&Entry> {
     entries
 }
 
+/// Outcome of comparing two journals at their first divergence.
+///
+/// `Identical` means the vector-clock ordered streams match exactly.
+/// `Diverged` carries the first differing pair. `Truncated` means one stream
+/// is a strict prefix of the other: the longer side's first extra entry is
+/// carried so callers can distinguish a truncated replay from a behavior
+/// change instead of collapsing both to `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Divergence<'a> {
+    Identical,
+    Diverged {
+        left: &'a Entry,
+        right: &'a Entry,
+    },
+    Truncated {
+        left: Option<&'a Entry>,
+        right: Option<&'a Entry>,
+    },
+}
+
+impl<'a> Divergence<'a> {
+    /// Whether the compared streams match exactly.
+    #[allow(dead_code)]
+    pub fn is_identical(&self) -> bool {
+        matches!(self, Self::Identical)
+    }
+}
+
 /// Compare two journals at their first divergent entry pair.
 ///
 /// Both streams are walked in vector-clock order, so a difference in append
 /// order of concurrent entries is not a divergence. A strict prefix of one
-/// journal is a truncated replay, not a behavior change: it returns `None`
-/// like an identical match. When the journals do diverge, both sides of the
-/// returned pair are `Some`.
-pub fn first_divergence<'a>(
-    left: &'a Journal,
-    right: &'a Journal,
-) -> Option<(Option<&'a Entry>, Option<&'a Entry>)> {
+/// journal is a truncated replay, not a behavior change: it returns
+/// [`Divergence::Truncated`] with the longer side's first extra entry,
+/// never [`Divergence::Identical`]. When the journals do diverge, the
+/// [`Divergence::Diverged`] pair carries both sides.
+pub fn first_divergence<'a>(left: &'a Journal, right: &'a Journal) -> Divergence<'a> {
     let mut left_iter = entries_in_vc_order(left).into_iter();
     let mut right_iter = entries_in_vc_order(right).into_iter();
     loop {
         match (left_iter.next(), right_iter.next()) {
-            (None, None) => return None,
+            (None, None) => return Divergence::Identical,
             (Some(left_entry), Some(right_entry)) => {
                 if left_entry.id != right_entry.id {
-                    return Some((Some(left_entry), Some(right_entry)));
+                    return Divergence::Diverged {
+                        left: left_entry,
+                        right: right_entry,
+                    };
                 }
             }
-            // One journal truncated early. A truncated replay is a leak
-            // case, not a behavior-change divergence.
-            (Some(_), None) | (None, Some(_)) => return None,
+            // One journal truncated early. A truncated replay is an explicit
+            // case, not an identical match: the longer side's first extra
+            // entry is carried.
+            (Some(extra), None) => {
+                return Divergence::Truncated {
+                    left: Some(extra),
+                    right: None,
+                };
+            }
+            (None, Some(extra)) => {
+                return Divergence::Truncated {
+                    left: None,
+                    right: Some(extra),
+                };
+            }
         }
     }
 }
@@ -44,7 +85,9 @@ pub fn first_divergence<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
+    use ledger_format::ActorId;
+    use ledger_format::EntryHash;
+    use ledger_format::{CanonicalValue, EntryKind, EntryPayload, SequenceNumber};
     use ledger_sim::RunResult;
 
     fn journal_with(values: &[u64]) -> Journal {
@@ -53,10 +96,10 @@ mod tests {
             journal
                 .append(
                     EntryKind::Outcome,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: CanonicalValue::Unsigned(*value),
                     }),
                 )
@@ -87,7 +130,7 @@ mod tests {
         let right = run(concurrent_journal(&[(2, 20), (1, 10)]));
 
         assert!(
-            first_divergence(&left.journal, &right.journal).is_none(),
+            first_divergence(&left.journal, &right.journal).is_identical(),
             "identical vector-clock semantics must not read as a divergence"
         );
     }
@@ -103,10 +146,10 @@ mod tests {
             journal
                 .append(
                     EntryKind::Outcome,
-                    *actor,
+                    ActorId(*actor),
                     [],
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: CanonicalValue::Unsigned(*value),
                     }),
                 )
@@ -116,21 +159,27 @@ mod tests {
     }
 
     #[test]
-    fn prefix_truncation_is_not_a_divergence_either_way() {
+    fn prefix_truncation_reports_truncated_either_way() {
         let left = run(journal_with(&[1, 2, 3, 4]));
         let right = run(journal_with(&[1, 2, 3]));
 
-        assert!(
-            first_divergence(&left.journal, &right.journal).is_none(),
-            "a strict prefix must not read as a divergence"
-        );
+        match first_divergence(&left.journal, &right.journal) {
+            Divergence::Truncated {
+                left: Some(_),
+                right: None,
+            } => {}
+            other => panic!("a strict prefix must report Truncated, got {other:?}"),
+        }
 
         let swapped_left = run(journal_with(&[1, 2, 3]));
         let swapped_right = run(journal_with(&[1, 2, 3, 4]));
-        assert!(
-            first_divergence(&swapped_left.journal, &swapped_right.journal).is_none(),
-            "prefix direction must not matter"
-        );
+        match first_divergence(&swapped_left.journal, &swapped_right.journal) {
+            Divergence::Truncated {
+                left: None,
+                right: Some(_),
+            } => {}
+            other => panic!("prefix direction must report Truncated, got {other:?}"),
+        }
     }
 
     #[test]
@@ -140,12 +189,22 @@ mod tests {
         let left = run(concurrent_journal(&[(1, 10), (2, 20)]));
         let right = run(concurrent_journal(&[(2, 20), (1, 99)]));
 
-        let (left_entry, right_entry) =
-            first_divergence(&left.journal, &right.journal).expect("runs must diverge");
-        let left_entry = left_entry.expect("divergent pair carries the left entry");
-        let right_entry = right_entry.expect("divergent pair carries the right entry");
-        assert_eq!((left_entry.data.actor, left_entry.data.sequence), (1, 0));
-        assert_eq!((right_entry.data.actor, right_entry.data.sequence), (1, 0));
-        assert_ne!(left_entry.id, right_entry.id);
+        match first_divergence(&left.journal, &right.journal) {
+            Divergence::Diverged {
+                left: left_entry,
+                right: right_entry,
+            } => {
+                assert_eq!(
+                    (left_entry.data.actor, left_entry.data.sequence),
+                    (ActorId(1), SequenceNumber(0))
+                );
+                assert_eq!(
+                    (right_entry.data.actor, right_entry.data.sequence),
+                    (ActorId(1), SequenceNumber(0))
+                );
+                assert_ne!(left_entry.id, right_entry.id);
+            }
+            other => panic!("runs must diverge, got {other:?}"),
+        }
     }
 }

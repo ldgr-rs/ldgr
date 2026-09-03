@@ -16,6 +16,8 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ledger_explorer::services::certify_hazard;
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{EntryKind, EntryPayload, MessageId, RecvFrame, SendFrame};
 use ledger_journal::Journal;
 use std::hint::black_box;
@@ -23,17 +25,17 @@ use std::hint::black_box;
 const SIZES: [usize; 4] = [1_000, 10_000, 100_000, 1_000_000];
 
 /// Build the shared-gate fan-in hazard: (journal, verdict, gate-send id).
-fn build_fan_in(paths: usize) -> (Journal, ledger_explorer::Verdict, ledger_format::Hash) {
+fn build_fan_in(paths: usize) -> (Journal, ledger_explorer::Verdict, ledger_format::EntryHash) {
     let mut journal = Journal::new();
     let gate = journal
         .append(
             EntryKind::Send,
-            0,
+            ActorId(0),
             [],
             EntryPayload::Send(SendFrame {
-                message_id: MessageId::new(0, 0),
-                from: 0,
-                to: 1,
+                message_id: MessageId::new(ActorId(0), 0),
+                from: ActorId(0),
+                to: ActorId(1),
                 original_content: vec![0],
             }),
         )
@@ -44,12 +46,12 @@ fn build_fan_in(paths: usize) -> (Journal, ledger_explorer::Verdict, ledger_form
         let witness = journal
             .append(
                 EntryKind::Recv,
-                actor,
+                ActorId(actor),
                 [gate],
                 EntryPayload::Recv(RecvFrame {
-                    message_id: MessageId::new(actor, index as u64),
-                    from: 0,
-                    to: actor,
+                    message_id: MessageId::new(ActorId(actor), index as u64),
+                    from: ActorId(0),
+                    to: ActorId(actor),
                     observed_content: vec![0],
                 }),
             )
@@ -77,7 +79,7 @@ fn scaling_curve(c: &mut Criterion) {
                     || (journal.clone(), verdict.clone()),
                     |(journal, verdict)| {
                         let (hypotheses, certificate) =
-                            certify_hazard(journal, &verdict, [7u8; 32], 1024)
+                            certify_hazard(journal, &verdict, EntryHash([7u8; 32]), 1024)
                                 .expect("end-to-end certification must succeed");
                         black_box((hypotheses.len(), certificate));
                     },

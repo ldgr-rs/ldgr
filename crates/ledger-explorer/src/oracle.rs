@@ -1,6 +1,7 @@
 //! Composable history, assertion, invariant, and differential oracles over journal runs.
 
-use ledger_format::{EntryKind, EntryPayload, Hash};
+use ledger_format::ActorId;
+use ledger_format::{EntryHash, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::RunResult;
 use std::cell::{Cell, RefCell};
@@ -11,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 pub struct Verdict {
     pub violated: bool,
     /// Journal entry hashes witnessing the violation.
-    pub witnesses: Vec<Hash>,
+    pub witnesses: Vec<EntryHash>,
     pub reason: String,
 }
 
@@ -24,7 +25,7 @@ impl Verdict {
         }
     }
 
-    pub fn fail(witnesses: Vec<Hash>, reason: impl Into<String>) -> Self {
+    pub fn fail(witnesses: Vec<EntryHash>, reason: impl Into<String>) -> Self {
         Self {
             violated: true,
             witnesses,
@@ -76,7 +77,7 @@ impl Oracle for ExactlyOnceValueOracle {
         let mut last_input: Option<(u64, usize)> = None;
         // The last numeric Outcome in journal order: the terminal `Done`
         // journals an Outcome with a text payload that must not shadow it.
-        let mut last_numeric_outcome: Option<Hash> = None;
+        let mut last_numeric_outcome: Option<EntryHash> = None;
         for (index, entry) in run.journal.entries().enumerate() {
             if let EntryPayload::InputStep(step) = &entry.data.payload {
                 if let ledger_format::CanonicalValue::Unsigned(value) = step.value {
@@ -187,26 +188,26 @@ pub enum HistoryOperation {
     Write {
         key: String,
         value: u64,
-        witness: Hash,
+        witness: EntryHash,
     },
     Read {
         key: String,
         value: u64,
-        witness: Hash,
+        witness: EntryHash,
     },
     Push {
         value: u64,
-        witness: Hash,
+        witness: EntryHash,
     },
     Pop {
         value: u64,
-        witness: Hash,
+        witness: EntryHash,
     },
 }
 
 impl HistoryOperation {
     /// Journal entry witnessing this operation.
-    pub fn witness(&self) -> Hash {
+    pub fn witness(&self) -> EntryHash {
         match self {
             HistoryOperation::Write { witness, .. }
             | HistoryOperation::Read { witness, .. }
@@ -224,9 +225,9 @@ impl HistoryOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinOperation {
     /// Journal entry id of the operation's invocation.
-    pub invoke: Hash,
+    pub invoke: EntryHash,
     /// Journal entry id of the operation's response.
-    pub response: Hash,
+    pub response: EntryHash,
     /// The operation replayed against the sequential specification.
     pub operation: HistoryOperation,
 }
@@ -455,7 +456,7 @@ where
         let chain = failure
             .prefix
             .iter()
-            .map(|index| format!("{}:{:02x?}", index, &operations[*index].invoke[..4]))
+            .map(|index| format!("{}:{:02x?}", index, &operations[*index].invoke.0[..4]))
             .collect::<Vec<_>>()
             .join(" -> ");
         let operation = &operations[failure.index];
@@ -494,7 +495,7 @@ impl Oracle for AssertionOracle {
                     }) => {
                         return Verdict::fail(
                             vec![entry.id],
-                            format!("assertion failed at actor {}", entry.data.actor),
+                            format!("assertion failed at actor {}", entry.data.actor.0),
                         );
                     }
                     EntryPayload::Assert(ledger_format::AssertPayload {
@@ -513,7 +514,7 @@ impl Oracle for AssertionOracle {
 
 /// One observable output of a run: the actor plus payload of an `Outcome`
 /// entry, in journal order.
-fn observable_outputs(run: &RunResult) -> Vec<(u32, u64)> {
+fn observable_outputs(run: &RunResult) -> Vec<(ActorId, u64)> {
     run.journal
         .entries()
         .filter(|entry| entry.data.kind == EntryKind::Outcome)
@@ -532,13 +533,13 @@ fn observable_outputs(run: &RunResult) -> Vec<(u32, u64)> {
 /// `None` when the sequences are equal. The reason names the actor and both
 /// payloads (or the length mismatch) so a divergence report points at the
 /// diverging step instead of only at the journal root.
-fn output_divergence_reason(left: &[(u32, u64)], right: &[(u32, u64)]) -> Option<String> {
+fn output_divergence_reason(left: &[(ActorId, u64)], right: &[(ActorId, u64)]) -> Option<String> {
     let common = left.len().min(right.len());
     for index in 0..common {
         if left[index] != right[index] {
             return Some(format!(
                 "differential output divergence at output {index}: left=(actor {}, value {}), right=(actor {}, value {})",
-                left[index].0, left[index].1, right[index].0, right[index].1
+                left[index].0.0, left[index].1, right[index].0.0, right[index].1
             ));
         }
     }
@@ -604,7 +605,7 @@ impl DifferentialOracle {
 ///
 /// These structural entries carry the semantic outcome of a run, so they are
 /// the natural witnesses for a property violation.
-pub fn witnesses_from_journal(journal: &Journal) -> Vec<Hash> {
+pub fn witnesses_from_journal(journal: &Journal) -> Vec<EntryHash> {
     journal
         .entries()
         .filter_map(|entry| match entry.data.kind {
@@ -663,7 +664,7 @@ where
 {
     oracle: PropertyOracle<P>,
     version: u64,
-    cache: RefCell<HashMap<(u64, Hash), Verdict>>,
+    cache: RefCell<HashMap<(u64, EntryHash), Verdict>>,
     evaluations: Cell<usize>,
 }
 
@@ -745,7 +746,7 @@ mod tests {
 
     fn run_programs(programs: Vec<Vec<Instruction>>) -> RunResult {
         let config = RunConfig::builder()
-            .seed([3; 32])
+            .seed(EntryHash([3; 32]))
             .policy(ledger_sim::Policy::Random)
             .max_steps(512)
             .build();
@@ -822,12 +823,12 @@ mod tests {
         let write = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 1),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 1),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -835,10 +836,10 @@ mod tests {
         let read = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [write],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(1),
                 }),
             )
@@ -880,12 +881,12 @@ mod tests {
         let write = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 1),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 1),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -893,10 +894,10 @@ mod tests {
         let read = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [write],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(0),
                 }),
             )
@@ -944,12 +945,12 @@ mod tests {
         let w_invoke = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 1),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 1),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -957,12 +958,12 @@ mod tests {
         let w_response = journal
             .append(
                 EntryKind::Recv,
-                1,
+                ActorId(1),
                 [w_invoke],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     observed_content: 0u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -970,10 +971,10 @@ mod tests {
         let r_invoke = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(0),
                 }),
             )
@@ -981,10 +982,10 @@ mod tests {
         let r_response = journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [r_invoke],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Unsigned(0),
                 }),
             )
@@ -1021,7 +1022,7 @@ mod tests {
     #[test]
     fn linearizability_oracle_finds_mini_kv_stale_read() {
         let config = RunConfig::builder()
-            .seed([0; 32])
+            .seed(EntryHash([0; 32]))
             .policy(ledger_sim::Policy::Random)
             .max_steps(256)
             .build();
@@ -1038,7 +1039,7 @@ mod tests {
             journal
                 .append(
                     EntryKind::InputStep,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::InputStep(ledger_format::InputStepPayload {
                         generator: 0,
@@ -1052,10 +1053,10 @@ mod tests {
             journal
                 .append(
                     EntryKind::Outcome,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: ledger_format::CanonicalValue::Unsigned(outcome),
                     }),
                 )

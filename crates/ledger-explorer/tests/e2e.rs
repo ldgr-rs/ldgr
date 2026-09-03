@@ -4,12 +4,13 @@ use ledger_explorer::oracle::{AssertionOracle, HistoryOracle, KeyValueSpec, Orac
 use ledger_explorer::search::{Workload, diff, replay_prefix, replay_strict, run_campaign, search};
 use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::{MiniKvWorkload, StorageCrashWorkload, TwoPhaseCommitWorkload};
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig};
 
 #[test]
 fn mini_kv_finds_and_reproduces_stale_read() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .dropped_events(Vec::new())
@@ -37,13 +38,13 @@ fn mini_kv_finds_and_reproduces_stale_read() {
         finding.run.journal.root_hash(),
         replayed.journal.root_hash()
     );
-    assert!(diff(&finding.run, &replayed).is_none());
+    assert!(diff(&finding.run, &replayed).is_identical());
 }
 
 #[test]
 fn bandit_scheduler_discovers_diverse_journal_roots() {
     let config = RunConfig::builder()
-        .seed([1; 32])
+        .seed(EntryHash([1; 32]))
         .policy(Policy::Bandit {
             exploration_constant: 1.414,
             pct_mix: ledger_sim::Probability::new(0.1).unwrap(),
@@ -62,7 +63,7 @@ fn bandit_scheduler_discovers_diverse_journal_roots() {
 #[test]
 fn two_phase_commit_passes_assertion_oracle() {
     let config = RunConfig::builder()
-        .seed([2; 32])
+        .seed(EntryHash([2; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .dropped_events(Vec::new())
@@ -78,7 +79,7 @@ fn two_phase_commit_passes_assertion_oracle() {
 #[test]
 fn storage_crash_consistency_preserves_fsynced_state() {
     let config = RunConfig::builder()
-        .seed([3; 32])
+        .seed(EntryHash([3; 32]))
         .policy(Policy::Random)
         .max_steps(64)
         .dropped_events(Vec::new())
@@ -96,7 +97,7 @@ fn storage_crash_consistency_preserves_fsynced_state() {
 #[test]
 fn causal_slice_preserves_witness_provenance() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .dropped_events(Vec::new())
@@ -117,7 +118,7 @@ fn causal_slice_preserves_witness_provenance() {
 #[test]
 fn schedule_minimizer_reduces_decision_sequence() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .dropped_events(Vec::new())
@@ -141,7 +142,7 @@ fn schedule_minimizer_reduces_decision_sequence() {
 #[test]
 fn same_seed_produces_identical_journal_root() {
     let config = RunConfig::builder()
-        .seed([42; 32])
+        .seed(EntryHash([42; 32]))
         .policy(Policy::Random)
         .max_steps(100)
         .build();

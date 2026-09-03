@@ -7,7 +7,7 @@ use crate::oracle::Oracle;
 use crate::pbt::{INPUT_SAMPLE_RANGE, PbtBridge, gen_id};
 use crate::solver::{FaultSolver, HittingSetSolver, SolverConfig, select_solver};
 use crate::solver_state::{load as load_solver_state, save as save_solver_state};
-use ledger_format::{ActorId, Hash};
+use ledger_format::{ActorId, EntryHash};
 use ledger_journal::Journal;
 use ledger_sim::{Policy, RunConfig, SeedTree, Simulation, canonical_hash};
 use std::collections::HashSet;
@@ -31,7 +31,7 @@ impl Default for CampaignPersist {
 }
 
 /// Actor id stamped on persisted solver-state entries.
-const CAMPAIGN_PERSIST_ACTOR: ActorId = u32::MAX;
+const CAMPAIGN_PERSIST_ACTOR: ActorId = ActorId(u32::MAX);
 
 impl CampaignPersist {
     pub fn new() -> Self {
@@ -98,7 +98,10 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
     attempts: usize,
     mut state: Option<&mut CampaignPersist>,
 ) -> Result<CampaignReport, SearchError> {
-    let mut distinct_roots: HashSet<Hash> = HashSet::new();
+    // Explicit per-campaign clause cache scope. Each solver built below owns
+    // its cache; no process-global store exists.
+    let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
+    let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
 
@@ -191,6 +194,7 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
             &schedule,
             Some(hash_inputs(&inputs)),
             Some(&perturbed),
+            Some(config.seed()),
         );
         if let Some(entry) = memo.get(&key) {
             distinct_roots.insert(entry.journal_root);

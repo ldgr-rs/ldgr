@@ -64,7 +64,8 @@ use ledger_explorer::{
     FaultSolver, HittingSetSolver, MaxSatSolver, SolverConfig, SolverEngine, Verdict,
     maxsat::{HazardEncoding, encode_hazard},
 };
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
+use ledger_format::ActorId;
+use ledger_format::{CanonicalValue, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -92,17 +93,17 @@ type TableResult = (Vec<(usize, Vec<VariantTiming>)>, Option<usize>);
 /// `[root_i]` per root.
 fn build_disjoint_clauses_journal(n: usize) -> (Journal, Verdict) {
     let mut journal = Journal::new();
-    let mut roots: Vec<Hash> = Vec::with_capacity(n);
+    let mut roots: Vec<EntryHash> = Vec::with_capacity(n);
     for i in 0..n {
         let id = journal
             .append(
                 EntryKind::Send,
-                (i + 1) as u32,
+                ActorId((i + 1) as u32),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new((i + 1) as u32, 0),
-                    from: (i + 1) as u32,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId((i + 1) as u32), 0),
+                    from: ActorId((i + 1) as u32),
+                    to: ActorId(1),
                     original_content: (i as u64).to_le_bytes().to_vec(),
                 }),
             )
@@ -113,10 +114,10 @@ fn build_disjoint_clauses_journal(n: usize) -> (Journal, Verdict) {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            u32::MAX,
+            ActorId(u32::MAX),
             roots.clone(),
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(u64::MAX),
             }),
         )

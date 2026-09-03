@@ -5,7 +5,7 @@ use super::{
 };
 use crate::memo::{CampaignMemo, MemoEntry, hash_inputs, memo_key};
 use crate::oracle::Oracle;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, SeedTree, SimFault, Simulation, SwarmConfig};
 use std::collections::{HashMap, HashSet};
 
@@ -194,6 +194,8 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
     exploration: f64,
     attempts: usize,
 ) -> Result<CampaignReport, SearchError> {
+    // Explicit per-campaign clause cache scope; see `run_campaign`.
+    let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
     let candidates = enumerate_variants(&base, mutation)?;
     let mut bandit = QuadBandit::new();
     let mut variant_of: HashMap<u64, QuadVariant> = HashMap::new();
@@ -202,7 +204,7 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
         variant_of.insert(arm, variant);
     }
 
-    let mut distinct_roots: HashSet<Hash> = HashSet::new();
+    let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
     // LazyMOP / AgentReplay memo: per-campaign local dedup over
@@ -231,12 +233,22 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
             None => (workload.programs(), None, None),
         };
 
+        let mut seed = base.seed();
+        seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        let config = base
+            .clone()
+            .with_seed(seed)
+            .with_policy(variant.policy)
+            .with_swarm(variant.swarm.clone())
+            .with_fault_schedule(variant.faults.clone());
+
         let key = memo_key(
             &variant.policy,
             &variant.swarm,
             &variant.faults,
             input_hash,
             None,
+            Some(config.seed()),
         );
         if let Some(entry) = memo.get(&key) {
             distinct_roots.insert(entry.journal_root);
@@ -245,26 +257,9 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
             // keeps exploring without budget cost. A cache that also stored
             // the violated flag could replay the exact reward.
             bandit.reward(arm, 0.0);
-            let mut seed = base.seed();
-            seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
-            let config = base
-                .clone()
-                .with_seed(seed)
-                .with_policy(variant.policy)
-                .with_swarm(variant.swarm.clone())
-                .with_fault_schedule(variant.faults.clone());
             variants.push(describe_variant(&config, attempt, input_label.as_deref()));
             continue;
         }
-
-        let mut seed = base.seed();
-        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
-        let config = base
-            .clone()
-            .with_seed(seed)
-            .with_policy(variant.policy)
-            .with_swarm(variant.swarm.clone())
-            .with_fault_schedule(variant.faults.clone());
 
         let run = Simulation::new(config.clone(), programs).run()?;
 

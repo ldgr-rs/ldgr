@@ -13,7 +13,7 @@
 //! the campaign run that owns it; it is never global, so concurrent
 //! campaigns cannot observe each other's entries.
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, SimFault, SwarmConfig};
 use std::collections::HashMap;
 
@@ -22,9 +22,9 @@ use std::collections::HashMap;
 pub struct MemoEntry {
     /// The memo key itself (blake3 of the canonical variant bytes plus
     /// input and replay extensions). Stored for debugging.
-    pub run_config_hash: Hash,
+    pub run_config_hash: EntryHash,
     /// Journal root of the run that produced this entry.
-    pub journal_root: Hash,
+    pub journal_root: EntryHash,
     /// Whether the root was distinct at insertion time.
     pub distinct: bool,
 }
@@ -37,7 +37,7 @@ pub struct MemoEntry {
 /// executed, so the caller can reuse the cached journal root.
 #[derive(Debug, Clone, Default)]
 pub struct CampaignMemo {
-    cache: HashMap<Hash, MemoEntry>,
+    cache: HashMap<EntryHash, MemoEntry>,
 }
 
 impl CampaignMemo {
@@ -47,11 +47,11 @@ impl CampaignMemo {
         }
     }
 
-    pub fn get(&self, key: &Hash) -> Option<&MemoEntry> {
+    pub fn get(&self, key: &EntryHash) -> Option<&MemoEntry> {
         self.cache.get(key)
     }
 
-    pub fn insert(&mut self, key: Hash, entry: MemoEntry) -> Option<MemoEntry> {
+    pub fn insert(&mut self, key: EntryHash, entry: MemoEntry) -> Option<MemoEntry> {
         self.cache.insert(key, entry)
     }
 
@@ -63,11 +63,11 @@ impl CampaignMemo {
         self.cache.is_empty()
     }
 
-    pub fn contains(&self, key: &Hash) -> bool {
+    pub fn contains(&self, key: &EntryHash) -> bool {
         self.cache.contains_key(key)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&Hash, &MemoEntry)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&EntryHash, &MemoEntry)> {
         self.cache.iter()
     }
 
@@ -76,17 +76,17 @@ impl CampaignMemo {
     }
 }
 
-/// Hash a slice of PBT inputs into a content address.
+/// EntryHash a slice of PBT inputs into a content address.
 ///
 /// Each input is a u64 sampled from the input axis. The hash is
 /// `BLAKE3(len || inputs[*])` so distinct samples always hash distinct.
-pub fn hash_inputs(inputs: &[u64]) -> Hash {
+pub fn hash_inputs(inputs: &[u64]) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(inputs.len() as u64).to_le_bytes());
     for value in inputs {
         hasher.update(&value.to_le_bytes());
     }
-    *hasher.finalize().as_bytes()
+    EntryHash(*hasher.finalize().as_bytes())
 }
 
 /// Canonical bytes for one quadruple variant.
@@ -136,30 +136,30 @@ pub fn canonical_variant_bytes(
         match fault {
             SimFault::Drop(id) => {
                 bytes.push(0);
-                bytes.extend_from_slice(id);
+                bytes.extend_from_slice(&id.0);
             }
             SimFault::Delay { send, ticks } => {
                 bytes.push(1);
-                bytes.extend_from_slice(send);
+                bytes.extend_from_slice(&send.0);
                 bytes.extend_from_slice(&ticks.to_le_bytes());
             }
             SimFault::Partition { src, dst } => {
                 bytes.push(2);
-                bytes.extend_from_slice(&src.to_le_bytes());
-                bytes.extend_from_slice(&dst.to_le_bytes());
+                bytes.extend_from_slice(&src.0.to_le_bytes());
+                bytes.extend_from_slice(&dst.0.to_le_bytes());
             }
             SimFault::Crash(id) => {
                 bytes.push(3);
-                bytes.extend_from_slice(id);
+                bytes.extend_from_slice(&id.0);
             }
             SimFault::Corrupt { write, xor_mask } => {
                 bytes.push(4);
-                bytes.extend_from_slice(write);
+                bytes.extend_from_slice(&write.0);
                 bytes.extend_from_slice(&xor_mask.to_le_bytes());
             }
             SimFault::CrashState { write, state } => {
                 bytes.push(5);
-                bytes.extend_from_slice(write);
+                bytes.extend_from_slice(&write.0);
                 bytes.extend_from_slice(&state.to_le_bytes());
             }
         }
@@ -177,16 +177,17 @@ pub fn memo_key(
     policy: &Policy,
     swarm: &SwarmConfig,
     faults: &[SimFault],
-    input_hash: Option<Hash>,
+    input_hash: Option<EntryHash>,
     replay: Option<&[usize]>,
-) -> Hash {
+    seed: Option<EntryHash>,
+) -> EntryHash {
     let variant_bytes = canonical_variant_bytes(policy, swarm, faults);
     let variant_digest = blake3::hash(&variant_bytes);
     let mut hasher = blake3::Hasher::new();
     hasher.update(variant_digest.as_bytes());
     hasher.update(&[0xA0]);
     if let Some(hash) = input_hash {
-        hasher.update(&hash);
+        hasher.update(&hash.0);
         hasher.update(&[0xA1]);
     } else {
         hasher.update(&[0x00]);
@@ -200,7 +201,13 @@ pub fn memo_key(
     } else {
         hasher.update(&[0x01]);
     }
-    *hasher.finalize().as_bytes()
+    if let Some(s) = seed {
+        hasher.update(&s.0);
+        hasher.update(&[0xA3]);
+    } else {
+        hasher.update(&[0x02]);
+    }
+    EntryHash(*hasher.finalize().as_bytes())
 }
 
 #[cfg(test)]
@@ -221,16 +228,16 @@ mod tests {
     #[test]
     fn memo_key_deterministic() {
         let swarm = test_swarm();
-        let k1 = memo_key(&Policy::Random, &swarm, &[], None, None);
-        let k2 = memo_key(&Policy::Random, &swarm, &[], None, None);
+        let k1 = memo_key(&Policy::Random, &swarm, &[], None, None, None);
+        let k2 = memo_key(&Policy::Random, &swarm, &[], None, None, None);
         assert_eq!(k1, k2);
     }
 
     #[test]
     fn memo_key_differs_on_policy() {
         let swarm = test_swarm();
-        let k1 = memo_key(&Policy::Random, &swarm, &[], None, None);
-        let k2 = memo_key(&Policy::Replay, &swarm, &[], None, None);
+        let k1 = memo_key(&Policy::Random, &swarm, &[], None, None, None);
+        let k2 = memo_key(&Policy::Replay, &swarm, &[], None, None, None);
         assert_ne!(k1, k2);
     }
 
@@ -239,9 +246,9 @@ mod tests {
         let swarm = test_swarm();
         let h1 = hash_inputs(&[1, 2, 3]);
         let h2 = hash_inputs(&[4, 5, 6]);
-        let k1 = memo_key(&Policy::Random, &swarm, &[], Some(h1), None);
-        let k2 = memo_key(&Policy::Random, &swarm, &[], Some(h2), None);
-        let k3 = memo_key(&Policy::Random, &swarm, &[], None, None);
+        let k1 = memo_key(&Policy::Random, &swarm, &[], Some(h1), None, None);
+        let k2 = memo_key(&Policy::Random, &swarm, &[], Some(h2), None, None);
+        let k3 = memo_key(&Policy::Random, &swarm, &[], None, None, None);
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
         assert_ne!(k2, k3);
@@ -250,9 +257,33 @@ mod tests {
     #[test]
     fn memo_key_differs_on_replay() {
         let swarm = test_swarm();
-        let k1 = memo_key(&Policy::Random, &swarm, &[], None, Some(&[1, 2, 3]));
-        let k2 = memo_key(&Policy::Random, &swarm, &[], None, Some(&[1, 2, 4]));
-        let k3 = memo_key(&Policy::Random, &swarm, &[], None, None);
+        let k1 = memo_key(&Policy::Random, &swarm, &[], None, Some(&[1, 2, 3]), None);
+        let k2 = memo_key(&Policy::Random, &swarm, &[], None, Some(&[1, 2, 4]), None);
+        let k3 = memo_key(&Policy::Random, &swarm, &[], None, None, None);
+        assert_ne!(k1, k2);
+        assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn memo_key_differs_on_seed() {
+        let swarm = test_swarm();
+        let k1 = memo_key(
+            &Policy::Random,
+            &swarm,
+            &[],
+            None,
+            None,
+            Some(EntryHash([1; 32])),
+        );
+        let k2 = memo_key(
+            &Policy::Random,
+            &swarm,
+            &[],
+            None,
+            None,
+            Some(EntryHash([2; 32])),
+        );
+        let k3 = memo_key(&Policy::Random, &swarm, &[], None, None, None);
         assert_ne!(k1, k2);
         assert_ne!(k1, k3);
     }
@@ -270,10 +301,10 @@ mod tests {
     fn campaign_memo_insert_and_get() {
         let mut memo = CampaignMemo::new();
         let swarm = test_swarm();
-        let key = memo_key(&Policy::Random, &swarm, &[], None, None);
+        let key = memo_key(&Policy::Random, &swarm, &[], None, None, None);
         let entry = MemoEntry {
             run_config_hash: key,
-            journal_root: [7; 32],
+            journal_root: EntryHash([7; 32]),
             distinct: true,
         };
         assert!(memo.get(&key).is_none());
@@ -304,14 +335,14 @@ mod tests {
         let variants = 4usize;
         for attempt in 0..attempts {
             let policy = &policies[attempt % variants];
-            let key = memo_key(policy, &swarm, &[], None, None);
+            let key = memo_key(policy, &swarm, &[], None, None, None);
             if memo.get(&key).is_none() {
                 let entry = MemoEntry {
                     run_config_hash: key,
                     journal_root: {
-                        let mut root = [0u8; 32];
-                        root[0] = attempt as u8;
-                        root[1] = match policy {
+                        let mut root = EntryHash([0u8; 32]);
+                        root.0[0] = attempt as u8;
+                        root.0[1] = match policy {
                             Policy::Random => 0,
                             Policy::Replay => 1,
                             Policy::Pct { .. } => 2,
@@ -337,8 +368,22 @@ mod tests {
         let inputs_a = hash_inputs(&[1, 2, 3]);
         let inputs_b = hash_inputs(&[1, 2, 3]);
         assert_eq!(inputs_a, inputs_b);
-        let k1 = memo_key(&Policy::Random, &swarm, &[], Some(inputs_a), Some(&[5, 6]));
-        let k2 = memo_key(&Policy::Random, &swarm, &[], Some(inputs_b), Some(&[5, 6]));
+        let k1 = memo_key(
+            &Policy::Random,
+            &swarm,
+            &[],
+            Some(inputs_a),
+            Some(&[5, 6]),
+            None,
+        );
+        let k2 = memo_key(
+            &Policy::Random,
+            &swarm,
+            &[],
+            Some(inputs_b),
+            Some(&[5, 6]),
+            None,
+        );
         assert_eq!(k1, k2);
     }
 
@@ -347,15 +392,23 @@ mod tests {
         // Same swarm and policy must give same variant base; adding input hash or
         // replay must change the final memo key.
         let swarm = test_swarm();
-        let base = memo_key(&Policy::Random, &swarm, &[], None, None);
-        let with_input = memo_key(&Policy::Random, &swarm, &[], Some(hash_inputs(&[42])), None);
-        let with_replay = memo_key(&Policy::Random, &swarm, &[], None, Some(&[0, 1]));
+        let base = memo_key(&Policy::Random, &swarm, &[], None, None, None);
+        let with_input = memo_key(
+            &Policy::Random,
+            &swarm,
+            &[],
+            Some(hash_inputs(&[42])),
+            None,
+            None,
+        );
+        let with_replay = memo_key(&Policy::Random, &swarm, &[], None, Some(&[0, 1]), None);
         let with_both = memo_key(
             &Policy::Random,
             &swarm,
             &[],
             Some(hash_inputs(&[42])),
             Some(&[0, 1]),
+            None,
         );
         assert_ne!(base, with_input);
         assert_ne!(base, with_replay);

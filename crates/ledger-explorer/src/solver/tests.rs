@@ -2,7 +2,8 @@ use super::*;
 use crate::ldfi::{FaultHypothesis, FaultableEvent};
 use crate::oracle::Verdict;
 use crate::solver_cache::{ClauseCache, WeightedClause};
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
+use ledger_format::ActorId;
+use ledger_format::{CanonicalValue, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::{Journal, JournalError};
 
 #[test]
@@ -22,12 +23,12 @@ fn hitting_set_solver_detects_two_disjoint_supports() {
     let send_a = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -35,12 +36,12 @@ fn hitting_set_solver_detects_two_disjoint_supports() {
     let send_b = journal
         .append(
             EntryKind::Send,
-            2,
+            ActorId(2),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(2, 0),
-                from: 2,
-                to: 3,
+                message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                from: ActorId(2),
+                to: ActorId(3),
                 original_content: 2u64.to_le_bytes().to_vec(),
             }),
         )
@@ -48,10 +49,10 @@ fn hitting_set_solver_detects_two_disjoint_supports() {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            3,
+            ActorId(3),
             [send_a, send_b],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -83,12 +84,12 @@ fn hitting_set_solver_picks_shared_root_over_two_branches() {
     let shared = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 99u64.to_le_bytes().to_vec(),
             }),
         )
@@ -96,12 +97,12 @@ fn hitting_set_solver_picks_shared_root_over_two_branches() {
     let branch_a = journal
         .append(
             EntryKind::Recv,
-            2,
+            ActorId(2),
             [shared],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(2, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 observed_content: 0u64.to_le_bytes().to_vec(),
             }),
         )
@@ -109,12 +110,12 @@ fn hitting_set_solver_picks_shared_root_over_two_branches() {
     let branch_b = journal
         .append(
             EntryKind::Recv,
-            3,
+            ActorId(3),
             [shared],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(3, 0),
-                from: 1,
-                to: 3,
+                message_id: ledger_format::MessageId::new(ActorId(3), 0),
+                from: ActorId(1),
+                to: ActorId(3),
                 observed_content: 0u64.to_le_bytes().to_vec(),
             }),
         )
@@ -122,10 +123,10 @@ fn hitting_set_solver_picks_shared_root_over_two_branches() {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            4,
+            ActorId(4),
             [branch_a, branch_b],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -154,12 +155,12 @@ fn solver_succeeds_on_small_journal() {
     let send = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -167,10 +168,10 @@ fn solver_succeeds_on_small_journal() {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [send],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -187,12 +188,12 @@ fn trait_object_dispatch_works() {
     let send = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -200,10 +201,10 @@ fn trait_object_dispatch_works() {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [send],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -221,7 +222,7 @@ fn trait_object_dispatch_works() {
 
 #[test]
 fn solver_error_from_journal_error() {
-    let journal_err = JournalError::MissingParent([9; 32]);
+    let journal_err = JournalError::MissingParent(EntryHash([9; 32]));
     let solver_err: SolverError = journal_err.clone().into();
     assert_eq!(solver_err, SolverError::Journal(journal_err));
     assert!(format!("{solver_err}").contains("missing parent"));
@@ -229,7 +230,7 @@ fn solver_error_from_journal_error() {
 
 #[test]
 fn weighted_clause_helper() {
-    let hash = [1; 32];
+    let hash = EntryHash([1; 32]);
     let clause = WeightedClause::new(vec![hash], 5);
     assert!(!clause.is_empty());
     assert_eq!(clause.weight, 5);
@@ -244,12 +245,12 @@ fn maxsat_solver_matches_hitting_set_optimum() {
     let send = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -257,10 +258,10 @@ fn maxsat_solver_matches_hitting_set_optimum() {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [send],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -300,7 +301,7 @@ fn maxsat_solver_matches_hitting_set_optimum() {
         "the returned cut must hit every hard clause"
     );
     for removed in cut {
-        let reduced: Vec<Hash> = cut
+        let reduced: Vec<EntryHash> = cut
             .iter()
             .copied()
             .filter(|event| event != removed)
@@ -328,12 +329,12 @@ fn cache_memoizes_across_identical_solves() {
     let send = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -341,10 +342,10 @@ fn cache_memoizes_across_identical_solves() {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [send],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -366,8 +367,8 @@ fn cache_memoizes_across_identical_solves() {
 #[test]
 fn incremental_solve_uses_cache() {
     let mut solver = HittingSetSolver::new();
-    let hash_a = [1; 32];
-    let hash_b = [2; 32];
+    let hash_a = EntryHash([1; 32]);
+    let hash_b = EntryHash([2; 32]);
     let closure = ClauseCache::closure_hash(&[hash_a, hash_b]);
     let clauses = vec![
         WeightedClause::new(vec![hash_a], 2),
@@ -388,12 +389,12 @@ fn bounded_closure_limits_depth() {
     let root = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(1),
                 original_content: 0u64.to_le_bytes().to_vec(),
             }),
         )
@@ -401,12 +402,12 @@ fn bounded_closure_limits_depth() {
     let mid = journal
         .append(
             EntryKind::Recv,
-            2,
+            ActorId(2),
             [root],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(2, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 observed_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -414,10 +415,10 @@ fn bounded_closure_limits_depth() {
     let leaf = journal
         .append(
             EntryKind::Outcome,
-            3,
+            ActorId(3),
             [mid],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(2),
             }),
         )
@@ -441,12 +442,12 @@ fn solver_respects_horizon() {
     let root = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(1),
                 original_content: 0u64.to_le_bytes().to_vec(),
             }),
         )
@@ -454,12 +455,12 @@ fn solver_respects_horizon() {
     let mid = journal
         .append(
             EntryKind::Recv,
-            2,
+            ActorId(2),
             [root],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(2, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 observed_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -467,26 +468,28 @@ fn solver_respects_horizon() {
     let leaf = journal
         .append(
             EntryKind::Outcome,
-            3,
+            ActorId(3),
             [mid],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(2),
             }),
         )
         .expect("append must succeed");
     let verdict = Verdict::fail(vec![leaf], "horizon");
     let mut unbounded = HittingSetSolver::unbounded();
-    let mut bounded = HittingSetSolver::with_horizon(0);
     let unb = unbounded.solve(&journal, &verdict).expect("unb");
-    let bou = bounded.solve(&journal, &verdict).expect("bou");
-    // bounded with horizon 0 sees no faultable ancestors, falls back.
-    // unbounded should find root or mid.
     assert!(!unb.is_empty());
-    assert!(!bou.is_empty());
-    // They may differ; ensure deterministic.
-    let bou2 = bounded.solve(&journal, &verdict).expect("bou2");
-    assert_eq!(bou, bou2);
+    // Bounded horizon 0 sees no faultable ancestors within the bound: the
+    // typed walk fails closed instead of ranking an unrelated event.
+    let mut bounded = HittingSetSolver::with_horizon(0);
+    let bounded_error = bounded
+        .solve(&journal, &verdict)
+        .expect_err("bounded empty provenance must fail");
+    assert_eq!(bounded_error, SolverError::EmptyProvenance);
+    // Unbounded stays deterministic.
+    let unb2 = unbounded.solve(&journal, &verdict).expect("unb2");
+    assert_eq!(unb, unb2);
 }
 
 #[test]
@@ -496,12 +499,12 @@ fn samc_prune_coalesces_concurrent_swaps() {
     let send_a = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -509,12 +512,12 @@ fn samc_prune_coalesces_concurrent_swaps() {
     let send_b = journal
         .append(
             EntryKind::Send,
-            2,
+            ActorId(2),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(2, 0),
-                from: 2,
-                to: 3,
+                message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                from: ActorId(2),
+                to: ActorId(3),
                 original_content: 2u64.to_le_bytes().to_vec(),
             }),
         )
@@ -523,10 +526,10 @@ fn samc_prune_coalesces_concurrent_swaps() {
     let _witness = journal
         .append(
             EntryKind::Outcome,
-            3,
+            ActorId(3),
             [send_a, send_b],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -559,12 +562,12 @@ fn samc_prune_keeps_non_concurrent() {
     let root = journal
         .append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 2,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(2),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
@@ -572,12 +575,12 @@ fn samc_prune_keeps_non_concurrent() {
     let child = journal
         .append(
             EntryKind::Recv,
-            1,
+            ActorId(1),
             [root],
             EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(1),
                 observed_content: 0u64.to_le_bytes().to_vec(),
             }),
         )
@@ -625,7 +628,7 @@ fn hitting_set_solver_default_has_bounded_horizon() {
 
 #[test]
 fn solver_config_input_class_partitions_cache() {
-    let hash = [7; 32];
+    let hash = EntryHash([7; 32]);
     let closure = ClauseCache::closure_hash(&[hash]);
     let clauses = vec![WeightedClause::new(vec![hash], 2)];
     let mut solver_a = HittingSetSolver::with_config(
@@ -663,8 +666,8 @@ fn solver_config_input_class_partitions_cache() {
 #[test]
 fn maxsat_incremental_logs_cache_hit() {
     let mut solver = MaxSatSolver::new();
-    let ha = [5; 32];
-    let _hb = [6; 32];
+    let ha = EntryHash([5; 32]);
+    let _hb = EntryHash([6; 32]);
     let closure = ClauseCache::closure_hash(&[ha]);
     let clauses = vec![WeightedClause::new(vec![ha], 2)];
     let _ = solver.solve_incremental(closure, clauses.clone());
@@ -676,7 +679,7 @@ fn maxsat_incremental_logs_cache_hit() {
 fn synthetic_encoding(hard_count: usize) -> crate::maxsat::HazardEncoding {
     crate::maxsat::HazardEncoding {
         hard: (0..hard_count)
-            .map(|index| vec![[index as u8; 32]])
+            .map(|index| vec![EntryHash([index as u8; 32])])
             .collect(),
         soft: Vec::new(),
         cardinality: None,
@@ -748,7 +751,7 @@ fn select_solver_auto_falls_back_to_builtin_without_cadical_feature() {
 fn incremental_solve_engine_tags_do_not_share_cache_entries() {
     use crate::solver_cache::engine_tag;
     let mut solver = HittingSetSolver::new();
-    let hash = [3u8; 32];
+    let hash = EntryHash([3u8; 32]);
     let closure = ClauseCache::closure_hash(&[hash]);
     let clauses = vec![WeightedClause::new(vec![hash], 2)];
     let _ = solver.solve_incremental_with_tag(closure, clauses.clone(), engine_tag::BUILTIN);
@@ -765,7 +768,7 @@ mod proptest_hitting_set {
     use super::*;
     use proptest::prelude::*;
 
-    fn hypothesis_covers_all_paths(hyp: &[Hash], paths: &[Vec<Hash>]) -> bool {
+    fn hypothesis_covers_all_paths(hyp: &[EntryHash], paths: &[Vec<EntryHash>]) -> bool {
         paths
             .iter()
             .all(|path| path.iter().any(|e| hyp.contains(e)))
@@ -780,15 +783,15 @@ mod proptest_hitting_set {
             // Build a journal with 2-5 disjoint supports, each path 1-3 faults.
             let mut journal = Journal::new();
             let mut all_paths: Vec<Vec<FaultableEvent>> = Vec::new();
-            let mut witness_parents: Vec<Hash> = Vec::new();
+            let mut witness_parents: Vec<EntryHash> = Vec::new();
             for p in 0..num_paths {
-                let mut prev: Option<Hash> = None;
+                let mut prev: Option<EntryHash> = None;
                 let mut path_events: Vec<FaultableEvent> = Vec::new();
                 for _ in 0..path_len {
                     let actor = (p as u32) + 10;
                     let parents = prev.into_iter().collect::<Vec<_>>();
                     let id = journal
-                        .append(EntryKind::Send, actor, parents.clone(), EntryPayload::Send(ledger_format::SendFrame { message_id: ledger_format::MessageId::new(actor, 0), from: actor, to: 2, original_content: 1u64.to_le_bytes().to_vec() }))
+                        .append(EntryKind::Send, ActorId(actor), parents.clone(), EntryPayload::Send(ledger_format::SendFrame { message_id: ledger_format::MessageId::new(ActorId(actor), 0), from: ActorId(actor), to: ActorId(2), original_content: 1u64.to_le_bytes().to_vec() }))
                         .expect("append must succeed");
                     let cost = event_fault_cost(&journal, &id);
                     path_events.push(FaultableEvent { event: id, kind: EntryKind::Send, cost });
@@ -804,19 +807,19 @@ mod proptest_hitting_set {
             }
             // Witness outcome
             let witness = journal
-                .append(EntryKind::Outcome, 99, witness_parents.clone(), EntryPayload::Outcome(ledger_format::OutcomePayload { schema: [0x00; 32], value: CanonicalValue::Unsigned(0) }))
+                .append(EntryKind::Outcome, ActorId(99), witness_parents.clone(), EntryPayload::Outcome(ledger_format::OutcomePayload { schema: EntryHash([0x00; 32]), value: CanonicalValue::Unsigned(0) }))
                 .expect("append must succeed");
-            let path_hashes: Vec<Vec<Hash>> = all_paths.iter().map(|p| p.iter().map(|e| e.event).collect()).collect();
+            let path_hashes: Vec<Vec<EntryHash>> = all_paths.iter().map(|p| p.iter().map(|e| e.event).collect()).collect();
             let hitting_sets = compute_minimal_hitting_sets(&all_paths);
             prop_assert!(!hitting_sets.is_empty(), "must produce at least one hitting set");
             for hs in &hitting_sets {
-                let v: Vec<Hash> = hs.iter().copied().collect();
+                let v: Vec<EntryHash> = hs.iter().copied().collect();
                 prop_assert!(hypothesis_covers_all_paths(&v, &path_hashes), "hitting set must cover all paths");
                 // Minimality: no proper subset covers all paths.
                 for elem in hs.iter() {
                     let mut subset = hs.clone();
                     subset.remove(elem);
-                    let subset_vec: Vec<Hash> = subset.into_iter().collect();
+                    let subset_vec: Vec<EntryHash> = subset.into_iter().collect();
                     prop_assert!(!hypothesis_covers_all_paths(&subset_vec, &path_hashes), "hitting set must be minimal");
                 }
             }

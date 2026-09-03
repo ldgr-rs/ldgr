@@ -52,7 +52,7 @@ pub use oracle::{
     PropertyOracle, SequentialSpec, Verdict, compose_oracles, predicate_version,
 };
 pub use search::{
-    CampaignReport, Finding, QuadBandit, QuadMutation, Workload, diff, replay_prefix,
+    CampaignReport, Finding, JournalDiff, QuadBandit, QuadMutation, Workload, diff, replay_prefix,
     replay_strict, replay_with_faults, run_bandit_campaign, run_campaign, run_campaign_quad,
     run_feedback_campaign, run_feedback_campaign_with_state, run_swarm_campaign, search,
     search_input, search_input_energy,
@@ -65,5 +65,5 @@ pub use solver::{
 pub use solver_cache::{ClauseCache, WeightedClause};
 pub use support::{
     StaticSupportProvider, SupportError, SupportExpr, SupportOutcome, SupportProvider, all_of_ids,
-    entry_ids_by,
+    entry_ids_by, hard_clauses_from_support, support_from_paths,
 };

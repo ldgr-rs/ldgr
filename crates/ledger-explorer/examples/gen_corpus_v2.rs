@@ -17,8 +17,8 @@ use ledger_format::RunManifest;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-fn hex(h: &ledger_format::Hash) -> String {
-    h.iter().take(6).map(|b| format!("{b:02x}")).collect()
+fn hex(h: &ledger_format::EntryHash) -> String {
+    h.0.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 fn main() {

@@ -2,7 +2,7 @@ use crate::ldfi::FaultHypothesis;
 use crate::maxsat::HazardEncoding;
 use crate::oracle::Verdict;
 use crate::solver_cache::WeightedClause;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::{Journal, JournalError};
 use thiserror::Error;
 
@@ -13,6 +13,17 @@ pub enum SolverError {
     Journal(#[from] JournalError),
     #[error("solver state: {0}")]
     SolverState(#[from] crate::solver_state::SolverStateError),
+    /// No faultable provenance reaches the witnesses under the configured
+    /// horizon. The hazard walk derived no hard clause, so no cut can be
+    /// claimed. Callers must fail closed instead of ranking an unrelated
+    /// event.
+    #[error("no faultable provenance for the witnesses under this horizon")]
+    EmptyProvenance,
+    /// A deterministic solve budget was exhausted. The bound counts clauses,
+    /// cost units, or search nodes, never wall-clock time, so the failure is
+    /// reproducible.
+    #[error("solve budget exhausted: {0}")]
+    BudgetExhausted(&'static str),
     #[error("unsupported operation")]
     Unsupported,
 }
@@ -79,9 +90,9 @@ pub struct SolverConfig {
     pub input_class: Option<u64>,
     pub max_faults: Option<usize>,
     pub engine: SolverEngine,
-    pub run_config_hash: Option<Hash>,
+    pub run_config_hash: Option<EntryHash>,
     pub support_version: Option<u64>,
-    pub support_digest: Option<Hash>,
+    pub support_digest: Option<EntryHash>,
 }
 
 impl SolverConfig {
@@ -114,7 +125,7 @@ impl SolverConfig {
         self
     }
 
-    pub fn with_run_config_hash(mut self, hash: Hash) -> Self {
+    pub fn with_run_config_hash(mut self, hash: EntryHash) -> Self {
         self.run_config_hash = Some(hash);
         self
     }
@@ -126,7 +137,7 @@ impl SolverConfig {
     }
 
     /// Pin the support-provider digest on this config.
-    pub fn with_support_digest(mut self, digest: Hash) -> Self {
+    pub fn with_support_digest(mut self, digest: EntryHash) -> Self {
         self.support_digest = Some(digest);
         self
     }
@@ -179,7 +190,7 @@ pub trait FaultSolver {
     /// Deterministic: same closure hash and clause set yield same hypotheses.
     fn solve_incremental(
         &mut self,
-        closure_hash: Hash,
+        closure_hash: EntryHash,
         clauses: Vec<WeightedClause>,
     ) -> Vec<FaultHypothesis>;
 

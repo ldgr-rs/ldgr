@@ -30,8 +30,9 @@
 use ledger_explorer::ldfi::{hypothesis_to_schedule, solve_with};
 use ledger_explorer::oracle::{Oracle, PropertyOracle, Verdict};
 use ledger_explorer::search::{FaultReplayError, FaultReplayReport, Workload, replay_with_faults};
-use ledger_explorer::solver::HittingSetSolver;
-use ledger_format::{CanonicalValue, EntryPayload, Hash};
+use ledger_explorer::solver::{HittingSetSolver, SolverError};
+use ledger_format::ActorId;
+use ledger_format::{CanonicalValue, EntryHash, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SeedTree, SimFault, Simulation};
 use rand_core::Rng;
@@ -45,13 +46,13 @@ use rand_core::Rng;
 const B: usize = 16;
 
 /// Predeclared paired seeds: the same 20 seeds per case and method.
-const PAIRED_SEEDS: [[u8; 32]; 20] = {
-    let mut seeds = [[0u8; 32]; 20];
+const PAIRED_SEEDS: [EntryHash; 20] = {
+    let mut seeds = [EntryHash([0u8; 32]); 20];
     let mut index = 0;
     while index < 20 {
-        let mut seed = [0u8; 32];
-        seed[0] = (index + 1) as u8;
-        seed[1] = 0x5A;
+        let mut seed = EntryHash([0u8; 32]);
+        seed.0[0] = (index + 1) as u8;
+        seed.0[1] = 0x5A;
         seeds[index] = seed;
         index += 1;
     }
@@ -84,7 +85,7 @@ const COUNTED_CASES: [&str; 10] = [
 // ---------------------------------------------------------------------------
 
 /// Draw 0..=2 distinct faults from the declared space on one seeded stream.
-fn draw_faults_from(seed: [u8; 32], label: &str, space: &[SimFault]) -> Vec<SimFault> {
+fn draw_faults_from(seed: EntryHash, label: &str, space: &[SimFault]) -> Vec<SimFault> {
     let mut rng = SeedTree::new(seed).rng(label);
     let count = (rng.next_u64() as usize) % 3;
     let mut chosen: Vec<SimFault> = Vec::new();
@@ -100,12 +101,12 @@ fn draw_faults_from(seed: [u8; 32], label: &str, space: &[SimFault]) -> Vec<SimF
 }
 
 /// Independent random-baseline fault draw: its own stream.
-fn draw_random_faults(space: &[SimFault], base: [u8; 32], attempt: usize) -> Vec<SimFault> {
+fn draw_random_faults(space: &[SimFault], base: EntryHash, attempt: usize) -> Vec<SimFault> {
     draw_faults_from(base, &format!("dr0003-random/{attempt}"), space)
 }
 
 /// Journal entry targeted by a fault, if the fault attaches to one.
-fn injection_target(fault: &SimFault) -> Option<ledger_format::Hash> {
+fn injection_target(fault: &SimFault) -> Option<ledger_format::EntryHash> {
     match fault {
         SimFault::Drop(id)
         | SimFault::Crash(id)
@@ -119,7 +120,7 @@ fn injection_target(fault: &SimFault) -> Option<ledger_format::Hash> {
 /// Every entry id a support expression mentions.
 fn support_targets(
     expr: &ledger_explorer::support::SupportExpr,
-) -> std::collections::BTreeSet<ledger_format::Hash> {
+) -> std::collections::BTreeSet<ledger_format::EntryHash> {
     let mut out = std::collections::BTreeSet::new();
     match expr {
         ledger_explorer::support::SupportExpr::AllOf(ids) => out.extend(ids.iter().copied()),
@@ -152,11 +153,119 @@ fn rank_by_support(case: &Case, space: &[SimFault]) -> Vec<SimFault> {
     ranked.into_iter().map(|(_, f)| f).collect()
 }
 
+/// Fresh support for the CURRENT journal, mirroring `probe_support` semantics
+/// but evaluated on the violated run instead of the seed-0 probe.
+///
+/// Probe ids go stale when fault injection changes entry hashes (a `Fault`
+/// parent rehashes later entries), so solving a violated run with probe ids
+/// yields no surviving clause. Re-deriving the same semantic role (last
+/// `Send`/`FsWrite` of the critical actor, or the joint send sets) from the
+/// violated journal keeps the support honest and present.
+fn fresh_support(journal: &Journal, name: &str) -> ledger_explorer::support::SupportExpr {
+    use ledger_explorer::support::{all_of_ids, entry_ids_by};
+    let sends_of = |actor: usize| {
+        entry_ids_by(
+            journal,
+            ledger_format::EntryKind::Send,
+            ledger_format::ActorId(actor as u32),
+        )
+    };
+    let last_of = |kind: ledger_format::EntryKind, actor: usize| {
+        journal
+            .entries()
+            .filter(|entry| {
+                entry.data.kind == kind && entry.data.actor == ledger_format::ActorId(actor as u32)
+            })
+            .last()
+            .map(|entry| entry.id)
+    };
+    match name {
+        "faultdep-critical-send" | "faultdep-critical-recv" => {
+            match last_of(ledger_format::EntryKind::Send, 0) {
+                Some(id) => all_of_ids(std::iter::once(id)),
+                None => ledger_explorer::support::SupportExpr::Opaque,
+            }
+        }
+        "faultdep-critical-send-wide" => match last_of(ledger_format::EntryKind::Send, 1) {
+            Some(id) => all_of_ids(std::iter::once(id)),
+            None => ledger_explorer::support::SupportExpr::Opaque,
+        },
+        "faultdep-partition-relay" => {
+            let mut ids = sends_of(0);
+            ids.extend(sends_of(1));
+            all_of_ids(ids)
+        }
+        "faultdep-dual-critical" => {
+            let mut ids = sends_of(0);
+            ids.extend(sends_of(1));
+            all_of_ids(ids)
+        }
+        "faultdep-torn-durable" | "faultdep-corrupt-journal" | "faultdep-crash-state" => {
+            match last_of(ledger_format::EntryKind::FsWrite, 0) {
+                Some(id) => all_of_ids(std::iter::once(id)),
+                None => ledger_explorer::support::SupportExpr::Opaque,
+            }
+        }
+        "faultdep-wake-liveness" | "faultdep-voided-delays" => {
+            match last_of(ledger_format::EntryKind::Send, 0) {
+                Some(id) => all_of_ids(std::iter::once(id)),
+                None => ledger_explorer::support::SupportExpr::Opaque,
+            }
+        }
+        // Unknown names (for example the corpus-ratio mini-cloud cases that
+        // share this helper) degrade to `Opaque`: no strong claim, witness
+        // walk handles the solve.
+        _ => ledger_explorer::support::SupportExpr::Opaque,
+    }
+}
+
+/// Solve one case, preferring the explicit support model when it is strong.
+///
+/// A strong `AllOf`/`AnyOf` model names the faultable entries directly and
+/// preserves alternative groups, so hazards with empty oracle witnesses
+/// (for example a missing `Outcome` after a partition) still cut honestly.
+/// An `Opaque` model cannot back a strong claim and uses the witness walk;
+/// an [`SolverError::EmptyProvenance`] means no provenance exists under the
+/// horizon and yields no hypotheses instead of an invented cut.
+fn solve_case(
+    case: &Case,
+    journal: &Journal,
+    verdict: &Verdict,
+) -> Result<Vec<ledger_explorer::ldfi::FaultHypothesis>, SolverError> {
+    // Prefer a fresh support derived from the CURRENT journal: probe ids go
+    // stale when faults rehash entries, so the probe expression may name
+    // nothing present. A fresh strong model cuts honestly; an opaque model
+    // uses the witness walk. Empty provenance yields no hypotheses.
+    let fresh = fresh_support(journal, case.name);
+    if fresh.is_strong() {
+        let mut solver = HittingSetSolver::new();
+        match solver.solve_with_support(journal, verdict, &fresh) {
+            Ok(hyps) => Ok(hyps),
+            Err(SolverError::EmptyProvenance) => Ok(Vec::new()),
+            Err(other) => Err(other),
+        }
+    } else if case.support.is_strong() {
+        let mut solver = HittingSetSolver::new();
+        match solver.solve_with_support(journal, verdict, &case.support) {
+            Ok(hyps) => Ok(hyps),
+            Err(SolverError::EmptyProvenance) => Ok(Vec::new()),
+            Err(other) => Err(other),
+        }
+    } else {
+        let mut solver = HittingSetSolver::new();
+        match solve_with(&mut solver, journal, verdict) {
+            Ok(hyps) => Ok(hyps),
+            Err(SolverError::EmptyProvenance) => Ok(Vec::new()),
+            Err(other) => Err(other),
+        }
+    }
+}
+
 /// The directed LDFI find phase: probe the support-ranked space, and once a
 /// violation appears, let the hazard solver drive the schedule queue until a
 /// qualifying reproduction lands. Same budget and stopping rule as the
 /// random control.
-fn ldfi_qualifying_cost(case: &Case, seed: [u8; 32], space: &[SimFault], budget: usize) -> usize {
+fn ldfi_qualifying_cost(case: &Case, seed: EntryHash, space: &[SimFault], budget: usize) -> usize {
     let baseline = case.execute(seed, Vec::new());
     if case.check(&baseline).violated {
         panic!(
@@ -170,7 +279,7 @@ fn ldfi_qualifying_cost(case: &Case, seed: [u8; 32], space: &[SimFault], budget:
     for attempt in 0..budget {
         let attempt_seed = {
             let mut s = seed;
-            s[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            s.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
             s
         };
         let schedule = match queued.pop_front() {
@@ -187,9 +296,10 @@ fn ldfi_qualifying_cost(case: &Case, seed: [u8; 32], space: &[SimFault], budget:
         }
 
         // The violation is real; derive the hazard cut and try the solver
-        // schedules, queuing the ones the replay cannot yet confirm.
-        let mut solver = HittingSetSolver::new();
-        let hypotheses = match solve_with(&mut solver, &run.journal, &verdict) {
+        // schedules, queuing the ones the replay cannot yet confirm. Strong
+        // support cuts honestly even with empty witnesses; empty provenance
+        // yields no hypotheses instead of an invented cut.
+        let hypotheses = match solve_case(case, &run.journal, &verdict) {
             Ok(h) => h,
             Err(error) => panic!("{}: solver failed: {error}", case.name),
         };
@@ -235,7 +345,7 @@ struct Case {
 }
 
 impl Case {
-    fn execute(&self, seed: [u8; 32], faults: Vec<SimFault>) -> RunResult {
+    fn execute(&self, seed: EntryHash, faults: Vec<SimFault>) -> RunResult {
         let config = RunConfig::builder()
             .seed(seed)
             .policy(Policy::Random)
@@ -255,7 +365,7 @@ impl Case {
     /// typed report so condition (2) can assert applied faults.
     fn replay(
         &self,
-        seed: [u8; 32],
+        seed: EntryHash,
         witness: &RunResult,
         schedule: Vec<SimFault>,
     ) -> Result<FaultReplayReport, FaultReplayError> {
@@ -276,7 +386,7 @@ impl Case {
 fn probe_support(workload: &dyn Workload, name: &str) -> ledger_explorer::support::SupportExpr {
     use ledger_explorer::support::{all_of_ids, entry_ids_by};
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(4096)
         .build();
@@ -286,12 +396,19 @@ fn probe_support(workload: &dyn Workload, name: &str) -> ledger_explorer::suppor
     let journal = run.journal;
     // The value producer is the LAST journal entry of its kind and actor
     // before the consume point. Journal order, not content-address order.
-    let sends_of =
-        |actor: usize| entry_ids_by(&journal, ledger_format::EntryKind::Send, actor as u32);
+    let sends_of = |actor: usize| {
+        entry_ids_by(
+            &journal,
+            ledger_format::EntryKind::Send,
+            ledger_format::ActorId(actor as u32),
+        )
+    };
     let last_of = |kind: ledger_format::EntryKind, actor: usize| {
         journal
             .entries()
-            .filter(|entry| entry.data.kind == kind && entry.data.actor == actor as u32)
+            .filter(|entry| {
+                entry.data.kind == kind && entry.data.actor == ledger_format::ActorId(actor as u32)
+            })
             .last()
             .map(|entry| entry.id)
             .unwrap_or_else(|| panic!("{name}: probe journal must contain the support entry"))
@@ -440,9 +557,9 @@ fn outcome_value(journal: &Journal) -> Option<u64> {
 }
 
 /// Entry ids of the faultable events of a seed-0 probe run.
-fn probe_event_ids(workload: &dyn Workload, kind: ledger_format::EntryKind) -> Vec<Hash> {
+fn probe_event_ids(workload: &dyn Workload, kind: ledger_format::EntryKind) -> Vec<EntryHash> {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(4096)
         .build();
@@ -462,8 +579,8 @@ fn send_drop_space(workload: &dyn Workload, senders: usize, extra: Vec<SimFault>
         for dst in 0..senders {
             if src != dst {
                 space.push(SimFault::Partition {
-                    src: src as u32,
-                    dst: dst as u32,
+                    src: ActorId(src as u32),
+                    dst: ActorId(dst as u32),
                 });
             }
         }
@@ -505,8 +622,8 @@ fn build_cases() -> Vec<Case> {
             for dst in 0..tasks {
                 if src != dst {
                     space.push(SimFault::Partition {
-                        src: src as u32,
-                        dst: dst as u32,
+                        src: ActorId(src as u32),
+                        dst: ActorId(dst as u32),
                     });
                 }
             }
@@ -622,8 +739,8 @@ fn build_cases() -> Vec<Case> {
             for dst in 0..tasks {
                 if src != dst {
                     space.push(SimFault::Partition {
-                        src: src as u32,
-                        dst: dst as u32,
+                        src: ActorId(src as u32),
+                        dst: ActorId(dst as u32),
                     });
                 }
             }
@@ -951,11 +1068,11 @@ fn build_cases() -> Vec<Case> {
 /// reproduces, (5) a final no-fault rerun passes. Returns the one-based
 /// execution cost, or `B + 1` when the budget is exhausted.
 /// Uniform-sampler signature shared by the random control draws.
-type ScheduleFn = dyn Fn(&[SimFault], [u8; 32], usize) -> Vec<SimFault>;
+type ScheduleFn = dyn Fn(&[SimFault], EntryHash, usize) -> Vec<SimFault>;
 
 fn qualifying_cost(
     case: &Case,
-    seed: [u8; 32],
+    seed: EntryHash,
     space: &[SimFault],
     budget: usize,
     schedule_fn: &ScheduleFn,
@@ -975,7 +1092,7 @@ fn qualifying_cost(
     for attempt in 0..budget {
         let attempt_seed = {
             let mut s = seed;
-            s[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            s.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
             s
         };
         let schedule = schedule_fn(space, seed, attempt);
@@ -986,9 +1103,9 @@ fn qualifying_cost(
         }
 
         // Condition (3) holds; verify (4) strict replay reproduces with an
-        // eligible applied fault (2).
-        let mut solver = HittingSetSolver::new();
-        let hypotheses = match solve_with(&mut solver, &run.journal, &verdict) {
+        // eligible applied fault (2). Strong support cuts honestly even with
+        // empty witnesses.
+        let hypotheses = match solve_case(case, &run.journal, &verdict) {
             Ok(h) => h,
             Err(error) => panic!("{}: solver failed: {error}", case.name),
         };
@@ -1235,7 +1352,7 @@ fn dr0003_pbt_gate() {
     }
 
     let base = RunConfig::builder()
-        .seed([7; 32])
+        .seed(EntryHash([7; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();

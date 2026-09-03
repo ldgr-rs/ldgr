@@ -28,7 +28,8 @@ use ledger_explorer::FaultSolver;
 use ledger_explorer::maxsat::{HazardEncoding, encode_hazard};
 use ledger_explorer::oracle::Verdict;
 use ledger_explorer::solver::{MaxSatSolver, SolverConfig, SolverEngine, event_fault_cost};
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload, Hash};
+use ledger_format::ActorId;
+use ledger_format::{CanonicalValue, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use rand_chacha::ChaCha8Rng;
 use rand_core::{Rng, SeedableRng};
@@ -53,7 +54,7 @@ struct EncodingCase {
 fn build_case(rng: &mut ChaCha8Rng) -> EncodingCase {
     let count = 12 + (rng.next_u32() as usize % 9);
     let mut journal = Journal::new();
-    let mut ids: Vec<Hash> = Vec::new();
+    let mut ids: Vec<EntryHash> = Vec::new();
     for _ in 0..count {
         let kind = match rng.next_u32() % 4 {
             0 => EntryKind::Send,
@@ -73,24 +74,24 @@ fn build_case(rng: &mut ChaCha8Rng) -> EncodingCase {
         }
         let payload = match kind {
             EntryKind::Send => EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(actor, 0),
-                from: actor,
-                to: (rng.next_u32() % 3 + 1),
+                message_id: ledger_format::MessageId::new(ActorId(actor), 0),
+                from: ActorId(actor),
+                to: ActorId(rng.next_u32() % 3 + 1),
                 original_content: (rng.next_u32() % 1000).to_le_bytes().to_vec(),
             }),
             EntryKind::Recv => EntryPayload::Recv(ledger_format::RecvFrame {
-                message_id: ledger_format::MessageId::new(actor, 0),
-                from: 1,
-                to: actor,
+                message_id: ledger_format::MessageId::new(ActorId(actor), 0),
+                from: ActorId(1),
+                to: ActorId(actor),
                 observed_content: (rng.next_u32() % 1000).to_le_bytes().to_vec(),
             }),
             _ => EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned((rng.next_u32() % 1000) as u64),
             }),
         };
         let id = journal
-            .append(kind, actor, parents, payload)
+            .append(kind, ActorId(actor), parents, payload)
             .expect("randomized append must succeed");
         ids.push(id);
     }
@@ -104,10 +105,10 @@ fn build_case(rng: &mut ChaCha8Rng) -> EncodingCase {
     let witness = journal
         .append(
             EntryKind::Outcome,
-            4,
+            ActorId(4),
             witness_parents,
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned((rng.next_u32() % 1000) as u64),
             }),
         )
@@ -138,7 +139,7 @@ fn corpus() -> Vec<(EncodingCase, HazardEncoding)> {
 
 /// The cut must hit every hard clause, and dropping any member must leave
 /// some hard clause unhit.
-fn assert_cut_valid_and_minimal(encoding: &HazardEncoding, cut: &[Hash]) {
+fn assert_cut_valid_and_minimal(encoding: &HazardEncoding, cut: &[EntryHash]) {
     assert!(
         encoding
             .hard
@@ -147,7 +148,7 @@ fn assert_cut_valid_and_minimal(encoding: &HazardEncoding, cut: &[Hash]) {
         "the cut must satisfy every hard clause"
     );
     for removed in cut {
-        let reduced: Vec<Hash> = cut
+        let reduced: Vec<EntryHash> = cut
             .iter()
             .copied()
             .filter(|event| event != removed)
@@ -163,7 +164,7 @@ fn assert_cut_valid_and_minimal(encoding: &HazardEncoding, cut: &[Hash]) {
 }
 
 /// The recomputed per-event cost of the cut must equal the reported total.
-fn assert_cost_consistent(journal: &Journal, cut: &[Hash], total_cost: u64) {
+fn assert_cost_consistent(journal: &Journal, cut: &[EntryHash], total_cost: u64) {
     let recomputed: u64 = cut
         .iter()
         .map(|event| event_fault_cost(journal, event))

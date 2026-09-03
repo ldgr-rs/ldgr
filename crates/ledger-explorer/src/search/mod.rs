@@ -20,12 +20,12 @@ pub use joint::{CampaignPersist, run_joint_campaign, run_joint_campaign_with_sta
 pub use ledger_journal::{Journal, PersistentJournal};
 pub use quad::{QuadMutation, run_campaign_quad, run_swarm_campaign};
 pub use replay::{
-    FaultReplayError, FaultReplayReport, diff, replay, replay_prefix, replay_strict,
+    FaultReplayError, FaultReplayReport, JournalDiff, diff, replay, replay_prefix, replay_strict,
     replay_with_faults,
 };
 
 use crate::oracle::Oracle;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Probability, RunConfig, SeedTree, SimFault, Simulation, SwarmConfig};
 use rand_core::Rng;
 use std::collections::HashSet;
@@ -66,7 +66,7 @@ impl From<FaultReplayError> for SearchError {
     }
 }
 
-fn fault_injection_target(injection: &SimFault) -> Option<Hash> {
+fn fault_injection_target(injection: &SimFault) -> Option<EntryHash> {
     match injection {
         SimFault::Drop(id)
         | SimFault::Delay { send: id, .. }
@@ -89,7 +89,7 @@ fn find_first_violation<W: Workload, O: Oracle>(
 ) -> Result<(Option<Finding>, usize), SearchError> {
     for attempt in 0..budget {
         let mut seed = base.seed();
-        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let config = base.clone().with_seed(seed);
         let run = Simulation::new(config.clone(), workload.programs()).run()?;
         let verdict = effective_verdict(&run, oracle.check(&run));
@@ -167,7 +167,7 @@ fn unbiased_range(rng: &mut impl Rng, bound: u64) -> u64 {
 }
 
 fn draw_swarm(
-    seed: Hash,
+    seed: EntryHash,
     label: &str,
     budget: u64,
     crash_ceiling: f64,

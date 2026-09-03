@@ -7,7 +7,7 @@ use crate::maxsat::encode_hazard;
 use crate::oracle::Oracle;
 use crate::search::replay::FaultReplayError;
 use crate::solver::{SolverConfig, select_solver};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{RunConfig, SimFault, Simulation, canonical_hash};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -87,9 +87,9 @@ pub fn escalate(injection: &SimFault) -> Option<SimFault> {
 /// `Ord` order so the schedule stays deterministic.
 fn rebuild_schedule(
     base: Vec<SimFault>,
-    suppressed: &BTreeSet<Hash>,
+    suppressed: &BTreeSet<EntryHash>,
     voided: &BTreeSet<SimFault>,
-    escalated: &BTreeMap<Hash, SimFault>,
+    escalated: &BTreeMap<EntryHash, SimFault>,
 ) -> Vec<SimFault> {
     let base: Vec<SimFault> = base
         .into_iter()
@@ -98,7 +98,7 @@ fn rebuild_schedule(
             None => !voided.contains(injection),
         })
         .collect();
-    let mut seen_targets: BTreeSet<Hash> = BTreeSet::new();
+    let mut seen_targets: BTreeSet<EntryHash> = BTreeSet::new();
     let mut rebuilt: Vec<SimFault> = Vec::with_capacity(base.len());
     for injection in base {
         if let Some(hash) = fault_injection_target(&injection) {
@@ -156,6 +156,9 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
     attempts: usize,
     mut state: Option<&mut CampaignPersist>,
 ) -> Result<CampaignReport, SearchError> {
+    // Explicit per-campaign clause cache scope. Each LDFI solver built below
+    // owns its cache; no process-global store exists.
+    let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
     if attempts == 0 {
         return Ok(CampaignReport {
             runs_executed: 0,
@@ -167,7 +170,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         });
     }
     let budget = attempts / 2;
-    let mut distinct_roots: HashSet<Hash> = HashSet::new();
+    let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
     let mut search_runs: usize = 0;
@@ -180,7 +183,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
             break;
         }
         let mut seed = base.seed();
-        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let config = base.clone().with_seed(seed);
         let run = Simulation::new(config.clone(), workload.programs()).run()?;
         distinct_roots.insert(run.journal.root_hash());
@@ -253,9 +256,9 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
     schedule.sort();
     schedule.dedup();
 
-    let mut suppressed: BTreeSet<Hash> = BTreeSet::new();
+    let mut suppressed: BTreeSet<EntryHash> = BTreeSet::new();
     let mut voided_sigs: BTreeSet<SimFault> = BTreeSet::new();
-    let mut escalated_map: BTreeMap<Hash, SimFault> = BTreeMap::new();
+    let mut escalated_map: BTreeMap<EntryHash, SimFault> = BTreeMap::new();
     let mut feedback_executed: usize = 0;
 
     for round in 0..remaining {
@@ -291,8 +294,8 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
                 // violation still contributes deterministically. The round
                 // number fills the full width so late rounds cannot collide
                 // with earlier ones.
-                let mut synthetic = [0u8; 32];
-                synthetic[..8].copy_from_slice(&round.to_le_bytes());
+                let mut synthetic = EntryHash([0u8; 32]);
+                synthetic.0[..8].copy_from_slice(&round.to_le_bytes());
                 distinct_roots.insert(synthetic);
                 feedback_executed += 1;
                 // Re-solve for the next round with the updated suppression.

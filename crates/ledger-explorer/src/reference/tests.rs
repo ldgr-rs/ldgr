@@ -1,11 +1,12 @@
 use super::*;
 use crate::search::Workload as _;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, Simulation};
 
 fn run_with_seed(seed_byte: u8) -> (Journal, bool) {
     let (builders, oracle) = mini_raft();
     let config = RunConfig::builder()
-        .seed([seed_byte; 32])
+        .seed(EntryHash([seed_byte; 32]))
         .policy(Policy::Random)
         .max_steps(4096)
         .build();
@@ -44,7 +45,7 @@ fn every_scenario_exposes_an_explicit_support_model() {
     // v1: evaluate each model on the scenario's own no-fault probe journal;
     // the expression ids are content hashes of that journal's entries.
     for scenario in corpus_scenarios() {
-        let probe_seed = [0u8; 32];
+        let probe_seed = EntryHash([0u8; 32]);
         let journal = match &scenario.runner {
             CorpusRunner::Tasks { builders, .. } => {
                 let config = RunConfig::builder()

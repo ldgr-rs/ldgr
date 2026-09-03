@@ -12,7 +12,7 @@
 // ledger-lint:allow:SystemTime::now (host-side identity capture; the cross-process test uniquifies the temp file name with the system clock)
 // ledger-lint:allow:std::fs:: (host-side identity capture; the cross-process test exchanges the digest through a temp file)
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::{
     CRASH_SEMANTICS_VERSION, ExecutionIdentity, JOURNAL_FORMAT_VERSION, ResourceLimits,
 };
@@ -42,7 +42,7 @@ pub struct EngineBuild {
     /// Enabled engine features, comma separated and sorted.
     pub features: String,
     /// Digest of the workspace lockfile baked in at compile time.
-    pub lockfile_digest: Option<Hash>,
+    pub lockfile_digest: Option<EntryHash>,
 }
 
 impl EngineBuild {
@@ -75,25 +75,25 @@ pub struct IdentityContext {
     /// Whether the SUT tree was dirty at execution time.
     pub sut_dirty: bool,
     /// Digest of the SUT artifact when one is bound.
-    pub sut_artifact_digest: Option<Hash>,
+    pub sut_artifact_digest: Option<EntryHash>,
     /// Digest of a guest or component artifact when one is used.
-    pub guest_digest: Option<Hash>,
+    pub guest_digest: Option<EntryHash>,
     /// Workload identifier selecting the instruction programs.
     pub workload_id: String,
     /// Digest of the workload program set.
-    pub program_digest: Hash,
+    pub program_digest: EntryHash,
     /// Digests of every workload input.
-    pub input_digests: Vec<Hash>,
+    pub input_digests: Vec<EntryHash>,
     /// Backend identifier (`sim`, `wasm`, `tokio`).
     pub backend: String,
     /// Runtime profile description or fingerprint of the executing host.
     pub runtime_profile: String,
     /// Digest of the canonical `RunConfig` bytes.
-    pub run_config_digest: Hash,
+    pub run_config_digest: EntryHash,
     /// Root of the run's seed tree (the config root seed).
-    pub seed_tree_root: Hash,
+    pub seed_tree_root: EntryHash,
     /// Digest of the fault specification; `None` when no faults are bound.
-    pub faultspec_digest: Option<Hash>,
+    pub faultspec_digest: Option<EntryHash>,
     /// Oracle version; `None` when the default oracle is used.
     pub oracle_version: Option<u64>,
     /// Support-provider version; `None` when no provider is bound.
@@ -151,9 +151,9 @@ fn feature_list() -> String {
 /// `include_str!` freezes the lockfile bytes into the binary and makes cargo
 /// rebuild when the lockfile changes, so the digest is a build-time constant
 /// without a build-dependency on blake3.
-fn lockfile_digest() -> Hash {
+fn lockfile_digest() -> EntryHash {
     let lockfile = include_str!("../../../Cargo.lock");
-    *blake3::hash(lockfile.as_bytes()).as_bytes()
+    EntryHash(*blake3::hash(lockfile.as_bytes()).as_bytes())
 }
 
 #[cfg(test)]
@@ -169,7 +169,7 @@ mod tests {
             target_triple: "x86_64-unknown-linux-gnu".to_string(),
             build_profile: "debug".to_string(),
             features: "solver-cadical".to_string(),
-            lockfile_digest: Some([0x11; 32]),
+            lockfile_digest: Some(EntryHash([0x11; 32])),
         }
     }
 
@@ -180,12 +180,12 @@ mod tests {
             sut_artifact_digest: None,
             guest_digest: None,
             workload_id: "kv".to_string(),
-            program_digest: [0x44; 32],
+            program_digest: EntryHash([0x44; 32]),
             input_digests: Vec::new(),
             backend: "sim".to_string(),
             runtime_profile: "cpus=8".to_string(),
-            run_config_digest: [0x77; 32],
-            seed_tree_root: [0x88; 32],
+            run_config_digest: EntryHash([0x77; 32]),
+            seed_tree_root: EntryHash([0x88; 32]),
             faultspec_digest: None,
             oracle_version: None,
             support_provider_version: None,
@@ -232,7 +232,10 @@ mod tests {
         assert_eq!(identity.backend, "sim");
         assert_eq!(identity.journal_format_version, JOURNAL_FORMAT_VERSION);
         assert_eq!(identity.crash_semantics_version, CRASH_SEMANTICS_VERSION);
-        assert!(identity.digest().is_some(), "sample identity is complete");
+        assert!(
+            identity.digest().expect("complete").is_some(),
+            "sample identity is complete"
+        );
     }
 
     #[test]
@@ -248,7 +251,8 @@ mod tests {
             ledger_format::hash_to_hex(
                 &assemble_identity(build, context)
                     .digest()
-                    .expect("complete identity"),
+                    .expect("complete identity")
+                    .expect("complete identity has a digest"),
             )
         };
         if std::env::var_os(CHILD_ENV).is_some() {

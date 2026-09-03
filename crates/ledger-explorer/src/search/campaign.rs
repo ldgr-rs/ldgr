@@ -2,7 +2,7 @@ use super::SearchError;
 use crate::monitor::{MonitorOracle, OnlineMonitor};
 use crate::oracle::{Oracle, Verdict};
 use crate::pbt::InputsWorkload;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Instruction, RunConfig, RunResult, Simulation};
 use std::collections::HashSet;
 
@@ -44,7 +44,7 @@ pub trait Workload {
 #[derive(Debug, Clone)]
 pub struct Finding {
     /// Root seed that found the violation.
-    pub seed: Hash,
+    pub seed: EntryHash,
     pub run: RunResult,
     pub verdict: Verdict,
 }
@@ -97,12 +97,16 @@ pub fn run_campaign<W: Workload, O: Oracle>(
     base: RunConfig,
     attempts: usize,
 ) -> Result<CampaignReport, SearchError> {
-    let mut distinct_roots: HashSet<Hash> = HashSet::new();
+    // Explicit per-campaign clause cache scope. Campaign search itself is
+    // simulation-only, but any LDFI solve derived from its findings must use
+    // this campaign's cache, never a process-global store.
+    let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
+    let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
 
     for attempt in 0..attempts {
         let mut seed = base.seed();
-        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let config = base.clone().with_seed(seed);
         let run = Simulation::new(config.clone(), workload.programs()).run()?;
 
@@ -161,6 +165,8 @@ pub fn run_monitored_campaign<W: Workload, O: Oracle>(
     monitors: Vec<Box<dyn OnlineMonitor>>,
     attempts: usize,
 ) -> Result<CampaignReport, SearchError> {
+    // Explicit per-campaign clause cache scope; see `run_campaign`.
+    let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
     let monitor_names = monitors
         .iter()
         .map(|monitor| monitor.name().to_string())
@@ -170,12 +176,12 @@ pub fn run_monitored_campaign<W: Workload, O: Oracle>(
         monitor_oracle = monitor_oracle.with_monitor(monitor);
     }
 
-    let mut distinct_roots: HashSet<Hash> = HashSet::new();
+    let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
 
     for attempt in 0..attempts {
         let mut seed = base.seed();
-        seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let config = base.clone().with_seed(seed);
         // Reset monitors before the mid-run delta feed so each attempt
         // starts from a clean state; the shared monitors are also used by
@@ -222,6 +228,7 @@ pub fn search<W: Workload, O: Oracle>(
 mod liveness_tests {
     use super::*;
     use crate::oracle::Verdict;
+    use ledger_format::ActorId;
     use ledger_sim::{Instruction, RunConfig};
 
     /// A workload whose single task blocks on a receive that never has a
@@ -248,7 +255,10 @@ mod liveness_tests {
 
     #[test]
     fn quiesced_pending_tasks_become_liveness_findings() {
-        let config = RunConfig::builder().seed([9; 32]).max_steps(64).build();
+        let config = RunConfig::builder()
+            .seed(EntryHash([9; 32]))
+            .max_steps(64)
+            .build();
         let report =
             run_campaign(&DeadlockWorkload, &PassOracle, config, 2).expect("campaign succeeds");
         assert_eq!(
@@ -277,10 +287,10 @@ mod liveness_tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -354,7 +364,10 @@ mod liveness_tests {
             },
             "outcome 99 forbidden",
         );
-        let base = RunConfig::builder().seed([7; 32]).max_steps(64).build();
+        let base = RunConfig::builder()
+            .seed(EntryHash([7; 32]))
+            .max_steps(64)
+            .build();
         let report = run_monitored_campaign(
             &ViolatingWorkload,
             &PassOracle,

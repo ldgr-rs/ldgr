@@ -1,4 +1,4 @@
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_journal::Journal;
 use ledger_journal::JournalError;
 
@@ -11,7 +11,7 @@ pub struct MinimizationReport {
     pub minimized_decisions: Vec<usize>,
 }
 
-pub fn causal_slice(journal: &Journal, witness: Hash) -> Result<Vec<Hash>, JournalError> {
+pub fn causal_slice(journal: &Journal, witness: EntryHash) -> Result<Vec<EntryHash>, JournalError> {
     journal.causal_slice(&[witness])
 }
 
@@ -20,8 +20,19 @@ pub fn causal_slice(journal: &Journal, witness: Hash) -> Result<Vec<Hash>, Journ
 /// The minimizer's slice path uses the forward-closed slice so the repro
 /// journal is self-contained for replay: the entries that consume the sliced
 /// boundary events are kept alongside their causes.
-pub fn causal_slice_forward(journal: &Journal, witness: Hash) -> Result<Vec<Hash>, JournalError> {
+pub fn causal_slice_forward(
+    journal: &Journal,
+    witness: EntryHash,
+) -> Result<Vec<EntryHash>, JournalError> {
     journal.causal_slice_forward(&[witness])
+}
+
+/// Slice forward from all witnesses, keeping the slice self-contained.
+pub fn causal_slice_forward_all(
+    journal: &Journal,
+    witnesses: &[EntryHash],
+) -> Result<Vec<EntryHash>, JournalError> {
+    journal.causal_slice_forward(witnesses)
 }
 
 /// Return a one-minimal failing subset using the ddmin delta-debugging algorithm.

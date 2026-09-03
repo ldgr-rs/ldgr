@@ -26,8 +26,8 @@ pub fn distinct_outcomes_oracle() -> impl Fn(&Journal) -> bool {
 /// follower acknowledged. A stalled commit index violates it.
 pub fn live_quorum_commit_oracle() -> impl Fn(&Journal) -> bool {
     |journal: &Journal| {
-        let leader = outcome_by_actor(journal, 0);
-        let live_follower = outcome_by_actor(journal, 1);
+        let leader = outcome_by_actor(journal, ledger_format::ActorId(0));
+        let live_follower = outcome_by_actor(journal, ledger_format::ActorId(1));
         match (leader.last(), live_follower.last()) {
             (Some(committed), Some(acknowledged)) => committed == acknowledged,
             _ => false,
@@ -39,8 +39,8 @@ pub fn live_quorum_commit_oracle() -> impl Fn(&Journal) -> bool {
 /// holder's write, not an expired holder's late write.
 pub fn current_lease_holder_write_oracle() -> impl Fn(&Journal) -> bool {
     |journal: &Journal| {
-        let storage = outcome_by_actor(journal, 3);
-        let current_holder = outcome_by_actor(journal, 2);
+        let storage = outcome_by_actor(journal, ledger_format::ActorId(3));
+        let current_holder = outcome_by_actor(journal, ledger_format::ActorId(2));
         match (storage.last(), current_holder.last()) {
             (Some(applied), Some(written)) => applied == written,
             _ => false,
@@ -54,7 +54,7 @@ pub fn current_lease_holder_write_oracle() -> impl Fn(&Journal) -> bool {
 /// Each applied write journals its sequence number as an `Outcome`. A final
 /// value below the applied maximum means a newer write was overwritten by an
 /// older one: a lost update. An actor with no applied writes holds.
-pub fn last_write_wins_oracle(actor: u32) -> impl Fn(&Journal) -> bool {
+pub fn last_write_wins_oracle(actor: ledger_format::ActorId) -> impl Fn(&Journal) -> bool {
     move |journal: &Journal| {
         let applied = outcome_by_actor(journal, actor);
         applied.last().copied() == applied.iter().copied().max()

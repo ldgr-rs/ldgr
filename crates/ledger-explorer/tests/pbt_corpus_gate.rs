@@ -28,6 +28,7 @@ use ledger_explorer::oracle::{
 };
 use ledger_explorer::pbt::gen_id;
 use ledger_explorer::search::{Workload, search_input};
+use ledger_format::EntryHash;
 use ledger_format::{EntryKind, RunManifest};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, RunConfig, RunResult, Simulation};
@@ -153,7 +154,7 @@ fn journal_input_values(journal: &Journal) -> Vec<u64> {
 }
 
 /// The first journal entry id carrying `value` on the input axis.
-fn input_witness(journal: &Journal, value: u64) -> ledger_format::Hash {
+fn input_witness(journal: &Journal, value: u64) -> ledger_format::EntryHash {
     journal
         .entries()
         .find(|entry| {
@@ -161,15 +162,18 @@ fn input_witness(journal: &Journal, value: u64) -> ledger_format::Hash {
                 if step.value == ledger_format::CanonicalValue::Unsigned(value))
         })
         .map(|entry| entry.id)
-        .unwrap_or([0; 32])
+        .unwrap_or(EntryHash([0; 32]))
 }
 
 /// The joint plant's leading write: written before any input, so its entry
 /// id is input-independent and the pinned crash fault applies on every
 /// attempt.
-fn joint_fault_write(label: &'static str, inputs: &[u64]) -> ledger_format::Hash {
+fn joint_fault_write(label: &'static str, inputs: &[u64]) -> ledger_format::EntryHash {
     let workload = JointTemplate(label).with_inputs(inputs);
-    let config = RunConfig::builder().seed([0; 32]).max_steps(4096).build();
+    let config = RunConfig::builder()
+        .seed(EntryHash([0; 32]))
+        .max_steps(4096)
+        .build();
     let run = Simulation::new(config, workload.programs())
         .run()
         .expect("joint probe run must execute");
@@ -186,7 +190,7 @@ struct PbtCase {
     /// Generator stream label (`gen/<generator>`).
     generator: &'static str,
     /// Pinned search seed.
-    search_seed: [u8; 32],
+    search_seed: EntryHash,
     /// Number of generated inputs the workload applies.
     applied: usize,
     /// The oracle judging a run; holds when the system is correct.
@@ -199,7 +203,7 @@ static CASES: [PbtCase; 6] = [
     PbtCase {
         name: "pbt-exactly-once-dup",
         generator: "pbt-dedup",
-        search_seed: [31; 32],
+        search_seed: EntryHash([31; 32]),
         applied: 4,
         // Exactly-once: no input value may be applied twice.
         oracle: || Box::new(ExactlyOnceValueOracle),
@@ -208,7 +212,7 @@ static CASES: [PbtCase; 6] = [
     PbtCase {
         name: "pbt-forbidden-value",
         generator: "pbt-forbidden",
-        search_seed: [32; 32],
+        search_seed: EntryHash([32; 32]),
         applied: 16,
         // Safety: the forbidden ticket value must never be applied.
         oracle: || {
@@ -222,7 +226,7 @@ static CASES: [PbtCase; 6] = [
     PbtCase {
         name: "pbt-quorum-conflict",
         generator: "pbt-quorum",
-        search_seed: [33; 32],
+        search_seed: EntryHash([33; 32]),
         applied: 16,
         // Quorum invariant: two conflicting leaders must never both gather
         // support.
@@ -240,7 +244,7 @@ static CASES: [PbtCase; 6] = [
     PbtCase {
         name: "pbt-rollback-after-promote",
         generator: "pbt-rollback",
-        search_seed: [34; 32],
+        search_seed: EntryHash([34; 32]),
         applied: 16,
         // Consistency: a rolled-back version must never follow the promoted
         // one.
@@ -263,7 +267,7 @@ static CASES: [PbtCase; 6] = [
     PbtCase {
         name: "pbt-linearizability",
         generator: "pbt-lin",
-        search_seed: [35; 32],
+        search_seed: EntryHash([35; 32]),
         applied: 8,
         // Linearizability: the planted stale read of an unwritten value.
         oracle: || {
@@ -275,7 +279,7 @@ static CASES: [PbtCase; 6] = [
     PbtCase {
         name: "pbt-promote-crash-joint",
         generator: "pbt-joint",
-        search_seed: [36; 32],
+        search_seed: EntryHash([36; 32]),
         applied: 8,
         // Joint (input, fault) plant: the torn-promotion bug needs BOTH the
         // trigger input and the injected crash fault; neither axis alone
@@ -545,7 +549,10 @@ fn pbt_negative_control_is_not_found() {
         property: |journal: &Journal| !journal_input_values(journal).contains(&TRIGGER),
         name: "forbidden value must never be applied".into(),
     });
-    let config = RunConfig::builder().seed([32; 32]).max_steps(4096).build();
+    let config = RunConfig::builder()
+        .seed(EntryHash([32; 32]))
+        .max_steps(4096)
+        .build();
     let finding = search_input(&Sanitized, oracle.as_ref(), config, "pbt-forbidden", BUDGET)
         .expect("search must run");
     assert!(

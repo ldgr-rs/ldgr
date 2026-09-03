@@ -5,12 +5,13 @@ use ledger_explorer::minimizer::minimize_full;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec, Oracle};
 use ledger_explorer::search::search;
 use ledger_explorer::workloads::MiniKvWorkload;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, RunResult};
 
 #[test]
 fn full_pipeline_minimizes_stale_read_and_preserves_violation() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();

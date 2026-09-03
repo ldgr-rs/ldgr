@@ -4,14 +4,15 @@
 //!
 //! The cache is keyed by a BLAKE3 digest over the causal closure hash,
 //! the horizon bound, and the oracle predicate version. All operations
-//! are deterministic and do not use time or ambient threads. A per-solver
-//! instance cache is the primary store; a global [`OnceLock`] store is
-//! provided for cross-solver memoization.
+//! are deterministic and do not use time or ambient threads. The cache is
+//! always explicit and per-campaign/per-solver: each campaign entry point
+//! constructs its own [`ClauseCache`] (or its solver, which owns one), so
+//! concurrent campaigns never observe each other's entries. No
+//! process-global store exists.
 
 use crate::solver::SolverConfig;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 /// Engine discriminator folded into content-addressed cache keys.
 ///
@@ -31,12 +32,12 @@ pub mod engine_tag {
 /// where soft clauses correspond to derivation paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedClause {
-    pub literals: Vec<Hash>,
+    pub literals: Vec<EntryHash>,
     pub weight: u64,
 }
 
 impl WeightedClause {
-    pub fn new(literals: Vec<Hash>, weight: u64) -> Self {
+    pub fn new(literals: Vec<EntryHash>, weight: u64) -> Self {
         Self { literals, weight }
     }
 
@@ -53,7 +54,7 @@ impl WeightedClause {
 /// so repeat solves hit the cache without re-walking the journal.
 #[derive(Debug, Clone, Default)]
 pub struct ClauseCache {
-    inner: HashMap<Hash, Vec<WeightedClause>>,
+    inner: HashMap<EntryHash, Vec<WeightedClause>>,
 }
 
 impl ClauseCache {
@@ -63,15 +64,15 @@ impl ClauseCache {
         }
     }
 
-    pub fn get(&self, key: &Hash) -> Option<&Vec<WeightedClause>> {
+    pub fn get(&self, key: &EntryHash) -> Option<&Vec<WeightedClause>> {
         self.inner.get(key)
     }
 
-    pub fn get_cloned(&self, key: &Hash) -> Option<Vec<WeightedClause>> {
+    pub fn get_cloned(&self, key: &EntryHash) -> Option<Vec<WeightedClause>> {
         self.inner.get(key).cloned()
     }
 
-    pub fn insert(&mut self, key: Hash, clauses: Vec<WeightedClause>) {
+    pub fn insert(&mut self, key: EntryHash, clauses: Vec<WeightedClause>) {
         self.inner.insert(key, clauses);
     }
 
@@ -87,28 +88,28 @@ impl ClauseCache {
         self.inner.clear();
     }
 
-    pub fn contains(&self, key: &Hash) -> bool {
+    pub fn contains(&self, key: &EntryHash) -> bool {
         self.inner.contains_key(key)
     }
 
     /// Compute the closure hash over sorted fault hypothesis ids.
     ///
     /// Deterministic: sorts the input, hashes with BLAKE3.
-    pub fn closure_hash(sorted_ids: &[Hash]) -> Hash {
+    pub fn closure_hash(sorted_ids: &[EntryHash]) -> EntryHash {
         let mut ids = sorted_ids.to_vec();
         ids.sort();
         let mut hasher = blake3::Hasher::new();
         for id in &ids {
-            hasher.update(id);
+            hasher.update(&id.0);
         }
-        *hasher.finalize().as_bytes()
+        EntryHash(*hasher.finalize().as_bytes())
     }
 
-    /// Hash a clause set deterministically.
+    /// EntryHash a clause set deterministically.
     ///
     /// Sorts literals within each clause and sorts clauses by their
     /// literal bytes so the hash is stable under permutation.
-    pub fn clauses_hash(clauses: &[WeightedClause]) -> Hash {
+    pub fn clauses_hash(clauses: &[WeightedClause]) -> EntryHash {
         let mut hasher = blake3::Hasher::new();
         let mut sorted = clauses.to_vec();
         for clause in &mut sorted {
@@ -120,11 +121,11 @@ impl ClauseCache {
         for clause in &sorted {
             hasher.update(&clause.weight.to_le_bytes());
             for lit in &clause.literals {
-                hasher.update(lit);
+                hasher.update(&lit.0);
             }
             hasher.update(&[0xff]);
         }
-        *hasher.finalize().as_bytes()
+        EntryHash(*hasher.finalize().as_bytes())
     }
 
     /// Compute the content-addressed key for a solver invocation.
@@ -138,9 +139,13 @@ impl ClauseCache {
     /// support-provider version and digest. Entries derived under different
     /// values of any dimension must never satisfy each other, and each
     /// presence byte keeps `None` apart from `Some(0)`.
-    pub fn compute_key(closure_hash: Hash, engine_tag: u8, config: &SolverConfig) -> Hash {
+    pub fn compute_key(
+        closure_hash: EntryHash,
+        engine_tag: u8,
+        config: &SolverConfig,
+    ) -> EntryHash {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&closure_hash);
+        hasher.update(&closure_hash.0);
         hasher.update(&[0xfe]);
         if let Some(h) = config.max_horizon {
             hasher.update(&(h as u64).to_le_bytes());
@@ -173,7 +178,7 @@ impl ClauseCache {
         hasher.update(&[0xf9]);
         if let Some(hash) = config.run_config_hash {
             hasher.update(&[0x01]);
-            hasher.update(&hash);
+            hasher.update(&hash.0);
         } else {
             hasher.update(&[0x00]);
         }
@@ -187,70 +192,26 @@ impl ClauseCache {
         hasher.update(&[0xf7]);
         if let Some(digest) = config.support_digest {
             hasher.update(&[0x01]);
-            hasher.update(&digest);
+            hasher.update(&digest.0);
         } else {
             hasher.update(&[0x00]);
         }
-        *hasher.finalize().as_bytes()
+        EntryHash(*hasher.finalize().as_bytes())
     }
 
     /// Iterate over cached entries.
-    pub fn iter(&self) -> impl Iterator<Item = (&Hash, &Vec<WeightedClause>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&EntryHash, &Vec<WeightedClause>)> {
         self.inner.iter()
     }
-}
-
-/// Global content-addressed clause cache.
-///
-/// Backed by `OnceLock<Mutex<ClauseCache>>` so it is deterministic and
-/// does not spawn threads. Callers that need cross-solver sharing lock
-/// the mutex, clone the hit, and release.
-pub fn global_cache() -> &'static Mutex<ClauseCache> {
-    static GLOBAL: OnceLock<Mutex<ClauseCache>> = OnceLock::new();
-    GLOBAL.get_or_init(|| Mutex::new(ClauseCache::new()))
-}
-
-/// Insert into the global cache and return whether it was a new key.
-pub fn global_insert(key: Hash, clauses: Vec<WeightedClause>) -> bool {
-    let mut cache = global_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let is_new = !cache.contains(&key);
-    cache.insert(key, clauses);
-    is_new
-}
-
-/// Get a cloned entry from the global cache.
-pub fn global_get(key: &Hash) -> Option<Vec<WeightedClause>> {
-    let cache = global_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.get_cloned(key)
-}
-
-/// Number of entries in the global cache.
-pub fn global_len() -> usize {
-    let cache = global_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.len()
-}
-
-/// Clear the global cache.
-pub fn global_clear() {
-    let mut cache = global_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache.clear();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger_format::Hash;
+    use ledger_format::EntryHash;
 
-    fn hash_of(byte: u8) -> Hash {
-        [byte; 32]
+    fn hash_of(byte: u8) -> EntryHash {
+        EntryHash([byte; 32])
     }
 
     #[test]
@@ -480,18 +441,21 @@ mod tests {
     }
 
     #[test]
-    fn global_cache_is_singleton() {
-        let mut guard = global_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.clear();
+    fn per_campaign_caches_are_isolated() {
+        // Two explicit per-campaign caches never share entries: each entry
+        // point constructs its own `ClauseCache`, so isolation is structural
+        // instead of relying on a process-global clear.
+        let mut first = ClauseCache::new();
+        let second = ClauseCache::new();
         let key = hash_of(11);
         let clause = WeightedClause::new(vec![hash_of(2)], 7);
-        guard.insert(key, vec![clause.clone()]);
-        assert_eq!(guard.get_cloned(&key), Some(vec![clause]));
-        assert_eq!(guard.len(), 1);
-        guard.clear();
-        assert_eq!(guard.len(), 0);
+        first.insert(key, vec![clause.clone()]);
+        assert_eq!(first.get_cloned(&key), Some(vec![clause]));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 0);
+        assert!(second.get(&key).is_none());
+        first.clear();
+        assert_eq!(first.len(), 0);
     }
 
     #[test]

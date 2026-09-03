@@ -78,9 +78,25 @@ pub fn rank_motifs_by_lift(
 }
 
 fn distinct_transitions(journal: &Journal) -> HashSet<(EntryKind, EntryKind)> {
+    // Causal motif walk over vector-clock order, not append order. Append
+    // order is a total order that can interleave concurrent entries
+    // differently between runs; the causal order below is a deterministic
+    // linear extension of happens-before (vector-clock sum strictly grows
+    // along any parent edge), so concurrent interleavings map to one order
+    // and motifs name causal adjacency instead of scheduling accidents.
+    let mut ordered: Vec<_> = journal.entries().collect();
+    ordered.sort_by(|a, b| {
+        let sum_a: u64 = a.vector_clock.iter().map(|(_, v)| v).sum();
+        let sum_b: u64 = b.vector_clock.iter().map(|(_, v)| v).sum();
+        sum_a
+            .cmp(&sum_b)
+            .then(a.data.actor.cmp(&b.data.actor))
+            .then(a.data.sequence.cmp(&b.data.sequence))
+            .then(a.id.cmp(&b.id))
+    });
     let mut seen = HashSet::new();
     let mut prev: Option<EntryKind> = None;
-    for entry in journal.entries() {
+    for entry in ordered {
         if let Some(p) = prev {
             seen.insert((p, entry.data.kind));
         }
@@ -96,6 +112,8 @@ fn motif_label(motif: (EntryKind, EntryKind)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledger_format::ActorId;
+    use ledger_format::EntryHash;
     use ledger_format::{CanonicalValue, EntryPayload};
 
     fn chain_journal(entries: &[(EntryKind, u64)]) -> Journal {
@@ -103,26 +121,26 @@ mod tests {
         for (kind, value) in entries {
             let payload = match kind {
                 EntryKind::Send => EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: value.to_le_bytes().to_vec(),
                 }),
                 EntryKind::Recv => EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     observed_content: value.to_le_bytes().to_vec(),
                 }),
                 EntryKind::Assert => EntryPayload::Assert(ledger_format::AssertPayload {
-                    predicate: [0x00; 32],
+                    predicate: EntryHash([0x00; 32]),
                     passed: *value != 0,
                     detail: CanonicalValue::Unsigned(*value),
                 }),
                 _ => unreachable!("fixture kinds"),
             };
             journal
-                .append(*kind, 1, [], payload)
+                .append(*kind, ActorId(1), [], payload)
                 .expect("append must succeed");
         }
         journal

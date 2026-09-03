@@ -15,13 +15,15 @@ use ledger_explorer::search::{
     run_swarm_campaign, search,
 };
 use ledger_explorer::workloads::{MiniKvWorkload, StorageCrashWorkload};
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SimFault, Simulation, SwarmConfig};
 
 fn mini_kv_base(seed: u8) -> RunConfig {
     RunConfig::builder()
-        .seed([seed; 32])
+        .seed(EntryHash([seed; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build()
@@ -195,7 +197,7 @@ fn quad_bandit_arm_determinism() {
 /// Run `programs` at `seed` and return the journal.
 fn run_programs(programs: Vec<Vec<Instruction>>, seed: u8, faults: Vec<SimFault>) -> RunResult {
     let config = RunConfig::builder()
-        .seed([seed; 32])
+        .seed(EntryHash([seed; 32]))
         .policy(Policy::Random)
         .max_steps(512)
         .fault_schedule(faults)
@@ -245,7 +247,7 @@ impl Workload for ReorderStaleReadWorkload {
                     EntryPayload::Send(ledger_format::SendFrame {
                         original_content, ..
                     }),
-                ) if entry.data.actor == 0
+                ) if entry.data.actor == ActorId(0)
                     && original_content.as_slice() == 42u64.to_le_bytes() =>
                 {
                     Some(HistoryOperation::Write {
@@ -260,7 +262,7 @@ impl Workload for ReorderStaleReadWorkload {
                         value: CanonicalValue::Unsigned(value),
                         ..
                     }),
-                ) if entry.data.actor == 1 => Some(HistoryOperation::Read {
+                ) if entry.data.actor == ActorId(1) => Some(HistoryOperation::Read {
                     key: "k".into(),
                     value: *value,
                     witness: entry.id,
@@ -290,7 +292,7 @@ fn linearizability_axis_catches_the_planted_stale_read() {
     }
     // The search axis flag catches the same violation on the first attempt.
     let config = RunConfig::builder()
-        .seed([2; 32])
+        .seed(EntryHash([2; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -377,14 +379,17 @@ impl Workload for QuorumStaleReadWorkload {
 #[test]
 fn quorum_axis_catches_the_planted_stale_read() {
     // The plant needs the write to replica C partitioned away.
-    let faults = vec![SimFault::Partition { src: 0, dst: 3 }];
+    let faults = vec![SimFault::Partition {
+        src: ActorId(0),
+        dst: ActorId(3),
+    }];
     let oracle = PropertyOracle {
         property: |journal: &Journal| {
             let acks: Vec<u64> = journal
                 .entries()
                 .filter(|entry| {
-                    entry.data.actor >= 1
-                        && entry.data.actor <= 3
+                    entry.data.actor >= ledger_format::ActorId(1)
+                        && entry.data.actor <= ledger_format::ActorId(3)
                         && entry.data.kind == EntryKind::Send
                 })
                 .filter_map(|entry| match &entry.data.payload {
@@ -403,7 +408,9 @@ fn quorum_axis_catches_the_planted_stale_read() {
             let quorum_fresh = acks.iter().filter(|value| **value == 42).count() >= 2;
             let outcome = journal
                 .entries()
-                .filter(|entry| entry.data.actor == 4 && entry.data.kind == EntryKind::Outcome)
+                .filter(|entry| {
+                    entry.data.actor == ActorId(4) && entry.data.kind == EntryKind::Outcome
+                })
                 .find_map(|entry| match &entry.data.payload {
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
                         value: CanonicalValue::Unsigned(value),
@@ -424,7 +431,8 @@ fn quorum_axis_catches_the_planted_stale_read() {
         assert!(
             run.journal
                 .entries()
-                .all(|entry| entry.data.actor != 3 || entry.data.kind != EntryKind::Recv),
+                .all(|entry| entry.data.actor != ledger_format::ActorId(3)
+                    || entry.data.kind != EntryKind::Recv),
             "seed {seed}: replica C must never receive the write under the partition"
         );
         let verdict = oracle.check(&run);
@@ -575,7 +583,7 @@ fn exactly_once_axis_catches_duplicate_and_torn_applies() {
     }
     // The search axis flag catches the duplicate apply on the first attempt.
     let config = RunConfig::builder()
-        .seed([2; 32])
+        .seed(EntryHash([2; 32]))
         .policy(Policy::Random)
         .max_steps(128)
         .build();

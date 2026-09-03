@@ -11,6 +11,8 @@ use crate::oracle::{HistoryOracle, KeyValueSpec, Oracle, PropertyOracle, Verdict
 use crate::search::Finding;
 use crate::search::Workload as _;
 use crate::workloads::MiniKvWorkload;
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_journal::Journal;
 use ledger_sim::{Policy, RunConfig, RunResult, RuntimeError, SimFault, Simulation, TaskBuilder};
 
@@ -58,7 +60,7 @@ pub struct CorpusScenario {
     pub name: &'static str,
     /// Pinned base seed: the manifest seed for reference sims, the search
     /// start seed for Mini-Kv.
-    pub base_seed: [u8; 32],
+    pub base_seed: EntryHash,
     /// How the scenario runs and which oracle judges it.
     pub runner: CorpusRunner,
     /// Declared candidate fault space (partitions, drops, delays) for
@@ -76,7 +78,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
     vec![
         CorpusScenario {
             name: "mini-zab-split-brain",
-            base_seed: [1; 32],
+            base_seed: EntryHash([1; 32]),
             runner: CorpusRunner::Tasks {
                 builders: zab_builders,
                 property: zab_property,
@@ -86,7 +88,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-hdfs-double-grant",
-            base_seed: [2; 32],
+            base_seed: EntryHash([2; 32]),
             runner: CorpusRunner::Tasks {
                 builders: hdfs_builders,
                 property: hdfs_property,
@@ -96,7 +98,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-cassandra-stale-read",
-            base_seed: [3; 32],
+            base_seed: EntryHash([3; 32]),
             runner: CorpusRunner::Tasks {
                 builders: cassandra_builders,
                 property: cassandra_property,
@@ -106,7 +108,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-2pc-coordinator-crash",
-            base_seed: [4; 32],
+            base_seed: EntryHash([4; 32]),
             runner: CorpusRunner::Tasks {
                 builders: two_pc_builders,
                 property: two_pc_property,
@@ -116,7 +118,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-leader-stepdown",
-            base_seed: [5; 32],
+            base_seed: EntryHash([5; 32]),
             runner: CorpusRunner::Tasks {
                 builders: leader_stepdown_builders,
                 property: leader_stepdown_property,
@@ -126,7 +128,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-membership-churn",
-            base_seed: [6; 32],
+            base_seed: EntryHash([6; 32]),
             runner: CorpusRunner::Tasks {
                 builders: membership_churn_builders,
                 property: membership_churn_property,
@@ -136,7 +138,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-hdfs-lease-expiry",
-            base_seed: [7; 32],
+            base_seed: EntryHash([7; 32]),
             runner: CorpusRunner::Tasks {
                 builders: hdfs_lease_expiry_builders,
                 property: hdfs_lease_expiry_property,
@@ -146,14 +148,14 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-kv-stale-read",
-            base_seed: [0; 32],
+            base_seed: EntryHash([0; 32]),
             runner: CorpusRunner::MiniKv,
             fault_space: mini_kv_faults,
             support: mini_kv_stale_read_support,
         },
         CorpusScenario {
             name: "mini-reorder-lost-update",
-            base_seed: [8; 32],
+            base_seed: EntryHash([8; 32]),
             runner: CorpusRunner::Tasks {
                 builders: reorder_lost_update_builders,
                 property: reorder_lost_update_property,
@@ -163,7 +165,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-lease-timer-race",
-            base_seed: [9; 32],
+            base_seed: EntryHash([9; 32]),
             runner: CorpusRunner::Tasks {
                 builders: lease_timer_race_builders,
                 property: lease_timer_race_property,
@@ -173,7 +175,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-restart-dup-append",
-            base_seed: [10; 32],
+            base_seed: EntryHash([10; 32]),
             runner: CorpusRunner::Tasks {
                 builders: restart_dup_append_builders,
                 property: restart_dup_append_property,
@@ -183,7 +185,7 @@ pub fn corpus_scenarios() -> Vec<CorpusScenario> {
         },
         CorpusScenario {
             name: "mini-partition-retry-dup",
-            base_seed: [11; 32],
+            base_seed: EntryHash([11; 32]),
             runner: CorpusRunner::Tasks {
                 builders: partition_retry_dup_builders,
                 property: partition_retry_dup_property,
@@ -256,7 +258,7 @@ impl CorpusScenario {
 
     /// Run the scenario at `seed` with optional injected faults under the
     /// corpus gate config (Random policy, 4096-step budget).
-    pub fn run(&self, seed: [u8; 32], faults: Vec<SimFault>) -> Result<RunResult, RuntimeError> {
+    pub fn run(&self, seed: EntryHash, faults: Vec<SimFault>) -> Result<RunResult, RuntimeError> {
         let config = RunConfig::builder()
             .seed(seed)
             .policy(Policy::Random)
@@ -329,7 +331,7 @@ impl CorpusScenario {
     /// mechanic).
     pub fn replay_faults(
         &self,
-        seed: [u8; 32],
+        seed: EntryHash,
         witness: &RunResult,
         schedule: Vec<SimFault>,
     ) -> Result<RunResult, ReferenceReplayError> {
@@ -444,7 +446,10 @@ fn partition_retry_dup_property(journal: &Journal) -> bool {
 fn link_partitions(links: &[(u32, u32)]) -> Vec<SimFault> {
     links
         .iter()
-        .map(|&(src, dst)| SimFault::Partition { src, dst })
+        .map(|&(src, dst)| SimFault::Partition {
+            src: ActorId(src),
+            dst: ActorId(dst),
+        })
         .collect()
 }
 
@@ -470,7 +475,7 @@ fn client_server_faults() -> Result<Vec<SimFault>, String> {
 fn mini_kv_faults() -> Result<Vec<SimFault>, String> {
     let mut space = link_partitions(&[(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]);
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(512)
         .build();

@@ -6,12 +6,13 @@ use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec, Oracle};
 use ledger_explorer::search::{replay_prefix, search};
 use ledger_explorer::solver::HittingSetSolver;
 use ledger_explorer::workloads::MiniKvWorkload;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig};
 
 fn main() {
     println!("=== Ledger Engine: Mini-KV Race Exploration ===");
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();

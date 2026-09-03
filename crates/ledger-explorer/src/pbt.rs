@@ -6,7 +6,7 @@
 
 use crate::oracle::HistoryOperation;
 use crate::search::Workload;
-use ledger_format::{GenId, Hash};
+use ledger_format::EntryHash;
 use ledger_sim::{Instruction, RunResult, SeedTree};
 use rand_chacha::ChaCha20Rng;
 use rand_core::Rng;
@@ -41,7 +41,7 @@ pub enum EnergyDistribution {
 }
 
 impl PbtBridge {
-    pub fn new(name: &str, seed: Hash) -> Self {
+    pub fn new(name: &str, seed: EntryHash) -> Self {
         let tree = SeedTree::new(seed);
         Self {
             rng: tree.gen_stream(name),
@@ -100,9 +100,9 @@ impl PbtBridge {
 
 /// Derive a stable generator id from a generator name.
 ///
-/// The first 8 bytes of the BLAKE3 hash of the name become the `GenId`, so a
+/// The first 8 bytes of the BLAKE3 hash of the name become the generator id, so a
 /// named generator maps to one id across every run.
-pub fn gen_id(generator: &str) -> GenId {
+pub fn gen_id(generator: &str) -> u64 {
     let digest = blake3::hash(generator.as_bytes());
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest.as_bytes()[..8]);
@@ -139,8 +139,8 @@ mod tests {
 
     #[test]
     fn same_name_and_seed_reproduces_identical_sequence() {
-        let mut left = PbtBridge::new("arith", [1; 32]);
-        let mut right = PbtBridge::new("arith", [1; 32]);
+        let mut left = PbtBridge::new("arith", EntryHash([1; 32]));
+        let mut right = PbtBridge::new("arith", EntryHash([1; 32]));
         for _ in 0..16 {
             assert_eq!(left.sample_u64(), right.sample_u64());
         }
@@ -148,8 +148,8 @@ mod tests {
 
     #[test]
     fn distinct_generator_names_draw_independent_sequences() {
-        let mut left = PbtBridge::new("alpha", [1; 32]);
-        let mut right = PbtBridge::new("beta", [1; 32]);
+        let mut left = PbtBridge::new("alpha", EntryHash([1; 32]));
+        let mut right = PbtBridge::new("beta", EntryHash([1; 32]));
         let left_seq = (0..16).map(|_| left.sample_u64()).collect::<Vec<_>>();
         let right_seq = (0..16).map(|_| right.sample_u64()).collect::<Vec<_>>();
         assert_ne!(left_seq, right_seq, "independent streams must differ");
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn sample_range_stays_within_bounds() {
-        let mut bridge = PbtBridge::new("range", [2; 32]);
+        let mut bridge = PbtBridge::new("range", EntryHash([2; 32]));
         for _ in 0..256 {
             let value = bridge.sample_range(10, 20);
             assert!((10..20).contains(&value));
@@ -172,8 +172,8 @@ mod tests {
 
     #[test]
     fn uniform_equals_sample_range_sequence() {
-        let mut via_range = PbtBridge::new("uniform-eq", [7; 32]);
-        let mut via_energy = PbtBridge::new("uniform-eq", [7; 32]);
+        let mut via_range = PbtBridge::new("uniform-eq", EntryHash([7; 32]));
+        let mut via_energy = PbtBridge::new("uniform-eq", EntryHash([7; 32]));
         for _ in 0..256 {
             let a = via_range.sample_range(0, INPUT_SAMPLE_RANGE);
             let b = via_energy
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn power_exponent_2_biases_low() {
-        let mut bridge = PbtBridge::new("power-low", [11; 32]);
+        let mut bridge = PbtBridge::new("power-low", EntryHash([11; 32]));
         let dist = EnergyDistribution::Power { exponent: 2.0 };
         let n = 1000;
         let mut sum: u64 = 0;
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn power_exponent_half_biases_high() {
-        let mut bridge = PbtBridge::new("power-high", [13; 32]);
+        let mut bridge = PbtBridge::new("power-high", EntryHash([13; 32]));
         let dist = EnergyDistribution::Power { exponent: 0.5 };
         let n = 1000;
         let mut sum: u64 = 0;
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn invalid_exponent_returns_error() {
-        let mut bridge = PbtBridge::new("invalid-exp", [17; 32]);
+        let mut bridge = PbtBridge::new("invalid-exp", EntryHash([17; 32]));
         assert!(
             bridge
                 .sample_energy(
@@ -274,8 +274,8 @@ mod tests {
 
     #[test]
     fn sample_energy_is_deterministic() {
-        let mut left = PbtBridge::new("energy-det", [19; 32]);
-        let mut right = PbtBridge::new("energy-det", [19; 32]);
+        let mut left = PbtBridge::new("energy-det", EntryHash([19; 32]));
+        let mut right = PbtBridge::new("energy-det", EntryHash([19; 32]));
         let dist = EnergyDistribution::Power { exponent: 2.0 };
         for _ in 0..64 {
             let a = left.sample_energy(INPUT_SAMPLE_RANGE, &dist).unwrap();
@@ -283,8 +283,8 @@ mod tests {
             assert_eq!(a, b);
         }
         // Uniform determinism already covered via uniform_equals test, but double-check.
-        let mut left_u = PbtBridge::new("energy-det-u", [23; 32]);
-        let mut right_u = PbtBridge::new("energy-det-u", [23; 32]);
+        let mut left_u = PbtBridge::new("energy-det-u", EntryHash([23; 32]));
+        let mut right_u = PbtBridge::new("energy-det-u", EntryHash([23; 32]));
         for _ in 0..64 {
             let a = left_u
                 .sample_energy(INPUT_SAMPLE_RANGE, &EnergyDistribution::Uniform)

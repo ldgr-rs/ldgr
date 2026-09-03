@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use ledger_format::{ActorId, EntryKind, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind};
 use ledger_journal::Journal;
 use thiserror::Error;
 
@@ -56,7 +56,7 @@ impl SupportOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SupportExpr {
     /// Every listed entry is jointly required.
-    AllOf(BTreeSet<Hash>),
+    AllOf(BTreeSet<EntryHash>),
     /// One listed branch is sufficient.
     AnyOf(Vec<SupportExpr>),
     /// Semantics are unknown; strong claims degrade to heuristic.
@@ -65,7 +65,7 @@ pub enum SupportExpr {
 
 impl SupportExpr {
     /// Construct `AllOf`, rejecting an empty requirement set.
-    pub fn all_of(ids: BTreeSet<Hash>) -> Result<Self, SupportError> {
+    pub fn all_of(ids: BTreeSet<EntryHash>) -> Result<Self, SupportError> {
         if ids.is_empty() {
             return Err(SupportError::EmptyAllOf);
         }
@@ -160,7 +160,7 @@ impl SupportExpr {
             Self::AllOf(ids) => {
                 out.push(0x00);
                 for id in ids {
-                    out.extend_from_slice(id);
+                    out.extend_from_slice(&id.0);
                 }
             }
             Self::AnyOf(branches) => {
@@ -174,15 +174,15 @@ impl SupportExpr {
     }
 
     /// BLAKE3 digest over the canonical encoding.
-    pub fn digest(&self) -> Hash {
-        *blake3::hash(&self.canonical_bytes()).as_bytes()
+    pub fn digest(&self) -> EntryHash {
+        EntryHash(*blake3::hash(&self.canonical_bytes()).as_bytes())
     }
 }
 
-impl TryFrom<BTreeSet<Hash>> for SupportExpr {
+impl TryFrom<BTreeSet<EntryHash>> for SupportExpr {
     type Error = SupportError;
 
-    fn try_from(ids: BTreeSet<Hash>) -> Result<Self, Self::Error> {
+    fn try_from(ids: BTreeSet<EntryHash>) -> Result<Self, Self::Error> {
         Self::all_of(ids)
     }
 }
@@ -206,7 +206,7 @@ pub trait SupportProvider {
     fn version(&self) -> u64;
 
     /// Digest over `version` and the declared expression.
-    fn digest(&self) -> Hash;
+    fn digest(&self) -> EntryHash;
 
     /// The support expression this provider derives for `journal`.
     fn support(&self, journal: &Journal) -> SupportExpr;
@@ -220,7 +220,7 @@ pub trait SupportProvider {
 pub struct StaticSupportProvider {
     version: u64,
     expression: SupportExpr,
-    digest: Hash,
+    digest: EntryHash,
 }
 
 impl StaticSupportProvider {
@@ -228,8 +228,8 @@ impl StaticSupportProvider {
     pub fn new(version: u64, expression: SupportExpr) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&version.to_le_bytes());
-        hasher.update(&expression.digest());
-        let digest = *hasher.finalize().as_bytes();
+        hasher.update(&expression.digest().0);
+        let digest = EntryHash(*hasher.finalize().as_bytes());
         Self {
             version,
             expression,
@@ -248,7 +248,7 @@ impl StaticSupportProvider {
     }
 
     /// The provider digest over `version` and the declared expression.
-    pub fn digest(&self) -> Hash {
+    pub fn digest(&self) -> EntryHash {
         self.digest
     }
 }
@@ -258,7 +258,7 @@ impl SupportProvider for StaticSupportProvider {
         self.version
     }
 
-    fn digest(&self) -> Hash {
+    fn digest(&self) -> EntryHash {
         self.digest
     }
 
@@ -271,7 +271,7 @@ impl SupportProvider for StaticSupportProvider {
 ///
 /// The result is a `BTreeSet`, so ids arrive canonically sorted for
 /// [`SupportExpr::all_of`].
-pub fn entry_ids_by(journal: &Journal, kind: EntryKind, actor: ActorId) -> BTreeSet<Hash> {
+pub fn entry_ids_by(journal: &Journal, kind: EntryKind, actor: ActorId) -> BTreeSet<EntryHash> {
     journal
         .entries()
         .filter(|entry| entry.data.kind == kind && entry.data.actor == actor)
@@ -283,11 +283,69 @@ pub fn entry_ids_by(journal: &Journal, kind: EntryKind, actor: ActorId) -> BTree
 ///
 /// A run without the named semantic role cannot support a strong claim, so
 /// the model reports unknown instead of an empty requirement set.
-pub fn all_of_ids(ids: impl IntoIterator<Item = Hash>) -> SupportExpr {
+pub fn all_of_ids(ids: impl IntoIterator<Item = EntryHash>) -> SupportExpr {
     match SupportExpr::all_of(ids.into_iter().collect()) {
         Ok(expr) => expr,
         Err(_) => SupportExpr::Opaque,
     }
+}
+
+/// Hard clauses for one support expression, preserving alternative groups.
+///
+/// Each `AllOf` member set becomes one hard clause. Each `AnyOf` branch
+/// contributes its own clauses without merging into a single flattened
+/// clause: alternative derivations stay separate so a cut must break every
+/// branch. `Opaque` contributes no clause; callers treat an empty result as
+/// unknown support and fail closed.
+pub fn hard_clauses_from_support(expr: &SupportExpr) -> Vec<Vec<EntryHash>> {
+    match expr {
+        SupportExpr::AllOf(ids) => {
+            let clause: Vec<EntryHash> = ids.iter().copied().collect();
+            if clause.is_empty() {
+                Vec::new()
+            } else {
+                vec![clause]
+            }
+        }
+        SupportExpr::AnyOf(branches) => {
+            let mut out = Vec::new();
+            for branch in branches {
+                out.extend(hard_clauses_from_support(branch));
+            }
+            out
+        }
+        SupportExpr::Opaque => Vec::new(),
+    }
+}
+
+/// Build a support expression from faultable derivation paths.
+///
+/// Each non-empty path becomes one `AllOf` branch; the branches join under
+/// one `AnyOf` so alternatives stay separate. When `truncated` is true the
+/// horizon cut the walk, so an `Opaque` branch joins the alternatives and
+/// forces [`SupportExpr::is_strong`] to false. An empty path list yields
+/// `Opaque`, never an empty `AnyOf`.
+pub fn support_from_paths(paths: &[Vec<EntryHash>], truncated: bool) -> SupportExpr {
+    let mut branches = Vec::new();
+    for path in paths {
+        let ids: BTreeSet<EntryHash> = path.iter().copied().collect();
+        if ids.is_empty() {
+            continue;
+        }
+        if let Ok(expr) = SupportExpr::all_of(ids) {
+            branches.push(expr);
+        }
+    }
+    if truncated {
+        branches.push(SupportExpr::Opaque);
+    }
+    if branches.is_empty() {
+        return SupportExpr::Opaque;
+    }
+    if branches.len() == 1 && !truncated {
+        return branches.into_iter().next().unwrap_or(SupportExpr::Opaque);
+    }
+    SupportExpr::any_of(branches).unwrap_or(SupportExpr::Opaque)
 }
 
 #[cfg(test)]
@@ -295,19 +353,19 @@ mod tests {
     use super::*;
     use ledger_format::EntryPayload;
 
-    fn journal_with_ids(count: usize) -> (Journal, Vec<Hash>) {
+    fn journal_with_ids(count: usize) -> (Journal, Vec<EntryHash>) {
         let mut journal = Journal::new();
         let mut recorded = Vec::new();
         for i in 0..count {
             let hash = journal
                 .append(
                     EntryKind::Send,
-                    (i % 3) as ActorId,
+                    ActorId((i % 3) as u32),
                     [],
                     EntryPayload::Send(ledger_format::SendFrame {
-                        message_id: ledger_format::MessageId::new((i % 3) as ActorId, 0),
-                        from: (i % 3) as ActorId,
-                        to: 1,
+                        message_id: ledger_format::MessageId::new(ActorId((i % 3) as u32), 0),
+                        from: ActorId((i % 3) as u32),
+                        to: ActorId(1),
                         original_content: (i as u64).to_le_bytes().to_vec(),
                     }),
                 )
@@ -317,11 +375,11 @@ mod tests {
         (journal, recorded)
     }
 
-    fn absent_id() -> Hash {
-        [0xEE; 32]
+    fn absent_id() -> EntryHash {
+        EntryHash([0xEE; 32])
     }
 
-    fn all(ids: Vec<Hash>) -> SupportExpr {
+    fn all(ids: Vec<EntryHash>) -> SupportExpr {
         SupportExpr::all_of(ids.into_iter().collect()).expect("non-empty")
     }
 
@@ -336,7 +394,7 @@ mod tests {
             Err(SupportError::EmptyAllOf)
         );
         assert_eq!(
-            BTreeSet::<Hash>::new().try_into(),
+            BTreeSet::<EntryHash>::new().try_into(),
             Err::<SupportExpr, _>(SupportError::EmptyAllOf)
         );
     }
@@ -485,12 +543,12 @@ mod tests {
         let send = journal
             .append(
                 EntryKind::Send,
-                0,
+                ActorId(0),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(0, 0),
-                    from: 0,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(0), 0),
+                    from: ActorId(0),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -498,19 +556,19 @@ mod tests {
         journal
             .append(
                 EntryKind::Recv,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Recv(ledger_format::RecvFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     observed_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
             .expect("recv");
-        let ids = entry_ids_by(&journal, EntryKind::Send, 0);
+        let ids = entry_ids_by(&journal, EntryKind::Send, ActorId(0));
         assert_eq!(ids.len(), 1);
         assert!(ids.contains(&send));
-        assert!(entry_ids_by(&journal, EntryKind::Send, 1).is_empty());
+        assert!(entry_ids_by(&journal, EntryKind::Send, ActorId(1)).is_empty());
     }
 }

@@ -5,6 +5,8 @@ use crate::oracle::{HistoryOperation, HistoryOracle, KeyValueSpec, PropertyOracl
 use crate::pbt::{EnergyDistribution, InputsWorkload};
 use crate::solver_state::load as load_solver_state;
 use crate::workloads::MiniKvWorkload;
+use ledger_format::ActorId;
+use ledger_format::EntryHash;
 use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, RunResult, SeedTree, SimFault};
@@ -54,7 +56,7 @@ fn journal_contains_input_value(run: &RunResult, target: u64) -> bool {
 #[test]
 fn search_input_finds_violation_only_for_specific_input_sample() {
     let base = RunConfig::builder()
-        .seed([5; 32])
+        .seed(EntryHash([5; 32]))
         .policy(Policy::Random)
         .max_steps(512)
         .build();
@@ -107,7 +109,7 @@ fn swarm_knob(variant: &str, knob: &str) -> f64 {
 #[test]
 fn swarm_axis_distribution_matches_across_campaign_types() {
     let base = RunConfig::builder()
-        .seed([3; 32])
+        .seed(EntryHash([3; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -148,7 +150,7 @@ fn swarm_axis_distribution_matches_across_campaign_types() {
 
 #[test]
 fn input_axis_draws_distinct_values_per_attempt_seed() {
-    let base = RunConfig::builder().seed([9; 32]).build();
+    let base = RunConfig::builder().seed(EntryHash([9; 32])).build();
     let first = draw_inputs(
         "quad-test",
         SeedTree::new(base.seed()).derive("quad-input/0"),
@@ -171,7 +173,7 @@ fn input_axis_draws_distinct_values_per_attempt_seed() {
 
 #[test]
 fn input_axis_propagates_invalid_energy_exponent() {
-    let base = RunConfig::builder().seed([9; 32]).build();
+    let base = RunConfig::builder().seed(EntryHash([9; 32])).build();
     let result = draw_inputs(
         "quad-test",
         SeedTree::new(base.seed()).derive("quad-input/0"),
@@ -186,7 +188,7 @@ fn input_axis_propagates_invalid_energy_exponent() {
 #[test]
 fn quad_campaign_mutates_input_axis_with_the_other_three() {
     let base = RunConfig::builder()
-        .seed([9; 32])
+        .seed(EntryHash([9; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -229,7 +231,7 @@ fn quad_campaign_mutates_input_axis_with_the_other_three() {
 #[test]
 fn bandit_campaign_mutates_input_axis() {
     let base = RunConfig::builder()
-        .seed([11; 32])
+        .seed(EntryHash([11; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -274,7 +276,7 @@ fn bandit_campaign_mutates_input_axis() {
 #[test]
 fn quad_campaign_with_power_energy_reruns_equal_variants() {
     let base = RunConfig::builder()
-        .seed([13; 32])
+        .seed(EntryHash([13; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -383,10 +385,13 @@ fn feedback_campaign_reproduces_violation_and_reports_escalation() {
     let oracle = kv_oracle(42);
     // Fault-dependent: base carries the triggering partition so Phase 0 finds quickly.
     let base = RunConfig::builder()
-        .seed([17; 32])
+        .seed(EntryHash([17; 32]))
         .policy(Policy::Random)
         .max_steps(512)
-        .fault_schedule(vec![SimFault::Partition { src: 1, dst: 2 }])
+        .fault_schedule(vec![SimFault::Partition {
+            src: ActorId(1),
+            dst: ActorId(2),
+        }])
         .build();
     let report =
         run_feedback_campaign(&workload, &oracle, base, 8).expect("feedback campaign must run");
@@ -430,10 +435,13 @@ fn feedback_voided_faults_shrink_schedule() {
     };
     let oracle = kv_oracle(42);
     let base = RunConfig::builder()
-        .seed([17; 32])
+        .seed(EntryHash([17; 32]))
         .policy(Policy::Random)
         .max_steps(512)
-        .fault_schedule(vec![SimFault::Partition { src: 1, dst: 2 }])
+        .fault_schedule(vec![SimFault::Partition {
+            src: ActorId(1),
+            dst: ActorId(2),
+        }])
         .build();
     let report =
         run_feedback_campaign(&workload, &oracle, base, 6).expect("feedback campaign must run");
@@ -487,10 +495,13 @@ fn feedback_campaign_is_deterministic() {
     };
     let oracle = kv_oracle(42);
     let base = RunConfig::builder()
-        .seed([17; 32])
+        .seed(EntryHash([17; 32]))
         .policy(Policy::Random)
         .max_steps(512)
-        .fault_schedule(vec![SimFault::Partition { src: 1, dst: 2 }])
+        .fault_schedule(vec![SimFault::Partition {
+            src: ActorId(1),
+            dst: ActorId(2),
+        }])
         .build();
     let first = run_feedback_campaign(&workload, &oracle, base.clone(), 8).expect("first run");
     let second = run_feedback_campaign(&workload, &oracle, base, 8).expect("second run");
@@ -557,7 +568,7 @@ fn outcome_halt_monitor(payload: u64) -> Box<dyn OnlineMonitor> {
 #[test]
 fn monitored_campaign_records_names_and_prefixes_monitor_reasons() {
     let base = RunConfig::builder()
-        .seed([21; 32])
+        .seed(EntryHash([21; 32]))
         .policy(Policy::Random)
         .max_steps(128)
         .build();
@@ -619,7 +630,7 @@ fn compose_oracle_feeds_run_campaign_on_violating_workload() {
     use crate::oracle::compose_oracles;
 
     let base = RunConfig::builder()
-        .seed([22; 32])
+        .seed(EntryHash([22; 32]))
         .policy(Policy::Random)
         .max_steps(128)
         .build();
@@ -657,10 +668,10 @@ fn campaign_report_renders_ndjson_coverage_records() {
     journal
         .append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(5),
             }),
         )
@@ -683,9 +694,9 @@ fn campaign_report_renders_ndjson_coverage_records() {
         runs_executed: 9,
         distinct_roots: 4,
         findings: vec![Finding {
-            seed: [3u8; 32],
+            seed: EntryHash([3u8; 32]),
             run,
-            verdict: Verdict::fail(vec![[3u8; 32]], "test"),
+            verdict: Verdict::fail(vec![EntryHash([3u8; 32])], "test"),
         }],
         variants: Vec::new(),
         monitors: Vec::new(),
@@ -717,9 +728,8 @@ fn campaign_report_renders_ndjson_coverage_records() {
 
 #[test]
 fn joint_campaign_second_stateful_run_hits_memo_for_identical_rounds() {
-    crate::solver_cache::global_clear();
     let base = RunConfig::builder()
-        .seed([7; 32])
+        .seed(EntryHash([7; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -758,17 +768,19 @@ fn joint_campaign_second_stateful_run_hits_memo_for_identical_rounds() {
 
 #[test]
 fn feedback_campaign_with_state_matches_plain_and_persists_artifacts() {
-    crate::solver_cache::global_clear();
     let workload = KvVariant {
         fw: 42,
         direct: 100,
     };
     let oracle = kv_oracle(42);
     let base = RunConfig::builder()
-        .seed([17; 32])
+        .seed(EntryHash([17; 32]))
         .policy(Policy::Random)
         .max_steps(512)
-        .fault_schedule(vec![SimFault::Partition { src: 1, dst: 2 }])
+        .fault_schedule(vec![SimFault::Partition {
+            src: ActorId(1),
+            dst: ActorId(2),
+        }])
         .build();
 
     let plain = run_feedback_campaign(&workload, &oracle, base.clone(), 8)

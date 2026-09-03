@@ -1,7 +1,7 @@
 use super::{Finding, SearchError, Workload};
 use crate::oracle::Oracle;
 use crate::pbt::{EnergyDistribution, INPUT_SAMPLE_RANGE, PbtBridge};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{RunConfig, SeedTree, Simulation};
 
 pub(super) const INPUT_AXIS_SAMPLE: usize = 16;
@@ -15,7 +15,7 @@ pub(super) const INPUT_AXIS_SAMPLE: usize = 16;
 /// validation error propagates to the caller.
 pub(super) fn draw_inputs(
     generator: &str,
-    attempt_seed: Hash,
+    attempt_seed: EntryHash,
     dist: Option<&EnergyDistribution>,
 ) -> Result<Vec<u64>, SearchError> {
     let mut bridge = PbtBridge::new(generator, attempt_seed);
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn draw_is_deterministic_per_attempt_seed() {
-        let seed: Hash = [7; 32];
+        let seed: EntryHash = EntryHash([7; 32]);
         let first = draw_inputs("gen-a", seed, None).unwrap();
         let second = draw_inputs("gen-a", seed, None).unwrap();
         assert_eq!(
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn generator_streams_are_independent() {
-        let seed: Hash = [7; 32];
+        let seed: EntryHash = EntryHash([7; 32]);
         let a = draw_inputs("gen-a", seed, None).unwrap();
         let b = draw_inputs("gen-b", seed, None).unwrap();
         assert_ne!(a, b, "distinct generators must draw distinct streams");
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn power_energy_validates_the_exponent() {
-        let seed: Hash = [7; 32];
+        let seed: EntryHash = EntryHash([7; 32]);
         let error = draw_inputs(
             "gen-a",
             seed,
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn draws_stay_inside_the_declared_domain() {
-        let seed: Hash = [9; 32];
+        let seed: EntryHash = EntryHash([9; 32]);
         let inputs = draw_inputs("gen-bounds", seed, None).unwrap();
         assert!(inputs.iter().all(|value| *value < 100));
     }

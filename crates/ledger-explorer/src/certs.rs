@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::attest_uri::{build_type_campaign_v1, predicate_type_campaign_v1};
 use crate::search::CampaignReport;
 use crate::solver::{event_fault_cost, is_faultable};
-use ledger_format::{EntryKind, EntryPayload, Hash};
+use ledger_format::{EntryHash, EntryKind, EntryPayload};
 use ledger_journal::Journal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -78,21 +78,65 @@ pub fn check_cert_bytes(len: usize) -> Result<(), CertError> {
     Ok(())
 }
 
+/// Serde bridge for [`EntryHash`] as a 32-byte array.
+///
+/// `ledger-format` is `no_std` without a serde dependency, so the newtype
+/// cannot implement `Serialize`/`Deserialize` itself. The bridge serializes
+/// the inner `[u8; 32]` exactly as the old `Hash = [u8; 32]` alias did, so
+/// derived JSON for certificates stays byte-identical.
+mod serde_entryhash {
+    use ledger_format::EntryHash;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(hash: &EntryHash, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::Serialize;
+        hash.0.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<EntryHash, D::Error> {
+        use serde::Deserialize;
+        <[u8; 32]>::deserialize(deserializer).map(EntryHash)
+    }
+}
+
+/// Serde bridge for `Vec<EntryHash>` as a list of 32-byte arrays.
+mod serde_entryhash_vec {
+    use ledger_format::EntryHash;
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(vec: &[EntryHash], serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::Serialize;
+        let raw: Vec<[u8; 32]> = vec.iter().map(|hash| hash.0).collect();
+        raw.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<EntryHash>, D::Error> {
+        use serde::Deserialize;
+        <Vec<[u8; 32]>>::deserialize(deserializer)
+            .map(|raw| raw.into_iter().map(EntryHash).collect())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subject {
     pub name: String,
-    pub digest: Hash,
+    #[serde(with = "serde_entryhash")]
+    pub digest: EntryHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedDependency {
     pub name: String,
-    pub digest: Hash,
+    #[serde(with = "serde_entryhash")]
+    pub digest: EntryHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedSolverData {
-    pub cut: Vec<Hash>,
+    #[serde(with = "serde_entryhash_vec")]
+    pub cut: Vec<EntryHash>,
     /// Exact cut cost recomputed from the journal fault model at emission.
     pub cost: u64,
     pub method: String,
@@ -104,7 +148,8 @@ pub struct RecordedSolverData {
     /// after the fact is rejected by support-aware validation.
     pub support_provider_version: Option<u64>,
     /// Violation witnesses the cut was derived against.
-    pub witnesses: Vec<Hash>,
+    #[serde(with = "serde_entryhash_vec")]
+    pub witnesses: Vec<EntryHash>,
     /// Strict replay with the recorded cut applied reproduced the violation.
     pub reproduced: bool,
     /// The no-fault baseline rerun passed.
@@ -140,7 +185,7 @@ pub struct CampaignCertificate {
     pub subject: Subject,
     pub predicate_type: String,
     pub build_type: String,
-    pub external_parameters_digest: Hash,
+    pub external_parameters_digest: EntryHash,
     pub resolved_dependencies: Vec<ResolvedDependency>,
     pub builder_id: String,
     pub runs_executed: usize,
@@ -157,7 +202,7 @@ pub struct CampaignCertificate {
     /// identity-aware journal verification ([`Self::verify_with_journal_and_identity`])
     /// treats a present-but-unmatched digest as a failure before any root
     /// comparison.
-    pub execution_identity: Option<Hash>,
+    pub execution_identity: Option<EntryHash>,
 }
 
 #[derive(Debug, Error)]
@@ -185,11 +230,11 @@ pub enum CertError {
 
 /// Shared lowercase-hex renderer for 32-byte hashes, used by certificate and
 /// coverage emission.
-pub(crate) fn hash_to_hex(hash: &Hash) -> String {
-    hash.iter().map(|b| format!("{b:02x}")).collect()
+pub(crate) fn hash_to_hex(hash: &EntryHash) -> String {
+    hash.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn hex_to_hash(s: &str) -> Result<Hash, String> {
+fn hex_to_hash(s: &str) -> Result<EntryHash, String> {
     if s.len() != 64 {
         return Err(format!("hash hex must be 64 chars, got {}", s.len()));
     }
@@ -197,7 +242,7 @@ fn hex_to_hash(s: &str) -> Result<Hash, String> {
     for i in 0..32 {
         out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
     }
-    Ok(out)
+    Ok(EntryHash(out))
 }
 
 fn check_string_bytes(s: &str, field: &str) -> Result<(), CertError> {
@@ -264,13 +309,13 @@ fn check_object_fields(
 }
 
 /// Reject duplicate cut members after count bounds have been checked.
-fn check_cut_duplicates(cut: &[Hash]) -> Result<(), CertError> {
+fn check_cut_duplicates(cut: &[EntryHash]) -> Result<(), CertError> {
     let mut seen = std::collections::HashSet::with_capacity(cut.len());
     for id in cut {
         if !seen.insert(id) {
             return Err(CertError::Verification(format!(
                 "duplicate cut member {:02x?}",
-                &id[..4]
+                &id.0[..4]
             )));
         }
     }
@@ -300,8 +345,8 @@ impl CampaignCertificate {
         report: &CampaignReport,
         builder_id: &str,
         deps: Vec<ResolvedDependency>,
-        run_config_digest: Hash,
-        execution_identity: Option<Hash>,
+        run_config_digest: EntryHash,
+        execution_identity: Option<EntryHash>,
     ) -> Result<Self, CertError> {
         Self::from_campaign_with(
             report,
@@ -318,8 +363,8 @@ impl CampaignCertificate {
         report: &CampaignReport,
         builder_id: &str,
         deps: Vec<ResolvedDependency>,
-        run_config_digest: Hash,
-        execution_identity: Option<Hash>,
+        run_config_digest: EntryHash,
+        execution_identity: Option<EntryHash>,
         policy: LineagePolicy,
     ) -> Result<Self, CertError> {
         if policy == LineagePolicy::Strict {
@@ -340,8 +385,8 @@ impl CampaignCertificate {
         report: &CampaignReport,
         builder_id: &str,
         deps: Vec<ResolvedDependency>,
-        run_config_digest: Hash,
-        execution_identity: Option<Hash>,
+        run_config_digest: EntryHash,
+        execution_identity: Option<EntryHash>,
     ) -> Result<Self, CertError> {
         let subject = if let Some(f) = report.findings.first() {
             Subject {
@@ -351,7 +396,7 @@ impl CampaignCertificate {
         } else {
             Subject {
                 name: "journal-root".to_string(),
-                digest: [0u8; 32],
+                digest: EntryHash([0u8; 32]),
             }
         };
         let mut s = deps;
@@ -776,12 +821,12 @@ impl CampaignCertificate {
                 "findingsCount must not exceed runsExecuted".into(),
             ));
         }
-        if self.findings_count > 0 && self.subject.digest == [0u8; 32] {
+        if self.findings_count > 0 && self.subject.digest == EntryHash([0u8; 32]) {
             return Err(CertError::Verification(
                 "subject digest must be non-zero when findings exist".into(),
             ));
         }
-        if self.findings_count == 0 && self.subject.digest != [0u8; 32] {
+        if self.findings_count == 0 && self.subject.digest != EntryHash([0u8; 32]) {
             return Err(CertError::Verification(
                 "subject digest must be zero when no findings exist".into(),
             ));
@@ -880,7 +925,7 @@ impl CampaignCertificate {
                 journal.len()
             )));
         }
-        if self.subject.digest == [0u8; 32] {
+        if self.subject.digest == EntryHash([0u8; 32]) {
             return Err(CertError::Verification(
                 "journal mode requires concrete subject digest; zero digest never binds".into(),
             ));
@@ -890,7 +935,7 @@ impl CampaignCertificate {
                 if journal.get(witness).is_none() {
                     return Err(CertError::Verification(format!(
                         "forged witness: references unknown journal entry {:02x?}",
-                        &witness[..4]
+                        &witness.0[..4]
                     )));
                 }
             }
@@ -899,8 +944,8 @@ impl CampaignCertificate {
         if subject_root != self.subject.digest {
             return Err(CertError::Verification(format!(
                 "subject digest mismatch: certificate attests {:02x?}, journal root is {:02x?}",
-                &self.subject.digest[..4],
-                &subject_root[..4]
+                &self.subject.digest.0[..4],
+                &subject_root.0[..4]
             )));
         }
         if let Some(data) = &self.solver_data {
@@ -908,13 +953,13 @@ impl CampaignCertificate {
                 let Some(entry) = journal.get(id) else {
                     return Err(CertError::Verification(format!(
                         "forged cut: references unknown journal entry {:02x?}",
-                        &id[..4]
+                        &id.0[..4]
                     )));
                 };
                 if !is_faultable(entry.data.kind) {
                     return Err(CertError::Verification(format!(
                         "forged cut: entry {:02x?} has kind {:?}, which the fault model cannot inject",
-                        &id[..4],
+                        &id.0[..4],
                         entry.data.kind
                     )));
                 }
@@ -958,7 +1003,7 @@ impl CampaignCertificate {
     pub fn verify_with_journal_and_identity(
         &self,
         journal: &Journal,
-        expected_identity: Option<Hash>,
+        expected_identity: Option<EntryHash>,
     ) -> Result<(), CertError> {
         match (self.execution_identity, expected_identity) {
             (Some(certificate), Some(expected)) if certificate == expected => {}
@@ -1045,7 +1090,7 @@ impl CampaignCertificate {
             ));
         }
         let paths = collect_fault_paths_iterative(journal, &data.witnesses, horizon)?;
-        let cut: std::collections::BTreeSet<Hash> = data.cut.iter().copied().collect();
+        let cut: std::collections::BTreeSet<EntryHash> = data.cut.iter().copied().collect();
         for path in &paths {
             if path.iter().all(|id| !cut.contains(id)) {
                 return Err(CertError::Verification(
@@ -1061,7 +1106,7 @@ impl CampaignCertificate {
                 return Err(CertError::Verification(format!(
                     "cut member {:02x?} is redundant: the recorded cut is not \
                      inclusion-minimal",
-                    &member[..4]
+                    &member.0[..4]
                 )));
             }
         }
@@ -1089,13 +1134,11 @@ const MAX_INCLUSION_PATHS: usize = 65536;
 /// error when the path budget is exceeded, which fails the check closed.
 fn collect_fault_paths_iterative(
     journal: &Journal,
-    witnesses: &[Hash],
+    witnesses: &[EntryHash],
     horizon: usize,
-) -> Result<Vec<Vec<Hash>>, CertError> {
+) -> Result<Vec<Vec<EntryHash>>, CertError> {
     let mut paths = Vec::new();
     for witness in witnesses {
-        let mut visited: std::collections::HashSet<(Hash, usize)> =
-            std::collections::HashSet::new();
         let mut stack = vec![(*witness, 0usize, Vec::new())];
         while let Some((current, depth, mut path)) = stack.pop() {
             if depth > horizon {
@@ -1109,7 +1152,7 @@ fn collect_fault_paths_iterative(
                 }
                 continue;
             }
-            if !visited.insert((current, depth)) {
+            if path.contains(&current) {
                 continue;
             }
             let Some(entry) = journal.get(&current) else {
@@ -1152,9 +1195,9 @@ impl CampaignReport {
     pub fn write_certificate(
         &self,
         path: &Path,
-        run_config_digest: Hash,
+        run_config_digest: EntryHash,
         builder_id: &str,
-        execution_identity: Option<Hash>,
+        execution_identity: Option<EntryHash>,
     ) -> Result<(), CertError> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -1188,6 +1231,7 @@ mod tests {
     use super::*;
     use crate::oracle::Verdict;
     use crate::search::{CampaignReport, Finding};
+    use ledger_format::ActorId;
     use ledger_format::{CanonicalValue, EntryKind};
     use ledger_journal::Journal;
     use ledger_sim::RunResult;
@@ -1197,10 +1241,10 @@ mod tests {
         let mut j = Journal::new();
         j.append(
             ledger_format::EntryKind::Outcome,
-            1,
+            ActorId(1),
             [],
             ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: ledger_format::CanonicalValue::Unsigned(1),
             }),
         )
@@ -1222,9 +1266,9 @@ mod tests {
             runs_executed: 10,
             distinct_roots: 1,
             findings: vec![Finding {
-                seed: [7u8; 32],
+                seed: EntryHash([7u8; 32]),
                 run,
-                verdict: Verdict::fail(vec![[7u8; 32]], "test"),
+                verdict: Verdict::fail(vec![EntryHash([7u8; 32])], "test"),
             }],
             variants: Vec::new(),
             monitors: Vec::new(),
@@ -1249,14 +1293,16 @@ mod tests {
         let deps = vec![
             ResolvedDependency {
                 name: "z-dep".into(),
-                digest: [2u8; 32],
+                digest: EntryHash([2u8; 32]),
             },
             ResolvedDependency {
                 name: "a-dep".into(),
-                digest: [1u8; 32],
+                digest: EntryHash([1u8; 32]),
             },
         ];
-        let c = CampaignCertificate::from_campaign(&r, "builder-1", deps, [9u8; 32], None).unwrap();
+        let c =
+            CampaignCertificate::from_campaign(&r, "builder-1", deps, EntryHash([9u8; 32]), None)
+                .unwrap();
         let j = c.to_json().unwrap();
         let b = CampaignCertificate::from_json(&j).unwrap();
         assert_eq!(c.subject, b.subject);
@@ -1266,15 +1312,20 @@ mod tests {
 
     #[test]
     fn emitted_json_limit_preserves_round_trip_boundary() {
-        let base =
-            CampaignCertificate::from_campaign(&empty(10), "builder", Vec::new(), [9u8; 32], None)
-                .expect("base certificate must be valid");
+        let base = CampaignCertificate::from_campaign(
+            &empty(10),
+            "builder",
+            Vec::new(),
+            EntryHash([9u8; 32]),
+            None,
+        )
+        .expect("base certificate must be valid");
         let with_dependency_name_size = |name_bytes: usize| {
             let mut certificate = base.clone();
             certificate.resolved_dependencies = (0..MAX_RESOLVED_DEPENDENCIES)
                 .map(|_| ResolvedDependency {
                     name: "x".repeat(name_bytes),
-                    digest: [7u8; 32],
+                    digest: EntryHash([7u8; 32]),
                 })
                 .collect();
             certificate
@@ -1335,7 +1386,7 @@ mod tests {
         // Writing onto an existing directory fails deterministically on
         // unix with IsADirectory: the write arm keeps the io source.
         let err = empty(1)
-            .write_certificate(&dir, [0u8; 32], "builder", None)
+            .write_certificate(&dir, EntryHash([0u8; 32]), "builder", None)
             .unwrap_err();
         match &err {
             CertError::Io {
@@ -1370,7 +1421,7 @@ mod tests {
         std::fs::write(&blocker, b"x").expect("write blocker file");
         let cert_path = blocker.join("cert.json");
         let err = empty(1)
-            .write_certificate(&cert_path, [0u8; 32], "builder", None)
+            .write_certificate(&cert_path, EntryHash([0u8; 32]), "builder", None)
             .unwrap_err();
         match &err {
             CertError::Io {
@@ -1407,7 +1458,7 @@ mod tests {
         let cert_path = dir.join("cert.json");
         let builder = "x".repeat(CERT_MAX_BYTES + 1);
         let error = empty(1)
-            .write_certificate(&cert_path, [9u8; 32], &builder, None)
+            .write_certificate(&cert_path, EntryHash([9u8; 32]), &builder, None)
             .expect_err("oversized certificate input must fail");
         assert!(
             matches!(error, CertError::Schema(_) | CertError::Serialization(_)),
@@ -1424,7 +1475,7 @@ mod tests {
         let dir = unique_cert_dir("rt");
         let cert_path = dir.join("cert.json");
         with_finding()
-            .write_certificate(&cert_path, [9u8; 32], "builder", None)
+            .write_certificate(&cert_path, EntryHash([9u8; 32]), "builder", None)
             .expect("write certificate");
         let bytes = std::fs::read(&cert_path).expect("read certificate");
         let text = String::from_utf8(bytes).expect("certificate must be utf8");
@@ -1435,9 +1486,14 @@ mod tests {
 
     #[test]
     fn verify_rejects_wrong_predicate_type() {
-        let mut c =
-            CampaignCertificate::from_campaign(&empty(10), "b", Vec::new(), [1u8; 32], None)
-                .unwrap();
+        let mut c = CampaignCertificate::from_campaign(
+            &empty(10),
+            "b",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .unwrap();
         c.predicate_type = format!(
             "{}/attestations/wrong/v1",
             crate::attest_uri::attestation_base()
@@ -1454,10 +1510,15 @@ mod tests {
 
     #[test]
     fn verify_rejects_zero_subject_with_findings() {
-        let mut c =
-            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
-                .expect("valid campaign must create a certificate");
-        c.subject.digest = [0u8; 32];
+        let mut c = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .expect("valid campaign must create a certificate");
+        c.subject.digest = EntryHash([0u8; 32]);
         assert!(matches!(c.verify(), Err(CertError::Verification(_))));
     }
 
@@ -1469,13 +1530,13 @@ mod tests {
             &with_finding(),
             "b",
             Vec::new(),
-            [1u8; 32],
-            Some([0xaa; 32]),
+            EntryHash([1u8; 32]),
+            Some(EntryHash([0xaa; 32])),
         )
         .expect("certificate with identity must build");
         let journal = &with_finding().findings[0].run.journal;
         let error = certificate
-            .verify_with_journal_and_identity(journal, Some([0xbb; 32]))
+            .verify_with_journal_and_identity(journal, Some(EntryHash([0xbb; 32])))
             .expect_err("disagreeing identity must fail");
         assert!(matches!(error, CertError::Verification(_)));
     }
@@ -1486,8 +1547,8 @@ mod tests {
             &with_finding(),
             "b",
             Vec::new(),
-            [1u8; 32],
-            Some([0xaa; 32]),
+            EntryHash([1u8; 32]),
+            Some(EntryHash([0xaa; 32])),
         )
         .expect("certificate with identity must build");
         let journal = &with_finding().findings[0].run.journal;
@@ -1498,11 +1559,16 @@ mod tests {
         assert!(matches!(error, CertError::Verification(_)));
 
         // Run carries identity, certificate carries none: incomplete.
-        let legacy =
-            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
-                .expect("legacy certificate must build");
+        let legacy = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .expect("legacy certificate must build");
         let error = legacy
-            .verify_with_journal_and_identity(journal, Some([0xaa; 32]))
+            .verify_with_journal_and_identity(journal, Some(EntryHash([0xaa; 32])))
             .expect_err("certificate without identity must fail");
         assert!(matches!(error, CertError::Verification(_)));
     }
@@ -1513,8 +1579,8 @@ mod tests {
             &with_finding(),
             "b",
             Vec::new(),
-            [1u8; 32],
-            Some([0xaa; 32]),
+            EntryHash([1u8; 32]),
+            Some(EntryHash([0xaa; 32])),
         )
         .expect("certificate with identity must build");
         let journal = &with_finding().findings[0].run.journal;
@@ -1522,13 +1588,18 @@ mod tests {
         // digest equals the journal root from with_finding).
         assert!(
             certificate
-                .verify_with_journal_and_identity(journal, Some([0xaa; 32]))
+                .verify_with_journal_and_identity(journal, Some(EntryHash([0xaa; 32])))
                 .is_ok()
         );
         // Both sides absent: the legacy comparison path is unchanged.
-        let legacy =
-            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
-                .expect("legacy certificate must build");
+        let legacy = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .expect("legacy certificate must build");
         assert!(
             legacy
                 .verify_with_journal_and_identity(journal, None)
@@ -1542,14 +1613,14 @@ mod tests {
             &with_finding(),
             "b",
             Vec::new(),
-            [1u8; 32],
-            Some([0xaa; 32]),
+            EntryHash([1u8; 32]),
+            Some(EntryHash([0xaa; 32])),
         )
         .expect("certificate with identity must build");
         let json = certificate.to_json().expect("certificate serializes");
         assert!(json.contains("executionIdentity"));
         let decoded = CampaignCertificate::from_json(&json).expect("certificate parses");
-        assert_eq!(decoded.execution_identity, Some([0xaa; 32]));
+        assert_eq!(decoded.execution_identity, Some(EntryHash([0xaa; 32])));
         // Legacy JSON without the field parses to None. The identity field
         // lives under externalParameters; removing the serialized value must
         // leave a valid legacy statement.
@@ -1580,15 +1651,25 @@ mod tests {
 
     #[test]
     fn verify_rejects_absent_or_malformed_subject() {
-        let mut c =
-            CampaignCertificate::from_campaign(&with_finding(), "b", Vec::new(), [1u8; 32], None)
-                .expect("valid campaign must create a certificate");
+        let mut c = CampaignCertificate::from_campaign(
+            &with_finding(),
+            "b",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .expect("valid campaign must create a certificate");
         c.subject.name = "  ".into();
         assert!(matches!(c.verify(), Err(CertError::Verification(_))));
-        let mut c =
-            CampaignCertificate::from_campaign(&empty(10), "b", Vec::new(), [1u8; 32], None)
-                .unwrap();
-        c.subject.digest = [7u8; 32];
+        let mut c = CampaignCertificate::from_campaign(
+            &empty(10),
+            "b",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .unwrap();
+        c.subject.digest = EntryHash([7u8; 32]);
         assert!(
             matches!(c.verify(), Err(CertError::Verification(_))),
             "zero findings must not carry a subject digest"
@@ -1601,7 +1682,7 @@ mod tests {
             &with_finding(),
             "builder",
             Vec::new(),
-            [1u8; 32],
+            EntryHash([1u8; 32]),
             None,
         )
         .expect("valid campaign must create a certificate");
@@ -1634,9 +1715,14 @@ mod tests {
 
     #[test]
     fn from_json_rejects_wrong_type_and_multiple_subjects() {
-        let certificate =
-            CampaignCertificate::from_campaign(&empty(10), "builder", Vec::new(), [1u8; 32], None)
-                .expect("valid campaign must create a certificate");
+        let certificate = CampaignCertificate::from_campaign(
+            &empty(10),
+            "builder",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .expect("valid campaign must create a certificate");
         let mut value: serde_json::Value =
             serde_json::from_str(&certificate.to_json().expect("certificate must serialize"))
                 .expect("certificate JSON must parse");
@@ -1661,7 +1747,7 @@ mod tests {
             &with_finding(),
             "builder",
             Vec::new(),
-            [1u8; 32],
+            EntryHash([1u8; 32]),
             None,
         )
         .expect("valid campaign must create a certificate");
@@ -1701,12 +1787,12 @@ mod tests {
         assert!(error.to_string().contains("horizon"), "{error}");
     }
 
-    fn journal_certificate(journal: &Journal, cut: Vec<Hash>) -> CampaignCertificate {
+    fn journal_certificate(journal: &Journal, cut: Vec<EntryHash>) -> CampaignCertificate {
         let report = CampaignReport {
             runs_executed: 1,
             distinct_roots: 1,
             findings: vec![Finding {
-                seed: [7u8; 32],
+                seed: EntryHash([7u8; 32]),
                 run: RunResult {
                     outcome: ledger_sim::RunOutcome::Completed,
                     journal_error: None,
@@ -1726,9 +1812,14 @@ mod tests {
             monitors: Vec::new(),
             memo_hits: 0,
         };
-        let mut certificate =
-            CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32], None)
-                .expect("valid campaign must create a certificate");
+        let mut certificate = CampaignCertificate::from_campaign(
+            &report,
+            "builder",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .expect("valid campaign must create a certificate");
         let exact_cost = cut.iter().fold(0u64, |total, id| {
             total.saturating_add(event_fault_cost(journal, id))
         });
@@ -1751,18 +1842,18 @@ mod tests {
         let member = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 7u64.to_le_bytes().to_vec(),
                 }),
             )
             .expect("journal append must succeed");
         let mut certificate = journal_certificate(&journal, vec![member]);
-        certificate.subject.digest = [0u8; 32];
+        certificate.subject.digest = EntryHash([0u8; 32]);
         certificate.findings_count = 0;
         let error = certificate
             .verify_with_journal(&journal)
@@ -1774,12 +1865,12 @@ mod tests {
         other
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 8u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -1796,12 +1887,12 @@ mod tests {
         let member = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 7u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -1822,12 +1913,12 @@ mod tests {
         let member = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 7u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -1835,15 +1926,15 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                2,
+                ActorId(2),
                 [member],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
             .expect("journal append must succeed");
-        let certificate = journal_certificate(&journal, vec![[0xEE; 32]]);
+        let certificate = journal_certificate(&journal, vec![EntryHash([0xEE; 32])]);
         let error = certificate
             .verify_with_journal(&journal)
             .expect_err("unknown cut member must fail");
@@ -1859,12 +1950,12 @@ mod tests {
         let recorded = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
                     original_content: 7u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -1872,12 +1963,12 @@ mod tests {
         let unrelated = journal
             .append(
                 EntryKind::Send,
-                2,
+                ActorId(2),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(2, 0),
-                    from: 2,
-                    to: 3,
+                    message_id: ledger_format::MessageId::new(ActorId(2), 0),
+                    from: ActorId(2),
+                    to: ActorId(3),
                     original_content: 8u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -1885,10 +1976,10 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                3,
+                ActorId(3),
                 [recorded],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -1901,21 +1992,21 @@ mod tests {
         );
     }
 
-    fn deep_chain_journal(depth: usize) -> (Journal, Hash, Hash) {
+    fn deep_chain_journal(depth: usize) -> (Journal, EntryHash, EntryHash) {
         let mut journal = Journal::new();
         let mut parent = None;
-        let mut head = [0u8; 32];
-        let mut witness = [0u8; 32];
+        let mut head = EntryHash([0u8; 32]);
+        let mut witness = EntryHash([0u8; 32]);
         for i in 0..depth {
             let id = journal
                 .append(
                     EntryKind::Send,
-                    1,
-                    parent.map_or(Vec::new(), |p: Hash| vec![p]),
+                    ActorId(1),
+                    parent.map_or(Vec::new(), |p: EntryHash| vec![p]),
                     EntryPayload::Send(ledger_format::SendFrame {
-                        message_id: ledger_format::MessageId::new(1, 0),
-                        from: 1,
-                        to: (i as u32).wrapping_add(1),
+                        message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                        from: ActorId(1),
+                        to: ActorId((i as u32).wrapping_add(1)),
                         original_content: (i as u64).wrapping_add(2).to_le_bytes().to_vec(),
                     }),
                 )
@@ -2100,9 +2191,14 @@ mod tests {
     #[test]
     fn statement_round_trips_journal_validation_and_minimality_results() {
         let report = with_finding();
-        let mut certificate =
-            CampaignCertificate::from_campaign(&report, "b", Vec::new(), [1u8; 32], None)
-                .expect("valid campaign must create a certificate");
+        let mut certificate = CampaignCertificate::from_campaign(
+            &report,
+            "b",
+            Vec::new(),
+            EntryHash([1u8; 32]),
+            None,
+        )
+        .expect("valid campaign must create a certificate");
         certificate.journal_validation = Some(JournalValidation::Bound);
         certificate.inclusion_minimal = Some(InclusionMinimal::Minimal);
         let json = certificate.to_json().expect("certificate serializes");

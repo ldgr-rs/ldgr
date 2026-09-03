@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use ledger_explorer::oracle::{AssertionOracle, HistoryOracle, KeyValueSpec};
 use ledger_explorer::search::{CampaignReport, Finding, run_swarm_campaign};
 use ledger_explorer::workloads::{MiniKvWorkload, TwoPhaseCommitWorkload};
-use ledger_format::{Hash, RunManifest};
+use ledger_format::{EntryHash, RunManifest};
 use ledger_sim::{Policy, RunConfig};
 
 /// Hard cap on campaign attempts. Keeps a nightly run time-bounded on a free
@@ -139,7 +139,7 @@ fn base_config(seed: u64, max_steps: usize) -> RunConfig {
     let mut seed_bytes = [0u8; 32];
     seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
     RunConfig::builder()
-        .seed(seed_bytes)
+        .seed(EntryHash(seed_bytes))
         .policy(Policy::Random)
         .max_steps(max_steps)
         .build()
@@ -147,9 +147,9 @@ fn base_config(seed: u64, max_steps: usize) -> RunConfig {
 
 /// Recover the campaign attempt index from a finding seed. The swarm campaign
 /// writes the attempt index into the first eight bytes of each attempt seed.
-fn attempt_of(seed: &Hash) -> usize {
+fn attempt_of(seed: &EntryHash) -> usize {
     let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&seed[..8]);
+    bytes.copy_from_slice(&seed.0[..8]);
     u64::from_le_bytes(bytes) as usize
 }
 
@@ -172,8 +172,8 @@ fn build_manifest(finding: &Finding) -> RunManifest {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+fn hex(hash: &EntryHash) -> String {
+    hash.0.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Escape one string for safe embedding in a JSON string literal.
@@ -203,7 +203,7 @@ fn emit(
     report: &CampaignReport,
     workload_name: &str,
     oracle_name: &str,
-    base_seed: &Hash,
+    base_seed: &EntryHash,
     max_steps: usize,
     out: &Path,
 ) -> Result<(), String> {
@@ -253,7 +253,7 @@ fn emit(
 /// The versioned canonical bytes come from the owned codec in
 /// `ledger_sim::config_canonical`; this driver no longer carries a private
 /// copy, so the worker boundary and the certificate can never disagree.
-fn run_config_digest(config: &RunConfig) -> Result<Hash, String> {
+fn run_config_digest(config: &RunConfig) -> Result<EntryHash, String> {
     ledger_sim::canonical_hash(config)
         .map_err(|error| format!("run config canonical bytes: {error}"))
 }

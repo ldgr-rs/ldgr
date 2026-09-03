@@ -5,7 +5,7 @@
 //! a completed [`RunResult`] journal through each monitor in deterministic
 //! order and aggregates halts into a [`Verdict`].
 
-use ledger_format::{EntryKind, Hash};
+use ledger_format::{EntryHash, EntryKind};
 use ledger_journal::Entry;
 use ledger_sim::{OnlineAction, RunResult, StepMonitor};
 use std::cell::RefCell;
@@ -145,7 +145,7 @@ impl MonitorOracle {
 
 impl Oracle for MonitorOracle {
     fn check(&self, run: &RunResult) -> Verdict {
-        let mut witnesses: Vec<Hash> = Vec::new();
+        let mut witnesses: Vec<EntryHash> = Vec::new();
         let mut reasons: Vec<String> = Vec::new();
         let mut warns: Vec<String> = Vec::new();
 
@@ -339,6 +339,7 @@ impl OnlineMonitor for LivenessMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledger_format::ActorId;
     use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
     use ledger_journal::Journal;
     use ledger_sim::{Instruction, Policy, RunConfig, RunResult};
@@ -359,17 +360,17 @@ mod tests {
         }
     }
 
-    fn journal_with_outcomes(payloads: &[u64]) -> (Journal, Vec<Hash>) {
+    fn journal_with_outcomes(payloads: &[u64]) -> (Journal, Vec<EntryHash>) {
         let mut journal = Journal::new();
         let mut ids = Vec::new();
         for payload in payloads {
             let id = journal
                 .append(
                     EntryKind::Outcome,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: CanonicalValue::Unsigned(*payload),
                     }),
                 )
@@ -443,12 +444,12 @@ mod tests {
         let id1 = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -456,12 +457,12 @@ mod tests {
         let id2 = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -469,12 +470,12 @@ mod tests {
         let id3 = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 3u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -504,10 +505,10 @@ mod tests {
         let outcome_id = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -525,12 +526,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -538,12 +539,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -582,12 +583,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -595,12 +596,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -614,10 +615,10 @@ mod tests {
         clean
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -636,12 +637,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -649,12 +650,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -662,12 +663,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 3u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -687,12 +688,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -700,10 +701,10 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -711,12 +712,12 @@ mod tests {
         journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -761,10 +762,10 @@ mod tests {
         let id_a = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(10),
                 }),
             )
@@ -772,10 +773,10 @@ mod tests {
         let id_b = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(20),
                 }),
             )
@@ -804,10 +805,10 @@ mod tests {
         let id = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -835,12 +836,12 @@ mod tests {
         let id1 = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 1u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -848,10 +849,10 @@ mod tests {
         let id2 = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(0),
                 }),
             )
@@ -859,12 +860,12 @@ mod tests {
         let id3 = journal
             .append(
                 EntryKind::Send,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 1,
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(1),
                     original_content: 2u64.to_le_bytes().to_vec(),
                 }),
             )
@@ -917,7 +918,7 @@ mod tests {
         let oracle = MonitorOracle::new()
             .with_monitor(Box::new(SafetyMonitor::new(|_: &Entry| true, "never")));
         let base = RunConfig::builder()
-            .seed([1; 32])
+            .seed(EntryHash([1; 32]))
             .policy(Policy::Random)
             .max_steps(64)
             .build();
@@ -963,7 +964,7 @@ mod tests {
             "outcome 99 forbidden",
         )));
         let base = RunConfig::builder()
-            .seed([2; 32])
+            .seed(EntryHash([2; 32]))
             .policy(Policy::Random)
             .max_steps(64)
             .build();
@@ -1011,10 +1012,10 @@ mod tests {
             journal
                 .append(
                     EntryKind::Outcome,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Outcome(ledger_format::OutcomePayload {
-                        schema: [0x00; 32],
+                        schema: EntryHash([0x00; 32]),
                         value: CanonicalValue::Unsigned(v),
                     }),
                 )
@@ -1041,10 +1042,10 @@ mod tests {
         let _id10 = journal2
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(10),
                 }),
             )
@@ -1052,10 +1053,10 @@ mod tests {
         let id20 = journal2
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(20),
                 }),
             )
@@ -1063,10 +1064,10 @@ mod tests {
         let _id30 = journal2
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(30),
                 }),
             )
@@ -1086,24 +1087,24 @@ mod tests {
         let mut j1 = Journal::new();
         j1.append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(1),
                 original_content: 1u64.to_le_bytes().to_vec(),
             }),
         )
         .unwrap();
         j1.append(
             EntryKind::Send,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(1, 0),
-                from: 1,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                from: ActorId(1),
+                to: ActorId(1),
                 original_content: 2u64.to_le_bytes().to_vec(),
             }),
         )
@@ -1115,10 +1116,10 @@ mod tests {
         let mut j2 = Journal::new();
         j2.append(
             EntryKind::Outcome,
-            1,
+            ActorId(1),
             [],
             EntryPayload::Outcome(ledger_format::OutcomePayload {
-                schema: [0x00; 32],
+                schema: EntryHash([0x00; 32]),
                 value: CanonicalValue::Unsigned(0),
             }),
         )
@@ -1202,10 +1203,10 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -1219,10 +1220,10 @@ mod tests {
         let _id10 = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(10),
                 }),
             )
@@ -1238,10 +1239,10 @@ mod tests {
         let _id20 = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(20),
                 }),
             )
@@ -1279,10 +1280,10 @@ mod tests {
         journal2
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(10),
                 }),
             )
@@ -1290,10 +1291,10 @@ mod tests {
         journal2
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(20),
                 }),
             )
@@ -1328,10 +1329,10 @@ mod tests {
         journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(1),
                 }),
             )
@@ -1343,10 +1344,10 @@ mod tests {
         let _id = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 [],
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: CanonicalValue::Unsigned(99),
                 }),
             )

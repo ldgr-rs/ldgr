@@ -6,7 +6,7 @@
 use ledger_explorer::faultspec_bridge::to_sim_injections;
 use ledger_explorer::search::{FaultReplayError, Workload, replay_with_faults};
 use ledger_faultspec::{canonical_library, compile};
-use ledger_format::{EntryKind, EntryPayload, Hash};
+use ledger_format::{EntryHash, EntryKind, EntryPayload};
 use ledger_sim::{Instruction, Policy, RunConfig, SimFault, Simulation};
 
 struct ProbeWorkload {
@@ -65,23 +65,28 @@ fn probe_workload() -> ProbeWorkload {
     }
 }
 
-fn probe_base() -> (ProbeWorkload, ledger_sim::RunResult, Vec<Hash>, Vec<Hash>) {
+fn probe_base() -> (
+    ProbeWorkload,
+    ledger_sim::RunResult,
+    Vec<EntryHash>,
+    Vec<EntryHash>,
+) {
     let workload = probe_workload();
     let config = RunConfig::builder()
-        .seed([42; 32])
+        .seed(EntryHash([42; 32]))
         .policy(Policy::Random)
         .max_steps(512)
         .build();
     let run = Simulation::new(config, workload.programs())
         .run()
         .unwrap_or_else(|error| panic!("probe base must run: {error}"));
-    let sends: Vec<Hash> = run
+    let sends: Vec<EntryHash> = run
         .journal
         .entries()
         .filter(|entry| entry.data.kind == EntryKind::Send)
         .map(|entry| entry.id)
         .collect();
-    let writes: Vec<Hash> = run
+    let writes: Vec<EntryHash> = run
         .journal
         .entries()
         .filter(|entry| entry.data.kind == EntryKind::FsWrite)
@@ -101,8 +106,8 @@ fn probe_base() -> (ProbeWorkload, ledger_sim::RunResult, Vec<Hash>, Vec<Hash>) 
 
 fn map_synthetic_to_real(
     synthetic: Vec<SimFault>,
-    sends: &[Hash],
-    writes: &[Hash],
+    sends: &[EntryHash],
+    writes: &[EntryHash],
 ) -> Vec<SimFault> {
     let mut out = Vec::with_capacity(synthetic.len());
     let mut send_idx = 0;
@@ -154,7 +159,7 @@ fn every_canonical_scenario_dispatches_without_voided_faults() {
         "library must have at least 8 scenarios"
     );
     let (workload, base, sends, writes) = probe_base();
-    let seed = [42; 32];
+    let seed = EntryHash([42; 32]);
     for scenario in scenarios {
         let compiled = compile(&scenario)
             .unwrap_or_else(|error| panic!("scenario {} must compile: {error}", scenario.name));
@@ -164,14 +169,18 @@ fn every_canonical_scenario_dispatches_without_voided_faults() {
             "{}: one fault per schedule entry",
             scenario.name
         );
-        let synthetic = to_sim_injections(&compiled);
+        let synthetic = to_sim_injections(&compiled).unwrap_or_else(|error| {
+            panic!("scenario {} bridge must convert: {error}", scenario.name)
+        });
         assert!(
             !synthetic.is_empty(),
             "{}: bridge must produce at least one injection",
             scenario.name
         );
         // Bridge is deterministic.
-        let again = to_sim_injections(&compiled);
+        let again = to_sim_injections(&compiled).unwrap_or_else(|error| {
+            panic!("scenario {} bridge must convert: {error}", scenario.name)
+        });
         assert_eq!(
             synthetic, again,
             "{}: bridge must be deterministic",
@@ -320,11 +329,11 @@ fn every_canonical_scenario_dispatches_without_voided_faults() {
 #[test]
 fn ghost_injection_is_reported_as_voided_negative_control() {
     let (workload, base, _sends, _writes) = probe_base();
-    let ghost = [0xAB; 32];
+    let ghost = EntryHash([0xAB; 32]);
     let report = replay_with_faults(
         &workload,
         &base.journal,
-        [42; 32],
+        EntryHash([42; 32]),
         base.decisions.clone(),
         vec![SimFault::Drop(ghost)],
     )
@@ -356,8 +365,10 @@ fn bridge_output_is_stable_for_all_canonical_ids() {
             .unwrap_or_else(|error| panic!("dsl for {:?} must parse: {error}", id));
         let compiled = compile(&scenario)
             .unwrap_or_else(|error| panic!("dsl for {:?} must compile: {error}", id));
-        let first = to_sim_injections(&compiled);
-        let second = to_sim_injections(&compiled);
+        let first = to_sim_injections(&compiled)
+            .unwrap_or_else(|error| panic!("dsl for {:?} bridge must convert: {error}", id));
+        let second = to_sim_injections(&compiled)
+            .unwrap_or_else(|error| panic!("dsl for {:?} bridge must convert: {error}", id));
         assert_eq!(first, second, "bridge must be deterministic for {:?}", id);
         for fault in &first {
             match fault {
@@ -366,7 +377,12 @@ fn bridge_output_is_stable_for_all_canonical_ids() {
                 | SimFault::Corrupt { write: hash, .. }
                 | SimFault::CrashState { write: hash, .. }
                 | SimFault::Delay { send: hash, .. } => {
-                    assert_ne!(*hash, [0; 32], "hash must not be zero for {:?}", id);
+                    assert_ne!(
+                        *hash,
+                        EntryHash([0; 32]),
+                        "hash must not be zero for {:?}",
+                        id
+                    );
                 }
                 SimFault::Partition { .. } => {}
             }
