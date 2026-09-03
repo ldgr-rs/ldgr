@@ -34,6 +34,9 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 /// Maximum allocation delta a bound-rejected decode may produce.
 const MAX_HARNESS_DELTA: usize = 4 * 1024;
 
+/// Serializes the tests in this binary: the counting allocator is process
+static MEASURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn allocated_delta_around(call: impl FnOnce()) -> usize {
     let before = ALLOCATED.load(Ordering::SeqCst);
     call();
@@ -42,6 +45,8 @@ fn allocated_delta_around(call: impl FnOnce()) -> usize {
 
 #[test]
 fn oversized_array_length_fails_before_content_allocation() {
+    let _guard = MEASURE_LOCK.lock().unwrap();
+    let _ = CborValue::from_canonical_bytes(&[0xf6]);
     // Array declares 2^32 items with 4 bytes remaining; must fail before
     // `Vec::with_capacity(2^32)`.
     let hostile = [0x9A, 0x01, 0x00, 0x00, 0x00];
@@ -57,6 +62,8 @@ fn oversized_array_length_fails_before_content_allocation() {
 
 #[test]
 fn oversized_text_length_fails_before_content_allocation() {
+    let _guard = MEASURE_LOCK.lock().unwrap();
+    let _ = CborValue::from_canonical_bytes(&[0xf6]);
     // Text declares 2^32 bytes with 3 bytes remaining.
     let hostile = [0x7A, 0x01, 0x00, 0x00, 0x00, b'a', b'b', b'c'];
     let delta = allocated_delta_around(|| {
@@ -71,6 +78,8 @@ fn oversized_text_length_fails_before_content_allocation() {
 
 #[test]
 fn oversized_frame_header_fails_before_any_header_copy() {
+    let _guard = MEASURE_LOCK.lock().unwrap();
+    let _ = CborValue::from_canonical_bytes(&[0xf6]);
     // Frame declares beyond the 1 MiB cap; the cap checks before allocation.
     let mut hostile = Vec::new();
     hostile.extend_from_slice(MAGIC_SEGMENT);
@@ -91,6 +100,7 @@ fn oversized_frame_header_fails_before_any_header_copy() {
 fn encoder_rejects_an_entry_the_decoder_would_reject() {
     // The encoder must reject what the decoder rejects, or a journal could
     // seal an entry that then fails on every read.
+    let _guard = MEASURE_LOCK.lock().unwrap();
     use ledger_format::{ActorId, EntryData, EntryKind, EntryPayload, RngDrawPayload};
     use ledger_format::{SequenceNumber, StreamId};
     let oversized = EntryData {

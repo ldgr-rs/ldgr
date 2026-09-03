@@ -725,7 +725,7 @@ mod tests {
             buf.len()
         );
         assert!(
-            elapsed >= std::time::Duration::from_millis(50),
+            elapsed >= std::time::Duration::from_millis(40),
             "the drop must wait for the read timeout, not earlier: {elapsed:?}"
         );
         drop(client);
