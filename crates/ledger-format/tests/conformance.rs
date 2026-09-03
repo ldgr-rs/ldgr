@@ -560,12 +560,15 @@ fn sample_entry_bytes() -> Vec<u8> {
     EntryData {
         format_version: ledger_format::FORMAT_VERSION,
         kind: EntryKind::Fault,
-        actor: 1,
-        parents: vec![[1u8; 32], [2u8; 32]],
+        actor: ledger_format::ActorId(1),
+        parents: smallvec::smallvec![
+            ledger_format::EntryHash([1u8; 32]),
+            ledger_format::EntryHash([2u8; 32])
+        ],
         vector_clock: vec![3, 4],
-        sequence: 5,
+        sequence: ledger_format::SequenceNumber(5),
         payload: ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::DelayMessage {
-            message_id: ledger_format::MessageId::new(1, 0),
+            message_id: ledger_format::MessageId::new(ledger_format::ActorId(1), 0),
             ticks: 100,
         }),
     }
@@ -578,11 +581,20 @@ fn sample_manifest_bytes() -> Vec<u8> {
         format_version: ledger_format::FORMAT_VERSION,
         crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
         execution_identity: None,
-        root_seed: [7u8; 32],
+        root_seed: ledger_format::EntryHash([7u8; 32]),
         policy_tag: "pct".into(),
-        journal_root: [9u8; 32],
+        journal_root: ledger_format::EntryHash([9u8; 32]),
         entry_count: 42,
-        actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
+        actor_heads: BTreeMap::from([
+            (
+                ledger_format::ActorId(0),
+                ledger_format::EntryHash([1u8; 32]),
+            ),
+            (
+                ledger_format::ActorId(1),
+                ledger_format::EntryHash([2u8; 32]),
+            ),
+        ]),
     }
     .to_canonical_bytes()
     .expect("sample manifest encodes")
@@ -719,10 +731,10 @@ fn entry_round_trip_stability() {
         let data = EntryData {
             format_version: ledger_format::FORMAT_VERSION,
             kind: *kind,
-            actor: 7,
-            parents: vec![[0xaa; 32]],
+            actor: ledger_format::ActorId(7),
+            parents: smallvec::smallvec![ledger_format::EntryHash([0xaa; 32])],
             vector_clock: vec![1, 2, 3],
-            sequence: 4,
+            sequence: ledger_format::SequenceNumber(4),
             payload: default_payload(*kind),
         };
         let first = data.try_canonical_bytes().expect("entry encodes");
@@ -743,7 +755,9 @@ fn entry_round_trip_stability() {
 fn default_payload(kind: EntryKind) -> ledger_format::EntryPayload {
     use ledger_format::*;
     match kind {
-        EntryKind::Spawn => EntryPayload::Spawn { child_actor: 7 },
+        EntryKind::Spawn => EntryPayload::Spawn {
+            child_actor: ActorId(7),
+        },
         EntryKind::Block => EntryPayload::Block(BlockPayload::Yield),
         EntryKind::Wake => EntryPayload::Wake(WakePayload::TimerReady { timer_id: 1 }),
         EntryKind::TimerSet => EntryPayload::TimerSet {
@@ -756,15 +770,15 @@ fn default_payload(kind: EntryKind) -> ledger_format::EntryPayload {
         },
         EntryKind::ClockRead => EntryPayload::ClockRead { ticks: 9 },
         EntryKind::Send => EntryPayload::Send(SendFrame {
-            message_id: MessageId::new(7, 4),
-            from: 7,
-            to: 1,
+            message_id: MessageId::new(ActorId(7), 4),
+            from: ActorId(7),
+            to: ActorId(1),
             original_content: b"m".to_vec(),
         }),
         EntryKind::Recv => EntryPayload::Recv(RecvFrame {
-            message_id: MessageId::new(7, 4),
-            from: 7,
-            to: 1,
+            message_id: MessageId::new(ActorId(7), 4),
+            from: ActorId(7),
+            to: ActorId(1),
             observed_content: b"m".to_vec(),
         }),
         EntryKind::FsWrite => EntryPayload::FsWrite(FsWritePayload::Allocate {
@@ -789,21 +803,21 @@ fn default_payload(kind: EntryKind) -> ledger_format::EntryPayload {
             observed: ObservedRead::Missing,
         }),
         EntryKind::RngDraw => EntryPayload::RngDraw(RngDrawPayload {
-            stream: 11,
+            stream: StreamId(11),
             draw_index: 0,
             content: Vec::new(),
         }),
         EntryKind::Outcome => EntryPayload::Outcome(OutcomePayload {
-            schema: [0xdd; 32],
+            schema: EntryHash([0xdd; 32]),
             value: CanonicalValue::Unsigned(1),
         }),
         EntryKind::Assert => EntryPayload::Assert(AssertPayload {
-            predicate: [0xdd; 32],
+            predicate: EntryHash([0xdd; 32]),
             passed: true,
             detail: CanonicalValue::Unsigned(0),
         }),
         EntryKind::Snapshot => EntryPayload::Snapshot(SnapshotPayload {
-            snapshot_digest: [0xee; 32],
+            snapshot_digest: EntryHash([0xee; 32]),
         }),
         EntryKind::Epoch => EntryPayload::Epoch(EpochPayload { epoch: 3 }),
         EntryKind::InputStep => EntryPayload::InputStep(InputStepPayload {
@@ -813,8 +827,8 @@ fn default_payload(kind: EntryKind) -> ledger_format::EntryPayload {
         }),
         EntryKind::CapRequest => EntryPayload::CapRequest(CapRequestPayload {
             request: [0x11; 16],
-            subject: [0x22; 32],
-            capability: [0x33; 32],
+            subject: EntryHash([0x22; 32]),
+            capability: EntryHash([0x33; 32]),
         }),
         EntryKind::CapGrant => EntryPayload::CapGrant(CapGrantPayload {
             request: [0x11; 16],
@@ -823,15 +837,15 @@ fn default_payload(kind: EntryKind) -> ledger_format::EntryPayload {
         }),
         EntryKind::CapInvoke => EntryPayload::CapInvoke(CapInvokePayload {
             grant: [0x22; 16],
-            operation: [0x33; 32],
+            operation: EntryHash([0x33; 32]),
         }),
         EntryKind::CapRevoke => EntryPayload::CapRevoke(CapRevokePayload {
             grant: [0x22; 16],
             epoch: 1,
         }),
         EntryKind::Fault => EntryPayload::Fault(FaultPayload::Partition {
-            src: 1,
-            dst: 2,
+            src: ActorId(1),
+            dst: ActorId(2),
             enabled: true,
         }),
         EntryKind::StepBegin => EntryPayload::StepBegin(StepBeginPayload {
@@ -852,11 +866,20 @@ fn manifest_version_migration() {
         format_version: ledger_format::FORMAT_VERSION,
         crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
         execution_identity: None,
-        root_seed: [7u8; 32],
+        root_seed: ledger_format::EntryHash([7u8; 32]),
         policy_tag: "bandit".into(),
-        journal_root: [9u8; 32],
+        journal_root: ledger_format::EntryHash([9u8; 32]),
         entry_count: 1234,
-        actor_heads: BTreeMap::from([(1u32, [1u8; 32]), (2u32, [2u8; 32])]),
+        actor_heads: BTreeMap::from([
+            (
+                ledger_format::ActorId(1),
+                ledger_format::EntryHash([1u8; 32]),
+            ),
+            (
+                ledger_format::ActorId(2),
+                ledger_format::EntryHash([2u8; 32]),
+            ),
+        ]),
     };
     assert!(ManifestVersion::CURRENT.is_supported());
     assert!(ManifestVersion(2).is_supported());

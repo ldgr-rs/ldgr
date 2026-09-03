@@ -55,21 +55,23 @@ fn seed_corpus() -> Vec<Vec<u8>> {
     let entries: Vec<(EntryKind, ledger_format::EntryPayload)> = [
         (
             EntryKind::Spawn,
-            ledger_format::EntryPayload::Spawn { child_actor: 7 },
+            ledger_format::EntryPayload::Spawn {
+                child_actor: ledger_format::ActorId(7),
+            },
         ),
         (
             EntryKind::Send,
             ledger_format::EntryPayload::Send(ledger_format::SendFrame {
-                message_id: ledger_format::MessageId::new(7, 0),
-                from: 7,
-                to: 1,
+                message_id: ledger_format::MessageId::new(ledger_format::ActorId(7), 0),
+                from: ledger_format::ActorId(7),
+                to: ledger_format::ActorId(1),
                 original_content: b"hello determinism".to_vec(),
             }),
         ),
         (
             EntryKind::RngDraw,
             ledger_format::EntryPayload::RngDraw(ledger_format::RngDrawPayload {
-                stream: 7,
+                stream: ledger_format::StreamId(7),
                 draw_index: 0,
                 content: 42u64.to_le_bytes().to_vec(),
             }),
@@ -85,15 +87,15 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         (
             EntryKind::Fault,
             ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::Partition {
-                src: 1,
-                dst: 2,
+                src: ledger_format::ActorId(1),
+                dst: ledger_format::ActorId(2),
                 enabled: true,
             }),
         ),
         (
             EntryKind::Fault,
             ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::CrashActor {
-                actor: 7,
+                actor: ledger_format::ActorId(7),
                 crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
             }),
         ),
@@ -114,10 +116,13 @@ fn seed_corpus() -> Vec<Vec<u8>> {
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
                 kind: *kind,
-                actor: 7,
-                parents: vec![[0xaa; 32], [0xbb; 32]],
+                actor: ledger_format::ActorId(7),
+                parents: smallvec::smallvec![
+                    ledger_format::EntryHash([0xaa; 32]),
+                    ledger_format::EntryHash([0xbb; 32])
+                ],
                 vector_clock: vec![1, 2, 3],
-                sequence: 4,
+                sequence: ledger_format::SequenceNumber(4),
                 payload: payload.clone(),
             }
             .try_canonical_bytes()
@@ -129,11 +134,20 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         format_version: ledger_format::FORMAT_VERSION,
         crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
         execution_identity: None,
-        root_seed: [7u8; 32],
+        root_seed: ledger_format::EntryHash([7u8; 32]),
         policy_tag: "pct".into(),
-        journal_root: [9u8; 32],
+        journal_root: ledger_format::EntryHash([9u8; 32]),
         entry_count: 42,
-        actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
+        actor_heads: BTreeMap::from([
+            (
+                ledger_format::ActorId(0),
+                ledger_format::EntryHash([1u8; 32]),
+            ),
+            (
+                ledger_format::ActorId(1),
+                ledger_format::EntryHash([2u8; 32]),
+            ),
+        ]),
     };
     corpus.push(
         manifest
@@ -269,11 +283,20 @@ fn mutation_harness_never_panics() {
         format_version: ledger_format::FORMAT_VERSION,
         crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
         execution_identity: None,
-        root_seed: [7u8; 32],
+        root_seed: ledger_format::EntryHash([7u8; 32]),
         policy_tag: "pct".into(),
-        journal_root: [9u8; 32],
+        journal_root: ledger_format::EntryHash([9u8; 32]),
         entry_count: 42,
-        actor_heads: BTreeMap::from([(0u32, [1u8; 32]), (1u32, [2u8; 32])]),
+        actor_heads: BTreeMap::from([
+            (
+                ledger_format::ActorId(0),
+                ledger_format::EntryHash([1u8; 32]),
+            ),
+            (
+                ledger_format::ActorId(1),
+                ledger_format::EntryHash([2u8; 32]),
+            ),
+        ]),
     };
     let manifest_bytes = manifest
         .to_canonical_bytes()

@@ -43,6 +43,30 @@ pub const MAGIC_ENVELOPE: &[u8; 4] = b"LDGE";
 /// Solver-state artifact magic.
 pub const MAGIC_SOLVER_STATE: &[u8; 4] = b"LDGV";
 
+/// Journal archive-file magic.
+///
+/// This is the single registry entry for the archive file magic used by the
+/// journal archive store (`archive.ldgr`). Its bytes are identical to the
+/// former journal-side `ARCHIVE_MAGIC`. It differs from [`MAGIC_ARCHIVE`],
+/// which is a frame-prefix container magic, and the two values must not be
+/// confused: this one starts the big-endian archive file, the other starts a
+/// little-endian frame prefix.
+pub const MAGIC_JOURNAL_ARCHIVE: &[u8; 4] = b"LDAR";
+
+/// Journal archive-file format version.
+pub const JOURNAL_ARCHIVE_VERSION: u32 = 1;
+
+/// Snapshot-store file magic.
+///
+/// This is the single registry entry for the snapshot-store file magic used
+/// by the journal snapshot store (`snapshots.ldgr`). Its bytes are identical
+/// to the former journal-side `SNAPSHOT_MAGIC`. It differs from
+/// [`MAGIC_SNAPSHOT`], which is a frame-prefix container magic.
+pub const MAGIC_SNAPSHOT_STORE: &[u8; 4] = b"LDSN";
+
+/// Snapshot-store file format version.
+pub const SNAPSHOT_STORE_VERSION: u32 = 1;
+
 /// Outer frame validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {

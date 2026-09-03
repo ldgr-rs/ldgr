@@ -98,8 +98,8 @@ impl PathRef {
     ///
     /// `canonical_path` must already be canonical (see [`canonicalize`]).
     /// The caller supplies the hash to keep `ledger-format` free of the
-    /// BLAKE3 dependency; journal and explorer crates compute it with
-    /// `ledger_format::path::hash_canonical` helpers.
+    /// BLAKE3 dependency; callers compute it using domain-separated BLAKE3
+    /// hashing.
     pub fn new(path_hash: [u8; PATH_HASH_LEN], canonical_path: Vec<u8>) -> Self {
         Self {
             path_hash,

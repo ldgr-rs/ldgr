@@ -21,6 +21,8 @@
 
 use alloc::vec::Vec;
 
+use smallvec::SmallVec;
+
 use crate::cbor::items::ItemReader;
 use crate::cbor::{self, CborError};
 use crate::limits::{
@@ -29,20 +31,158 @@ use crate::limits::{
 use crate::path::{self, PathRef};
 use crate::value::CanonicalValue;
 
-/// Stable actor identifier.
-pub type ActorId = u32;
-
-/// Stable stream identifier for deterministic randomness.
-pub type StreamId = u32;
-
-/// Generator identifier for the PBT input axis.
-pub type GenId = u64;
-
-/// Replay key for the PBT input axis.
-pub type InputKey = u64;
+use core::fmt;
 
 /// A 32-byte BLAKE3 content address.
-pub type Hash = [u8; 32];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryHash(pub [u8; 32]);
+
+impl EntryHash {
+    /// Create a new entry hash from raw bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Access the raw byte array.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for EntryHash {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<EntryHash> for [u8; 32] {
+    fn from(hash: EntryHash) -> Self {
+        hash.0
+    }
+}
+
+impl AsRef<[u8; 32]> for EntryHash {
+    fn as_ref(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for EntryHash {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Display for EntryHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Stable actor identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ActorId(pub u32);
+
+impl ActorId {
+    /// Create a new actor identifier.
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// Access the raw integer value.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for ActorId {
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<ActorId> for u32 {
+    fn from(actor: ActorId) -> Self {
+        actor.0
+    }
+}
+
+impl fmt::Display for ActorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Stable stream identifier for deterministic randomness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StreamId(pub u32);
+
+impl StreamId {
+    /// Create a new stream identifier.
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// Access the raw integer value.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for StreamId {
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<StreamId> for u32 {
+    fn from(stream: StreamId) -> Self {
+        stream.0
+    }
+}
+
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Monotonic per-actor entry sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SequenceNumber(pub u64);
+
+impl SequenceNumber {
+    /// Create a new sequence number.
+    pub const fn new(seq: u64) -> Self {
+        Self(seq)
+    }
+
+    /// Access the raw integer value.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<u64> for SequenceNumber {
+    fn from(seq: u64) -> Self {
+        Self(seq)
+    }
+}
+
+impl From<SequenceNumber> for u64 {
+    fn from(seq: SequenceNumber) -> Self {
+        seq.0
+    }
+}
+
+impl fmt::Display for SequenceNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// A fault injected by the explorer into a run (schedule vocabulary).
 ///
@@ -292,7 +432,7 @@ pub struct RngDrawPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutcomePayload {
     /// Domain schema digest bound in `ExecutionIdentity`.
-    pub schema: Hash,
+    pub schema: EntryHash,
     /// The outcome value.
     pub value: CanonicalValue,
 }
@@ -301,7 +441,7 @@ pub struct OutcomePayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssertPayload {
     /// Predicate schema digest bound in `ExecutionIdentity`.
-    pub predicate: Hash,
+    pub predicate: EntryHash,
     /// Whether the predicate passed.
     pub passed: bool,
     /// Observed detail.
@@ -312,7 +452,7 @@ pub struct AssertPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPayload {
     /// Content address of the snapshot state.
-    pub snapshot_digest: Hash,
+    pub snapshot_digest: EntryHash,
 }
 
 /// Epoch marker payload.
@@ -326,9 +466,9 @@ pub struct EpochPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputStepPayload {
     /// Workload generator identity.
-    pub generator: GenId,
+    pub generator: u64,
     /// Replay key of the drawn input.
-    pub replay: InputKey,
+    pub replay: u64,
     /// The drawn input value.
     pub value: CanonicalValue,
 }
@@ -339,9 +479,9 @@ pub struct CapRequestPayload {
     /// 16-byte request identifier.
     pub request: [u8; 16],
     /// Subject digest.
-    pub subject: Hash,
+    pub subject: EntryHash,
     /// Capability digest.
-    pub capability: Hash,
+    pub capability: EntryHash,
 }
 
 /// Capability grant payload.
@@ -361,7 +501,7 @@ pub struct CapInvokePayload {
     /// 16-byte grant identifier.
     pub grant: [u8; 16],
     /// Operation digest.
-    pub operation: Hash,
+    pub operation: EntryHash,
 }
 
 /// Capability revoke payload.
@@ -382,18 +522,18 @@ pub enum CrashOperation {
     DropPaths { paths: Vec<PathRef> },
     /// Persists a prefix of one targeted dirty write.
     TornWrite {
-        write_entry: Hash,
+        write_entry: EntryHash,
         persisted_prefix: u64,
     },
     /// Applies XOR bytes to the intersection with a targeted write range.
     CorruptRange {
-        write_entry: Hash,
+        write_entry: EntryHash,
         offset: u64,
         xor_bytes: Vec<u8>,
     },
     /// Flips one bit inside a targeted write range.
     BitFlip {
-        write_entry: Hash,
+        write_entry: EntryHash,
         offset: u64,
         bit: u8,
     },
@@ -530,7 +670,7 @@ impl EntryPayload {
         match self {
             Self::Spawn { child_actor } => {
                 cbor::array(out, 1);
-                cbor::unsigned(out, *child_actor as u64);
+                cbor::unsigned(out, child_actor.0 as u64);
             }
             Self::Block(block) => {
                 cbor::array(out, 1);
@@ -570,15 +710,15 @@ impl EntryPayload {
             Self::Send(frame) => {
                 cbor::array(out, 4);
                 encode_message_id(out, &frame.message_id);
-                cbor::unsigned(out, frame.from as u64);
-                cbor::unsigned(out, frame.to as u64);
+                cbor::unsigned(out, frame.from.0 as u64);
+                cbor::unsigned(out, frame.to.0 as u64);
                 cbor::bytes(out, &frame.original_content);
             }
             Self::Recv(frame) => {
                 cbor::array(out, 4);
                 encode_message_id(out, &frame.message_id);
-                cbor::unsigned(out, frame.from as u64);
-                cbor::unsigned(out, frame.to as u64);
+                cbor::unsigned(out, frame.from.0 as u64);
+                cbor::unsigned(out, frame.to.0 as u64);
                 cbor::bytes(out, &frame.observed_content);
             }
             Self::FsWrite(write) => match write {
@@ -631,20 +771,20 @@ impl EntryPayload {
             }
             Self::RngDraw(draw) => {
                 cbor::array(out, 3);
-                cbor::unsigned(out, draw.stream as u64);
+                cbor::unsigned(out, draw.stream.0 as u64);
                 cbor::unsigned(out, draw.draw_index);
                 cbor::bytes(out, &draw.content);
             }
             Self::Outcome(outcome) => {
                 cbor::array(out, 2);
-                cbor::bytes(out, &outcome.schema);
+                cbor::bytes(out, &outcome.schema.0);
                 outcome.value.try_encode(out).map_err(|_| {
                     CborError::MalformedManifest("outcome value exceeds canonical bounds")
                 })?;
             }
             Self::Assert(assert) => {
                 cbor::array(out, 3);
-                cbor::bytes(out, &assert.predicate);
+                cbor::bytes(out, &assert.predicate.0);
                 cbor::boolean(out, assert.passed);
                 assert.detail.try_encode(out).map_err(|_| {
                     CborError::MalformedManifest("assert detail exceeds canonical bounds")
@@ -652,7 +792,7 @@ impl EntryPayload {
             }
             Self::Snapshot(snapshot) => {
                 cbor::array(out, 1);
-                cbor::bytes(out, &snapshot.snapshot_digest);
+                cbor::bytes(out, &snapshot.snapshot_digest.0);
             }
             Self::Epoch(epoch) => {
                 cbor::array(out, 1);
@@ -669,8 +809,8 @@ impl EntryPayload {
             Self::CapRequest(request) => {
                 cbor::array(out, 3);
                 cbor::bytes(out, &request.request);
-                cbor::bytes(out, &request.subject);
-                cbor::bytes(out, &request.capability);
+                cbor::bytes(out, &request.subject.0);
+                cbor::bytes(out, &request.capability.0);
             }
             Self::CapGrant(grant) => {
                 cbor::array(out, 3);
@@ -681,7 +821,7 @@ impl EntryPayload {
             Self::CapInvoke(invoke) => {
                 cbor::array(out, 2);
                 cbor::bytes(out, &invoke.grant);
-                cbor::bytes(out, &invoke.operation);
+                cbor::bytes(out, &invoke.operation.0);
             }
             Self::CapRevoke(revoke) => {
                 cbor::array(out, 2);
@@ -718,7 +858,7 @@ impl EntryPayload {
 
 fn encode_message_id(out: &mut Vec<u8>, message_id: &MessageId) {
     cbor::array(out, 2);
-    cbor::unsigned(out, message_id.sender as u64);
+    cbor::unsigned(out, message_id.sender.0 as u64);
     cbor::unsigned(out, message_id.sender_sequence);
 }
 
@@ -758,8 +898,8 @@ fn encode_fault_payload(out: &mut Vec<u8>, fault: &FaultPayload) {
         FaultPayload::Partition { src, dst, enabled } => {
             cbor::array(out, 4);
             cbor::unsigned(out, 4);
-            cbor::unsigned(out, *src as u64);
-            cbor::unsigned(out, *dst as u64);
+            cbor::unsigned(out, src.0 as u64);
+            cbor::unsigned(out, dst.0 as u64);
             cbor::boolean(out, *enabled);
         }
         FaultPayload::CrashActor {
@@ -768,7 +908,7 @@ fn encode_fault_payload(out: &mut Vec<u8>, fault: &FaultPayload) {
         } => {
             cbor::array(out, 3);
             cbor::unsigned(out, 5);
-            cbor::unsigned(out, *actor as u64);
+            cbor::unsigned(out, actor.0 as u64);
             match crash_operation {
                 CrashOperation::DropAllUnsynced => {
                     cbor::array(out, 1);
@@ -788,7 +928,7 @@ fn encode_fault_payload(out: &mut Vec<u8>, fault: &FaultPayload) {
                 } => {
                     cbor::array(out, 3);
                     cbor::unsigned(out, 2);
-                    cbor::bytes(out, write_entry);
+                    cbor::bytes(out, &write_entry.0);
                     cbor::unsigned(out, *persisted_prefix);
                 }
                 CrashOperation::CorruptRange {
@@ -798,7 +938,7 @@ fn encode_fault_payload(out: &mut Vec<u8>, fault: &FaultPayload) {
                 } => {
                     cbor::array(out, 4);
                     cbor::unsigned(out, 3);
-                    cbor::bytes(out, write_entry);
+                    cbor::bytes(out, &write_entry.0);
                     cbor::unsigned(out, *offset);
                     cbor::bytes(out, xor_bytes);
                 }
@@ -809,7 +949,7 @@ fn encode_fault_payload(out: &mut Vec<u8>, fault: &FaultPayload) {
                 } => {
                     cbor::array(out, 4);
                     cbor::unsigned(out, 4);
-                    cbor::bytes(out, write_entry);
+                    cbor::bytes(out, &write_entry.0);
                     cbor::unsigned(out, *offset);
                     cbor::unsigned(out, *bit as u64);
                 }
@@ -824,9 +964,9 @@ pub struct EntryData {
     pub format_version: u32,
     pub kind: EntryKind,
     pub actor: ActorId,
-    pub parents: Vec<Hash>,
+    pub parents: SmallVec<[EntryHash; 2]>,
     pub vector_clock: Vec<u64>,
-    pub sequence: u64,
+    pub sequence: SequenceNumber,
     pub payload: EntryPayload,
 }
 
@@ -840,20 +980,27 @@ impl EntryData {
 
     /// Encodes all hash-covered fields into a caller-provided buffer.
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), CborError> {
+        // The decoder rejects more parents than the cap, so the encoder
+        // rejects them before writing any bytes: an entry that encodes but
+        // cannot decode would be written, sealed, and hash-verified, then
+        // fail on every read.
+        if self.parents.len() > MAX_PARENTS_PER_ENTRY {
+            return Err(CborError::LengthOverflow);
+        }
         let start = out.len();
         cbor::array(out, 7);
         cbor::unsigned(out, self.format_version as u64);
         cbor::unsigned(out, self.kind.tag());
-        cbor::unsigned(out, self.actor as u64);
+        cbor::unsigned(out, self.actor.0 as u64);
         cbor::array(out, self.parents.len());
         for parent in &self.parents {
-            cbor::bytes(out, parent);
+            cbor::bytes(out, &parent.0);
         }
         cbor::array(out, self.vector_clock.len());
         for component in &self.vector_clock {
             cbor::unsigned(out, *component);
         }
-        cbor::unsigned(out, self.sequence);
+        cbor::unsigned(out, self.sequence.0);
         self.payload.encode_into(out)?;
         let encoded = out.len() - start;
         // The decoder rejects entries over the limit, so the encoder must
@@ -888,20 +1035,21 @@ impl EntryData {
         let tag = reader.read_unsigned()?;
         let kind = EntryKind::from_tag(tag).ok_or(CborError::UnknownTag(tag))?;
         let actor_u64 = reader.read_unsigned()?;
-        let actor = u32::try_from(actor_u64)
-            .map_err(|_| CborError::MalformedManifest("actor exceeds u32"))?;
+        let actor = ActorId(
+            u32::try_from(actor_u64)
+                .map_err(|_| CborError::MalformedManifest("actor exceeds u32"))?,
+        );
 
         let parent_count = reader.read_array()?;
         if parent_count > MAX_PARENTS_PER_ENTRY {
             return Err(CborError::LengthOverflow);
         }
-        let mut parents = Vec::with_capacity(parent_count);
+        let mut parents: SmallVec<[EntryHash; 2]> = SmallVec::with_capacity(parent_count);
         for _ in 0..parent_count {
             let bytes = reader.read_bytes()?;
-            parents.push(
-                <[u8; 32]>::try_from(bytes)
-                    .map_err(|_| CborError::MalformedManifest("parent hash must be 32 bytes"))?,
-            );
+            parents.push(EntryHash(<[u8; 32]>::try_from(bytes).map_err(|_| {
+                CborError::MalformedManifest("parent hash must be 32 bytes")
+            })?));
         }
 
         let vc_count = reader.read_array()?;
@@ -913,7 +1061,7 @@ impl EntryData {
             vector_clock.push(reader.read_unsigned()?);
         }
 
-        let sequence = reader.read_unsigned()?;
+        let sequence = SequenceNumber(reader.read_unsigned()?);
         let payload = decode_payload(&mut reader, kind)?;
         if !reader.at_end() {
             return Err(CborError::TrailingBytes);
@@ -941,8 +1089,10 @@ fn decode_payload(reader: &mut ItemReader<'_>, kind: EntryKind) -> Result<EntryP
             }
             let child = reader.read_unsigned()?;
             EntryPayload::Spawn {
-                child_actor: u32::try_from(child)
-                    .map_err(|_| CborError::MalformedManifest("child_actor exceeds u32"))?,
+                child_actor: ActorId(
+                    u32::try_from(child)
+                        .map_err(|_| CborError::MalformedManifest("child_actor exceeds u32"))?,
+                ),
             }
         }
         EntryKind::Block => {
@@ -1355,17 +1505,23 @@ fn decode_message_id(reader: &mut ItemReader<'_>) -> Result<MessageId, CborError
 
 fn decode_actor(reader: &mut ItemReader<'_>) -> Result<ActorId, CborError> {
     let value = reader.read_unsigned()?;
-    u32::try_from(value).map_err(|_| CborError::MalformedManifest("actor exceeds u32"))
+    u32::try_from(value)
+        .map(ActorId)
+        .map_err(|_| CborError::MalformedManifest("actor exceeds u32"))
 }
 
 fn decode_stream(reader: &mut ItemReader<'_>) -> Result<StreamId, CborError> {
     let value = reader.read_unsigned()?;
-    u32::try_from(value).map_err(|_| CborError::MalformedManifest("stream exceeds u32"))
+    u32::try_from(value)
+        .map(StreamId)
+        .map_err(|_| CborError::MalformedManifest("stream exceeds u32"))
 }
 
-fn decode_hash(reader: &mut ItemReader<'_>) -> Result<Hash, CborError> {
+fn decode_hash(reader: &mut ItemReader<'_>) -> Result<EntryHash, CborError> {
     let bytes = reader.read_bytes()?;
-    <[u8; 32]>::try_from(bytes).map_err(|_| CborError::MalformedManifest("hash must be 32 bytes"))
+    <[u8; 32]>::try_from(bytes)
+        .map(EntryHash)
+        .map_err(|_| CborError::MalformedManifest("hash must be 32 bytes"))
 }
 
 fn decode_bytes_16(reader: &mut ItemReader<'_>) -> Result<[u8; 16], CborError> {
@@ -1379,7 +1535,7 @@ fn decode_path_ref(reader: &mut ItemReader<'_>) -> Result<PathRef, CborError> {
     if n != 2 {
         return Err(CborError::MalformedManifest("path ref must have 2 items"));
     }
-    let path_hash = decode_hash(reader)?;
+    let path_hash = decode_hash(reader)?.0;
     let canonical_path = reader.read_bytes()?.to_vec();
     // The decoder recomputes and verifies path_hash; the hash check lives in
     // the journal layer where BLAKE3 is available, so here we validate the

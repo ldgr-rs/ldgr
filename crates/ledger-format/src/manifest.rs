@@ -25,7 +25,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::cbor::{self, CborError, CborValue};
-use crate::entry::{ActorId, Hash};
+use crate::entry::{ActorId, EntryHash};
 use crate::limits::{CRASH_SEMANTICS_VERSION, FORMAT_VERSION};
 
 /// Current manifest format version. Version 2 is the only supported version.
@@ -55,16 +55,16 @@ pub struct RunManifest {
     ///
     /// `None` means the run did not bind an identity; a root comparison
     /// involving this manifest must treat the identity as incomplete.
-    pub execution_identity: Option<Hash>,
-    pub root_seed: Hash,
+    pub execution_identity: Option<EntryHash>,
+    pub root_seed: EntryHash,
     /// Scheduling policy name or parameters.
     pub policy_tag: String,
     /// Root hash of the resulting journal DAG.
-    pub journal_root: Hash,
+    pub journal_root: EntryHash,
     /// Total entries executed in this trial.
     pub entry_count: u64,
     /// Actor sequence heads at end of run.
-    pub actor_heads: BTreeMap<ActorId, Hash>,
+    pub actor_heads: BTreeMap<ActorId, EntryHash>,
 }
 
 impl RunManifest {
@@ -74,12 +74,12 @@ impl RunManifest {
         cbor::unsigned(&mut out, self.format_version as u64);
         cbor::unsigned(&mut out, self.crash_semantics_version as u64);
         match &self.execution_identity {
-            Some(digest) => cbor::bytes(&mut out, digest),
+            Some(digest) => cbor::bytes(&mut out, &digest.0),
             None => cbor::null(&mut out),
         }
-        cbor::bytes(&mut out, &self.root_seed);
+        cbor::bytes(&mut out, &self.root_seed.0);
         cbor::text(&mut out, &self.policy_tag);
-        cbor::bytes(&mut out, &self.journal_root);
+        cbor::bytes(&mut out, &self.journal_root.0);
         cbor::unsigned(&mut out, self.entry_count);
 
         let heads: Vec<(CborValue, CborValue)> = self
@@ -87,8 +87,8 @@ impl RunManifest {
             .iter()
             .map(|(actor, hash)| {
                 (
-                    CborValue::Unsigned(*actor as u64),
-                    CborValue::Bytes(hash.to_vec()),
+                    CborValue::Unsigned(actor.0 as u64),
+                    CborValue::Bytes(hash.0.to_vec()),
                 )
             })
             .collect();
@@ -139,9 +139,11 @@ impl RunManifest {
 
         let execution_identity = match &items[2] {
             CborValue::Null => None,
-            CborValue::Bytes(b) => Some(<[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
-                CborError::MalformedManifest("execution_identity digest must be a 32-byte hash")
-            })?),
+            CborValue::Bytes(b) => Some(EntryHash(<[u8; 32]>::try_from(b.as_slice()).map_err(
+                |_| {
+                    CborError::MalformedManifest("execution_identity digest must be a 32-byte hash")
+                },
+            )?)),
             _ => {
                 return Err(CborError::MalformedManifest(
                     "execution_identity must be null or a 32-byte hash",
@@ -150,8 +152,10 @@ impl RunManifest {
         };
 
         let root_seed = match &items[3] {
-            CborValue::Bytes(b) => <[u8; 32]>::try_from(b.as_slice())
-                .map_err(|_| CborError::MalformedManifest("root_seed must be 32 bytes"))?,
+            CborValue::Bytes(b) => EntryHash(
+                <[u8; 32]>::try_from(b.as_slice())
+                    .map_err(|_| CborError::MalformedManifest("root_seed must be 32 bytes"))?,
+            ),
             _ => {
                 return Err(CborError::MalformedManifest(
                     "root_seed must be a byte string",
@@ -163,8 +167,10 @@ impl RunManifest {
             _ => return Err(CborError::MalformedManifest("policy must be a text string")),
         };
         let journal_root = match &items[5] {
-            CborValue::Bytes(b) => <[u8; 32]>::try_from(b.as_slice())
-                .map_err(|_| CborError::MalformedManifest("journal_root must be 32 bytes"))?,
+            CborValue::Bytes(b) => EntryHash(
+                <[u8; 32]>::try_from(b.as_slice())
+                    .map_err(|_| CborError::MalformedManifest("journal_root must be 32 bytes"))?,
+            ),
             _ => {
                 return Err(CborError::MalformedManifest(
                     "journal_root must be a byte string",
@@ -185,7 +191,7 @@ impl RunManifest {
                 let mut map = BTreeMap::new();
                 for (key, val) in entries {
                     let actor = match key {
-                        CborValue::Unsigned(a) if *a <= u32::MAX as u64 => *a as ActorId,
+                        CborValue::Unsigned(a) if *a <= u32::MAX as u64 => ActorId(*a as u32),
                         _ => {
                             return Err(CborError::MalformedManifest(
                                 "actor key must be an unsigned integer",
@@ -194,9 +200,9 @@ impl RunManifest {
                     };
                     let hash = match val {
                         CborValue::Bytes(b) => {
-                            <[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
+                            EntryHash(<[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
                                 CborError::MalformedManifest("actor hash must be 32 bytes")
-                            })?
+                            })?)
                         }
                         _ => {
                             return Err(CborError::MalformedManifest(
@@ -234,9 +240,9 @@ mod tests {
             format_version: MANIFEST_FORMAT_VERSION,
             crash_semantics_version: CRASH_SEMANTICS_VERSION,
             execution_identity: None,
-            root_seed: [0x01; 32],
+            root_seed: EntryHash([0x01; 32]),
             policy_tag: "random".to_string(),
-            journal_root: [0x02; 32],
+            journal_root: EntryHash([0x02; 32]),
             entry_count: 7,
             actor_heads: BTreeMap::new(),
         }
@@ -245,10 +251,10 @@ mod tests {
     #[test]
     fn identity_digest_round_trips() {
         let mut manifest = sample_manifest();
-        manifest.execution_identity = Some([0xab; 32]);
+        manifest.execution_identity = Some(EntryHash([0xab; 32]));
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
         let decoded = RunManifest::from_canonical_bytes(&bytes).expect("manifest decodes");
-        assert_eq!(decoded.execution_identity, Some([0xab; 32]));
+        assert_eq!(decoded.execution_identity, Some(EntryHash([0xab; 32])));
         assert_eq!(decoded.to_canonical_bytes().expect("re-encode"), bytes);
     }
 
@@ -264,7 +270,7 @@ mod tests {
     fn identity_presence_changes_canonical_bytes() {
         let plain = sample_manifest();
         let mut bound = sample_manifest();
-        bound.execution_identity = Some([0xab; 32]);
+        bound.execution_identity = Some(EntryHash([0xab; 32]));
         assert_ne!(
             plain.to_canonical_bytes().expect("plain encodes"),
             bound.to_canonical_bytes().expect("bound encodes")

@@ -105,16 +105,17 @@ fn encoder_rejects_an_entry_the_decoder_would_reject() {
     // The 17 MiB entry cap is enforced on decode; the encoder must reject
     // the same shape, or a journal could seal and hash-verify an entry that
     // then fails on every read.
-    use ledger_format::{EntryData, EntryKind, EntryPayload, RngDrawPayload};
+    use ledger_format::{ActorId, EntryData, EntryKind, EntryPayload, RngDrawPayload};
+    use ledger_format::{SequenceNumber, StreamId};
     let oversized = EntryData {
         format_version: ledger_format::FORMAT_VERSION,
         kind: EntryKind::RngDraw,
-        actor: 1,
-        parents: Vec::new(),
+        actor: ActorId(1),
+        parents: smallvec::SmallVec::new(),
         vector_clock: Vec::new(),
-        sequence: 0,
+        sequence: SequenceNumber(0),
         payload: EntryPayload::RngDraw(RngDrawPayload {
-            stream: 0,
+            stream: StreamId(0),
             draw_index: 0,
             content: vec![0xab; ledger_format::limits::MAX_ENTRY_BYTES],
         }),
@@ -133,7 +134,7 @@ fn encoder_rejects_an_entry_the_decoder_would_reject() {
     // A valid entry just under the cap still round-trips.
     let valid = EntryData {
         payload: EntryPayload::RngDraw(RngDrawPayload {
-            stream: 0,
+            stream: StreamId(0),
             draw_index: 0,
             content: vec![0xab; ledger_format::limits::MAX_ENTRY_BYTES - 4096],
         }),

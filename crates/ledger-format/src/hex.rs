@@ -7,7 +7,7 @@
 use alloc::string::String;
 use core::fmt;
 
-use crate::Hash;
+use crate::entry::EntryHash;
 
 /// Errors from [`hash_from_hex`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,10 +32,10 @@ impl fmt::Display for HexError {
 impl core::error::Error for HexError {}
 
 /// Encode a hash as 64 lowercase hex chars.
-pub fn hash_to_hex(hash: &Hash) -> String {
+pub fn hash_to_hex(hash: &EntryHash) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(hash.len() * 2);
-    for byte in hash {
+    let mut out = String::with_capacity(64);
+    for byte in &hash.0 {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
@@ -55,7 +55,7 @@ fn hex_val(byte: u8) -> Option<u8> {
 ///
 /// # Errors
 /// Returns [`HexError`] when the input is not exactly 64 hex characters.
-pub fn hash_from_hex(s: &str) -> Result<Hash, HexError> {
+pub fn hash_from_hex(s: &str) -> Result<EntryHash, HexError> {
     if s.len() != 64 {
         return Err(HexError::InvalidLength(s.len()));
     }
@@ -71,7 +71,7 @@ pub fn hash_from_hex(s: &str) -> Result<Hash, HexError> {
         })?;
         out[i] = (high << 4) | low;
     }
-    Ok(out)
+    Ok(EntryHash(out))
 }
 
 #[cfg(test)]
@@ -81,8 +81,9 @@ mod tests {
     #[test]
     fn roundtrip() {
         let head = [0x00, 0x01, 0xfe, 0xff, 0xab, 0xcd, 0xef, 0x10];
-        let mut h = [0u8; 32];
-        h[..head.len()].copy_from_slice(&head);
+        let mut raw = [0u8; 32];
+        raw[..head.len()].copy_from_slice(&head);
+        let h = EntryHash(raw);
         let hex = hash_to_hex(&h);
         assert_eq!(hex.len(), 64);
         assert_eq!(
@@ -96,8 +97,8 @@ mod tests {
     fn decode_accepts_uppercase() {
         let upper = "00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
         let decoded = hash_from_hex(upper).unwrap();
-        assert_eq!(decoded[0], 0);
-        assert!(decoded[1..].iter().all(|&b| b == 0xff));
+        assert_eq!(decoded.0[0], 0);
+        assert!(decoded.0[1..].iter().all(|&b| b == 0xff));
     }
 
     #[test]

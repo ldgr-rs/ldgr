@@ -11,6 +11,7 @@ default = ["std"]
 std = []
 
 [dependencies]
+smallvec = { version = "1", default-features = false }
 
 [lints]
 workspace = true

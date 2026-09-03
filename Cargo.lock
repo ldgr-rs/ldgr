@@ -1425,6 +1425,9 @@ dependencies = [
 [[package]]
 name = "ledger-format"
 version = "0.1.0"
+dependencies = [
+ "smallvec",
+]
 
 [[package]]
 name = "ledger-format-fuzz"

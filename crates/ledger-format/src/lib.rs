@@ -21,10 +21,10 @@ pub mod value;
 pub use cbor::{CborError, CborValue, TolerantReader, compare_canonical_keys, parse_tolerant};
 pub use entry::{
     ActorId, AssertPayload, BlockPayload, CapGrantPayload, CapInvokePayload, CapRequestPayload,
-    CapRevokePayload, CrashOperation, EntryData, EntryKind, EntryPayload, EpochPayload,
-    FaultPayload, FaultSpec, FsReadPayload, FsSyncPayload, FsWritePayload, GenId, Hash, InputKey,
-    InputStepPayload, MessageId, ObservedRead, OutcomePayload, RecvFrame, RngDrawPayload,
-    SendFrame, SnapshotPayload, StepBeginPayload, StepEndPayload, StreamId, WakePayload,
+    CapRevokePayload, CrashOperation, EntryData, EntryHash, EntryKind, EntryPayload, EpochPayload,
+    FaultPayload, FaultSpec, FsReadPayload, FsSyncPayload, FsWritePayload, InputStepPayload,
+    MessageId, ObservedRead, OutcomePayload, RecvFrame, RngDrawPayload, SendFrame, SequenceNumber,
+    SnapshotPayload, StepBeginPayload, StepEndPayload, StreamId, WakePayload,
 };
 pub use frame::{FRAME_PREFIX_LEN, FrameError, FramePrefix};
 pub use hex::{HexError, hash_from_hex, hash_to_hex};

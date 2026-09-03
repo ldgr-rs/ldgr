@@ -73,14 +73,18 @@ fn cbor_round_trips_nested_structures() {
     assert_eq!(val, decoded);
 }
 
-fn entry(kind: EntryKind, actor: u32, payload: ledger_format::EntryPayload) -> EntryData {
+fn entry(
+    kind: EntryKind,
+    actor: ledger_format::ActorId,
+    payload: ledger_format::EntryPayload,
+) -> EntryData {
     EntryData {
         format_version: ledger_format::FORMAT_VERSION,
         kind,
         actor,
-        parents: vec![],
+        parents: smallvec::SmallVec::new(),
         vector_clock: vec![],
-        sequence: 0,
+        sequence: ledger_format::SequenceNumber(0),
         payload,
     }
 }
@@ -90,8 +94,10 @@ fn spawn_payload_round_trips() {
     // Spawn encodes as [child_actor]: array(1) with the actor.
     let data = entry(
         EntryKind::Spawn,
-        0,
-        ledger_format::EntryPayload::Spawn { child_actor: 5 },
+        ledger_format::ActorId(0),
+        ledger_format::EntryPayload::Spawn {
+            child_actor: ledger_format::ActorId(5),
+        },
     );
     let bytes = data.try_canonical_bytes().unwrap();
     // 7-element EntryData array: version, tag 0, actor 0, parents, clock,
@@ -500,9 +506,9 @@ fn entry_kind_structured_encoding_stable() {
     // parents, vector_clock, sequence, typed_payload].
     let rng = entry(
         EntryKind::RngDraw,
-        0,
+        ledger_format::ActorId(0),
         ledger_format::EntryPayload::RngDraw(ledger_format::RngDrawPayload {
-            stream: 7,
+            stream: ledger_format::StreamId(7),
             draw_index: 0,
             content: Vec::new(),
         }),
@@ -516,7 +522,7 @@ fn entry_kind_structured_encoding_stable() {
 
     let step = entry(
         EntryKind::InputStep,
-        0,
+        ledger_format::ActorId(0),
         ledger_format::EntryPayload::InputStep(ledger_format::InputStepPayload {
             generator: 2,
             replay: 3,
@@ -532,10 +538,10 @@ fn entry_kind_structured_encoding_stable() {
 
     let partition = entry(
         EntryKind::Fault,
-        0,
+        ledger_format::ActorId(0),
         ledger_format::EntryPayload::Fault(ledger_format::FaultPayload::Partition {
-            src: 1,
-            dst: 2,
+            src: ledger_format::ActorId(1),
+            dst: ledger_format::ActorId(2),
             enabled: true,
         }),
     );
@@ -548,9 +554,9 @@ fn entry_kind_structured_encoding_stable() {
 
     let outcome = entry(
         EntryKind::Outcome,
-        0,
+        ledger_format::ActorId(0),
         ledger_format::EntryPayload::Outcome(ledger_format::OutcomePayload {
-            schema: [0xaa; 32],
+            schema: ledger_format::EntryHash([0xaa; 32]),
             value: ledger_format::CanonicalValue::Unsigned(42),
         }),
     );
@@ -577,11 +583,20 @@ fn manifest_round_trip_and_version_reject() {
         format_version: ledger_format::FORMAT_VERSION,
         crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
         execution_identity: None,
-        root_seed: [7u8; 32],
+        root_seed: ledger_format::EntryHash([7u8; 32]),
         policy_tag: "bandit".into(),
-        journal_root: [9u8; 32],
+        journal_root: ledger_format::EntryHash([9u8; 32]),
         entry_count: 1234,
-        actor_heads: BTreeMap::from([(1u32, [1u8; 32]), (2u32, [2u8; 32])]),
+        actor_heads: BTreeMap::from([
+            (
+                ledger_format::ActorId(1),
+                ledger_format::EntryHash([1u8; 32]),
+            ),
+            (
+                ledger_format::ActorId(2),
+                ledger_format::EntryHash([2u8; 32]),
+            ),
+        ]),
     };
 
     let bytes = manifest.to_canonical_bytes().unwrap();
