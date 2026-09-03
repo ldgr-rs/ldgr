@@ -43,13 +43,14 @@ mod tests {
     #[test]
     fn workflow_logs_and_recovers_steps() {
         let mut journal = Journal::new();
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
 
         let begin_h = wf.step_begin(&mut journal, "charge_card").unwrap();
         wf.step_end(&mut journal, "charge_card", begin_h, 4200)
             .unwrap();
 
-        let recovered = WorkflowExecution::recover_from_journal(1, &journal);
+        let recovered =
+            WorkflowExecution::recover_from_journal(ledger_format::ActorId(1), &journal);
         assert_eq!(recovered.completed_steps.len(), 1);
         assert_eq!(recovered.completed_steps[0].0, "charge_card");
         assert_eq!(recovered.completed_steps[0].1, 4200);
@@ -58,14 +59,15 @@ mod tests {
     #[test]
     fn workflow_recovery_pairs_names_and_ignores_in_progress() {
         let mut journal = Journal::new();
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
         let h1 = wf.step_begin(&mut journal, "charge_card").unwrap();
         wf.step_end(&mut journal, "charge_card", h1, 4200).unwrap();
         let _h2 = wf.step_begin(&mut journal, "refund").unwrap();
         let h3 = wf.step_begin(&mut journal, "notify").unwrap();
         wf.step_end(&mut journal, "notify", h3, 99).unwrap();
 
-        let recovered = WorkflowExecution::recover_from_journal(1, &journal);
+        let recovered =
+            WorkflowExecution::recover_from_journal(ledger_format::ActorId(1), &journal);
         assert_eq!(recovered.step_counter, 3);
         assert_eq!(recovered.completed_steps.len(), 2);
         assert_eq!(recovered.completed_steps[0].0, "charge_card");
@@ -93,7 +95,7 @@ mod tests {
     #[test]
     fn resume_without_plan_errors() {
         let mut journal = Journal::new();
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
         assert!(matches!(
             wf.resume(&mut journal, |_| Ok(0)),
             Err(FlowError::NoPlan)
@@ -103,7 +105,7 @@ mod tests {
     #[test]
     fn resume_fresh_plan_is_idempotent() {
         let mut journal = Journal::new();
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
         wf.set_plan(WorkflowPlan::plan(vec!["charge".into(), "notify".into()]).unwrap());
 
         // Deterministic effect: result equals the step-name length.
@@ -152,12 +154,12 @@ mod tests {
         // Journal prefix left by a crash between steps 2 and 3:
         // begin1+end1, begin2 with no end2, nothing for step 3.
         let mut journal = Journal::new();
-        let mut crashed = WorkflowExecution::new(1);
+        let mut crashed = WorkflowExecution::new(ledger_format::ActorId(1));
         let h1 = crashed.step_begin(&mut journal, "s1").unwrap();
         crashed.step_end(&mut journal, "s1", h1, 10).unwrap();
         let _h2 = crashed.step_begin(&mut journal, "s2").unwrap();
 
-        let mut wf = WorkflowExecution::recover_from_journal(1, &journal);
+        let mut wf = WorkflowExecution::recover_from_journal(ledger_format::ActorId(1), &journal);
         assert_eq!(wf.completed_steps.len(), 1);
         wf.set_plan(WorkflowPlan::plan(vec!["s1".into(), "s2".into(), "s3".into()]).unwrap());
 
@@ -195,7 +197,7 @@ mod tests {
         let s2_begins = journal
             .entries()
             .filter(|entry| {
-                entry.data.actor == 1
+                entry.data.actor == ledger_format::ActorId(1)
                     && entry.data.kind == EntryKind::StepBegin
                     && matches!(
                         &entry.data.payload,
@@ -240,7 +242,7 @@ mod tests {
         journal
             .entries()
             .filter(|entry| {
-                entry.data.actor == 1
+                entry.data.actor == ledger_format::ActorId(1)
                     && entry.data.kind == EntryKind::StepBegin
                     && matches!(
                         &entry.data.payload,
@@ -256,11 +258,11 @@ mod tests {
     ///
     /// End entries carry the result as a number payload, so pairing goes
     /// through the recorded parent hash, never the text name.
-    fn count_ends_paired(journal: &Journal, begin: &[u8; 32]) -> usize {
+    fn count_ends_paired(journal: &Journal, begin: &ledger_format::EntryHash) -> usize {
         journal
             .entries()
             .filter(|entry| {
-                entry.data.actor == 1
+                entry.data.actor == ledger_format::ActorId(1)
                     && entry.data.kind == EntryKind::StepEnd
                     && entry.data.parents.first() == Some(begin)
             })
@@ -270,7 +272,7 @@ mod tests {
     #[test]
     fn resume_exec_failure_propagates_typed_error_and_keeps_crash_evidence() {
         let mut journal = Journal::new();
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
         wf.set_plan(WorkflowPlan::plan(vec!["s1".into(), "boom".into(), "s3".into()]).unwrap());
 
         // The second step's effect fails with a typed error; the resume
@@ -298,7 +300,7 @@ mod tests {
         let s1_begin = journal
             .entries()
             .find(|entry| {
-                entry.data.actor == 1
+                entry.data.actor == ledger_format::ActorId(1)
                     && entry.data.kind == EntryKind::StepBegin
                     && matches!(
                         &entry.data.payload,
@@ -312,7 +314,7 @@ mod tests {
         let boom_begin = journal
             .entries()
             .find(|entry| {
-                entry.data.actor == 1
+                entry.data.actor == ledger_format::ActorId(1)
                     && entry.data.kind == EntryKind::StepBegin
                     && matches!(
                         &entry.data.payload,
@@ -329,7 +331,8 @@ mod tests {
         assert_eq!(wf.completed_steps, vec![("s1".to_string(), 102)]);
 
         // Recovery sees the unpaired begin as an in-progress step.
-        let recovered = WorkflowExecution::recover_from_journal(1, &journal);
+        let recovered =
+            WorkflowExecution::recover_from_journal(ledger_format::ActorId(1), &journal);
         assert_eq!(recovered.step_counter, 2);
         assert_eq!(recovered.completed_steps, vec![("s1".to_string(), 102)]);
 
@@ -365,12 +368,12 @@ mod tests {
     #[test]
     fn step_end_rejects_unknown_parent_without_partial_state() {
         let mut journal = Journal::new();
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
         let begin = wf.step_begin(&mut journal, "s1").unwrap();
 
         // An end joined to a begin the journal does not hold is a typed
         // journal error, never a silent append.
-        let bogus = [0x42u8; 32];
+        let bogus = ledger_format::EntryHash([0x42u8; 32]);
         let error = wf
             .step_end(&mut journal, "s1", bogus, 7)
             .expect_err("unknown begin hash must be rejected");
@@ -389,7 +392,8 @@ mod tests {
         assert_ne!(end, bogus);
         assert_eq!(journal.len(), 2);
         assert_eq!(wf.completed_steps, vec![("s1".to_string(), 7)]);
-        let recovered = WorkflowExecution::recover_from_journal(1, &journal);
+        let recovered =
+            WorkflowExecution::recover_from_journal(ledger_format::ActorId(1), &journal);
         assert_eq!(recovered.completed_steps, vec![("s1".to_string(), 7)]);
     }
 
@@ -402,7 +406,7 @@ mod tests {
         let typed_begin = journal
             .append(
                 EntryKind::StepBegin,
-                1,
+                ledger_format::ActorId(1),
                 [],
                 EntryPayload::StepBegin(ledger_format::StepBeginPayload {
                     step_id: 99,
@@ -414,7 +418,7 @@ mod tests {
         let _paired_end = journal
             .append(
                 EntryKind::StepEnd,
-                1,
+                ledger_format::ActorId(1),
                 [typed_begin],
                 EntryPayload::StepEnd(ledger_format::StepEndPayload::Completed {
                     step_id: 1,
@@ -428,12 +432,12 @@ mod tests {
         let real_non_begin = journal
             .append(
                 EntryKind::Send,
-                1,
+                ledger_format::ActorId(1),
                 [],
                 EntryPayload::Send(ledger_format::SendFrame {
-                    message_id: ledger_format::MessageId::new(1, 0),
-                    from: 1,
-                    to: 2,
+                    message_id: ledger_format::MessageId::new(ledger_format::ActorId(1), 0),
+                    from: ledger_format::ActorId(1),
+                    to: ledger_format::ActorId(2),
                     original_content: b"marker".to_vec(),
                 }),
             )
@@ -441,7 +445,7 @@ mod tests {
         let _orphan_end = journal
             .append(
                 EntryKind::StepEnd,
-                1,
+                ledger_format::ActorId(1),
                 [real_non_begin],
                 EntryPayload::StepEnd(ledger_format::StepEndPayload::Completed {
                     step_id: 2,
@@ -449,17 +453,19 @@ mod tests {
                 }),
             )
             .unwrap();
-        let recovered = WorkflowExecution::recover_from_journal(1, &journal);
+        let recovered =
+            WorkflowExecution::recover_from_journal(ledger_format::ActorId(1), &journal);
         // The typed begin above pairs with its end into one completed step;
         // the orphan end (parent is a Send, not a begin) is ignored.
         assert_eq!(recovered.step_counter, 1);
         assert_eq!(recovered.completed_steps, vec![("".to_string(), 1)]);
         // Valid text begin is still recovered alongside the earlier typed
         // begin: recovery sees both in the same journal.
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
         let begin = wf.step_begin(&mut journal, "ok").unwrap();
         wf.step_end(&mut journal, "ok", begin, 5).unwrap();
-        let recovered2 = WorkflowExecution::recover_from_journal(1, &journal);
+        let recovered2 =
+            WorkflowExecution::recover_from_journal(ledger_format::ActorId(1), &journal);
         assert_eq!(
             recovered2.completed_steps,
             vec![("".to_string(), 1), ("ok".to_string(), 5)]
@@ -471,7 +477,7 @@ mod tests {
     fn resume_async_executes_steps() {
         let mut journal = Journal::new();
         let plan = WorkflowPlan::plan(vec!["step_a".to_string(), "step_b".to_string()]).unwrap();
-        let mut wf = WorkflowExecution::new(1);
+        let mut wf = WorkflowExecution::new(ledger_format::ActorId(1));
         wf.set_plan(plan);
 
         let fut = wf.resume_async(&mut journal, |name| {

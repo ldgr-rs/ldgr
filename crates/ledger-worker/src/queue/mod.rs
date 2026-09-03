@@ -6,7 +6,7 @@
 //! standalone mode. The root re-exports every public item so the historical
 //! `queue` API surface is unchanged.
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::RunConfig;
 
 mod memory;
@@ -54,14 +54,14 @@ pub struct Task {
     /// Workload name that selects the instruction programs.
     pub workload: String,
     /// Optional deterministic hash of run_config, computed at queue push.
-    pub run_config_hash: Option<Hash>,
+    pub run_config_hash: Option<EntryHash>,
     /// Execution-identity digest pinned by the task author.
     ///
     /// When present, the worker recomputes its own identity for the task
     /// and rejects the task before execution when the digests differ or its
     /// own identity is incomplete. `None` leaves the worker to record its
     /// own assembled identity in the result.
-    pub execution_identity: Option<Hash>,
+    pub execution_identity: Option<EntryHash>,
     /// Execution attempts charged against this task.
     pub attempts: u32,
     /// Attempt budget; exhaustion moves the task to the failed list.

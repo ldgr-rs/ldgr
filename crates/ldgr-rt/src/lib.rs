@@ -32,10 +32,13 @@ mod task;
 mod time;
 
 #[cfg(any(feature = "sim", feature = "sim-link"))]
-pub use ipc::{ENGINE_CONNECT_TIMEOUT_SECS, EngineProcess, IpcError, RunOutcome};
+pub use ipc::{
+    ENGINE_CONNECT_TIMEOUT_SECS, EngineProcess, IpcError, MAX_IPC_ACTOR, MAX_IPC_ATTEMPTS,
+    MAX_WORKLOAD_NAME_BYTES, RunOutcome,
+};
 pub use ledger_format::StreamId;
 pub use net::{Conn, SharedNetwork, shared_network};
-pub use rng::DetRng;
+pub use rng::{DetRng, MAX_ENTROPY_DETAIL_BYTES, RngError};
 pub use runtime::{
     Handle, IpcFault, JournalFault, RunCompletion, RunConfig, RunResult, RuntimeError, TaskMain,
     register_workload, run, run_named,
@@ -43,7 +46,7 @@ pub use runtime::{
 #[cfg(feature = "sim")]
 pub use shim::{EngineSession, ShimError};
 pub use task::{TaskId, task_id_for};
-pub use time::{SimClock, now};
+pub use time::{ClockError, SimClock};
 
 /// Compile-time surface probe: both `sim` and non-`sim` builds expose the same
 /// public methods on the handle. This function type-checks the probe trait.

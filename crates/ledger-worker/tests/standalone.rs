@@ -15,7 +15,9 @@ fn drain_once_with_task_produces_json() {
         ..WorkerConfig::default()
     };
     let mut q = InMemoryQueue::new(config.lease_timeout);
-    let run_config = RunConfig::builder().seed([3u8; 32]).build();
+    let run_config = RunConfig::builder()
+        .seed(ledger_format::EntryHash([3u8; 32]))
+        .build();
     q.push(Task::new("task-1", run_config, "kv"));
     let line = run_drain_once(config, Box::new(q)).expect("should produce a JSON line");
     let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
@@ -27,7 +29,7 @@ fn drain_once_with_task_produces_json() {
     );
     // Verify it decodes and is lowercase hex.
     let decoded = ledger_worker::hex_to_hash(jr).expect("hex decode");
-    assert_eq!(decoded.len(), 32);
+    assert_eq!(decoded.0.len(), 32);
     assert_eq!(jr, jr.to_ascii_lowercase());
     let steps = v["steps"].as_u64().expect("steps u64");
     assert!(steps > 0, "steps must be >0, got {steps}");
@@ -59,7 +61,9 @@ fn drain_once_journal_root_is_deterministic() {
         ..WorkerConfig::default()
     };
     let config_b = config_a.clone();
-    let run_config = RunConfig::builder().seed([7u8; 32]).build();
+    let run_config = RunConfig::builder()
+        .seed(ledger_format::EntryHash([7u8; 32]))
+        .build();
     let mut qa = InMemoryQueue::new(Duration::from_secs(30));
     qa.push(Task::new("det", run_config.clone(), "kv"));
     let mut qb = InMemoryQueue::new(Duration::from_secs(30));

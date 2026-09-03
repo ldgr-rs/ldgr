@@ -15,7 +15,7 @@ use rt_server::run;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<PathBuf> = None;
-    let mut seed = [0u8; 32];
+    let mut seed = ledger_format::EntryHash([0u8; 32]);
 
     let mut i = 1;
     while i < args.len() {
@@ -57,6 +57,6 @@ fn main() -> ExitCode {
 
 /// Decode 64 hex characters into a 32-byte seed. Returns `None` on any
 /// malformed input so the server fails closed with the zero seed.
-fn decode_hex(hex: &str) -> Option<[u8; 32]> {
+fn decode_hex(hex: &str) -> Option<ledger_format::EntryHash> {
     ledger_format::hash_from_hex(hex).ok()
 }

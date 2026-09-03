@@ -18,7 +18,7 @@ use ledger_explorer::search::Workload;
 use ledger_faultspec::{
     CompiledScenario, FaultInjection as CompiledFault, ScenarioError, compile, parse_scenario,
 };
-use ledger_format::{EntryKind, Hash};
+use ledger_format::{EntryHash, EntryKind};
 use ledger_sim::{RunConfig, RuntimeError, Simulation};
 
 /// Errors from the `faults` subcommand.
@@ -156,7 +156,7 @@ pub fn compile_scenario(path: &Path, json: bool) -> Result<String, FaultsError> 
 }
 
 /// Parses a 64-character hex string into a 32-byte seed.
-fn parse_seed_hex(seed_hex: &str) -> Result<Hash, FaultsError> {
+fn parse_seed_hex(seed_hex: &str) -> Result<EntryHash, FaultsError> {
     let bytes = seed_hex.as_bytes();
     if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
         return Err(FaultsError::InvalidSeedHex(seed_hex.to_string()));
@@ -168,7 +168,7 @@ fn parse_seed_hex(seed_hex: &str) -> Result<Hash, FaultsError> {
         let lo = (pair[1] as char).to_digit(16).unwrap_or(0) as u8;
         *byte = (hi << 4) | lo;
     }
-    Ok(seed)
+    Ok(EntryHash(seed))
 }
 
 /// Compiles the scenario, applies it to a seeded run config, runs the

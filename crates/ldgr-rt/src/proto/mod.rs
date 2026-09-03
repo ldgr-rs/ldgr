@@ -46,8 +46,8 @@ pub const MAX_RANDOM_COUNT: u32 = 4096;
 /// Maximum actors addressed by one effect.
 pub const MAX_ACTOR: u32 = 1 << 20;
 
-/// Number of bytes in one `ExecutionIdentity` digest (a BLAKE3 `Hash`).
+/// Number of bytes in one `ExecutionIdentity` digest (a BLAKE3 `EntryHash`).
 pub const IDENTITY_BYTES: usize = 32;
 
-/// Number of bytes in a journal root (a BLAKE3 `Hash`).
+/// Number of bytes in a journal root (a BLAKE3 `EntryHash`).
 pub const ROOT_BYTES: usize = 32;

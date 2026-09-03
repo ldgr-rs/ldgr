@@ -138,7 +138,7 @@ impl IngestedJournal {
     }
 
     /// Content-addressed envelope hash.
-    pub fn envelope_hash(&self) -> Result<ledger_format::Hash, AdapterError> {
+    pub fn envelope_hash(&self) -> Result<ledger_format::EntryHash, AdapterError> {
         self.envelope.envelope_hash()
     }
 
@@ -163,7 +163,7 @@ pub(crate) fn mark_fidelity(journal: &mut Journal, fidelity: Fidelity) -> Result
         journal
             .append(
                 EntryKind::Epoch,
-                0,
+                ledger_format::ActorId(0),
                 [],
                 EntryPayload::Epoch(ledger_format::EpochPayload { epoch: 0 }),
             )

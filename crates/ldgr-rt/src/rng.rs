@@ -1,4 +1,4 @@
-// ledger-lint:allow - host daemon / non-sim passthrough, like TokioBackend
+// ledger-lint:allow:getrandom:: - host daemon / non-sim passthrough, like TokioBackend
 //! Deterministic RNG facade.
 //!
 //! Why: ambient entropy (`rand::thread_rng`, `getrandom`) is forbidden inside
@@ -7,8 +7,33 @@
 //! ChaCha RNG so the call site stays identical.
 
 use rand_core::Rng as _;
+use thiserror::Error;
 
 pub use ledger_format::StreamId;
+
+/// Maximum bytes kept from a host-entropy failure message.
+///
+/// Bounds untrusted OS error text carried in [`RngError::EntropyUnavailable`].
+pub const MAX_ENTROPY_DETAIL_BYTES: usize = 128;
+
+/// Typed RNG failure.
+///
+/// Streams come from a live [`crate::Handle`] inside a run (journaled under
+/// `sim-link`, server-side under sim IPC). There is no ambient fallback:
+/// construction outside a run fails closed here instead of reading OS
+/// entropy or wall time.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RngError {
+    /// No deterministic run context backs this handle.
+    #[error("no run context: RNG unavailable outside a run; use Handle::rng inside run")]
+    NoContext,
+    /// Local RNG does not cross the IPC boundary; issue an engine effect.
+    #[error("local RNG unavailable under sim IPC; use server-side effects")]
+    IpcLocal,
+    /// Host entropy failed and no ambient fallback is taken.
+    #[error("host entropy unavailable: {detail}")]
+    EntropyUnavailable { detail: String },
+}
 
 /// Deterministic RNG handle for one labelled stream.
 #[cfg(feature = "sim-link")]
@@ -71,7 +96,7 @@ impl DetRng {
         }
     }
 
-    #[cfg(feature = "sim-link")]
+    #[cfg(all(feature = "sim-link", test))]
     pub(crate) fn from_chacha(stream: StreamId, rng: rand_chacha::ChaCha20Rng) -> Self {
         Self {
             stream,
@@ -93,24 +118,25 @@ impl DetRng {
         }
     }
 
-    #[cfg(not(feature = "sim-link"))]
-    pub(crate) fn from_seed(stream: StreamId) -> Self {
+    #[cfg(not(any(feature = "sim", feature = "sim-link")))]
+    pub(crate) fn from_seed(stream: StreamId) -> Result<Self, RngError> {
         let mut seed = [0u8; 32];
-        if getrandom::fill(&mut seed).is_err() {
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            seed[0..16].copy_from_slice(&t.to_le_bytes());
-            seed[16..32].copy_from_slice(&t.to_le_bytes());
-        }
-        Self {
+        // Fail closed: no wall-time fallback. A host entropy failure is a
+        // typed error, never ambient time bytes.
+        getrandom::fill(&mut seed).map_err(|error| {
+            let mut detail = error.to_string();
+            if detail.len() > MAX_ENTROPY_DETAIL_BYTES {
+                detail.truncate(MAX_ENTROPY_DETAIL_BYTES);
+            }
+            RngError::EntropyUnavailable { detail }
+        })?;
+        Ok(Self {
             inner: {
                 use rand_core::SeedableRng as _;
                 rand_chacha::ChaCha20Rng::from_seed(seed)
             },
             stream,
-        }
+        })
     }
 }
 
@@ -132,18 +158,38 @@ mod tests {
         {
             use rand_core::SeedableRng as _;
             let seed = [7u8; 32];
-            let mut a = DetRng::from_chacha(0, rand_chacha::ChaCha20Rng::from_seed(seed));
-            let mut b = DetRng::from_chacha(0, rand_chacha::ChaCha20Rng::from_seed(seed));
+            let mut a = DetRng::from_chacha(StreamId(0), rand_chacha::ChaCha20Rng::from_seed(seed));
+            let mut b = DetRng::from_chacha(StreamId(0), rand_chacha::ChaCha20Rng::from_seed(seed));
             assert_eq!(a.next_u64(), b.next_u64());
             assert_eq!(a.next_u64(), b.next_u64());
         }
-        #[cfg(not(feature = "sim-link"))]
+        #[cfg(not(any(feature = "sim", feature = "sim-link")))]
         {
-            let mut r = DetRng::from_seed(0);
-            let _ = r.next_u64();
-            let mut s = DetRng::from_seed(1);
-            let _ = s.next_u64();
+            // Host entropy either seeds two draws or fails closed typed;
+            // it never falls back to wall time.
+            let first = DetRng::from_seed(StreamId(0)).map(|mut r| r.next_u64());
+            let second = DetRng::from_seed(StreamId(1)).map(|mut r| r.next_u64());
+            match (first, second) {
+                (Ok(_), Ok(_)) => {}
+                (Err(error), _) | (_, Err(error)) => {
+                    assert!(
+                        matches!(error, RngError::EntropyUnavailable { .. }),
+                        "{error}"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn rng_error_is_typed_and_bounded() {
+        let error = RngError::NoContext;
+        assert_eq!(
+            error.to_string(),
+            "no run context: RNG unavailable outside a run; use Handle::rng inside run"
+        );
+        let long = "x".repeat(MAX_ENTROPY_DETAIL_BYTES + 16);
+        assert!(long.len() > MAX_ENTROPY_DETAIL_BYTES);
     }
 
     #[test]
@@ -151,15 +197,15 @@ mod tests {
         #[cfg(feature = "sim-link")]
         {
             use ledger_sim::SeedTree;
-            let seed = [9u8; 32];
+            let seed = ledger_format::EntryHash([9u8; 32]);
             let tree = SeedTree::new(seed);
-            let mut a = DetRng::from_chacha(0, tree.rng("app/0"));
-            let mut b = DetRng::from_chacha(1, tree.rng("app/1"));
+            let mut a = DetRng::from_chacha(StreamId(0), tree.rng("app/0"));
+            let mut b = DetRng::from_chacha(StreamId(1), tree.rng("app/1"));
             let va = a.next_u64();
             let vb = b.next_u64();
             assert_ne!(va, vb);
             let vb2 = b.next_u64();
-            let mut b_fresh = DetRng::from_chacha(1, tree.rng("app/1"));
+            let mut b_fresh = DetRng::from_chacha(StreamId(1), tree.rng("app/1"));
             let _ = b_fresh.next_u64();
             assert_eq!(vb2, b_fresh.next_u64());
         }

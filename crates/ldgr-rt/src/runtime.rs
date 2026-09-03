@@ -1,4 +1,4 @@
-// ledger-lint:allow - test-only probe; verifies thread-local registry isolation
+// ledger-lint:allow:thread::spawn - test-only probe; verifies thread-local registry isolation
 //! Runtime facade entrypoint.
 //!
 //! Why: the SUT should not name `ledger-sim` types. `Handle` is the single
@@ -27,15 +27,16 @@ use core::pin::Pin;
 use core::time::Duration;
 use std::cell::RefCell;
 
-use ledger_format::ActorId;
+use ledger_format::{ActorId, EntryHash, StreamId};
 use thiserror::Error;
 
 #[cfg(all(feature = "sim", not(feature = "sim-link")))]
 use crate::ipc::EngineProcess;
 use crate::net::{Conn, shared_network};
-use crate::rng::{DetRng, StreamId};
+use crate::rng::{DetRng, RngError};
+use crate::time::ClockError;
 #[cfg(feature = "sim-link")]
-use ledger_sim::{Effects as _, RunConfig as SimRunConfig, SeedTree, Simulation};
+use ledger_sim::{Effects as _, RunConfig as SimRunConfig, Simulation};
 
 // ---------------------------------------------------------------------------
 // Thread-local current handle
@@ -63,7 +64,7 @@ fn clear_current() {
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     /// Root seed for deterministic runs. Ignored outside `sim`.
-    pub seed: [u8; 32],
+    pub seed: EntryHash,
     /// Maximum executor steps before `StepLimit`.
     ///
     /// Enforced by the simulation backends (`sim`, `sim-link`) only; the
@@ -75,7 +76,7 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
-            seed: [0u8; 32],
+            seed: EntryHash([0u8; 32]),
             max_steps: 10_000,
         }
     }
@@ -88,7 +89,7 @@ impl RunConfig {
     }
 
     /// Root seed for deterministic runs.
-    pub fn seed(&self) -> [u8; 32] {
+    pub fn seed(&self) -> EntryHash {
         self.seed
     }
 
@@ -104,14 +105,14 @@ impl RunConfig {
 /// to finish.
 #[derive(Debug, Clone)]
 pub struct RunConfigBuilder {
-    seed: [u8; 32],
+    seed: EntryHash,
     max_steps: usize,
 }
 
 impl Default for RunConfigBuilder {
     fn default() -> Self {
         Self {
-            seed: [0u8; 32],
+            seed: EntryHash([0u8; 32]),
             max_steps: 10_000,
         }
     }
@@ -124,7 +125,7 @@ impl RunConfigBuilder {
     }
 
     /// Set the root seed.
-    pub fn seed(mut self, seed: [u8; 32]) -> Self {
+    pub fn seed(mut self, seed: EntryHash) -> Self {
         self.seed = seed;
         self
     }
@@ -186,7 +187,7 @@ impl From<ledger_sim::RunOutcome> for RunCompletion {
 pub struct RunResult {
     /// Root hash of the journal the backend produced. `None` when the run
     /// produced no journal (non-sim builds).
-    pub journal_root: Option<[u8; 32]>,
+    pub journal_root: Option<EntryHash>,
     /// Number of executor steps consumed.
     pub steps: usize,
     /// Whether the run completed, and the liveness reason when it did not.
@@ -436,7 +437,7 @@ pub struct Handle {
     // Only sim backends consume the seed today; the field stays on every
     // build so Handle literals keep one shape across feature combos.
     #[cfg_attr(not(feature = "sim-link"), allow(dead_code))]
-    seed: [u8; 32],
+    seed: EntryHash,
     shared_net: crate::net::SharedNetwork,
     actor: ActorId,
 }
@@ -460,7 +461,7 @@ impl Handle {
     }
 
     /// Root seed for the deterministic stream of this handle's draws.
-    pub fn seed(&self) -> [u8; 32] {
+    pub fn seed(&self) -> EntryHash {
         self.seed
     }
 
@@ -492,20 +493,27 @@ impl Handle {
 
     /// Return a deterministic clock snapshot.
     ///
-    /// Under `sim-link` with a live boundary this reads virtual time.
-    /// Without a boundary the sim-link path is unreachable in normal runs
-    /// and returns zero; non-sim builds read ambient time.
-    pub fn clock(&self) -> crate::time::SimClock {
+    /// Under `sim-link` with a live boundary this reads virtual time. Without
+    /// a boundary there is no deterministic source, so this fails with
+    /// [`ClockError::NoContext`] instead of returning epoch zero. Under `sim`
+    /// IPC the local clock is unavailable ([`ClockError::IpcLocal`]); issue a
+    /// server-side effect. Default builds read ambient time as host
+    /// passthrough.
+    pub fn clock(&self) -> Result<crate::time::SimClock, ClockError> {
         #[cfg(feature = "sim-link")]
         {
             if let Some(b) = &self.boundary {
-                return crate::time::SimClock::from_ticks(b.clock().now());
+                return Ok(crate::time::SimClock::from_ticks(b.clock().now()));
             }
-            crate::time::SimClock::from_ticks(0)
+            Err(ClockError::NoContext)
         }
-        #[cfg(not(feature = "sim-link"))]
+        #[cfg(all(feature = "sim", not(feature = "sim-link")))]
         {
-            crate::time::SimClock::ambient()
+            Err(ClockError::IpcLocal)
+        }
+        #[cfg(not(any(feature = "sim", feature = "sim-link")))]
+        {
+            Ok(crate::time::SimClock::ambient())
         }
     }
 
@@ -530,20 +538,25 @@ impl Handle {
     /// Return a deterministic RNG for `stream`.
     ///
     /// Each draw advances the stream and is journaled when a live
-    /// `sim-link` boundary is present, so successive draws yield successive
-    /// values and do not repeat. Hold the `DetRng` to draw repeatedly.
-    /// Outside `sim-link` the stream is seeded from ambient entropy, so it
-    /// is deterministic only per-handle, not across runs.
-    pub fn rng(&mut self, stream: StreamId) -> DetRng {
+    /// `sim-link` boundary is present. Without a boundary this fails with
+    /// [`RngError::NoContext`]. Under `sim` IPC local draws are unavailable
+    /// ([`RngError::IpcLocal`]); issue a server-side effect. Default builds
+    /// seed from host entropy and fail closed with
+    /// [`RngError::EntropyUnavailable`] instead of a wall-time fallback.
+    pub fn rng(&mut self, stream: StreamId) -> Result<DetRng, RngError> {
         #[cfg(feature = "sim-link")]
         {
             if let Some(b) = &self.boundary {
-                return DetRng::from_boundary(stream, b.clone());
+                return Ok(DetRng::from_boundary(stream, b.clone()));
             }
-            let label = format!("app/{stream}");
-            DetRng::from_chacha(stream, SeedTree::new(self.seed()).rng(&label))
+            Err(RngError::NoContext)
         }
-        #[cfg(not(feature = "sim-link"))]
+        #[cfg(all(feature = "sim", not(feature = "sim-link")))]
+        {
+            let _ = stream;
+            Err(RngError::IpcLocal)
+        }
+        #[cfg(not(any(feature = "sim", feature = "sim-link")))]
         {
             DetRng::from_seed(stream)
         }
@@ -554,8 +567,8 @@ impl Handle {
     /// Each call advances the stream, so successive calls yield successive
     /// values. This delegates to [`Handle::rng`] and journals the draw
     /// under `sim-link`.
-    pub fn rng_next_u64(&mut self, stream: StreamId) -> u64 {
-        self.rng(stream).next_u64()
+    pub fn rng_next_u64(&mut self, stream: StreamId) -> Result<u64, RngError> {
+        self.rng(stream).map(|mut rng| rng.next_u64())
     }
 
     /// Send a payload from `self.actor` to `to` via the facade net.
@@ -577,7 +590,7 @@ impl Handle {
                 return b.send_tracked(to_id as usize, payload);
             }
         }
-        Conn::new(self.actor, to_id, self.shared_net.clone()).send(payload)
+        Conn::new(self.actor, ActorId(to_id), self.shared_net.clone()).send(payload)
     }
 
     /// Receive a payload addressed to `self.actor` from any sender via the facade net.
@@ -727,9 +740,10 @@ type WorkloadFactory = fn() -> TaskMain;
 thread_local! {
     /// Named caller programs for direct-executor backends. Thread-local by
     /// contract: programs may capture non-`Send` state, and every backend
-    /// polls on the calling thread.
-    static WORKLOADS: RefCell<std::collections::HashMap<&'static str, WorkloadFactory>> =
-        RefCell::new(std::collections::HashMap::new());
+    /// polls on the calling thread. A `BTreeMap` keeps iteration order
+    /// deterministic across builds.
+    static WORKLOADS: RefCell<std::collections::BTreeMap<&'static str, WorkloadFactory>> =
+        RefCell::new(std::collections::BTreeMap::new());
 }
 
 /// Register a named caller program for the direct-executor backends
@@ -830,7 +844,7 @@ fn run_with_sim(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError
                 boundary: Some(boundary),
                 seed,
                 shared_net: net_for_sim,
-                actor: 0,
+                actor: ActorId(0),
             };
             set_current(handle.clone());
             let erased: Pin<Box<dyn Future<Output = ()>>> = Box::pin(async move {
@@ -862,13 +876,21 @@ fn run_with_sim(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError
 
 #[cfg(all(feature = "sim", not(feature = "sim-link")))]
 async fn run_via_ipc(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError> {
-    // Resolve engine binary from env or PATH and run a server-registered
-    // workload. Server workloads are deterministic for a given seed, so equal
-    // seeds yield equal roots across calls.
+    // Resolve engine binary from an explicit path or LEDGER_ENGINE_BIN and
+    // run a server-registered workload. Server workloads are deterministic
+    // for a given seed and actor, so equal inputs yield equal roots.
+    // The caller identity is threaded explicitly: single-actor runs use 0.
     let workload = main.into_workload()?;
-    // Spawn the engine process. The child is killed on drop.
+    // Spawn the engine process. The child is killed on drop. A missing engine
+    // configuration fails closed here with a typed IPC error.
     let mut engine = EngineProcess::spawn(None).await?;
-    let outcome = engine.run_workload_with_steps(workload, config.seed(), config.max_steps(), 1)?;
+    let outcome = engine.run_workload_with_steps(
+        workload,
+        config.seed(),
+        config.max_steps(),
+        1,
+        ActorId(0),
+    )?;
     let root = outcome.journal_root().ok_or(RuntimeError::MissingRoot)?;
     Ok(RunResult {
         outcome: RunCompletion::Completed,
@@ -889,7 +911,7 @@ fn run_with_tokio(config: RunConfig, main: Main) -> Result<RunResult, RuntimeErr
     let handle = Handle {
         seed: config.seed(),
         shared_net: shared_network(),
-        actor: 0,
+        actor: ActorId(0),
     };
     set_current(handle.clone());
     local.block_on(&rt, async move {
@@ -913,7 +935,7 @@ fn run_with_tokio(config: RunConfig, main: Main) -> Result<RunResult, RuntimeErr
 
 #[allow(dead_code)] // compile-time surface probe; see the block comment above
 trait Surface {
-    fn clock(&self) -> crate::time::SimClock;
+    fn clock(&self) -> Result<crate::time::SimClock, ClockError>;
     fn actor(&self) -> ActorId;
     fn with_actor(&self, actor: ActorId) -> Handle;
     fn net_send(&self, to: usize, payload: u64) -> bool;
@@ -924,7 +946,7 @@ trait Surface {
 }
 
 impl Surface for Handle {
-    fn clock(&self) -> crate::time::SimClock {
+    fn clock(&self) -> Result<crate::time::SimClock, ClockError> {
         Handle::clock(self)
     }
     fn actor(&self) -> ActorId {
@@ -952,12 +974,12 @@ pub(crate) fn assert_surface() {
     let h = Handle {
         #[cfg(feature = "sim-link")]
         boundary: None,
-        seed: [0u8; 32],
+        seed: EntryHash([0u8; 32]),
         shared_net: shared_network(),
-        actor: 0,
+        actor: ActorId(0),
     };
     needs_surface(&h);
-    let _ = h.with_actor(1).actor();
+    let _ = h.with_actor(ActorId(1)).actor();
 }
 
 #[cfg(test)]
@@ -983,10 +1005,22 @@ mod tests {
 
     #[test]
     fn run_completes_without_sim() {
-        let cfg = RunConfig::builder().seed([1u8; 32]).max_steps(1024).build();
+        let cfg = RunConfig::builder()
+            .seed(EntryHash([1u8; 32]))
+            .max_steps(1024)
+            .build();
         let res = run(cfg, |handle| async move {
-            let c = handle.clock();
-            let _ = c.now();
+            // Local clocks are unavailable under sim IPC; direct backends
+            // must produce one.
+            #[cfg(all(feature = "sim", not(feature = "sim-link")))]
+            {
+                let _ = handle;
+            }
+            #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
+            {
+                let c = handle.clock().expect("direct backends provide a clock");
+                let _ = c.now();
+            }
             handle.sleep(Duration::from_millis(1)).await;
         });
         assert_run_program_outcome(res);
@@ -994,12 +1028,31 @@ mod tests {
 
     #[test]
     fn run_rng_is_deterministic_in_sim() {
-        let cfg = RunConfig::builder().seed([9u8; 32]).max_steps(1024).build();
+        let cfg = RunConfig::builder()
+            .seed(EntryHash([9u8; 32]))
+            .max_steps(1024)
+            .build();
         let a = run(cfg.clone(), |mut h| async move {
-            let _ = h.rng_next_u64(1);
+            #[cfg(all(feature = "sim", not(feature = "sim-link")))]
+            {
+                let _ = h.rng_next_u64(StreamId(1));
+            }
+            #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
+            {
+                h.rng_next_u64(StreamId(1))
+                    .expect("direct backends provide RNG");
+            }
         });
         let b = run(cfg, |mut h| async move {
-            let _ = h.rng_next_u64(1);
+            #[cfg(all(feature = "sim", not(feature = "sim-link")))]
+            {
+                let _ = h.rng_next_u64(StreamId(1));
+            }
+            #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
+            {
+                h.rng_next_u64(StreamId(1))
+                    .expect("direct backends provide RNG");
+            }
         });
         #[cfg(all(feature = "sim", not(feature = "sim-link")))]
         {
@@ -1019,9 +1072,12 @@ mod tests {
 
     #[test]
     fn net_send_recv_roundtrip_without_sim() {
-        let cfg = RunConfig::builder().seed([2u8; 32]).max_steps(1024).build();
+        let cfg = RunConfig::builder()
+            .seed(EntryHash([2u8; 32]))
+            .max_steps(1024)
+            .build();
         let res = run(cfg, |handle| async move {
-            let c = handle.conn(0, 1);
+            let c = handle.conn(ActorId(0), ActorId(1));
             assert!(c.send(99));
             assert_eq!(c.recv(), Some(99));
         });
@@ -1030,7 +1086,10 @@ mod tests {
 
     #[test]
     fn spawn_returns_distinct_ids() {
-        let cfg = RunConfig::builder().seed([3u8; 32]).max_steps(1024).build();
+        let cfg = RunConfig::builder()
+            .seed(EntryHash([3u8; 32]))
+            .max_steps(1024)
+            .build();
         let res = run(cfg, |handle| async move {
             let first = handle.spawn(|_child| Box::pin(async move {}));
             let second = handle.spawn(|_child| Box::pin(async move {}));
@@ -1041,16 +1100,19 @@ mod tests {
 
     #[test]
     fn with_actor_binds_non_sim_send_recv() {
-        let cfg = RunConfig::builder().seed([5u8; 32]).max_steps(1024).build();
+        let cfg = RunConfig::builder()
+            .seed(EntryHash([5u8; 32]))
+            .max_steps(1024)
+            .build();
         let res = run(cfg, |handle| async move {
-            let a = handle.with_actor(3);
-            let b = handle.with_actor(7);
-            assert_eq!(a.actor(), 3);
-            assert_eq!(b.actor(), 7);
+            let a = handle.with_actor(ActorId(3));
+            let b = handle.with_actor(ActorId(7));
+            assert_eq!(a.actor(), ActorId(3));
+            assert_eq!(b.actor(), ActorId(7));
             assert!(a.net_send(7, 42));
             let payload = b.net_recv().await;
             assert_eq!(payload, 42);
-            assert!(!handle.conn(3, 0).has_ready());
+            assert!(!handle.conn(ActorId(3), ActorId(0)).has_ready());
         });
         assert_run_program_outcome(res);
     }
@@ -1059,7 +1121,7 @@ mod tests {
     #[test]
     fn sim_determinism_same_seed_same_root() {
         let cfg = RunConfig::builder()
-            .seed([42u8; 32])
+            .seed(EntryHash([42u8; 32]))
             .max_steps(2048)
             .build();
         let a = run(cfg.clone(), |handle| async move {
@@ -1078,7 +1140,10 @@ mod tests {
     fn sim_net_send_is_journaled_and_deterministic() {
         let run_once = |payload| {
             run(
-                RunConfig::builder().seed([7u8; 32]).max_steps(2048).build(),
+                RunConfig::builder()
+                    .seed(EntryHash([7u8; 32]))
+                    .max_steps(2048)
+                    .build(),
                 move |handle| async move {
                     let _ = handle.net_send(1, payload);
                 },
@@ -1139,7 +1204,7 @@ mod tests {
         PROGRAM_RAN.with(|ran| ran.set(false));
         register_workload("probe-wl", counting_factory);
         let config = RunConfig::builder()
-            .seed([13u8; 32])
+            .seed(EntryHash([13u8; 32]))
             .max_steps(1024)
             .build();
         let first = run_named(config.clone(), "probe-wl");
@@ -1183,7 +1248,7 @@ mod tests {
         const BEYOND_RANGE: usize = u32::MAX as usize + 1;
         let res = run(
             RunConfig::builder()
-                .seed([19u8; 32])
+                .seed(EntryHash([19u8; 32]))
                 .max_steps(1024)
                 .build(),
             |handle| async move {
@@ -1191,11 +1256,11 @@ mod tests {
                 // A wrapping truncation would land on actor 0; the real id
                 // space top must stay empty too. Both probes are
                 // non-blocking receives over the shared queue.
-                assert_eq!(handle.conn(0, 0).recv(), None);
-                assert_eq!(handle.conn(0, u32::MAX).recv(), None);
+                assert_eq!(handle.conn(ActorId(0), ActorId(0)).recv(), None);
+                assert_eq!(handle.conn(ActorId(0), ActorId(u32::MAX)).recv(), None);
                 // Positive control: an in-range high id still delivers.
                 assert!(handle.net_send(u32::MAX as usize, 7));
-                let receiver = handle.with_actor(u32::MAX);
+                let receiver = handle.with_actor(ActorId(u32::MAX));
                 assert_eq!(receiver.net_recv().await, 7);
             },
         );
@@ -1223,7 +1288,7 @@ mod tests {
     #[test]
     fn sim_link_closure_roots_are_deterministic_and_program_sensitive() {
         let cfg = RunConfig::builder()
-            .seed([17u8; 32])
+            .seed(EntryHash([17u8; 32]))
             .max_steps(2048)
             .build();
         let run_once = |payload| {
@@ -1260,16 +1325,70 @@ mod tests {
     fn high_actor_ids_receive_across_full_id_space() {
         let res = run(
             RunConfig::builder()
-                .seed([11u8; 32])
+                .seed(EntryHash([11u8; 32]))
                 .max_steps(1024)
                 .build(),
             |handle| async move {
-                let sender = handle.with_actor(u32::MAX - 1);
-                let receiver = handle.with_actor(u32::MAX);
+                let sender = handle.with_actor(ActorId(u32::MAX - 1));
+                let receiver = handle.with_actor(ActorId(u32::MAX));
                 assert!(sender.net_send(u32::MAX as usize, 4242));
                 assert_eq!(receiver.net_recv().await, 4242);
             },
         );
         assert_run_program_outcome(res);
+    }
+
+    /// Handles without a run context fail closed typed instead of ambient.
+    #[test]
+    fn handle_without_context_fails_closed() {
+        let handle = Handle {
+            #[cfg(feature = "sim-link")]
+            boundary: None,
+            seed: EntryHash([0u8; 32]),
+            shared_net: shared_network(),
+            actor: ActorId(0),
+        };
+        #[cfg(feature = "sim-link")]
+        {
+            assert!(matches!(
+                handle.clock(),
+                Err(crate::time::ClockError::NoContext)
+            ));
+            let mut handle = handle;
+            assert!(matches!(
+                handle.rng(StreamId(0)),
+                Err(crate::rng::RngError::NoContext)
+            ));
+            assert!(matches!(
+                handle.rng_next_u64(StreamId(0)),
+                Err(crate::rng::RngError::NoContext)
+            ));
+        }
+        #[cfg(all(feature = "sim", not(feature = "sim-link")))]
+        {
+            assert!(matches!(
+                handle.clock(),
+                Err(crate::time::ClockError::IpcLocal)
+            ));
+            let mut handle = handle;
+            assert!(matches!(
+                handle.rng(StreamId(0)),
+                Err(crate::rng::RngError::IpcLocal)
+            ));
+        }
+        #[cfg(not(any(feature = "sim", feature = "sim-link")))]
+        {
+            assert!(handle.clock().is_ok());
+            let mut handle = handle;
+            // Host entropy succeeds on test machines or fails typed; it
+            // never falls back to wall time.
+            match handle.rng_next_u64(StreamId(0)) {
+                Ok(_) => {}
+                Err(error) => assert!(matches!(
+                    error,
+                    crate::rng::RngError::EntropyUnavailable { .. }
+                )),
+            }
+        }
     }
 }

@@ -416,12 +416,14 @@ fn ingest_otlp_ndjson_outputs_journal_root() {
     let root_hex: String = ing
         .journal
         .root_hash()
+        .0
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
     let envelope_hex: String = ing
         .envelope_hash()
         .unwrap()
+        .0
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
@@ -501,7 +503,13 @@ fn scaffold_consensus_creates_mini_raft_files() {
         main_rs.contains("mini_raft"),
         "consensus template must contain mini_raft"
     );
-    assert_eq!(report.created.len(), 2);
+    assert_eq!(report.created.len(), 3);
+    assert!(dir.join("README.md").is_file());
+    let readme = std::fs::read_to_string(dir.join("README.md")).unwrap();
+    assert!(
+        readme.contains("AGPL"),
+        "scaffold README must warn about AGPL linkage"
+    );
     let err =
         ledger_cli::scaffold_consensus::scaffold_consensus(&dir, "consensus", false).unwrap_err();
     assert!(
@@ -836,22 +844,26 @@ fn cert_verify_journal_mode_valid() {
     use ledger_explorer::search::PersistentJournal;
     use ledger_explorer::search::{CampaignReport, Finding};
     use ledger_explorer::{CampaignCertificate, Verdict};
-    use ledger_format::{EntryKind, EntryPayload, MessageId, SendFrame};
+    use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, MessageId, SendFrame};
     use ledger_sim::{RunOutcome, RunResult};
     let dir = temp_dir("cert-journal-valid");
     let journal_dir = dir.join("journal");
     let mut pj = PersistentJournal::create(&journal_dir).expect("create journal");
     // Append a simple journal: two sends and an outcome.
-    let send = |to: u32, content: u64| {
+    let send = |to: ActorId, content: u64| {
         EntryPayload::Send(SendFrame {
-            message_id: MessageId::new(1, 0),
-            from: 1,
+            message_id: MessageId::new(ActorId(1), 0),
+            from: ActorId(1),
             to,
             original_content: content.to_le_bytes().to_vec(),
         })
     };
-    let s1 = pj.append(EntryKind::Send, 1, [], send(2, 7)).unwrap();
-    let s2 = pj.append(EntryKind::Send, 2, [], send(3, 9)).unwrap();
+    let s1 = pj
+        .append(EntryKind::Send, ActorId(1), [], send(ActorId(2), 7))
+        .unwrap();
+    let s2 = pj
+        .append(EntryKind::Send, ActorId(2), [], send(ActorId(3), 9))
+        .unwrap();
     let journal = pj.journal().clone();
     drop(pj);
     // Build a finding whose journal matches the persistent one.
@@ -872,7 +884,7 @@ fn cert_verify_journal_mode_valid() {
         runs_executed: 1,
         distinct_roots: 1,
         findings: vec![Finding {
-            seed: [7u8; 32],
+            seed: EntryHash([7u8; 32]),
             run,
             verdict: Verdict::fail(vec![s1], "test"),
         }],
@@ -880,8 +892,14 @@ fn cert_verify_journal_mode_valid() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [9u8; 32], None)
-        .expect("valid report must create a certificate");
+    let cert = CampaignCertificate::from_campaign(
+        &report,
+        "builder",
+        Vec::new(),
+        EntryHash([9u8; 32]),
+        None,
+    )
+    .expect("valid report must create a certificate");
     let cert_path = dir.join("cert.json");
     std::fs::write(&cert_path, cert.to_json().unwrap()).unwrap();
     // Journal binding should succeed.
@@ -916,25 +934,29 @@ fn cert_verify_journal_mode_wrong_root() {
     use ledger_explorer::search::PersistentJournal;
     use ledger_explorer::search::{CampaignReport, Finding};
     use ledger_explorer::{CampaignCertificate, Verdict};
-    use ledger_format::{EntryKind, EntryPayload, MessageId, SendFrame};
+    use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, MessageId, SendFrame};
     use ledger_sim::{RunOutcome, RunResult};
     let dir = temp_dir("cert-journal-wrong");
     let journal_dir_a = dir.join("journal_a");
     let journal_dir_b = dir.join("journal_b");
     let mut pj_a = PersistentJournal::create(&journal_dir_a).expect("create a");
     let mut pj_b = PersistentJournal::create(&journal_dir_b).expect("create b");
-    let send = |to: u32, content: u64| {
+    let send = |to: ActorId, content: u64| {
         EntryPayload::Send(SendFrame {
-            message_id: MessageId::new(1, 0),
-            from: 1,
+            message_id: MessageId::new(ActorId(1), 0),
+            from: ActorId(1),
             to,
             original_content: content.to_le_bytes().to_vec(),
         })
     };
     // Journal A: one entry value 7.
-    let s1 = pj_a.append(EntryKind::Send, 1, [], send(2, 7)).unwrap();
+    let s1 = pj_a
+        .append(EntryKind::Send, ActorId(1), [], send(ActorId(2), 7))
+        .unwrap();
     // Journal B: different payload so root differs.
-    let _s2 = pj_b.append(EntryKind::Send, 1, [], send(2, 77)).unwrap();
+    let _s2 = pj_b
+        .append(EntryKind::Send, ActorId(1), [], send(ActorId(2), 77))
+        .unwrap();
     let journal_a = pj_a.journal().clone();
     let journal_b = pj_b.journal().clone();
     assert_ne!(
@@ -961,7 +983,7 @@ fn cert_verify_journal_mode_wrong_root() {
         runs_executed: 1,
         distinct_roots: 1,
         findings: vec![Finding {
-            seed: [7u8; 32],
+            seed: EntryHash([7u8; 32]),
             run,
             verdict: Verdict::fail(vec![s1], "test"),
         }],
@@ -969,8 +991,14 @@ fn cert_verify_journal_mode_wrong_root() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [9u8; 32], None)
-        .expect("valid report must create a certificate");
+    let cert = CampaignCertificate::from_campaign(
+        &report,
+        "builder",
+        Vec::new(),
+        EntryHash([9u8; 32]),
+        None,
+    )
+    .expect("valid report must create a certificate");
     let cert_path = dir.join("cert.json");
     std::fs::write(&cert_path, cert.to_json().unwrap()).unwrap();
     let err = ledger_cli::cert_cmd::run_verify(
@@ -999,11 +1027,16 @@ fn cert_verify_human_recorded_solver_data_label() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let mut cert =
-        CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32], None)
-            .expect("valid report must create a certificate");
+    let mut cert = CampaignCertificate::from_campaign(
+        &report,
+        "builder",
+        Vec::new(),
+        ledger_format::EntryHash([1u8; 32]),
+        None,
+    )
+    .expect("valid report must create a certificate");
     cert.solver_data = Some(RecordedSolverData {
-        cut: vec![[3u8; 32]],
+        cut: vec![ledger_format::EntryHash([3u8; 32])],
         cost: 2,
         method: "m".into(),
         horizon: Some(64),
@@ -1085,8 +1118,14 @@ fn cert_verify_rejects_oversized_via_bounded_reader() {
         monitors: Vec::new(),
         memo_hits: 0,
     };
-    let cert = CampaignCertificate::from_campaign(&report, "builder", Vec::new(), [1u8; 32], None)
-        .expect("valid report must create a certificate");
+    let cert = CampaignCertificate::from_campaign(
+        &report,
+        "builder",
+        Vec::new(),
+        ledger_format::EntryHash([1u8; 32]),
+        None,
+    )
+    .expect("valid report must create a certificate");
     let json = cert.to_json().unwrap();
     assert!(json.len() < 1024 * 1024, "base cert must be small");
     let path_ok = dir.join("ok.json");

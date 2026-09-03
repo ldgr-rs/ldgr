@@ -234,7 +234,7 @@ async fn run_control_plane(
     let worker_id = format!("ledger-worker-{}", std::process::id());
     let heartbeat = (config.lease_timeout / 3).max(Duration::from_millis(1));
     let (tx, mut rx) = open_session(endpoint).await?;
-    let hello = worker_hello(&worker_id, env!("CARGO_PKG_VERSION"));
+    let hello = worker_hello(&worker_id, env!("CARGO_PKG_VERSION"))?;
     let hello_msg = ledger_worker::r#gen::SessionRequest {
         message: Some(session_request::Message::Hello(hello)),
     };
@@ -317,6 +317,7 @@ async fn run_control_plane(
                     .await;
                     continue;
                 }
+                let current_task_id = task.id.clone();
                 match run_assigned_task(&tx, task, &worker_id, heartbeat).await {
                     Ok(outcome) => {
                         use ledger_worker::TaskOutcome;
@@ -349,11 +350,13 @@ async fn run_control_plane(
                                 println!("{line}");
                             }
                             TaskOutcome::Failed(err) => {
+                                in_flight.remove(&current_task_id);
                                 eprintln!("ledger-worker: task failed: {err}");
                             }
                         }
                     }
                     Err(session_err) => {
+                        in_flight.remove(&current_task_id);
                         eprintln!("ledger-worker: session error: {session_err}");
                         return Err(session_err);
                     }

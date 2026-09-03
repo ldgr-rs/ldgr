@@ -11,6 +11,7 @@
 
 use super::codec::DecodeError;
 use super::{MAX_ACTOR, MAX_PATH_BYTES, MAX_PAYLOAD_BYTES, MAX_RANDOM_COUNT};
+use ledger_format::{ActorId, EntryHash};
 
 /// A complete application message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,17 +35,22 @@ pub enum Message {
 
 /// Client hello: the run identity binds the effect stream to one
 /// `ExecutionIdentity`, verified by the server before any effect is served.
+///
+/// The actor id travels in the handshake so the server routes every effect
+/// for this connection as that actor; it must not default to zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     /// Complete `ExecutionIdentity` digest (BLAKE3, 32 bytes).
-    pub identity: [u8; 32],
+    pub identity: EntryHash,
+    /// Logical actor this connection sends and receives as.
+    pub actor: ActorId,
 }
 
 /// Server acceptance of a hello.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Welcome {
     /// Stable actor id assigned to this connection for the run.
-    pub actor: u32,
+    pub actor: ActorId,
 }
 
 /// Server refusal of a hello.
@@ -83,7 +89,7 @@ pub struct EffectResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Goodbye {
     /// Journal root hash (BLAKE3, 32 bytes).
-    pub root: [u8; 32],
+    pub root: EntryHash,
     /// Number of entries the run journaled.
     pub entries: u64,
 }
@@ -98,7 +104,7 @@ pub enum Effect {
     /// Draw `count` 64-bit words from a labeled RNG stream.
     Random { stream: u32, count: u32 },
     /// Send `payload` bytes to actor `to`.
-    Send { to: u32, payload: Vec<u8> },
+    Send { to: ActorId, payload: Vec<u8> },
     /// Receive one message, if any is deliverable now.
     Recv,
     /// Write `bytes` at `offset` in the file at `path`.
@@ -175,11 +181,12 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
     match message {
         Message::Hello(hello) => {
             out.push(T_HELLO);
-            out.extend_from_slice(&hello.identity);
+            out.extend_from_slice(&hello.identity.0);
+            out.extend_from_slice(&hello.actor.0.to_le_bytes());
         }
         Message::Welcome(welcome) => {
             out.push(T_WELCOME);
-            out.extend_from_slice(&welcome.actor.to_le_bytes());
+            out.extend_from_slice(&welcome.actor.0.to_le_bytes());
         }
         Message::Reject(reject) => {
             out.push(T_REJECT);
@@ -198,7 +205,7 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
         Message::Finish => out.push(T_FINISH),
         Message::Goodbye(goodbye) => {
             out.push(T_GOODBYE);
-            out.extend_from_slice(&goodbye.root);
+            out.extend_from_slice(&goodbye.root.0);
             out.extend_from_slice(&goodbye.entries.to_le_bytes());
         }
     }
@@ -219,7 +226,7 @@ fn encode_effect(effect: &Effect, out: &mut Vec<u8>) {
         }
         Effect::Send { to, payload } => {
             out.push(E_SEND);
-            out.extend_from_slice(&to.to_le_bytes());
+            out.extend_from_slice(&to.0.to_le_bytes());
             out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             out.extend_from_slice(payload);
         }
@@ -291,11 +298,16 @@ pub fn decode_message(body: &[u8]) -> Result<Message, DecodeError> {
     match tag {
         T_HELLO => {
             let identity = r.hash32()?;
+            let actor_raw = r.u32()?;
+            if actor_raw > MAX_ACTOR {
+                return Err(DecodeError::BadActor(actor_raw));
+            }
+            let actor = ActorId(actor_raw);
             r.finish()?;
-            Ok(Message::Hello(Hello { identity }))
+            Ok(Message::Hello(Hello { identity, actor }))
         }
         T_WELCOME => {
-            let actor = r.u32()?;
+            let actor = ActorId(r.u32()?);
             r.finish()?;
             Ok(Message::Welcome(Welcome { actor }))
         }
@@ -346,10 +358,11 @@ fn decode_effect(r: &mut Reader<'_>) -> Result<Effect, DecodeError> {
             Ok(Effect::Random { stream, count })
         }
         E_SEND => {
-            let to = r.u32()?;
-            if to > MAX_ACTOR {
-                return Err(DecodeError::BadActor(to));
+            let to_raw = r.u32()?;
+            if to_raw > MAX_ACTOR {
+                return Err(DecodeError::BadActor(to_raw));
             }
+            let to = ActorId(to_raw);
             let payload = r.bounded_bytes()?;
             Ok(Effect::Send { to, payload })
         }
@@ -458,11 +471,11 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(out))
     }
 
-    fn hash32(&mut self) -> Result<[u8; 32], DecodeError> {
+    fn hash32(&mut self) -> Result<EntryHash, DecodeError> {
         let bytes = self.take(32)?;
         let mut out = [0u8; 32];
         out.copy_from_slice(bytes);
-        Ok(out)
+        Ok(EntryHash(out))
     }
 
     fn bounded_bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
@@ -509,9 +522,10 @@ mod tests {
     #[test]
     fn all_message_kinds_roundtrip() {
         roundtrip(&Message::Hello(Hello {
-            identity: [0xAA; 32],
+            identity: EntryHash([0xAA; 32]),
+            actor: ActorId(3),
         }));
-        roundtrip(&Message::Welcome(Welcome { actor: 42 }));
+        roundtrip(&Message::Welcome(Welcome { actor: ActorId(42) }));
         roundtrip(&Message::Reject(Reject {
             reason: RejectReason::Identity,
             detail: "identity mismatch".into(),
@@ -530,7 +544,7 @@ mod tests {
         }));
         roundtrip(&Message::EffectRequest(EffectRequest {
             effect: Effect::Send {
-                to: 1,
+                to: ActorId(1),
                 payload: vec![0xDE; 64],
             },
         }));
@@ -562,7 +576,7 @@ mod tests {
             },
         }));
         roundtrip(&Message::Goodbye(Goodbye {
-            root: [0xBB; 32],
+            root: EntryHash([0xBB; 32]),
             entries: 12,
         }));
         roundtrip(&Message::Finish);
@@ -597,6 +611,28 @@ mod tests {
             decode_message(&body),
             Err(DecodeError::UnexpectedEof),
             "a truncated payload must fail closed"
+        );
+    }
+
+    #[test]
+    fn hello_actor_is_bounded() {
+        let msg = Message::Hello(Hello {
+            identity: EntryHash([0xAA; 32]),
+            actor: ActorId(crate::proto::MAX_ACTOR + 1),
+        });
+        let body = encode_message(&msg);
+        assert_eq!(
+            decode_message(&body),
+            Err(DecodeError::BadActor(crate::proto::MAX_ACTOR + 1)),
+            "an actor over the cap must fail closed"
+        );
+        // A truncated hello (identity without actor) fails closed.
+        let mut short = vec![T_HELLO];
+        short.extend_from_slice(&[0xAA; 32]);
+        assert_eq!(
+            decode_message(&short),
+            Err(DecodeError::UnexpectedEof),
+            "old hellos without actor must not decode"
         );
     }
 }

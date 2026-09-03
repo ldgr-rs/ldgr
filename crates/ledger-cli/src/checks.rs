@@ -246,15 +246,17 @@ fn check_ci_parity(root: &Path) -> CheckOutcome {
 /// Verifies a typed entry payload round-trips through the canonical codec.
 fn check_format_conformance() -> CheckOutcome {
     const NAME: &str = "format conformance";
-    use ledger_format::{EntryData, EntryKind, EntryPayload, FsWritePayload, PathRef};
+    use ledger_format::{
+        ActorId, EntryData, EntryKind, EntryPayload, FsWritePayload, PathRef, SequenceNumber,
+    };
     let path = b"/tmp/f".to_vec();
     let entry = EntryData {
         format_version: ledger_format::limits::FORMAT_VERSION,
         kind: EntryKind::FsWrite,
-        actor: 1,
-        parents: vec![],
+        actor: ActorId(1),
+        parents: Default::default(),
         vector_clock: vec![0],
-        sequence: 0,
+        sequence: SequenceNumber(0),
         payload: EntryPayload::FsWrite(FsWritePayload::Write {
             path_ref: PathRef::new([0u8; 32], path),
             offset: 42,

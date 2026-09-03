@@ -17,6 +17,7 @@ use crate::proto::{
     RejectReason, Welcome, decode_frame, decode_message, encode_frame, encode_message,
     parse_header,
 };
+use ledger_format::{ActorId, EntryHash};
 use thiserror::Error;
 
 /// Errors from the SUT-side shim.
@@ -38,33 +39,49 @@ pub enum ShimError {
     /// The server's effect response sequence does not match the request.
     #[error("sequence mismatch in effect response")]
     SequenceMismatch,
+    /// The requested actor id is outside the accepted range.
+    #[error("invalid actor {actor}: must be 0..={max}")]
+    InvalidActor { actor: u32, max: u32 },
 }
 
 /// An open effect session to the engine.
 pub struct EngineSession {
     stream: UnixStream,
     next_seq: u64,
-    actor: u32,
+    actor: ActorId,
 }
 
 impl EngineSession {
     /// Connect to the engine at `socket` and complete the identity handshake.
     ///
     /// `identity` must equal the digest the server was launched with; any
-    /// mismatch fails closed before the first effect.
-    pub fn connect(socket: &Path, identity: [u8; 32]) -> Result<Self, ShimError> {
+    /// mismatch fails closed before the first effect. `actor` binds this
+    /// connection's effect routing; it is echoed back in `Welcome` and must
+    /// match, otherwise the session fails closed.
+    pub fn connect(socket: &Path, identity: EntryHash, actor: ActorId) -> Result<Self, ShimError> {
+        if actor.0 > crate::proto::MAX_ACTOR {
+            return Err(ShimError::InvalidActor {
+                actor: actor.0,
+                max: crate::proto::MAX_ACTOR,
+            });
+        }
         let mut stream = UnixStream::connect(socket)?;
-        write_message(&mut stream, 0, &Message::Hello(Hello { identity }))?;
+        write_message(&mut stream, 0, &Message::Hello(Hello { identity, actor }))?;
         let (seq, reply) = read_message(&mut stream)?;
         if seq != 0 {
             return Err(ShimError::UnexpectedReply);
         }
         match reply {
-            Message::Welcome(Welcome { actor }) => Ok(Self {
-                stream,
-                next_seq: 1,
-                actor,
-            }),
+            Message::Welcome(Welcome { actor: assigned }) => {
+                if assigned != actor {
+                    return Err(ShimError::UnexpectedReply);
+                }
+                Ok(Self {
+                    stream,
+                    next_seq: 1,
+                    actor: assigned,
+                })
+            }
             Message::Reject(Reject { reason, detail }) => {
                 Err(ShimError::Rejected { reason, detail })
             }
@@ -73,7 +90,7 @@ impl EngineSession {
     }
 
     /// The stable actor id assigned by the server.
-    pub fn actor(&self) -> u32 {
+    pub fn actor(&self) -> ActorId {
         self.actor
     }
 

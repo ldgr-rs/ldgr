@@ -53,6 +53,10 @@ pub enum SessionError {
         /// Validation failure reason.
         reason: String,
     },
+    /// The worker's own identity failed its encoding caps; the session
+    /// cannot open with an unhashable identity.
+    #[error("worker identity encoding failed: {0}")]
+    IdentityEncoding(#[from] ledger_journal::JournalError),
 }
 
 /// Dial the control-plane endpoint and open the session stream.
@@ -136,13 +140,18 @@ pub fn task_from_dispatch(dispatch: TaskDispatch) -> Result<Task, SessionError> 
             });
         }
         pin.copy_from_slice(&dispatch.execution_identity);
-        task.execution_identity = Some(pin);
+        task.execution_identity = Some(ledger_format::EntryHash(pin));
     }
     Ok(task)
 }
 
 /// Build the worker hello from the compiled identity and runtime profile.
-pub fn worker_hello(worker_id: &str, version: &str) -> WorkerHello {
+///
+/// # Errors
+/// Returns [`SessionError::IdentityEncoding`] when the build fields exceed
+/// the identity encoding caps; the session must not open with an
+/// unhashable identity.
+pub fn worker_hello(worker_id: &str, version: &str) -> Result<WorkerHello, SessionError> {
     let profile = RuntimeProfile {
         engine_sha: crate::RuntimeProfile::detect().engine_sha.clone(),
         toolchain: crate::RuntimeProfile::detect().toolchain.clone(),
@@ -152,20 +161,24 @@ pub fn worker_hello(worker_id: &str, version: &str) -> WorkerHello {
         env_sanitation: crate::RuntimeProfile::detect().env_sanitation.clone(),
         fingerprint_hex: crate::RuntimeProfile::detect().fingerprint_hex8(),
     };
-    WorkerHello {
+    Ok(WorkerHello {
         worker_id: worker_id.to_string(),
         version: version.to_string(),
         // The worker's own build identity, when the build data is complete.
-        execution_identity: worker_build_identity_digest()
-            .map(|h| h.to_vec())
+        execution_identity: worker_build_identity_digest()?
+            .map(|h| h.0.to_vec())
             .unwrap_or_default(),
         profile: Some(profile),
-    }
+    })
 }
 
 /// The worker's build-segment identity digest, or `None` when the build
 /// data is incomplete (dev builds without a captured revision).
-fn worker_build_identity_digest() -> Option<ledger_format::Hash> {
+///
+/// # Errors
+/// Returns [`SessionError::IdentityEncoding`] when the build fields exceed
+/// the identity encoding caps.
+fn worker_build_identity_digest() -> Result<Option<ledger_format::EntryHash>, SessionError> {
     use ledger_explorer::identity::{EngineBuild, IdentityContext};
     let build = EngineBuild::detect();
     let context = IdentityContext {
@@ -174,18 +187,18 @@ fn worker_build_identity_digest() -> Option<ledger_format::Hash> {
         sut_artifact_digest: None,
         guest_digest: None,
         workload_id: String::new(),
-        program_digest: *blake3::hash(b"").as_bytes(),
+        program_digest: ledger_format::EntryHash(*blake3::hash(b"").as_bytes()),
         input_digests: Vec::new(),
         backend: "sim".to_string(),
         runtime_profile: crate::RuntimeProfile::detect().fingerprint_hex8(),
-        run_config_digest: [0u8; 32],
-        seed_tree_root: [0u8; 32],
+        run_config_digest: ledger_format::EntryHash([0u8; 32]),
+        seed_tree_root: ledger_format::EntryHash([0u8; 32]),
         faultspec_digest: None,
         oracle_version: None,
         support_provider_version: None,
         resource_limits: ledger_journal::ResourceLimits { max_steps: 0 },
     };
-    ledger_explorer::identity::assemble_identity(&build, &context).digest()
+    Ok(ledger_explorer::identity::assemble_identity(&build, &context).digest()?)
 }
 
 /// Result of running one assigned task over the session.
@@ -260,7 +273,7 @@ pub async fn run_assigned_task(
                 error: String::new(),
                 execution_identity: ok
                     .execution_identity
-                    .map(|h| h.to_vec())
+                    .map(|h| h.0.to_vec())
                     .unwrap_or_default(),
             };
             let msg = SessionRequest {
@@ -375,14 +388,16 @@ mod tests {
     use ledger_sim::RunConfig;
 
     fn golden_dispatch() -> TaskDispatch {
-        let cfg = RunConfig::builder().seed([7u8; 32]).build();
+        let cfg = RunConfig::builder()
+            .seed(ledger_format::EntryHash([7u8; 32]))
+            .build();
         let hash = crate::proto::run_config_hash(&cfg).unwrap();
         TaskDispatch {
             task_id: "t1".to_string(),
             run_config_bytes: crate::proto::canonical_bytes(&cfg).unwrap(),
             workload: "kv".to_string(),
             run_config_hash_hex: crate::proto::hash_to_hex(&hash),
-            execution_identity: [0xabu8; 32].to_vec(),
+            execution_identity: ledger_format::EntryHash([0xabu8; 32]).0.to_vec(),
         }
     }
 
@@ -391,7 +406,10 @@ mod tests {
         let task = task_from_dispatch(golden_dispatch()).expect("dispatch must parse");
         assert_eq!(task.id, "t1");
         assert_eq!(task.workload, "kv");
-        assert_eq!(task.execution_identity, Some([0xabu8; 32]));
+        assert_eq!(
+            task.execution_identity,
+            Some(ledger_format::EntryHash([0xabu8; 32]))
+        );
         assert_eq!(
             task.run_config_hash,
             crate::proto::run_config_hash(&task.run_config).ok()
@@ -430,7 +448,7 @@ mod tests {
 
     #[test]
     fn hello_carries_identity_when_build_complete() {
-        let hello = worker_hello("w1", "0.1.0");
+        let hello = worker_hello("w1", "0.1.0").expect("hello builds");
         assert_eq!(hello.worker_id, "w1");
         assert_eq!(hello.version, "0.1.0");
         // The identity is either the complete 32-byte digest or empty for

@@ -153,9 +153,9 @@ fn default_manifest() -> Result<Vec<u8>, ScaffoldError> {
     let manifest = RunManifest {
         format_version: MANIFEST_FORMAT_VERSION,
         crash_semantics_version: ledger_format::CRASH_SEMANTICS_VERSION,
-        root_seed: [0u8; 32],
+        root_seed: ledger_format::EntryHash([0u8; 32]),
         policy_tag: "bandit".into(),
-        journal_root: [0u8; 32],
+        journal_root: ledger_format::EntryHash([0u8; 32]),
         entry_count: 0,
         actor_heads: BTreeMap::new(),
         execution_identity: None,
@@ -515,14 +515,21 @@ use core::time::Duration;
 use ldgr_rt::{Handle, RunConfig};
 
 async fn task_main(handle: Handle) {
-    // Clock: virtual time in sim, ambient otherwise.
-    let now = handle.clock().now();
-    println!("clock now: {:?}", now);
+    // Clock: virtual time in sim-link, server-side under sim IPC, ambient
+    // otherwise. Local sim IPC clocks fail typed; handle the Result.
+    match handle.clock() {
+        Ok(clock) => println!("clock now: {:?}", clock.now()),
+        Err(error) => println!("clock unavailable: {error}"),
+    }
 
-    // Deterministic RNG: same seed yields same draws.
+    // Deterministic RNG: same seed yields same draws under sim-link.
+    // Default builds seed from host entropy; sim IPC uses server effects.
     let mut rng_handle = handle.clone();
-    let value = rng_handle.rng_next_u64(0) % 1000;
-    println!("rng[0]: {}", value);
+    let value = rng_handle
+        .rng_next_u64(ledger_format::StreamId(0))
+        .unwrap_or(0)
+        % 1000;
+    println!("rng[0]: {value}");
 
     // Send to peer actor 1.
     let sent = handle.net_send(1, value);
@@ -531,7 +538,7 @@ async fn task_main(handle: Handle) {
     // Spawn child task.
     let child_id = handle.spawn(|child| {
         Box::pin(async move {
-            println!("[child actor {}] hello", child.actor());
+            println!("[child actor {}] hello", child.actor().0);
             child.sleep(Duration::from_micros(1)).await;
             println!("[child] done");
         })
@@ -539,7 +546,7 @@ async fn task_main(handle: Handle) {
     println!("spawned {:?}", child_id);
 
     handle.sleep(Duration::from_micros(5)).await;
-    println!("task done actor {}", handle.actor());
+    println!("task done actor {}", handle.actor().0);
 
     // cfg note: same binary runs under tokio and under sim.
     #[cfg(feature = "sim")]
@@ -590,7 +597,8 @@ fn same_seed_is_deterministic() {
     let cfg = RunConfig::builder().seed([42u8; 32]).max_steps(2048).build();
     // Caller programs do not cross the ldgr-rt IPC boundary yet; under the
     // `sim` feature `run` refuses them with a typed error, and named server
-    // workloads are reached via `run_named`.
+    // workloads are reached via `run_named`. Local RNG under sim IPC fails
+    // typed; direct backends draw through the handle.
     #[cfg(feature = "sim")]
     {
         let error = ldgr_rt::run(cfg.clone(), |mut h| async move {
@@ -605,11 +613,11 @@ fn same_seed_is_deterministic() {
     #[cfg(not(feature = "sim"))]
     {
         let a = ldgr_rt::run(cfg.clone(), |mut h| async move {
-            let _ = h.rng_next_u64(1);
+            h.rng_next_u64(1).expect("direct backends provide RNG");
         })
         .unwrap();
         let b = ldgr_rt::run(cfg, |mut h| async move {
-            let _ = h.rng_next_u64(1);
+            h.rng_next_u64(1).expect("direct backends provide RNG");
         })
         .unwrap();
         assert_eq!(a.steps, b.steps);

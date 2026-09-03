@@ -21,20 +21,22 @@ use core::time::Duration;
 
 use ldgr_rt::task_id_for;
 use ldgr_rt::{Handle, RunConfig};
+use ledger_format::{ActorId, EntryHash, StreamId};
 
 /// Simulated key-value node: stores one key and replicates it to a peer.
 ///
 /// The logic is intentionally tiny so the deterministic properties are easy
 /// to see: same seed -> same journal root, same RNG draws, same schedule.
-async fn kv_node(mut handle: Handle, peer: u32) {
-    // Deterministic RNG stream 0: same seed yields same value every run.
-    let my_value = handle.rng_next_u64(0) % 1000;
+async fn kv_node(mut handle: Handle, peer: ActorId) {
+    // Deterministic RNG stream 0: same seed yields same draws under sim.
+    // Default builds seed from host entropy; sim IPC uses server effects.
+    let my_value = handle.rng_next_u64(StreamId(0)).unwrap_or(0) % 1000;
     // Content-addressed task id for the write (CAM dedup demo).
-    let input_hash = *blake3::hash(&my_value.to_le_bytes()).as_bytes();
+    let input_hash = EntryHash(*blake3::hash(&my_value.to_le_bytes()).as_bytes());
     let write_id = task_id_for("kv_write", input_hash);
     println!(
         "[actor {}] write id {:?} value {}",
-        handle.actor(),
+        handle.actor().0,
         write_id,
         my_value
     );
@@ -44,8 +46,8 @@ async fn kv_node(mut handle: Handle, peer: u32) {
 
     // Replicate via the facade net. `with_actor` shows multi-actor routing
     // outside sim without needing SimNet.
-    let sent = handle.net_send(peer as usize, my_value);
-    println!("[actor {}] sent to {peer}: {sent}", handle.actor());
+    let sent = handle.net_send(peer.0 as usize, my_value);
+    println!("[actor {}] sent to {}: {sent}", handle.actor().0, peer.0);
 
     // Also demonstrate Conn for arbitrary pairs.
     let _conn = handle.conn(handle.actor(), peer);
@@ -54,9 +56,9 @@ async fn kv_node(mut handle: Handle, peer: u32) {
 async fn kv_replica(handle: Handle) {
     // This replica waits for the peer's value.
     let value = handle.net_recv().await;
-    println!("[actor {}] received {value}", handle.actor());
+    println!("[actor {}] received {value}", handle.actor().0);
     handle.sleep(Duration::from_micros(2)).await;
-    println!("[actor {}] replica done", handle.actor());
+    println!("[actor {}] replica done", handle.actor().0);
     // Ack back so main can wait deterministically in both modes.
     let _ = handle.net_send(0, 999);
 }
@@ -65,28 +67,28 @@ async fn mini_kv_main(handle: Handle) {
     // In sim the two nodes are separate tasks with distinct actors. Outside
     // sim they share the in-process SharedNet but use with_actor to route.
     // Spawn replica as actor 1, keep main as actor 0.
-    let replica_handle = handle.with_actor(1);
+    let replica_handle = handle.with_actor(ActorId(1));
     let _replica_id = handle.spawn(move |child| {
         // Child inherits the handle but we rebind to actor 1 for clarity.
-        let child = child.with_actor(1);
+        let child = child.with_actor(ActorId(1));
         Box::pin(kv_replica(child))
     });
 
     // Main node remains actor 0 and talks to 1.
-    let main_actor = handle.with_actor(0);
-    kv_node(main_actor, 1).await;
+    let main_actor = handle.with_actor(ActorId(0));
+    kv_node(main_actor, ActorId(1)).await;
 
     // Wait for replica ack (deterministic join in both modes).
     let ack = handle.net_recv().await;
-    println!("[actor {}] got ack {ack}", handle.actor());
+    println!("[actor {}] got ack {ack}", handle.actor().0);
     handle.sleep(Duration::from_micros(10)).await;
-    println!("mini_kv done (actor {})", handle.actor());
+    println!("mini_kv done (actor {})", handle.actor().0);
     let _ = replica_handle;
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = RunConfig::builder()
-        .seed([42u8; 32])
+        .seed(EntryHash([42u8; 32]))
         .max_steps(10_000)
         .build();
     let res = ldgr_rt::run(cfg, mini_kv_main)?;

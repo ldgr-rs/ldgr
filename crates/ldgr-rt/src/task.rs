@@ -1,4 +1,3 @@
-// ledger-lint:allow - test-only probe; verifies thread-local registry isolation
 //! Cooperative task spawning facade.
 //!
 //! Why a wrapper: `std::thread::spawn` and ambient `tokio::spawn` break the
@@ -7,7 +6,7 @@
 //! Outside `sim-link` `Handle::spawn` forwards to `tokio` (including `sim`
 //! IPC mode, where the remote run is deterministic server-side).
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 /// Opaque task identifier returned by `spawn`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -19,10 +18,10 @@ pub struct TaskId(pub u64);
 /// tasks can be deduped across runs (CAM idea). The same `(name, input)`
 /// always yields the same id on every platform; different inputs yield
 /// uncorrelated ids. The sentinel `0` is never returned.
-pub fn task_id_for(name: &str, input_hash: Hash) -> TaskId {
+pub fn task_id_for(name: &str, input_hash: EntryHash) -> TaskId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(name.as_bytes());
-    hasher.update(&input_hash);
+    hasher.update(&input_hash.0);
     let digest = hasher.finalize();
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&digest.as_bytes()[..8]);
@@ -46,8 +45,8 @@ mod tests {
 
     #[test]
     fn task_id_for_is_deterministic_and_nonzero() {
-        let h1 = [1u8; 32];
-        let h2 = [2u8; 32];
+        let h1 = ledger_format::EntryHash([1u8; 32]);
+        let h2 = ledger_format::EntryHash([2u8; 32]);
         let id_a = task_id_for("worker", h1);
         let id_b = task_id_for("worker", h1);
         let id_c = task_id_for("worker", h2);
@@ -61,20 +60,9 @@ mod tests {
     #[cfg(not(feature = "sim-link"))]
     #[test]
     fn handle_spawn_returns_id() {
-        // Under `sim` (IPC) `run` needs a live engine binary; skip when absent.
-        #[cfg(all(feature = "sim", not(feature = "sim-link")))]
-        {
-            let has_engine = std::env::var_os("LEDGER_ENGINE_BIN").is_some()
-                || std::path::Path::new(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../target/debug/ledger"
-                ))
-                .exists();
-            if !has_engine {
-                eprintln!("skipping: no engine binary for IPC transport");
-                return;
-            }
-        }
+        // Under `sim` (IPC) the refusal happens before any engine spawn
+        // (`Main::into_workload` rejects closures), so no engine binary or
+        // env probe is needed here.
         let res = crate::runtime::run(crate::runtime::RunConfig::default(), |handle| async move {
             let id = handle.spawn(|_| Box::pin(async {}));
             assert!(id.0 >= 1);

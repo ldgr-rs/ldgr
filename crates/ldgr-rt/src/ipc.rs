@@ -24,6 +24,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use ledger_format::{ActorId, EntryHash};
+
 /// Seconds to wait for the engine's socket to accept before giving up.
 pub const ENGINE_CONNECT_TIMEOUT_SECS: u64 = 10;
 
@@ -42,6 +44,21 @@ const MAX_SERVER_STEPS: u64 = 1 << 40;
 
 /// Upper bound for a server-reported finding count.
 const MAX_SERVER_FINDINGS: u64 = 1 << 24;
+
+/// Maximum bytes for a workload name.
+///
+/// Bounds untrusted workload strings before they reach the engine request.
+pub const MAX_WORKLOAD_NAME_BYTES: usize = 128;
+
+/// Maximum remote attempts per call.
+///
+/// Bounds server-reported root vectors before allocation.
+pub const MAX_IPC_ATTEMPTS: usize = 1024;
+
+/// Maximum actor id accepted on the IPC control path.
+///
+/// Matches the framed wire cap so control and effect paths stay routable.
+pub const MAX_IPC_ACTOR: u32 = 1 << 20;
 
 /// Errors from the engine process transport.
 #[derive(Debug, Error)]
@@ -71,13 +88,20 @@ pub enum IpcError {
     /// A server-reported counter crossed its accepted bounds.
     #[error("server reported {name}={raw} outside accepted bounds")]
     CounterBounds { name: &'static str, raw: u64 },
+    /// No engine binary configured: pass an explicit path or set
+    /// `LEDGER_ENGINE_BIN` to an existing binary.
+    #[error("engine binary not configured: pass explicit path or set LEDGER_ENGINE_BIN")]
+    EngineNotConfigured,
+    /// `LEDGER_ENGINE_BIN` points at a missing binary.
+    #[error("LEDGER_ENGINE_BIN points to missing binary at {path}")]
+    MissingEngine { path: String },
 }
 
 /// Outcome of a remote workload run.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
     /// One root per attempt, in attempt order.
-    pub roots: Vec<[u8; 32]>,
+    pub roots: Vec<EntryHash>,
     /// Number of oracle findings (violations) among the attempts.
     pub findings: usize,
     /// Steps reported by the server (max of attempts or first attempt).
@@ -86,7 +110,7 @@ pub struct RunOutcome {
 
 impl RunOutcome {
     /// Convenience: first root if any.
-    pub fn journal_root(&self) -> Option<[u8; 32]> {
+    pub fn journal_root(&self) -> Option<EntryHash> {
         self.roots.first().copied()
     }
 }
@@ -105,38 +129,36 @@ pub struct EngineProcess {
 impl EngineProcess {
     /// Resolve the engine binary path.
     ///
-    /// Precedence: explicit arg, `LEDGER_ENGINE_BIN` env, workspace
-    /// `target/debug/ledger`, then `ledger` on PATH.
-    fn resolve_engine_path(explicit: Option<PathBuf>) -> PathBuf {
+    /// Precedence: explicit arg, then `LEDGER_ENGINE_BIN`. No workspace or
+    /// PATH fallback: an implicit binary is not pinned to this build, so a
+    /// missing configuration fails closed with a typed error instead of
+    /// silently running an unverified engine.
+    fn resolve_engine_path(explicit: Option<PathBuf>) -> Result<PathBuf, IpcError> {
         if let Some(path) = explicit {
-            return path;
+            return Ok(path);
         }
-        // An absent or empty override falls through to the next candidate.
-        if let Ok(env) = std::env::var("LEDGER_ENGINE_BIN")
-            && !env.trim().is_empty()
-        {
-            let path = PathBuf::from(&env);
-            if path.exists() {
-                return path;
+        match std::env::var("LEDGER_ENGINE_BIN") {
+            Ok(env) if !env.trim().is_empty() => {
+                let path = PathBuf::from(&env);
+                if path.exists() {
+                    Ok(path)
+                } else {
+                    Err(IpcError::MissingEngine { path: env })
+                }
             }
+            _ => Err(IpcError::EngineNotConfigured),
         }
-        // Workspace build output: works for in-repo tests and examples without
-        // any env configuration.
-        let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ledger");
-        if candidate.exists() {
-            return candidate;
-        }
-        // Fallback to `ledger` on PATH for installed usage.
-        PathBuf::from("ledger")
     }
 
     /// Spawn the engine `rt-server` on a fresh socket inside a private
     /// directory (mode 0700) under the system temp root.
     ///
     /// Async: the readiness probe connects over the socket so the returned
-    /// process is guaranteed to be inside its accept loop.
+    /// process is guaranteed to be inside its accept loop. The engine path
+    /// must be explicit or configured via `LEDGER_ENGINE_BIN`; otherwise
+    /// this fails closed with [`IpcError::EngineNotConfigured`].
     pub async fn spawn(engine_path: Option<PathBuf>) -> Result<Self, IpcError> {
-        let engine = Self::resolve_engine_path(engine_path);
+        let engine = Self::resolve_engine_path(engine_path)?;
         let (dir, socket_path) = prepare_socket_dir()?;
         Self::spawn_in(engine, socket_path, Some(dir)).await
     }
@@ -149,7 +171,7 @@ impl EngineProcess {
         engine_path: Option<PathBuf>,
         socket_path: PathBuf,
     ) -> Result<Self, IpcError> {
-        let engine = Self::resolve_engine_path(engine_path);
+        let engine = Self::resolve_engine_path(engine_path)?;
         Self::spawn_in(engine, socket_path, None).await
     }
 
@@ -284,27 +306,34 @@ impl EngineProcess {
     pub fn run_workload(
         &mut self,
         workload: &str,
-        seed: [u8; 32],
+        seed: EntryHash,
         attempts: usize,
+        actor: ActorId,
     ) -> Result<RunOutcome, IpcError> {
-        self.run_workload_with_steps(workload, seed, 256, attempts)
+        self.run_workload_with_steps(workload, seed, 256, attempts, actor)
     }
 
     /// Run a named workload remotely with explicit `max_steps`.
+    ///
+    /// `actor` threads the caller's logical identity into the engine request
+    /// so multi-actor runs stay routed; the server journals per actor.
     pub fn run_workload_with_steps(
         &mut self,
         workload: &str,
-        seed: [u8; 32],
+        seed: EntryHash,
         max_steps: usize,
         attempts: usize,
+        actor: ActorId,
     ) -> Result<RunOutcome, IpcError> {
+        validate_workload_request(workload, max_steps, attempts, actor)?;
         let seed_hex = hex_encode(&seed);
         let request = serde_json::json!({
             "op": "run",
             "workload": workload,
             "seed_hex": seed_hex,
             "max_steps": max_steps,
-            "attempts": attempts
+            "attempts": attempts,
+            "actor": actor.0
         });
         let response = self
             .request(request)
@@ -479,12 +508,47 @@ fn spawn_stderr_drain(stderr: std::process::ChildStderr, tail: Arc<Mutex<Vec<u8>
     });
 }
 
+/// Validate one outbound workload request before it reaches the socket.
+///
+/// Bounds workload names, step budgets, attempt counts, and actor ids so a
+/// broken caller fails closed locally instead of asking the server to
+/// allocate unbounded work.
+fn validate_workload_request(
+    workload: &str,
+    max_steps: usize,
+    attempts: usize,
+    actor: ActorId,
+) -> Result<(), IpcError> {
+    if workload.is_empty() || workload.len() > MAX_WORKLOAD_NAME_BYTES {
+        return Err(IpcError::Protocol("invalid workload name"));
+    }
+    if max_steps == 0 || max_steps as u64 > MAX_SERVER_STEPS {
+        return Err(IpcError::CounterBounds {
+            name: "max_steps",
+            raw: max_steps as u64,
+        });
+    }
+    if attempts == 0 || attempts > MAX_IPC_ATTEMPTS {
+        return Err(IpcError::CounterBounds {
+            name: "attempts",
+            raw: attempts as u64,
+        });
+    }
+    if actor.0 > MAX_IPC_ACTOR {
+        return Err(IpcError::CounterBounds {
+            name: "actor",
+            raw: u64::from(actor.0),
+        });
+    }
+    Ok(())
+}
+
 /// Parse one successful `{roots, findings, steps}` reply.
 ///
 /// Counters cross a trust boundary, so they must exist, fit their caps, and
 /// convert losslessly; nothing is clamped or defaulted here.
 fn parse_run_response(value: &serde_json::Value) -> Result<RunOutcome, IpcError> {
-    let mut roots: Vec<[u8; 32]> = Vec::new();
+    let mut roots: Vec<EntryHash> = Vec::new();
     if let Some(array) = value.get("roots").and_then(|v| v.as_array()) {
         for item in array {
             if let Some(hex) = item.as_str() {
@@ -550,11 +614,11 @@ fn connect_with_retry(path: &Path) -> Result<std::os::unix::net::UnixStream, Ipc
     })
 }
 
-fn hex_encode(hash: &[u8; 32]) -> String {
+fn hex_encode(hash: &EntryHash) -> String {
     ledger_format::hash_to_hex(hash)
 }
 
-fn hex_decode32(text: &str) -> Result<[u8; 32], ledger_format::HexError> {
+fn hex_decode32(text: &str) -> Result<EntryHash, ledger_format::HexError> {
     let trimmed = text.trim();
     // Allow 0x prefix.
     let hex = if let Some(stripped) = trimmed.strip_prefix("0x") {
@@ -570,12 +634,13 @@ fn hex_decode32(text: &str) -> Result<[u8; 32], ledger_format::HexError> {
 #[cfg(test)]
 mod tests {
     use super::{IpcError, counter_from_server, hex_decode32, hex_encode, parse_run_response};
+    use ledger_format::EntryHash;
 
     const ROOT_HEX: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn hex_roundtrip() {
-        let bytes = [0xabu8; 32];
+        let bytes = EntryHash([0xabu8; 32]);
         let encoded = hex_encode(&bytes);
         assert_eq!(encoded.len(), 64);
         let decoded = hex_decode32(&encoded).expect("decode must succeed");
@@ -748,5 +813,70 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn engine_path_requires_explicit_or_env() {
+        // Explicit paths pass through untouched without touching the env.
+        let explicit = std::path::PathBuf::from("/tmp/ledger-test-engine");
+        assert_eq!(
+            super::EngineProcess::resolve_engine_path(Some(explicit.clone()))
+                .expect("explicit path"),
+            explicit
+        );
+        // An empty LEDGER_ENGINE_BIN is not a configuration: without an
+        // explicit path the resolver must fail closed typed. When the ambient
+        // env provides a real binary the Ok branch is exercised elsewhere
+        // (ipc_roundtrip); here only assert the error type is typed when it
+        // fires, without mutating process env (unsafe in edition 2024).
+        if std::env::var("LEDGER_ENGINE_BIN")
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
+            // Only assert when no ambient config exists; otherwise the env
+            // supplies a binary and Ok is correct.
+            let error = super::EngineProcess::resolve_engine_path(None)
+                .expect_err("missing config must fail closed");
+            assert!(matches!(error, IpcError::EngineNotConfigured), "{error}");
+        }
+    }
+
+    #[test]
+    fn workload_requests_are_bounded() {
+        assert!(
+            super::validate_workload_request("kv", 256, 1, ledger_format::ActorId(0)).is_ok(),
+            "well-formed request passes"
+        );
+        assert!(matches!(
+            super::validate_workload_request("", 256, 1, ledger_format::ActorId(0)),
+            Err(IpcError::Protocol(_))
+        ));
+        assert!(matches!(
+            super::validate_workload_request(&"k".repeat(129), 256, 1, ledger_format::ActorId(0)),
+            Err(IpcError::Protocol(_))
+        ));
+        assert!(matches!(
+            super::validate_workload_request("kv", 0, 1, ledger_format::ActorId(0)),
+            Err(IpcError::CounterBounds {
+                name: "max_steps",
+                ..
+            })
+        ));
+        assert!(matches!(
+            super::validate_workload_request("kv", 256, 0, ledger_format::ActorId(0)),
+            Err(IpcError::CounterBounds {
+                name: "attempts",
+                ..
+            })
+        ));
+        assert!(matches!(
+            super::validate_workload_request(
+                "kv",
+                256,
+                1,
+                ledger_format::ActorId(super::MAX_IPC_ACTOR + 1)
+            ),
+            Err(IpcError::CounterBounds { name: "actor", .. })
+        ));
     }
 }

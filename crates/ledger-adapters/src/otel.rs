@@ -23,7 +23,7 @@ use std::path::Path;
 
 use crate::envelope::{EntryMapping, EnvelopeHeader, Fidelity, InterchangeEnvelope};
 use crate::{AdapterError, IngestedJournal, mark_fidelity};
-use ledger_format::{EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, MessageId};
 use ledger_journal::Journal;
 
 /// An OTel event attached to a span.
@@ -109,7 +109,7 @@ fn hash_field(hasher: &mut blake3::Hasher, field: &[u8]) {
 /// length-prefixed value), then a canonical digest of the event sequence
 /// and sorted attributes. Length prefixes keep the encoding injective;
 /// identical span content always yields an identical hash.
-fn span_content_hash(span: &OtelSpan) -> Hash {
+fn span_content_hash(span: &OtelSpan) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hash_field(&mut hasher, span.trace_id.as_bytes());
     hash_field(&mut hasher, span.span_id.as_bytes());
@@ -135,7 +135,7 @@ fn span_content_hash(span: &OtelSpan) -> Hash {
         hash_field(&mut attr_hasher, v.as_bytes());
     }
     hash_field(&mut hasher, attr_hasher.finalize().as_bytes());
-    *hasher.finalize().as_bytes()
+    EntryHash(*hasher.finalize().as_bytes())
 }
 
 /// True if any span references a `parent_span_id` that is not present in
@@ -305,7 +305,7 @@ pub fn ingest_otel_with_fidelity(
     }
     let mut journal = Journal::new();
     // Preserve causality via parent lookup; first-wins binding for duplicate ids.
-    let mut span_id_to_hash: HashMap<&str, Hash> = HashMap::new();
+    let mut span_id_to_hash: HashMap<&str, EntryHash> = HashMap::new();
     for &idx in &order {
         let span = &spans[idx];
         let observed = span
@@ -317,10 +317,10 @@ pub fn ingest_otel_with_fidelity(
         let hash = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 observed,
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Text(span.name.clone()),
                 }),
             )
@@ -330,12 +330,12 @@ pub fn ingest_otel_with_fidelity(
             journal
                 .append(
                     EntryKind::Send,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Send(ledger_format::SendFrame {
-                        message_id: ledger_format::MessageId::new(1, 0),
-                        from: 1,
-                        to: 2,
+                        message_id: MessageId::new(ActorId(1), 0),
+                        from: ActorId(1),
+                        to: ActorId(2),
                         original_content: event.name.as_bytes().to_vec(),
                     }),
                 )
@@ -370,7 +370,7 @@ pub fn ingest_otel_enveloped(
     }
     let mut journal = Journal::new();
     let mut mappings = Vec::new();
-    let mut span_id_to_hash: HashMap<String, Hash> = HashMap::new();
+    let mut span_id_to_hash: HashMap<String, EntryHash> = HashMap::new();
     for &idx in &order {
         let span = &spans[idx];
         let observed = span
@@ -382,10 +382,10 @@ pub fn ingest_otel_enveloped(
         let hash = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 observed,
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Text(span.name.clone()),
                 }),
             )
@@ -400,12 +400,12 @@ pub fn ingest_otel_enveloped(
             journal
                 .append(
                     EntryKind::Send,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Send(ledger_format::SendFrame {
-                        message_id: ledger_format::MessageId::new(1, 0),
-                        from: 1,
-                        to: 2,
+                        message_id: MessageId::new(ActorId(1), 0),
+                        from: ActorId(1),
+                        to: ActorId(2),
                         original_content: event.name.clone().into_bytes(),
                     }),
                 )
@@ -460,7 +460,7 @@ pub fn ingest_otel_dedup(
 
     // Dedup phase: content-addressed by full-span hash.
     let deduped: Vec<OtelSpan> = if config.dedup {
-        let mut seen: HashSet<Hash> = HashSet::new();
+        let mut seen: HashSet<EntryHash> = HashSet::new();
         let mut out = Vec::with_capacity(spans.len());
         for span in spans {
             let h = span_content_hash(&span);
@@ -491,11 +491,11 @@ pub fn ingest_otel_dedup(
     // Journal build with causality.
     let mut journal = Journal::new();
     let mut mappings = Vec::new();
-    let mut span_id_to_hash: HashMap<String, Hash> = HashMap::new();
+    let mut span_id_to_hash: HashMap<String, EntryHash> = HashMap::new();
 
     for &idx in &order {
         let span = &deduped[idx];
-        let observed: Vec<Hash> = span
+        let observed: Vec<EntryHash> = span
             .parent_span_id
             .as_ref()
             .and_then(|pid| span_id_to_hash.get(pid).copied())
@@ -504,10 +504,10 @@ pub fn ingest_otel_dedup(
         let hash = journal
             .append(
                 EntryKind::Outcome,
-                1,
+                ActorId(1),
                 observed,
                 EntryPayload::Outcome(ledger_format::OutcomePayload {
-                    schema: [0x00; 32],
+                    schema: EntryHash([0x00; 32]),
                     value: ledger_format::CanonicalValue::Text(span.name.clone()),
                 }),
             )
@@ -524,12 +524,12 @@ pub fn ingest_otel_dedup(
             journal
                 .append(
                     EntryKind::Send,
-                    1,
+                    ActorId(1),
                     [],
                     EntryPayload::Send(ledger_format::SendFrame {
-                        message_id: ledger_format::MessageId::new(1, 0),
-                        from: 1,
-                        to: 2,
+                        message_id: MessageId::new(ActorId(1), 0),
+                        from: ActorId(1),
+                        to: ActorId(2),
                         original_content: event.name.clone().into_bytes(),
                     }),
                 )
@@ -583,12 +583,15 @@ pub fn ingest_otel_file_with_config(
     // BufReader over a Take to bound total bytes without reading whole file.
     let mut reader = BufReader::new(file.take(take_limit));
     let mut spans = Vec::new();
-    let mut line = String::new();
+    let mut line_bytes = Vec::new();
     let mut line_number: usize = 0;
     let mut total_bytes: usize = 0;
     loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
+        line_bytes.clear();
+        let bytes_read = {
+            let mut limited = (&mut reader).take((config.max_line_bytes as u64).saturating_add(1));
+            limited.read_until(b'\n', &mut line_bytes)?
+        };
         if bytes_read == 0 {
             break;
         }
@@ -605,13 +608,8 @@ pub fn ingest_otel_file_with_config(
                 limit: config.max_line_bytes,
             });
         }
-        // Also guard trimmed length when newline handling differs.
-        if line.len() > config.max_line_bytes {
-            return Err(AdapterError::LineTooLarge {
-                line: line_number,
-                limit: config.max_line_bytes,
-            });
-        }
+        let line = std::str::from_utf8(&line_bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -927,7 +925,10 @@ mod tests {
             parent_entry.id
         );
         // Vector clock of child should be greater on actor 1 than parent's.
-        assert!(child_entry.vector_clock.get(1) > parent_entry.vector_clock.get(1));
+        assert!(
+            child_entry.vector_clock.get(ledger_format::ActorId(1))
+                > parent_entry.vector_clock.get(ledger_format::ActorId(1))
+        );
     }
 
     #[test]
@@ -972,8 +973,11 @@ mod tests {
             .unwrap();
         // The child entry carries the parent entry hash as observed parent,
         // even though the parent was appended after the child arrived.
-        assert_eq!(child_entry.data.parents, vec![parent_entry.id]);
-        assert!(child_entry.vector_clock.get(1) > parent_entry.vector_clock.get(1));
+        assert_eq!(child_entry.data.parents.as_slice(), &[parent_entry.id]);
+        assert!(
+            child_entry.vector_clock.get(ledger_format::ActorId(1))
+                > parent_entry.vector_clock.get(ledger_format::ActorId(1))
+        );
 
         // Same set in dependency-first order yields the identical journal.
         let sorted = ingest_otel_dedup(vec![parent, child], cfg).unwrap();

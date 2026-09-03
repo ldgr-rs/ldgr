@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use thiserror::Error;
 
 /// Publication stage of an [`ArtifactError`].
@@ -137,10 +137,15 @@ impl HttpSink {
     /// Panics when the TLS backend cannot initialize (reqwest builder
     /// contract); this is a startup-time failure, not per-task.
     pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
         Self {
             base_url: base_url.into(),
             token,
-            client: reqwest::blocking::Client::new(),
+            client,
         }
     }
 
@@ -225,7 +230,7 @@ impl ArtifactSink for HttpSink {
 /// BLAKE3 digest of `bytes` as 64-char lowercase hex.
 pub fn checksum_hex(bytes: &[u8]) -> String {
     let hash = blake3::hash(bytes);
-    ledger_format::hash_to_hex(hash.as_bytes())
+    ledger_format::hash_to_hex(&EntryHash(*hash.as_bytes()))
 }
 
 /// Builder id used by the worker daemon and drain paths.
@@ -247,7 +252,7 @@ pub const WORKER_BUILDER_ID: &str = "ledger-worker";
 /// Returns the serialization error when JSON rendering fails.
 pub fn certificate_json(
     task_id: &str,
-    journal_root: &Hash,
+    journal_root: &EntryHash,
     steps: usize,
     campaign_findings: usize,
     builder_id: Option<&str>,
@@ -314,7 +319,7 @@ mod tests {
 
     #[test]
     fn certificate_json_attests_journal_root() {
-        let root: Hash = [9u8; 32];
+        let root: EntryHash = EntryHash([9u8; 32]);
         let bytes = certificate_json("task-1", &root, 12, 0, None, None).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["_type"], "https://in-toto.io/Statement/v1");
@@ -335,7 +340,7 @@ mod tests {
 
     #[test]
     fn certificate_json_binds_builder_and_profile_when_present() {
-        let root: Hash = [1u8; 32];
+        let root: EntryHash = EntryHash([1u8; 32]);
         let bytes = certificate_json(
             "task-2",
             &root,
@@ -371,7 +376,7 @@ mod tests {
 
     #[test]
     fn certificate_json_omits_builder_and_profile_when_absent() {
-        let root: Hash = [2u8; 32];
+        let root: EntryHash = EntryHash([2u8; 32]);
         let bytes = certificate_json("task-3", &root, 5, 0, None, None).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let predicate = value["predicate"].as_object().unwrap();

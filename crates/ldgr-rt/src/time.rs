@@ -1,4 +1,4 @@
-// ledger-lint:allow - host daemon / non-sim passthrough, like TokioBackend
+// ledger-lint:allow:SystemTime::now() - host daemon / non-sim passthrough, like TokioBackend
 //! Deterministic clock facade.
 //!
 //! Why a wrapper: direct `Instant::now` or `SystemTime::now` would break
@@ -7,6 +7,24 @@
 //! deterministic in sim and live in production.
 
 use core::time::Duration;
+
+use thiserror::Error;
+
+/// Typed clock failure.
+///
+/// Clocks come from a live [`crate::Handle`] inside a run. There is no
+/// ambient free clock: SUT code without a run context fails closed here
+/// instead of reading wall time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ClockError {
+    /// No deterministic run context backs this handle (sim-link without a
+    /// live boundary, or local use under sim IPC where the server owns time).
+    #[error("no run context: clock unavailable outside a run; use Handle::clock inside run")]
+    NoContext,
+    /// Local clocks do not cross the IPC boundary; issue an engine effect.
+    #[error("local clock unavailable under sim IPC; use server-side effects")]
+    IpcLocal,
+}
 
 /// Deterministic clock handle.
 ///
@@ -57,31 +75,9 @@ impl SimClock {
         Self { ticks }
     }
 
-    #[cfg(not(feature = "sim-link"))]
+    #[cfg(not(any(feature = "sim", feature = "sim-link")))]
     pub(crate) fn ambient() -> Self {
         Self { _private: () }
-    }
-}
-
-/// Free function that returns current time as a duration since the virtual epoch.
-///
-/// In `sim-link` mode this returns zero. Callers inside a run should prefer
-/// a `Handle`-bound clock which reads authoritative virtual time; this free
-/// function exists for code that has no handle yet and still needs a
-/// deterministic value.
-pub fn now() -> Duration {
-    #[cfg(feature = "sim-link")]
-    {
-        // No executor context available: fall back to epoch. Callers inside a
-        // `Handle` should use `Handle::clock` instead. Keeping this deterministic
-        // (zero) is safer than touching the ambient clock.
-        Duration::ZERO
-    }
-    #[cfg(not(feature = "sim-link"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
     }
 }
 
@@ -97,24 +93,30 @@ mod tests {
             assert_eq!(c.ticks(), 42);
             assert_eq!(c.now(), Duration::from_micros(42));
         }
-        #[cfg(not(feature = "sim-link"))]
+        #[cfg(not(any(feature = "sim", feature = "sim-link")))]
         {
             let c = SimClock::ambient();
             let _ = c.now();
             let _ = c.ticks();
         }
+        #[cfg(all(feature = "sim", not(feature = "sim-link")))]
+        {
+            // Local clocks are unavailable under sim IPC; the type still
+            // exposes the typed errors.
+            let _ = ClockError::IpcLocal;
+        }
     }
 
     #[test]
-    fn free_now_is_deterministic_in_sim() {
-        let a = now();
-        let b = now();
-        #[cfg(feature = "sim-link")]
-        assert_eq!(a, b);
-        #[cfg(not(feature = "sim-link"))]
-        {
-            // Outside sim-link, time moves forward monotonically.
-            assert!(a <= b);
-        }
+    fn clock_error_is_typed() {
+        let error = ClockError::NoContext;
+        assert_eq!(
+            error.to_string(),
+            "no run context: clock unavailable outside a run; use Handle::clock inside run"
+        );
+        assert_eq!(
+            ClockError::IpcLocal.to_string(),
+            "local clock unavailable under sim IPC; use server-side effects"
+        );
     }
 }

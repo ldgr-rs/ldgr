@@ -8,11 +8,11 @@ use core::future::Future;
 use core::pin::Pin;
 use core::time::Duration;
 
-use ledger_format::ActorId;
+use ledger_format::{ActorId, EntryHash};
 
 use ldgr_rt::{
-    Conn, DetRng, Handle, IpcFault, JournalFault, RunConfig, RunResult, RuntimeError, SimClock,
-    StreamId, TaskId, TaskMain, VERSION, shared_network,
+    ClockError, Conn, DetRng, Handle, IpcFault, JournalFault, RngError, RunConfig, RunResult,
+    RuntimeError, SimClock, StreamId, TaskId, TaskMain, VERSION, shared_network,
 };
 
 /// Exhaustive match: fails to compile if any variant goes missing under a
@@ -59,14 +59,14 @@ type AssertNonSend = Pin<Box<dyn Future<Output = ()>>>;
 #[allow(dead_code)]
 fn exercise_handle(handle: &mut Handle) -> TaskId {
     let _: ActorId = handle.actor();
-    let _: [u8; 32] = handle.seed();
-    let _: SimClock = handle.clock();
-    let _rebound: Handle = handle.with_actor(1);
+    let _: EntryHash = handle.seed();
+    let _: Result<SimClock, ClockError> = handle.clock();
+    let _rebound: Handle = handle.with_actor(ActorId(1));
     let _sent: bool = handle.net_send(1, 7);
-    let _: Conn = handle.conn(0, 1);
-    let stream: StreamId = 0;
-    let _: DetRng = handle.rng(stream);
-    let _: u64 = handle.rng_next_u64(stream);
+    let _: Conn = handle.conn(ActorId(0), ActorId(1));
+    let stream: StreamId = StreamId(0);
+    let _: Result<DetRng, RngError> = handle.rng(stream);
+    let _: Result<u64, RngError> = handle.rng_next_u64(stream);
     let _installed: Option<Handle> = Handle::current();
     let _shared = shared_network();
     let id: TaskId = handle.spawn(|child| {
@@ -102,7 +102,10 @@ fn registered_named_run_executes_the_caller_program() {
 
     ldgr_rt::register_workload("public-contract-wl", factory);
     let res = ldgr_rt::run_named(
-        RunConfig::builder().seed([23u8; 32]).max_steps(512).build(),
+        RunConfig::builder()
+            .seed(EntryHash([23u8; 32]))
+            .max_steps(512)
+            .build(),
         "public-contract-wl",
     );
     assert!(res.is_ok(), "{res:?}");
@@ -123,7 +126,7 @@ async fn exercise_handle_async(handle: &Handle) {
 #[allow(dead_code)]
 fn exercise_run_signature(config: RunConfig) -> Result<RunResult, RuntimeError> {
     ldgr_rt::run(config.clone(), |handle| async move {
-        let _ = handle.clock().now();
+        let _ = handle.clock();
     })?;
     ldgr_rt::run(config, |_handle| async {})
 }
@@ -132,7 +135,7 @@ fn exercise_run_signature(config: RunConfig) -> Result<RunResult, RuntimeError> 
 fn version_probe_and_pure_helpers_are_available_everywhere() {
     assert!(!VERSION.is_empty());
     ldgr_rt::probe();
-    let hash = [9u8; 32];
+    let hash = EntryHash([9u8; 32]);
     let first = ldgr_rt::task_id_for("workload", hash);
     let second = ldgr_rt::task_id_for("workload", hash);
     assert_eq!(first, second);
@@ -151,8 +154,11 @@ fn public_types_construct_identically_under_every_combo() {
     // Source chains stay walkable where they exist.
     assert!(core::error::Error::source(&journal).is_none());
 
-    let config = RunConfig::builder().seed([1u8; 32]).max_steps(8).build();
-    assert_eq!(config.seed(), [1u8; 32]);
+    let config = RunConfig::builder()
+        .seed(EntryHash([1u8; 32]))
+        .max_steps(8)
+        .build();
+    assert_eq!(config.seed(), EntryHash([1u8; 32]));
     assert_eq!(RunConfig::default().max_steps, 10_000);
 
     let error = RuntimeError::StepLimit { limit: 3 };
@@ -161,35 +167,25 @@ fn public_types_construct_identically_under_every_combo() {
     let _id = TaskId(1);
 }
 
-/// Mirror of `ipc::EngineProcess::resolve_engine_path` precedence so tests
-/// decide IPC testability exactly like production: empty `LEDGER_ENGINE_BIN`
-/// falls through, a set-but-missing binary is a setup error, and an installed
-/// `ledger` on PATH avoids false skips.
+/// Mirror of the engine-path precedence so tests decide IPC testability
+/// exactly like production: an explicit path or a set `LEDGER_ENGINE_BIN`
+/// pointing at an existing binary. No workspace or PATH fallback: an
+/// unpinned binary must not satisfy gates.
 // ledger-lint:allow - host-side test probes ambient env by design
 #[cfg(all(feature = "sim", not(feature = "sim-link")))]
 fn resolve_engine_for_test() -> Option<std::path::PathBuf> {
     if let Ok(env) = std::env::var("LEDGER_ENGINE_BIN") {
+        if env.trim().is_empty() {
+            return None;
+        }
         let path = std::path::PathBuf::from(&env);
         if path.exists() {
             return Some(path);
         }
-        if !env.trim().is_empty() {
-            panic!(
-                "LEDGER_ENGINE_BIN is set to {env} but the binary does not exist; \
-                 build ledger-cli or clear LEDGER_ENGINE_BIN"
-            );
-        }
-    }
-    let candidate =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/ledger");
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
-        let installed = dir.join("ledger");
-        if installed.is_file() {
-            return Some(installed);
-        }
+        panic!(
+            "LEDGER_ENGINE_BIN is set to {env} but the binary does not exist; \
+             build ledger-cli or clear LEDGER_ENGINE_BIN"
+        );
     }
     None
 }
@@ -211,7 +207,10 @@ fn handle_current_is_installed_inside_run() {
     #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
     {
         let res = ldgr_rt::run(
-            RunConfig::builder().seed([3u8; 32]).max_steps(256).build(),
+            RunConfig::builder()
+                .seed(EntryHash([3u8; 32]))
+                .max_steps(256)
+                .build(),
             |handle| async move {
                 assert!(
                     Handle::current().is_some(),
@@ -234,7 +233,10 @@ fn named_run_reaches_server_workload_under_ipc() {
         resolve_engine_for_test().is_some(),
         "engine binary required for IPC transport: build `cargo build -p ledger-cli` or set LEDGER_ENGINE_BIN (see resolve_engine_for_test precedence)"
     );
-    let config = RunConfig::builder().seed([21u8; 32]).max_steps(256).build();
+    let config = RunConfig::builder()
+        .seed(EntryHash([21u8; 32]))
+        .max_steps(256)
+        .build();
     let a = ldgr_rt::run_named(config.clone(), "kv").expect("named kv run must succeed");
     let b = ldgr_rt::run_named(config, "kv").expect("named kv rerun must succeed");
     assert_eq!(a.journal_root, b.journal_root, "server roots deterministic");

@@ -23,7 +23,7 @@ use ledger_explorer::search::Workload;
 use ledger_explorer::services::ServiceError;
 use ledger_explorer::services::{minimize_decisions, replay_prefix, replay_strict, search_first};
 use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, ReplayViolation, RunConfig, RuntimeError, SimFault, Simulation};
 
 /// Cancel flag for an armed watchdog. Dropping the guard disarms the thread.
@@ -148,11 +148,7 @@ fn main() -> ExitCode {
         } => run_diff(&cli, *seed_a, *seed_b, *max_steps),
         Command::Doctor => run_doctor(&cli),
         Command::Init { dir, force, sut } => run_init(&cli, dir.as_deref(), *force, *sut),
-        Command::Format { file, check } if *check => run_format_check(&cli, file),
-        Command::Format { .. } => {
-            eprintln!("ledger: `format` currently supports only `--check`");
-            Ok(ExitCode::FAILURE)
-        }
+        Command::Format { file, .. } => run_format_check(&cli, file),
         Command::Ldfi {
             seed,
             max_steps,
@@ -193,7 +189,7 @@ fn main() -> ExitCode {
 }
 
 /// Renders the violation record emitted by the `--json` sim path.
-fn json_violation(reason: &str, steps: usize, root: Hash) -> String {
+fn json_violation(reason: &str, steps: usize, root: EntryHash) -> String {
     serde_json::json!({
         "status": "violation",
         "reason": reason,
@@ -208,7 +204,10 @@ fn json_violation(reason: &str, steps: usize, root: Hash) -> String {
 /// Origins exist only for runs that flowed through origin-capturing calls
 /// (tracked facade sends, direct backend use). Instruction-program runs have
 /// no per-effect call sites, so this prints nothing there by design.
-fn print_effect_origins(origins: &[(Hash, ledger_sim::OriginSource)], witnesses: &[Hash]) {
+fn print_effect_origins(
+    origins: &[(EntryHash, ledger_sim::OriginSource)],
+    witnesses: &[EntryHash],
+) {
     let hits: Vec<_> = origins
         .iter()
         .filter(|(id, _)| witnesses.contains(id))
@@ -245,7 +244,7 @@ fn run_sim(
     if cli.ndjson {
         for attempt in 0..runs {
             let mut attempt_seed = config.seed();
-            attempt_seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            attempt_seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
             let attempt_config = config.clone().with_seed(attempt_seed);
             let run = Simulation::new(attempt_config, workload.programs()).run()?;
             let verdict = oracle.check(&run);
@@ -506,23 +505,40 @@ fn run_diff(
     let r1 = Simulation::new(c1, workload.programs()).run()?;
     let r2 = Simulation::new(c2, workload.programs()).run()?;
 
-    let diff_pair = ledger_explorer::diff(&r1, &r2);
+    let diff_result = ledger_explorer::diff(&r1, &r2);
     if cli.json || cli.ndjson {
-        let value = match diff_pair {
-            Some((a, b)) => {
-                serde_json::json!({"divergence": [ledger_format::hash_to_hex(&a), ledger_format::hash_to_hex(&b)]})
+        let value = match diff_result {
+            ledger_explorer::JournalDiff::Diverged { left, right } => {
+                serde_json::json!({"divergence": [ledger_format::hash_to_hex(&left), ledger_format::hash_to_hex(&right)]})
             }
-            None => serde_json::json!({"divergence": null}),
+            ledger_explorer::JournalDiff::Truncated { left, right } => {
+                let left_hex: Option<String> = left.as_ref().map(ledger_format::hash_to_hex);
+                let right_hex: Option<String> = right.as_ref().map(ledger_format::hash_to_hex);
+                serde_json::json!({"divergence": [left_hex, right_hex], "truncated": true})
+            }
+            ledger_explorer::JournalDiff::Identical => serde_json::json!({"divergence": null}),
         };
         println!("{}", value);
     } else {
-        match diff_pair {
-            Some((a, b)) => println!(
+        match diff_result {
+            ledger_explorer::JournalDiff::Diverged { left, right } => println!(
                 "First divergence entry pair: {} {}",
-                ledger_format::hash_to_hex(&a),
-                ledger_format::hash_to_hex(&b)
+                ledger_format::hash_to_hex(&left),
+                ledger_format::hash_to_hex(&right)
             ),
-            None => println!("No divergence"),
+            ledger_explorer::JournalDiff::Truncated { left, right } => {
+                let left_hex = left
+                    .as_ref()
+                    .map_or_else(|| "-".to_string(), ledger_format::hash_to_hex);
+                let right_hex = right
+                    .as_ref()
+                    .map_or_else(|| "-".to_string(), ledger_format::hash_to_hex);
+                println!(
+                    "Truncated: one run is a strict prefix of the other (first extra: {} {})",
+                    left_hex, right_hex
+                );
+            }
+            ledger_explorer::JournalDiff::Identical => println!("No divergence"),
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -775,7 +791,7 @@ fn describe_injection(injection: &SimFault) -> String {
         SimFault::Delay { send, ticks } => {
             format!("delay:{}:{ticks}", &ledger_format::hash_to_hex(send)[..8])
         }
-        SimFault::Partition { src, dst } => format!("partition:{src}->{dst}"),
+        SimFault::Partition { src, dst } => format!("partition:{}->{}", src.0, dst.0),
         SimFault::Crash(id) => format!("crash:{}", &ledger_format::hash_to_hex(id)[..8]),
         SimFault::Corrupt { write, xor_mask } => format!(
             "corrupt:{}:mask={xor_mask}",
@@ -893,11 +909,12 @@ fn run_completions(shell: Shell) -> Result<ExitCode, Box<dyn std::error::Error>>
 #[cfg(test)]
 mod tests {
     use super::json_violation;
+    use ledger_format::EntryHash;
 
     #[test]
     fn json_violation_escapes_quote_and_newline() {
         let reason = "read of \"k\" returned 0,\nexpected 42";
-        let text = json_violation(reason, 7, [0u8; 32]);
+        let text = json_violation(reason, 7, EntryHash([0u8; 32]));
         assert!(
             text.contains("\\\""),
             "quote must be escaped as \\\": {text}"

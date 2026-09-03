@@ -60,12 +60,18 @@ fn wait_for_socket(path: &Path, attempts: u64) -> bool {
     path.exists()
 }
 
-fn run_canary_binary(socket: &Path, identity: [u8; 32]) -> (String, bool) {
+fn run_canary_binary(
+    socket: &Path,
+    identity: ledger_format::EntryHash,
+    actor: ledger_format::ActorId,
+) -> (String, bool) {
     let output = Command::new(canary_bin())
         .arg("--socket")
         .arg(socket)
         .arg("--identity")
         .arg(hash_to_hex(&identity))
+        .arg("--actor")
+        .arg(actor.0.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -76,7 +82,7 @@ fn run_canary_binary(socket: &Path, identity: [u8; 32]) -> (String, bool) {
 
 #[test]
 fn external_canary_drives_the_engine_deterministically() {
-    let seed = [42u8; 32];
+    let seed = ledger_format::EntryHash([42u8; 32]);
     let identity = session_identity(seed);
 
     let socket_dir = std::env::temp_dir().join(format!("ldgr-d1-{}", std::process::id()));
@@ -95,11 +101,11 @@ fn external_canary_drives_the_engine_deterministically() {
         "rt-server must bind its socket"
     );
 
-    let (first_out, first_ok) = run_canary_binary(&socket, identity);
+    let (first_out, first_ok) = run_canary_binary(&socket, identity, ledger_format::ActorId(0));
     assert!(first_ok, "first canary run must succeed: {first_out}");
 
     // Second canary run against the same server must reproduce the root.
-    let (second_out, second_ok) = run_canary_binary(&socket, identity);
+    let (second_out, second_ok) = run_canary_binary(&socket, identity, ledger_format::ActorId(0));
     assert!(second_ok, "second canary run must succeed: {second_out}");
 
     let root_of = |out: &str| -> String {
@@ -131,9 +137,71 @@ fn external_canary_drives_the_engine_deterministically() {
 }
 
 #[test]
+fn two_actors_are_deterministic_per_actor() {
+    use ldgr_rt::proto::{Effect, EffectRequest, Hello, Message, encode_frame, encode_message};
+    use rt_server::serve_session;
+
+    // In-memory two-actor determinism without sockets: each actor's effect
+    // stream journals deterministically, and actor-routed sends diverge.
+    fn session_bytes(
+        _seed: ledger_format::EntryHash,
+        identity: ledger_format::EntryHash,
+        actor: ledger_format::ActorId,
+    ) -> Vec<u8> {
+        let hello = encode_frame(
+            0,
+            &encode_message(&Message::Hello(Hello { identity, actor })),
+        )
+        .unwrap();
+        let send = encode_frame(
+            1,
+            &encode_message(&Message::EffectRequest(EffectRequest {
+                effect: Effect::Send {
+                    to: actor,
+                    payload: b"hello".to_vec(),
+                },
+            })),
+        )
+        .unwrap();
+        let finish = encode_frame(2, &encode_message(&Message::Finish)).unwrap();
+        [hello, send, finish].concat()
+    }
+
+    let seed = ledger_format::EntryHash([77u8; 32]);
+    let identity = session_identity(seed);
+    for actor in [ledger_format::ActorId(0), ledger_format::ActorId(1)] {
+        let first =
+            serve_session(seed, identity, &session_bytes(seed, identity, actor)).expect("serves");
+        let second =
+            serve_session(seed, identity, &session_bytes(seed, identity, actor)).expect("reserves");
+        assert_eq!(
+            first.root, second.root,
+            "actor {} must be deterministic",
+            actor.0
+        );
+    }
+    let root0 = serve_session(
+        seed,
+        identity,
+        &session_bytes(seed, identity, ledger_format::ActorId(0)),
+    )
+    .expect("actor 0");
+    let root1 = serve_session(
+        seed,
+        identity,
+        &session_bytes(seed, identity, ledger_format::ActorId(1)),
+    )
+    .expect("actor 1");
+    assert_ne!(
+        root0.root, root1.root,
+        "actor-routed sends must diverge across actors"
+    );
+}
+
+#[test]
 fn explorer_services_run_over_the_canary_workload() {
     let config = RunConfig::builder()
-        .seed([0; 32])
+        .seed(ledger_format::EntryHash([0; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();

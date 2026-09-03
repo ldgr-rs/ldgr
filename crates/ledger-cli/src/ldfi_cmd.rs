@@ -11,7 +11,7 @@ use ledger_explorer::services::{
     ldfi_solve, replay_faults, schedule_from_hypothesis, search_first,
 };
 use ledger_explorer::solver::SolverConfig;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, SimFault};
 use thiserror::Error;
 
@@ -28,7 +28,7 @@ pub enum LdfiCmdError {
 #[derive(Debug, Clone)]
 pub struct LdfiHypothesis {
     /// Fault event ids in this cut.
-    pub events: Vec<Hash>,
+    pub events: Vec<EntryHash>,
     /// Aggregate cut cost.
     pub cost: u64,
     /// Explanation of which causal paths are broken.
@@ -45,7 +45,7 @@ pub struct LdfiReport {
     /// Steps in the violating run.
     pub steps: usize,
     /// Journal root of the violating run.
-    pub journal_root: Hash,
+    pub journal_root: EntryHash,
     /// Ranked hypotheses, cheapest first.
     pub hypotheses: Vec<LdfiHypothesis>,
     /// Fault injections in the executed top schedule.
@@ -55,9 +55,9 @@ pub struct LdfiReport {
     /// Number of injections that were voided.
     pub voided: usize,
     /// Journal entry hashes witnessing the violation.
-    pub witnesses: Vec<Hash>,
+    pub witnesses: Vec<EntryHash>,
     /// Effect origins for the witness entries, when captured.
-    pub origins: Vec<(Hash, ledger_sim::OriginSource)>,
+    pub origins: Vec<(EntryHash, ledger_sim::OriginSource)>,
     /// True when the journal prefix before the first fault matches the base run.
     pub prefix_ok: bool,
 }

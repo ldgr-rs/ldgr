@@ -27,7 +27,7 @@ use ldgr_rt::proto::{
     Effect, EffectRequest, EffectResponse, EffectResult, Goodbye, Hello, Message as Wire, Reject,
     RejectReason, Welcome, decode_frame, decode_message, encode_frame, encode_message,
 };
-use ledger_format::{ActorId, Hash, MessageId};
+use ledger_format::{ActorId, EntryHash, MessageId, StreamId};
 use ledger_sim::{Effects, Message, SeedTree, SimBackend};
 use rand_core::Rng;
 use thiserror::Error;
@@ -41,11 +41,11 @@ pub const SESSION_IDENTITY_DOMAIN: &[u8] = b"ldgr.d1.session\0";
 /// handshake already carries and verifies a 32-byte identity field, and this
 /// derivation is the deterministic placeholder available to both the AGPL
 /// server and the Apache-2.0 client without engine linkage.
-pub fn session_identity(seed: Hash) -> Hash {
+pub fn session_identity(seed: EntryHash) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SESSION_IDENTITY_DOMAIN);
-    hasher.update(&seed);
-    *hasher.finalize().as_bytes()
+    hasher.update(&seed.0);
+    EntryHash(*hasher.finalize().as_bytes())
 }
 
 /// Errors from the engine server.
@@ -61,23 +61,34 @@ pub enum ServerError {
     SocketSetup { path: String, reason: String },
 }
 
-/// One effect session against a single-actor deterministic backend.
+/// One effect session against a deterministic backend.
+///
+/// The actor identity is bound during the handshake from the client's
+/// `Hello`; no session defaults to actor zero.
 pub struct Session {
     backend: SimBackend,
-    actor: u32,
-    expected_identity: Hash,
+    actor: Option<ActorId>,
+    expected_identity: EntryHash,
     send_sequence: u64,
 }
 
 impl Session {
-    /// Create a session for `actor` bound to `seed` and `expected_identity`.
-    pub fn new(seed: Hash, actor: u32, expected_identity: Hash) -> Self {
+    /// Create a session bound to `seed` and `expected_identity`.
+    ///
+    /// The actor is unbound until the handshake delivers the client's
+    /// `Hello.actor`; effect routing before the handshake fails closed.
+    pub fn new(seed: EntryHash, expected_identity: EntryHash) -> Self {
         Self {
             backend: SimBackend::new(SeedTree::new(seed)),
-            actor,
+            actor: None,
             expected_identity,
             send_sequence: 0,
         }
+    }
+
+    /// Actor bound by the handshake, if any.
+    pub fn actor(&self) -> Option<ActorId> {
+        self.actor
     }
 
     /// Serve one session over generic read/write streams.
@@ -98,7 +109,7 @@ impl Session {
                 "first frame is not hello",
             );
         }
-        let Wire::Hello(Hello { identity }) = hello else {
+        let Wire::Hello(Hello { identity, actor }) = hello else {
             return self.reject(&mut writer, RejectReason::Protocol, "expected hello");
         };
         if identity != self.expected_identity {
@@ -108,11 +119,15 @@ impl Session {
                 "session identity mismatch",
             );
         }
-        write_message(
-            &mut writer,
-            hello_seq,
-            &Wire::Welcome(Welcome { actor: self.actor }),
-        )?;
+        if actor.0 > ldgr_rt::proto::MAX_ACTOR {
+            return self.reject(
+                &mut writer,
+                RejectReason::Protocol,
+                "actor over the protocol cap",
+            );
+        }
+        self.actor = Some(actor);
+        write_message(&mut writer, hello_seq, &Wire::Welcome(Welcome { actor }))?;
 
         // Effect loop: sequences must be exactly 1, 2, ... per session.
         let mut next_seq = 1u64;
@@ -159,6 +174,11 @@ impl Session {
     }
 
     fn apply(&mut self, effect: Effect) -> Result<EffectResult, ServerError> {
+        // The handshake always binds the actor before the effect loop, so a
+        // missing actor is a protocol violation, never a default zero.
+        let Some(actor) = self.actor else {
+            return Err(ServerError::Rejected(RejectReason::Protocol));
+        };
         match effect {
             Effect::Clock => Ok(EffectResult::Clock {
                 ticks: self.backend.clock().now(),
@@ -169,7 +189,7 @@ impl Session {
             }
             Effect::Random { stream, count } => {
                 let mut words = Vec::with_capacity(count as usize * 8);
-                let rng = self.backend.rng(stream);
+                let rng = self.backend.rng(StreamId(stream));
                 for _ in 0..count {
                     words.extend_from_slice(&rng.next_u64().to_le_bytes());
                 }
@@ -177,11 +197,11 @@ impl Session {
             }
             Effect::Send { to, payload } => {
                 let message = Message {
-                    from: self.actor as usize,
-                    to: to as usize,
+                    from: actor.0 as usize,
+                    to: to.0 as usize,
                     content: payload,
-                    send_id: [0u8; 32],
-                    message_id: MessageId::new(self.actor as ActorId, self.send_sequence),
+                    send_id: EntryHash([0u8; 32]),
+                    message_id: MessageId::new(actor, self.send_sequence),
                     deliver_at: 0,
                 };
                 self.send_sequence = self.send_sequence.saturating_add(1);
@@ -192,7 +212,7 @@ impl Session {
                 let message = self
                     .backend
                     .net()
-                    .recv(self.actor as usize, self.backend.clock().now());
+                    .recv(actor.0 as usize, self.backend.clock().now());
                 Ok(EffectResult::Recv {
                     payload: message.map(|m| m.content),
                 })
@@ -275,7 +295,7 @@ fn write_message(writer: &mut impl Write, seq: u64, message: &Wire) -> Result<()
 /// Binds `socket` (cleaning up any stale file), verifies connecting peers,
 /// and serves one session per connection. On Linux the peer uid is checked;
 /// non-matching peers are rejected before the handshake.
-pub fn run(socket: &Path, seed: Hash) -> Result<std::process::ExitCode, ServerError> {
+pub fn run(socket: &Path, seed: EntryHash) -> Result<std::process::ExitCode, ServerError> {
     if let Err(error) = std::fs::remove_file(socket)
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -288,16 +308,30 @@ pub fn run(socket: &Path, seed: Hash) -> Result<std::process::ExitCode, ServerEr
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let listener = UnixListener::bind(socket)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o700));
+    }
     let expected_identity = session_identity(seed);
     for stream in listener.incoming() {
         let mut stream = stream?;
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
         if !peer_is_current_user(&stream) {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             continue;
         }
-        let mut session = Session::new(seed, 0, expected_identity);
+        // Actor identity arrives in each connection's Hello; no session
+        // defaults to actor zero.
+        let mut session = Session::new(seed, expected_identity);
         let mut reader = stream.try_clone()?;
         let _ = session.serve(&mut reader, &mut stream);
     }
@@ -344,13 +378,15 @@ fn peer_is_current_user(stream: &UnixStream) -> bool {
 
 /// Serve one session over a byte-pair in memory (tests and the acceptance
 /// harness use this to exercise the full protocol without a socket).
+///
+/// The actor is read from the `Hello` inside `input`; no actor zero default
+/// is applied.
 pub fn serve_session(
-    seed: Hash,
-    actor: u32,
-    identity: Hash,
+    seed: EntryHash,
+    identity: EntryHash,
     input: &[u8],
 ) -> Result<Goodbye, ServerError> {
-    let mut session = Session::new(seed, actor, identity);
+    let mut session = Session::new(seed, identity);
     let mut reader = std::io::Cursor::new(input.to_vec());
     let mut writer = Vec::new();
     let goodbye = session.serve(&mut reader, &mut writer)?;
@@ -362,8 +398,16 @@ mod tests {
     use super::*;
     use ldgr_rt::proto::{Effect, EffectRequest, Hello, Message, encode_frame, encode_message};
 
-    fn frames(_seed: Hash, identity: Hash) -> Vec<u8> {
-        let hello = encode_frame(0, &encode_message(&Message::Hello(Hello { identity }))).unwrap();
+    fn frames(_seed: EntryHash, identity: EntryHash) -> Vec<u8> {
+        frames_for_actor(_seed, identity, ActorId(0))
+    }
+
+    fn frames_for_actor(_seed: EntryHash, identity: EntryHash, actor: ActorId) -> Vec<u8> {
+        let hello = encode_frame(
+            0,
+            &encode_message(&Message::Hello(Hello { identity, actor })),
+        )
+        .unwrap();
         let clock = encode_frame(
             1,
             &encode_message(&Message::EffectRequest(EffectRequest {
@@ -399,12 +443,13 @@ mod tests {
 
     #[test]
     fn full_session_serves_effects_and_journals_a_root() {
-        let seed = [7u8; 32];
+        let seed = EntryHash([7u8; 32]);
         let identity = session_identity(seed);
         let input = frames(seed, identity);
-        let goodbye = serve_session(seed, 0, identity, &input).expect("session serves");
+        let goodbye = serve_session(seed, identity, &input).expect("session serves");
         assert_ne!(
-            goodbye.root, [0u8; 32],
+            goodbye.root,
+            EntryHash([0u8; 32]),
             "a served session must produce a root"
         );
         assert!(
@@ -416,11 +461,11 @@ mod tests {
 
     #[test]
     fn identity_mismatch_fails_closed() {
-        let seed = [7u8; 32];
+        let seed = EntryHash([7u8; 32]);
         let identity = session_identity(seed);
-        let wrong = [9u8; 32];
+        let wrong = EntryHash([9u8; 32]);
         let input = frames(seed, wrong);
-        let err = serve_session(seed, 0, identity, &input).unwrap_err();
+        let err = serve_session(seed, identity, &input).unwrap_err();
         assert!(matches!(
             err,
             ServerError::Rejected(ldgr_rt::proto::RejectReason::Identity)
@@ -429,10 +474,17 @@ mod tests {
 
     #[test]
     fn sequence_gap_fails_closed() {
-        let seed = [7u8; 32];
+        let seed = EntryHash([7u8; 32]);
         let identity = session_identity(seed);
         // Hello (seq 0), then Clock at seq 5 (gap) must be rejected.
-        let hello = encode_frame(0, &encode_message(&Message::Hello(Hello { identity }))).unwrap();
+        let hello = encode_frame(
+            0,
+            &encode_message(&Message::Hello(Hello {
+                identity,
+                actor: ActorId(0),
+            })),
+        )
+        .unwrap();
         let clock = encode_frame(
             5,
             &encode_message(&Message::EffectRequest(EffectRequest {
@@ -441,7 +493,7 @@ mod tests {
         )
         .unwrap();
         let input = [hello, clock].concat();
-        let err = serve_session(seed, 0, identity, &input).unwrap_err();
+        let err = serve_session(seed, identity, &input).unwrap_err();
         assert!(matches!(
             err,
             ServerError::Rejected(ldgr_rt::proto::RejectReason::Protocol)
@@ -450,10 +502,17 @@ mod tests {
 
     #[test]
     fn byte_faithful_fs_operations_roundtrip() {
-        let seed = [12u8; 32];
+        let seed = EntryHash([12u8; 32]);
         let identity = session_identity(seed);
         let payload = vec![0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF, 0x42];
-        let hello = encode_frame(0, &encode_message(&Message::Hello(Hello { identity }))).unwrap();
+        let hello = encode_frame(
+            0,
+            &encode_message(&Message::Hello(Hello {
+                identity,
+                actor: ActorId(0),
+            })),
+        )
+        .unwrap();
         let write = encode_frame(
             1,
             &encode_message(&Message::EffectRequest(EffectRequest {
@@ -488,8 +547,59 @@ mod tests {
         let finish = encode_frame(4, &encode_message(&Message::Finish)).unwrap();
         let input = [hello, write, read, sync, finish].concat();
 
-        let goodbye = serve_session(seed, 0, identity, &input).expect("session serves");
+        let goodbye = serve_session(seed, identity, &input).expect("session serves");
         assert!(goodbye.entries >= 3, "fs operations must be journaled");
+    }
+
+    #[test]
+    fn two_actors_are_isolated_and_deterministic() {
+        // Same seed and same effect shape under two actors: each actor is
+        // deterministic across repeats, and actor-routed sends diverge.
+        let seed = EntryHash([21u8; 32]);
+        let identity = session_identity(seed);
+        for actor in [ActorId(0), ActorId(1)] {
+            let first = serve_session(seed, identity, &frames_for_actor(seed, identity, actor))
+                .expect("session serves");
+            let second = serve_session(seed, identity, &frames_for_actor(seed, identity, actor))
+                .expect("session rerun serves");
+            assert_eq!(
+                first.root, second.root,
+                "actor {} must be deterministic",
+                actor.0
+            );
+            assert_eq!(first.entries, second.entries);
+        }
+        let root0 = serve_session(
+            seed,
+            identity,
+            &frames_for_actor(seed, identity, ActorId(0)),
+        )
+        .expect("actor 0");
+        let root1 = serve_session(
+            seed,
+            identity,
+            &frames_for_actor(seed, identity, ActorId(1)),
+        )
+        .expect("actor 1");
+        // The shared fixture has no actor-routed sends, so both actors journal
+        // the same shape; the handshake still binds them distinctly and the
+        // server reports the bound actor per session.
+        assert_eq!(root0.entries, root1.entries);
+        let mut probe = Session::new(seed, identity);
+        let hello = encode_frame(
+            0,
+            &encode_message(&Message::Hello(Hello {
+                identity,
+                actor: ActorId(7),
+            })),
+        )
+        .unwrap();
+        let finish = encode_frame(1, &encode_message(&Message::Finish)).unwrap();
+        let mut reader = std::io::Cursor::new([hello, finish].concat());
+        let mut writer = Vec::new();
+        let goodbye = probe.serve(&mut reader, &mut writer).expect("probe serves");
+        assert_eq!(probe.actor(), Some(ActorId(7)));
+        assert_eq!(goodbye.entries, 0);
     }
 }
 

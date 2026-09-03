@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ledger_format::{EntryKind, FaultSpec};
+use ledger_format::{ActorId, EntryKind, FaultSpec};
 
 use crate::parser::{Block, Scenario, ScenarioError};
 
@@ -86,13 +86,24 @@ pub fn compile(scenario: &Scenario) -> Result<CompiledScenario, ScenarioError> {
     let mut faults = Vec::new();
     let mut schedule = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Scenario-scoped actor registry: every actor name the scenario
+    // mentions resolves deterministically. Numeric suffixes resolve
+    // directly; opaque names fall back to the historic wrapping hash with
+    // collision detection, so ad-hoc topologies (a->b) keep working while
+    // silent id merges fail closed.
+    let registry = scenario_registry(scenario.blocks.iter().flat_map(actor_names_for_block))?;
+    // Actor id owners across Partition blocks: distinct opaque names must not
+    // share one id. Numeric aliases for the same id under different spellings
+    // (replica-1 vs node:1) are collisions too.
+    let mut id_owners: HashMap<ActorId, String> = HashMap::new();
 
     for block in &scenario.blocks {
         let key = target_key(block);
         if !seen.insert(key.clone()) {
             return Err(ScenarioError::DuplicateTarget(key));
         }
-        let (fault_entries, injection) = compile_block(block)?;
+        let (fault_entries, injection) = compile_block(block, &registry)?;
+        check_partition_collision(&injection, &registry, &mut id_owners)?;
         faults.extend(fault_entries);
         schedule.push(injection);
     }
@@ -116,8 +127,88 @@ fn actors_for_block(block: &Block) -> Vec<String> {
     }
 }
 
+/// Actor names a block addresses as simulated actors.
+///
+/// `Corrupt` segments and `TornWrite` flags name storage objects, not
+/// actors, so they stay out of the actor registry (they still count toward
+/// the per-actor storm heuristic via [`actors_for_block`]).
+fn actor_names_for_block(block: &Block) -> Vec<String> {
+    match block {
+        Block::Drop { src, dst, .. } => vec![src.clone(), dst.clone()],
+        Block::CrashRestart { actor, .. } => vec![actor.clone()],
+        Block::Corrupt { .. } => Vec::new(),
+        Block::TornWrite { .. } => Vec::new(),
+        Block::Partition { src, dst } => vec![src.clone(), dst.clone()],
+        Block::ClockSkew { actor, .. } => vec![actor.clone()],
+        Block::BoundedLatency { src, dst, .. } => vec![src.clone(), dst.clone()],
+    }
+}
+
+/// Historic deterministic id for opaque actor names.
+///
+/// Restored wrapping multiply (`h % 10000 + 1`, never 0) so ad-hoc
+/// topologies keep byte-stable mappings across refactors. Collisions
+/// between distinct names are detected at registration, not silently
+/// merged.
+pub fn opaque_actor_id(name: &str) -> ActorId {
+    let mut h: u32 = 0;
+    for b in name.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(u32::from(b));
+    }
+    if h == 0 {
+        ActorId(1)
+    } else {
+        ActorId(h % 10000 + 1)
+    }
+}
+
+/// Build the scenario-scoped registry for `compile`.
+///
+/// Starts from [`ActorRegistry::with_known`] and auto-registers every
+/// opaque name the scenario mentions at its [`opaque_actor_id`]. Numeric
+/// suffixes need no registration. Distinct names that map to one id fail
+/// with [`ScenarioError::ActorCollision`].
+pub fn scenario_registry(
+    names: impl IntoIterator<Item = String>,
+) -> Result<ActorRegistry, ScenarioError> {
+    let mut registry = ActorRegistry::with_known();
+    for name in names {
+        if name.is_empty() || name.len() > crate::parser::MAX_NAME_LEN {
+            return Err(ScenarioError::InvalidSyntax(format!(
+                "actor name {name:?} must be 1..={} bytes",
+                crate::parser::MAX_NAME_LEN
+            )));
+        }
+        if numeric_suffix(&name).is_some() {
+            continue;
+        }
+        if registry.by_name.contains_key(&name) {
+            continue;
+        }
+        let id = opaque_actor_id(&name);
+        registry.register(&name, id)?;
+    }
+    Ok(registry)
+}
+
+/// Trailing numeric suffix after `-` or `:` (`replica-2` -> 2).
+fn numeric_suffix(name: &str) -> Option<u32> {
+    if let Some(pos) = name.rfind('-')
+        && let Ok(n) = name[pos + 1..].parse::<u32>()
+    {
+        return Some(n);
+    }
+    if let Some(pos) = name.rfind(':')
+        && let Ok(n) = name[pos + 1..].parse::<u32>()
+    {
+        return Some(n);
+    }
+    None
+}
+
 fn compile_block(
     block: &Block,
+    registry: &ActorRegistry,
 ) -> Result<(Vec<(EntryKind, FaultSpec)>, FaultInjection), ScenarioError> {
     match block {
         Block::Drop {
@@ -178,11 +269,20 @@ fn compile_block(
             Ok((faults, inj))
         }
         Block::Partition { src, dst } => {
+            let src_id = registry.resolve(src)?;
+            let dst_id = registry.resolve(dst)?;
+            if src_id == dst_id && src != dst {
+                return Err(ScenarioError::ActorCollision {
+                    first: src.clone(),
+                    second: dst.clone(),
+                    id: src_id,
+                });
+            }
             let faults = vec![(
                 EntryKind::Send,
                 FaultSpec::Partition {
-                    src: actor_id(src),
-                    dst: actor_id(dst),
+                    src: src_id,
+                    dst: dst_id,
                 },
             )];
             let inj = FaultInjection::Partition {
@@ -234,6 +334,35 @@ fn compile_block(
     }
 }
 
+/// Record Partition actor ids and reject cross-block id reuse across
+/// distinct names.
+fn check_partition_collision(
+    injection: &FaultInjection,
+    registry: &ActorRegistry,
+    owners: &mut HashMap<ActorId, String>,
+) -> Result<(), ScenarioError> {
+    let FaultInjection::Partition { src, dst } = injection else {
+        return Ok(());
+    };
+    for name in [src, dst] {
+        // Names resolve through the scenario registry built at compile;
+        // numeric and auto-registered opaque names both resolve here.
+        let id = registry.resolve(name)?;
+        if let Some(owner) = owners.get(&id) {
+            if owner != name {
+                return Err(ScenarioError::ActorCollision {
+                    first: owner.clone(),
+                    second: name.clone(),
+                    id,
+                });
+            }
+        } else {
+            owners.insert(id, name.clone());
+        }
+    }
+    Ok(())
+}
+
 fn target_key(block: &Block) -> String {
     match block {
         Block::Drop { src, dst, .. } => format!("drop:{src}->{dst}"),
@@ -246,31 +375,135 @@ fn target_key(block: &Block) -> String {
     }
 }
 
+/// Maximum actor id accepted by the registry.
+///
+/// Matches the IPC wire cap so compiled partitions stay routable; larger
+/// numeric suffixes are rejected with [`ScenarioError::InvalidActorId`].
+/// Zero is the default first actor and stays valid.
+pub const MAX_REGISTRY_ACTOR_ID: u32 = 1 << 20;
+
+/// Deterministic actor registry for opaque names.
+///
+/// Numeric suffixes (`replica-2`, `node:3`, `replica-0`) resolve directly
+/// without registration. Opaque names resolve through the scenario-scoped
+/// registry built by [`scenario_registry`], which auto-registers every
+/// name the scenario mentions at its [`opaque_actor_id`]; direct
+/// [`ActorRegistry::resolve`] on an unregistered opaque name fails with
+/// [`ScenarioError::UnknownActor`]. Registration rejects id reuse across
+/// distinct names with [`ScenarioError::ActorCollision`].
+#[derive(Debug, Clone, Default)]
+pub struct ActorRegistry {
+    by_name: std::collections::BTreeMap<String, ActorId>,
+    by_id: std::collections::BTreeMap<ActorId, String>,
+}
+
+impl ActorRegistry {
+    /// Empty registry with no opaque names.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registry preloaded with the canonical opaque names at their historic
+    /// ids (`leader` -> 3002, `replica` -> 4633) so existing canonical
+    /// scenarios keep identical mappings.
+    pub fn with_known() -> Self {
+        let mut registry = Self::new();
+        // Historic wrapping-hash values, preserved so canonical fixtures do
+        // not drift. Registration cannot collide here by construction.
+        let _ = registry.register("leader", ActorId(3002));
+        let _ = registry.register("replica", ActorId(4633));
+        registry
+    }
+
+    /// Register `name` at `id`.
+    ///
+    /// Rejects empty or overlong names and over-cap ids, and id reuse
+    /// across distinct names. Zero is a valid actor (the default first
+    /// actor; sim and the IPC wire both accept it).
+    pub fn register(&mut self, name: &str, id: ActorId) -> Result<(), ScenarioError> {
+        if name.is_empty() || name.len() > crate::parser::MAX_NAME_LEN {
+            return Err(ScenarioError::InvalidSyntax(format!(
+                "actor name {name:?} must be 1..={} bytes",
+                crate::parser::MAX_NAME_LEN
+            )));
+        }
+        if id.0 > MAX_REGISTRY_ACTOR_ID {
+            return Err(ScenarioError::InvalidActorId {
+                name: name.to_string(),
+                id,
+                max: MAX_REGISTRY_ACTOR_ID,
+            });
+        }
+        if let Some(known) = self.by_name.get(name) {
+            if *known == id {
+                return Ok(());
+            }
+            return Err(ScenarioError::ActorCollision {
+                first: name.to_string(),
+                second: name.to_string(),
+                id,
+            });
+        }
+        if let Some(owner) = self.by_id.get(&id) {
+            return Err(ScenarioError::ActorCollision {
+                first: owner.clone(),
+                second: name.to_string(),
+                id,
+            });
+        }
+        self.by_name.insert(name.to_string(), id);
+        self.by_id.insert(id, name.to_string());
+        Ok(())
+    }
+
+    /// Resolve `name` to an actor id.
+    ///
+    /// A trailing numeric suffix after `-` or `:` resolves directly
+    /// (`replica-2` -> 2, `node:3` -> 3, `replica-0` -> 0) within
+    /// `0..=MAX`. Opaque names resolve through registration (see
+    /// [`scenario_registry` for scenario-scoped auto-registration);
+    /// unknown opaque names fail with [`ScenarioError::UnknownActor`].
+    pub fn resolve(&self, name: &str) -> Result<ActorId, ScenarioError> {
+        if name.is_empty() || name.len() > crate::parser::MAX_NAME_LEN {
+            return Err(ScenarioError::InvalidSyntax(format!(
+                "actor name {name:?} must be 1..={} bytes",
+                crate::parser::MAX_NAME_LEN
+            )));
+        }
+        if let Some(n) = numeric_suffix(name) {
+            return check_numeric_id(name, n);
+        }
+        self.by_name
+            .get(name)
+            .copied()
+            .ok_or_else(|| ScenarioError::UnknownActor {
+                name: name.to_string(),
+            })
+    }
+}
+
+fn check_numeric_id(name: &str, id: u32) -> Result<ActorId, ScenarioError> {
+    if id > MAX_REGISTRY_ACTOR_ID {
+        return Err(ScenarioError::InvalidActorId {
+            name: name.to_string(),
+            id: ActorId(id),
+            max: MAX_REGISTRY_ACTOR_ID,
+        });
+    }
+    Ok(ActorId(id))
+}
+
 /// Deterministic actor-id parse shared with the explorer bridge.
 ///
-/// A trailing numeric suffix after `-` or `:` parses directly
-/// (`"replica-2"` -> 2, `"node:3"` -> 3). Opaque names fall back to a
-/// deterministic wrapping hash in 1..=10000; 0 is reserved for the scheduler
-/// actor. The bridge in `ledger-explorer` imports this single implementation
-/// for `SimFault::Partition` targeting.
-pub fn actor_id(name: &str) -> u32 {
-    if let Some(pos) = name.rfind('-')
-        && let Ok(n) = name[pos + 1..].parse::<u32>()
-    {
-        return n;
-    }
-    if let Some(pos) = name.rfind(':')
-        && let Ok(n) = name[pos + 1..].parse::<u32>()
-    {
-        return n;
-    }
-    // Fallback deterministic hash: simple wrapping multiply.
-    let mut h: u32 = 0;
-    for b in name.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(u32::from(b));
-    }
-    // Avoid 0 which is reserved for scheduler actor.
-    if h == 0 { 1 } else { h % 10000 + 1 }
+/// Numeric suffixes resolve directly; opaque names resolve through the
+/// canonical registry (`leader`, `replica` plus numeric forms). Unknown
+/// opaque names fail with [`ScenarioError::UnknownActor`]; use
+/// [`scenario_registry`] to resolve every name a scenario mentions
+/// (auto-registers opaque names at [`opaque_actor_id`] with collision
+/// detection). The bridge in `ledger-explorer` must propagate the
+/// `Result`.
+pub fn actor_id(name: &str) -> Result<ActorId, ScenarioError> {
+    ActorRegistry::with_known().resolve(name)
 }
 
 #[cfg(test)]
@@ -367,7 +600,7 @@ mod tests {
             "crash-restart replica-2 after FsFsync",
             "corrupt sector range [0x0,0x100) of seg-1",
             "torn-write on O_APPEND",
-            "partition a->b",
+            "partition replica-1->replica-2",
             "clock-skew n1 by 100ms",
             "delay a->b by 50ms",
         ];
@@ -422,7 +655,8 @@ mod tests {
 
     #[test]
     fn neutral_surface_deterministic() {
-        let input = "scenario d\ndrop 10% of a->b Msgs for 1s every 10s\npartition a->b";
+        let input =
+            "scenario d\ndrop 10% of a->b Msgs for 1s every 10s\npartition replica-1->replica-2";
         let s1 = parse_scenario(input).unwrap();
         let s2 = parse_scenario(input).unwrap();
         let c1 = compile(&s1).unwrap();
@@ -442,22 +676,89 @@ mod tests {
         assert_eq!(c.faults.len(), 1);
         match c.faults[0].1 {
             FaultSpec::Partition { src, dst } => {
-                assert_eq!(src, 2);
-                assert_eq!(dst, 7);
+                assert_eq!(src, ActorId(2));
+                assert_eq!(dst, ActorId(7));
             }
             _ => panic!("expected partition"),
         }
-        // Opaque names use the deterministic fallback id, never 0.
-        let s = parse_scenario("scenario p\npartition foo->bar").unwrap();
+        // Canonical opaque names keep their historic ids.
+        let s = parse_scenario("scenario p\npartition leader->replica").unwrap();
         let c = compile(&s).unwrap();
         match c.faults[0].1 {
             FaultSpec::Partition { src, dst } => {
-                assert_ne!(src, 0);
-                assert_ne!(dst, 0);
-                assert_ne!(src, dst);
+                assert_eq!(src, ActorId(3002));
+                assert_eq!(dst, ActorId(4633));
             }
             _ => panic!("expected partition"),
         }
+        // Opaque names in the scenario auto-register at their historic
+        // wrapping-hash ids with collision detection.
+        let s = parse_scenario("scenario p\npartition foo->bar").unwrap();
+        let c = compile(&s).expect("scenario names must auto-register");
+        match c.faults[0].1 {
+            FaultSpec::Partition { src, dst } => {
+                assert_eq!(src, opaque_actor_id("foo"));
+                assert_eq!(dst, opaque_actor_id("bar"));
+            }
+            _ => panic!("expected partition"),
+        }
+    }
+
+    #[test]
+    fn registry_rejects_collisions_and_bad_ids() {
+        // Distinct names sharing one id collide, even across blocks.
+        let s = parse_scenario(
+            "scenario c\npartition replica-1->replica-2\npartition node:1->replica-3",
+        )
+        .unwrap();
+        assert!(
+            matches!(compile(&s), Err(ScenarioError::ActorCollision { .. })),
+            "numeric aliases for one id must collide"
+        );
+        // Self-partition under two spellings of one id collides per block.
+        let s = parse_scenario("scenario c\npartition replica-1->node:1").unwrap();
+        assert!(
+            matches!(compile(&s), Err(ScenarioError::ActorCollision { .. })),
+            "same id under distinct names must collide"
+        );
+        // Zero is the default first actor; over-cap suffixes are rejected.
+        assert_eq!(
+            actor_id("replica-0").expect("replica-0 must resolve"),
+            ActorId(0)
+        );
+        assert!(matches!(
+            actor_id("replica-2097152"),
+            Err(ScenarioError::InvalidActorId { .. })
+        ));
+        // Direct registry collision on register.
+        let mut registry = ActorRegistry::new();
+        registry
+            .register("alpha", ActorId(11))
+            .expect("first register");
+        let error = registry
+            .register("beta", ActorId(11))
+            .expect_err("id reuse must collide");
+        assert!(
+            matches!(
+                error,
+                ScenarioError::ActorCollision {
+                    id: ActorId(11),
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        // Unknown opaque resolves fail; known resolve succeeds.
+        assert!(matches!(
+            ActorRegistry::new().resolve("ghost"),
+            Err(ScenarioError::UnknownActor { .. })
+        ));
+        assert_eq!(
+            ActorRegistry::with_known()
+                .resolve("leader")
+                .expect("known"),
+            ActorId(3002)
+        );
     }
 
     /// Every public facade type stays on ledger-format types only.
@@ -473,7 +774,7 @@ mod tests {
             "crash-restart replica-2 after FsFsync",
             "corrupt sector range [0x0,0x100) of seg-1",
             "torn-write on O_APPEND",
-            "partition a->b",
+            "partition replica-1->replica-2",
             "clock-skew n1 by 100ms",
             "delay a->b by 50ms",
         ];

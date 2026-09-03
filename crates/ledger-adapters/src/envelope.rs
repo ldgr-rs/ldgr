@@ -9,7 +9,7 @@
 //! BLAKE3 content address over those bytes.
 
 use crate::AdapterError;
-use ledger_format::{EntryKind, FaultSpec, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, FaultSpec};
 use serde::{Deserialize, Serialize};
 
 pub const ENVELOPE_MAGIC: [u8; 4] = *b"LDGR";
@@ -116,7 +116,10 @@ impl From<FaultSpec> for FaultSpecSerde {
         match f {
             FaultSpec::Drop => Self::Drop,
             FaultSpec::Delay { ticks } => Self::Delay { ticks },
-            FaultSpec::Partition { src, dst } => Self::Partition { src, dst },
+            FaultSpec::Partition { src, dst } => Self::Partition {
+                src: src.0,
+                dst: dst.0,
+            },
             FaultSpec::Crash => Self::Crash,
             FaultSpec::Corrupt => Self::Corrupt,
             FaultSpec::CrashState(s) => Self::CrashState(s),
@@ -129,7 +132,10 @@ impl From<FaultSpecSerde> for FaultSpec {
         match f {
             FaultSpecSerde::Drop => Self::Drop,
             FaultSpecSerde::Delay { ticks } => Self::Delay { ticks },
-            FaultSpecSerde::Partition { src, dst } => Self::Partition { src, dst },
+            FaultSpecSerde::Partition { src, dst } => Self::Partition {
+                src: ActorId(src),
+                dst: ActorId(dst),
+            },
             FaultSpecSerde::Crash => Self::Crash,
             FaultSpecSerde::Corrupt => Self::Corrupt,
             FaultSpecSerde::CrashState(s) => Self::CrashState(s),
@@ -242,9 +248,9 @@ impl InterchangeEnvelope {
     ///
     /// The hash is deterministic: same body and header yield identical
     /// bytes and identical hash. Useful for deduplication and lineage.
-    pub fn envelope_hash(&self) -> Result<Hash, AdapterError> {
+    pub fn envelope_hash(&self) -> Result<EntryHash, AdapterError> {
         let bytes = self.to_canonical_bytes()?;
-        Ok(*blake3::hash(&bytes).as_bytes())
+        Ok(EntryHash(*blake3::hash(&bytes).as_bytes()))
     }
 }
 

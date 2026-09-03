@@ -24,7 +24,9 @@ use std::sync::Arc;
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 
 fn golden_config() -> RunConfig {
-    RunConfig::builder().seed([7u8; 32]).build()
+    RunConfig::builder()
+        .seed(ledger_format::EntryHash([7u8; 32]))
+        .build()
 }
 
 fn golden_task(id: &str) -> Task {
@@ -236,7 +238,7 @@ async fn session_root_through_fake_cp(sock: &std::path::Path, accept: bool) -> S
     // The worker dials OUT; no socket of its own is created.
     let endpoint = ledger_worker::unix_endpoint(sock).expect("unix endpoint");
     let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
-    let hello = worker_hello("w-cross", env!("CARGO_PKG_VERSION"));
+    let hello = worker_hello("w-cross", env!("CARGO_PKG_VERSION")).expect("hello builds");
     tx.send(ledger_worker::r#gen::SessionRequest {
         message: Some(session_request::Message::Hello(hello)),
     })
@@ -392,7 +394,7 @@ async fn rejected_session_fails_closed() {
 
     let endpoint = ledger_worker::unix_endpoint(&sock).expect("unix endpoint");
     let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
-    let hello = worker_hello("w-reject", env!("CARGO_PKG_VERSION"));
+    let hello = worker_hello("w-reject", env!("CARGO_PKG_VERSION")).expect("hello builds");
     tx.send(ledger_worker::r#gen::SessionRequest {
         message: Some(session_request::Message::Hello(hello)),
     })
@@ -448,7 +450,7 @@ async fn heartbeats_flow_while_task_runs() {
     let state = fake_cp::spawn(&sock, golden_dispatch(), true).await;
     let endpoint = ledger_worker::unix_endpoint(&sock).expect("unix endpoint");
     let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
-    let hello = worker_hello("w-hb", env!("CARGO_PKG_VERSION"));
+    let hello = worker_hello("w-hb", env!("CARGO_PKG_VERSION")).expect("hello builds");
     tx.send(ledger_worker::r#gen::SessionRequest {
         message: Some(session_request::Message::Hello(hello)),
     })
@@ -513,7 +515,7 @@ async fn unknown_workload_fails_closed() {
     let state = fake_cp::spawn(&sock, dispatch, true).await;
     let endpoint = ledger_worker::unix_endpoint(&sock).expect("unix endpoint");
     let (tx, mut rx) = open_session(&endpoint).await.expect("open session");
-    let hello = worker_hello("w-uw", env!("CARGO_PKG_VERSION"));
+    let hello = worker_hello("w-uw", env!("CARGO_PKG_VERSION")).expect("hello builds");
     tx.send(ledger_worker::r#gen::SessionRequest {
         message: Some(session_request::Message::Hello(hello)),
     })

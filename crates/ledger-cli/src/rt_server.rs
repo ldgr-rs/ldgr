@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle, Workload};
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{RunConfig, RuntimeError, Simulation};
 
 use crate::DefaultMiniKv;
@@ -170,6 +170,12 @@ const UDS_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// applied (the listener drops and the bind is rolled back).
 fn bind_private(socket: &Path) -> Result<UnixListener, std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
+    if let Some(parent) = socket.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
     let listener = UnixListener::bind(socket)?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o700))?;
     Ok(listener)
@@ -261,7 +267,7 @@ const DEFAULT_MAX_STEPS: u64 = 256;
 #[derive(Debug)]
 struct RunRequest<'a> {
     workload: &'a str,
-    seed: Hash,
+    seed: EntryHash,
     max_steps: usize,
     attempts: usize,
 }
@@ -323,7 +329,7 @@ fn parse_run_request(value: &serde_json::Value) -> Result<RunRequest<'_>, RunErr
         })?;
         crate::seed_from_u64(number)
     } else {
-        [0u8; 32]
+        EntryHash([0u8; 32])
     };
     Ok(RunRequest {
         workload,
@@ -373,10 +379,10 @@ fn handle_request(text: &str) -> serde_json::Value {
 
 fn run_workload_named(
     workload: &str,
-    seed: Hash,
+    seed: EntryHash,
     max_steps: usize,
     attempts: usize,
-) -> Result<(Vec<Hash>, usize, usize), RunError> {
+) -> Result<(Vec<EntryHash>, usize, usize), RunError> {
     // Named dispatch is the only remote execution surface; caller programs
     // stay in the SUT process and are refused by ldgr-rt under `sim`.
     // No aliases: unknown names fail loudly so removed workloads stay gone.
@@ -387,10 +393,10 @@ fn run_workload_named(
 }
 
 fn run_kv(
-    seed: Hash,
+    seed: EntryHash,
     max_steps: usize,
     attempts: usize,
-) -> Result<(Vec<Hash>, usize, usize), RuntimeError> {
+) -> Result<(Vec<EntryHash>, usize, usize), RuntimeError> {
     let workload = DefaultMiniKv;
     let oracle = HistoryOracle::new(&workload, KeyValueSpec::default());
     let attempts = attempts.max(1);
@@ -400,7 +406,7 @@ fn run_kv(
     for attempt in 0..attempts {
         let mut attempt_seed = seed;
         if attempts > 1 {
-            attempt_seed[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+            attempt_seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         }
         let config = RunConfig::builder()
             .seed(attempt_seed)
@@ -416,11 +422,11 @@ fn run_kv(
     Ok((roots, findings, max_steps_seen))
 }
 
-fn hex_encode(hash: &Hash) -> String {
+fn hex_encode(hash: &EntryHash) -> String {
     ledger_format::hash_to_hex(hash)
 }
 
-fn hex_decode32(text: &str) -> Result<Hash, ledger_format::HexError> {
+fn hex_decode32(text: &str) -> Result<EntryHash, ledger_format::HexError> {
     let trimmed = text.trim();
     let hex = if let Some(stripped) = trimmed.strip_prefix("0x") {
         stripped
@@ -434,11 +440,11 @@ fn hex_decode32(text: &str) -> Result<Hash, ledger_format::HexError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunError, hex_decode32, hex_encode};
+    use super::{EntryHash, RunError, hex_decode32, hex_encode};
 
     #[test]
     fn hex_roundtrip() {
-        let bytes = [0x5au8; 32];
+        let bytes = EntryHash([0x5au8; 32]);
         let encoded = hex_encode(&bytes);
         assert_eq!(encoded.len(), 64);
         let decoded = hex_decode32(&encoded).expect("decode");
@@ -447,7 +453,7 @@ mod tests {
 
     #[test]
     fn hex_decode32_tolerates_prefix_and_padding() {
-        let bytes = [0x11u8; 32];
+        let bytes = EntryHash([0x11u8; 32]);
         let encoded = hex_encode(&bytes);
         assert_eq!(hex_decode32(&format!("0x{encoded}")).unwrap(), bytes);
         assert_eq!(hex_decode32(&format!("  {encoded} \n")).unwrap(), bytes);
@@ -456,7 +462,7 @@ mod tests {
 
     #[test]
     fn run_kv_is_deterministic() {
-        let seed = [7u8; 32];
+        let seed = EntryHash([7u8; 32]);
         let (a_roots, _, _) = super::run_kv(seed, 256, 1).expect("run");
         let (b_roots, _, _) = super::run_kv(seed, 256, 1).expect("run");
         assert_eq!(a_roots, b_roots);
@@ -473,7 +479,7 @@ mod tests {
             "mini_kv",
             "default",
         ] {
-            let error = super::run_workload_named(name, [7u8; 32], 256, 1).unwrap_err();
+            let error = super::run_workload_named(name, EntryHash([7u8; 32]), 256, 1).unwrap_err();
             assert!(
                 matches!(error, RunError::UnknownWorkload(ref got) if got == name),
                 "{name} must stay an unknown workload, got {error}"
@@ -551,7 +557,7 @@ mod tests {
         let request = parse_run_request(&minimal).expect("minimal request");
         assert_eq!(request.max_steps, 256);
         assert_eq!(request.attempts, 1);
-        assert_eq!(request.seed, [0u8; 32]);
+        assert_eq!(request.seed, EntryHash([0u8; 32]));
     }
 
     /// A present but invalid seed must be a protocol error: an overflowing
@@ -594,7 +600,7 @@ mod tests {
         let mut value = base.clone();
         value["seed_u64"] = serde_json::json!(42);
         let request = parse_run_request(&value).expect("valid seed_u64");
-        assert_ne!(request.seed, [0u8; 32]);
+        assert_ne!(request.seed, EntryHash([0u8; 32]));
     }
 
     #[test]

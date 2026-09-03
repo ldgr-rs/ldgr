@@ -17,7 +17,7 @@
 //! The fingerprint is deterministic: list fields are sorted before hashing,
 //! so equal profiles fingerprint equally regardless of registration order.
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use serde::{Deserialize, Serialize};
 
 /// Default env-sanitation pattern: stripped variable name families.
@@ -71,14 +71,14 @@ impl RuntimeProfile {
     /// Fields are encoded length-prefixed in declaration order; `sut_hashes`
     /// and `env_sanitation` are sorted first so registration order does not
     /// change the fingerprint.
-    pub fn fingerprint(&self) -> Hash {
-        *blake3::hash(&self.canonical_bytes()).as_bytes()
+    pub fn fingerprint(&self) -> EntryHash {
+        EntryHash(*blake3::hash(&self.canonical_bytes()).as_bytes())
     }
 
     /// First eight hex chars of [`Self::fingerprint`], for builder ids.
     pub fn fingerprint_hex8(&self) -> String {
         let mut s = String::with_capacity(8);
-        for b in self.fingerprint().iter().take(4) {
+        for b in self.fingerprint().0.iter().take(4) {
             s.push_str(&format!("{b:02x}"));
         }
         s

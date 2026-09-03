@@ -164,13 +164,13 @@ mod tests {
     #[test]
     fn worker_task_spec_maps_onto_default_shaped_run_config() {
         let spec = WorkerTaskSpec {
-            seed_hex: crate::proto::hash_to_hex(&[7u8; 32]),
+            seed_hex: crate::proto::hash_to_hex(&ledger_format::EntryHash([7u8; 32])),
             max_steps: 4_242,
             policy: "random".into(),
         };
         let cfg = spec.to_run_config().unwrap();
         let expected = RunConfig::builder()
-            .seed([7u8; 32])
+            .seed(ledger_format::EntryHash([7u8; 32]))
             .max_steps(4_242)
             .build();
         // RunConfig has no PartialEq; compare the projected fields and pin
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn worker_task_spec_rejects_unknown_policy_and_bad_seed() {
         let bad_policy = WorkerTaskSpec {
-            seed_hex: crate::proto::hash_to_hex(&[1u8; 32]),
+            seed_hex: crate::proto::hash_to_hex(&ledger_format::EntryHash([1u8; 32])),
             max_steps: 10,
             policy: "bandit".into(),
         };

@@ -3,7 +3,16 @@
 use std::num::ParseIntError;
 use thiserror::Error;
 
+/// Maximum bytes for an actor, segment, or flag name.
+///
+/// Bounds unbounded allocation from untrusted DSL input; longer names are
+/// rejected with [`ScenarioError::InvalidSyntax`].
+pub const MAX_NAME_LEN: usize = 64;
+
 /// A block in a failure scenario.
+///
+/// Actor, segment, and flag names are bounded to [`MAX_NAME_LEN`] bytes;
+/// longer names are rejected at parse time with a typed error.
 #[rustfmt::skip]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
@@ -54,6 +63,24 @@ pub enum ScenarioError {
     },
     #[error("storm detected: {0}")]
     StormDetected(String),
+    /// An opaque actor name is not in the deterministic registry and carries
+    /// no numeric suffix. Register the name or use `name-N` / `name:N` form.
+    #[error("unknown actor {name:?}: not registered and no numeric suffix")]
+    UnknownActor { name: String },
+    /// Two distinct actor names resolve to the same id.
+    #[error("actor collision: {first:?} and {second:?} both map to id {id:?}")]
+    ActorCollision {
+        first: String,
+        second: String,
+        id: ledger_format::ActorId,
+    },
+    /// A numeric actor suffix is outside the accepted id range.
+    #[error("invalid actor id {id:?} for {name:?}: must be 1..={max}")]
+    InvalidActorId {
+        name: String,
+        id: ledger_format::ActorId,
+        max: u32,
+    },
 }
 
 pub fn parse_scenario(input: &str) -> Result<Scenario, ScenarioError> {
@@ -73,6 +100,7 @@ pub fn parse_scenario(input: &str) -> Result<Scenario, ScenarioError> {
         if n.is_empty() {
             (String::from("default"), 1)
         } else {
+            check_name_len(n)?;
             (n.to_string(), 1)
         }
     } else {
@@ -96,7 +124,7 @@ fn parse_block(line: &str) -> Result<Block, ScenarioError> {
         parse_crash_restart(line)
     } else if l.starts_with("corrupt ") {
         parse_corrupt(line)
-    } else if l.starts_with("torn-write") {
+    } else if l == "torn-write" || l.starts_with("torn-write ") {
         parse_torn_write(line)
     } else if l.starts_with("partition ") {
         parse_partition(line)
@@ -135,11 +163,14 @@ fn parse_crash_restart(line: &str) -> Result<Block, ScenarioError> {
         if a.is_empty() || af.is_empty() {
             return Err(ScenarioError::InvalidSyntax(line.to_string()));
         }
+        check_name_len(&a)?;
+        check_name_len(&af)?;
         Ok(Block::CrashRestart {
             actor: a,
             after: af,
         })
     } else {
+        check_name_len(r)?;
         Ok(Block::CrashRestart {
             actor: r.to_string(),
             after: String::from("FsFsync"),
@@ -172,6 +203,7 @@ fn parse_corrupt(line: &str) -> Result<Block, ScenarioError> {
     if seg.is_empty() {
         return Err(ScenarioError::InvalidSyntax(line.to_string()));
     }
+    check_name_len(&seg)?;
     Ok(Block::Corrupt {
         range: (st, en),
         segment: seg,
@@ -192,6 +224,7 @@ fn parse_torn_write(line: &str) -> Result<Block, ScenarioError> {
     if flag.is_empty() {
         return Err(ScenarioError::InvalidSyntax(line.to_string()));
     }
+    check_name_len(&flag)?;
     Ok(Block::TornWrite { flag })
 }
 
@@ -217,6 +250,7 @@ fn parse_clock_skew(line: &str) -> Result<Block, ScenarioError> {
     if actor.is_empty() || dur_s.is_empty() {
         return Err(ScenarioError::InvalidSyntax(line.to_string()));
     }
+    check_name_len(&actor)?;
     let neg = dur_s.starts_with('-');
     let raw = if neg { &dur_s[1..] } else { dur_s.as_str() };
     let ticks = parse_duration_ticks(raw)?;
@@ -284,6 +318,8 @@ fn extract_link(line: &str) -> Result<(String, String), ScenarioError> {
             let s = tok[..pos].trim().to_string();
             let d = tok[pos + 2..].trim().trim_end_matches(',').to_string();
             if !s.is_empty() && !d.is_empty() {
+                check_name_len(&s)?;
+                check_name_len(&d)?;
                 return Ok((s, d));
             }
         }
@@ -345,6 +381,19 @@ fn parse_hex_u64(s: &str) -> Result<u64, ScenarioError> {
         token: s.to_string(),
         source,
     })
+}
+
+/// Reject names over [`MAX_NAME_LEN`] bytes with a typed syntax error.
+///
+/// Bounds allocation from untrusted DSL input before names reach the actor
+/// registry or the compiled schedule.
+fn check_name_len(name: &str) -> Result<(), ScenarioError> {
+    if name.len() > MAX_NAME_LEN {
+        return Err(ScenarioError::InvalidSyntax(format!(
+            "name {name:?} exceeds {MAX_NAME_LEN} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -423,6 +472,16 @@ mod tests {
         assert_eq!(
             parse_scenario(input).unwrap(),
             parse_scenario(input).unwrap()
+        );
+    }
+
+    #[test]
+    fn overlong_actor_names_are_rejected() {
+        let long = "a".repeat(crate::parser::MAX_NAME_LEN + 1);
+        let dsl = format!("partition {long}->replica-1");
+        assert!(
+            matches!(parse_scenario(&dsl), Err(ScenarioError::InvalidSyntax(_))),
+            "overlong actor names must be bounded"
         );
     }
 

@@ -475,7 +475,9 @@ mod tests {
     #[test]
     fn push_computes_run_config_hash() {
         let mut q = InMemoryQueue::new(Duration::from_secs(60));
-        let run_config = RunConfig::builder().seed([7u8; 32]).build();
+        let run_config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([7u8; 32]))
+            .build();
         let expected = crate::proto::run_config_hash(&run_config).unwrap();
         q.push(Task::new("hashed", run_config, "trivial"));
         let task = q.pull().unwrap();
@@ -487,8 +489,14 @@ mod tests {
         dns_a.insert("a.test", 1);
         let mut dns_b = ledger_sim::DnsTable::new();
         dns_b.insert("b.test", 1);
-        let cfg_a = RunConfig::builder().seed([3u8; 32]).dns(dns_a).build();
-        let cfg_b = RunConfig::builder().seed([3u8; 32]).dns(dns_b).build();
+        let cfg_a = RunConfig::builder()
+            .seed(ledger_format::EntryHash([3u8; 32]))
+            .dns(dns_a)
+            .build();
+        let cfg_b = RunConfig::builder()
+            .seed(ledger_format::EntryHash([3u8; 32]))
+            .dns(dns_b)
+            .build();
         let mut q = InMemoryQueue::new(Duration::from_secs(60));
         q.push(Task::new("ta", cfg_a, "trivial"));
         q.push(Task::new("tb", cfg_b, "trivial"));

@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::{Journal, JournalError};
 use thiserror::Error;
 
@@ -128,7 +128,7 @@ impl WorkflowExecution {
         &mut self,
         journal: &mut Journal,
         step_name: &str,
-    ) -> Result<Hash, JournalError> {
+    ) -> Result<EntryHash, JournalError> {
         let hash = journal.append(
             EntryKind::StepBegin,
             self.actor,
@@ -148,9 +148,9 @@ impl WorkflowExecution {
         &mut self,
         journal: &mut Journal,
         step_name: &str,
-        begin_hash: Hash,
+        begin_hash: EntryHash,
         result_value: u64,
-    ) -> Result<Hash, JournalError> {
+    ) -> Result<EntryHash, JournalError> {
         let end_hash = journal.append(
             EntryKind::StepEnd,
             self.actor,
@@ -330,11 +330,11 @@ impl WorkflowExecution {
 /// Journal evidence about durable steps, keyed by step name.
 struct StepEvidence {
     /// Latest begin hash per step name.
-    begins: HashMap<String, Hash>,
+    begins: HashMap<String, EntryHash>,
     /// Begin hash to step name for recovery.
-    begin_names: HashMap<Hash, String>,
+    begin_names: HashMap<EntryHash, String>,
     /// Recorded end values keyed by their paired begin hash.
-    ends: HashMap<Hash, u64>,
+    ends: HashMap<EntryHash, u64>,
 }
 
 /// Classification of one planned step against journal evidence.
@@ -342,7 +342,7 @@ enum StepPrior {
     /// No entries; run fresh and journal begin then end.
     Pending,
     /// Unpaired begin at this hash; re-run and pair the end against it.
-    InProgress(Hash),
+    InProgress(EntryHash),
     /// Paired begin and end; skip with the recorded result.
     Skipped { result: u64 },
 }

@@ -169,23 +169,30 @@ pub fn shared_network() -> SharedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ledger_format::ActorId;
 
     #[test]
     fn send_recv_roundtrip() {
         let net = shared_network();
-        let a = Conn::new(0, 1, net.clone());
-        let b = Conn::new(1, 0, net.clone());
+        let a = Conn::new(ActorId(0), ActorId(1), net.clone());
+        let b = Conn::new(ActorId(1), ActorId(0), net.clone());
         assert!(a.send(42));
         assert!(a.has_ready());
-        assert_eq!(Conn::new(0, 1, net.clone()).recv(), Some(42));
+        assert_eq!(
+            Conn::new(ActorId(0), ActorId(1), net.clone()).recv(),
+            Some(42)
+        );
         assert!(!a.has_ready());
         assert!(b.send(7));
-        assert_eq!(Conn::new(1, 0, net.clone()).recv(), Some(7));
+        assert_eq!(
+            Conn::new(ActorId(1), ActorId(0), net.clone()).recv(),
+            Some(7)
+        );
     }
 
     #[test]
     fn partition_blocks_send() {
-        let c = Conn::isolated(0, 1);
+        let c = Conn::isolated(ActorId(0), ActorId(1));
         c.partition();
         assert!(c.is_partitioned());
         assert!(!c.send(1));
@@ -193,7 +200,7 @@ mod tests {
 
     #[test]
     fn fifo_between_same_pair() {
-        let c = Conn::isolated(0, 1);
+        let c = Conn::isolated(ActorId(0), ActorId(1));
         let _ = c.send(1);
         let _ = c.send(2);
         assert_eq!(c.recv(), Some(1));
@@ -202,12 +209,12 @@ mod tests {
 
     #[test]
     fn actor_ids_are_stored_explicitly() {
-        let c = Conn::isolated(5, 9);
-        assert_eq!(c.from(), 5);
-        assert_eq!(c.to(), 9);
+        let c = Conn::isolated(ActorId(5), ActorId(9));
+        assert_eq!(c.from(), ActorId(5));
+        assert_eq!(c.to(), ActorId(9));
         let _ = c.send(123);
         // Different actor pair does not see the message.
-        let other = Conn::new(5, 8, c.shared.clone());
+        let other = Conn::new(ActorId(5), ActorId(8), c.shared.clone());
         assert!(!other.has_ready());
         assert!(c.has_ready());
     }
@@ -216,26 +223,26 @@ mod tests {
     fn recv_for_delivers_across_full_id_space_in_fifo_order() {
         let mut net = SharedNet::default();
         net.queue.push_back(Message {
-            from: 20,
-            to: 21,
+            from: ActorId(20),
+            to: ActorId(21),
             payload: 1,
         });
         net.queue.push_back(Message {
-            from: u32::MAX,
-            to: 21,
+            from: ActorId(u32::MAX),
+            to: ActorId(21),
             payload: 2,
         });
         net.queue.push_back(Message {
-            from: 0,
-            to: 22,
+            from: ActorId(0),
+            to: ActorId(22),
             payload: 3,
         });
-        assert_eq!(net.recv_for(21), Some(1));
-        assert_eq!(net.recv_for(21), Some(2));
+        assert_eq!(net.recv_for(ActorId(21)), Some(1));
+        assert_eq!(net.recv_for(ActorId(21)), Some(2));
         // Actor 20 never receives mail addressed elsewhere; unknown actors
         // find nothing.
-        assert_eq!(net.recv_for(20), None);
-        assert_eq!(net.recv_for(u32::MAX), None);
-        assert_eq!(net.recv_for(22), Some(3));
+        assert_eq!(net.recv_for(ActorId(20)), None);
+        assert_eq!(net.recv_for(ActorId(u32::MAX)), None);
+        assert_eq!(net.recv_for(ActorId(22)), Some(3));
     }
 }

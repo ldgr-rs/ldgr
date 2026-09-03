@@ -362,6 +362,7 @@ fn already_sorted_stays_identical() {
     let root_hex: String = a
         .journal
         .root_hash()
+        .0
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();

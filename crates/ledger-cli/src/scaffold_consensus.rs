@@ -6,22 +6,28 @@ use std::path::{Path, PathBuf};
 
 use crate::scaffold::{ScaffoldError, ScaffoldReport};
 
-const CONSENSUS_MAIN: &str = r#"use ledger_explorer::reference::mini_raft;
+const CONSENSUS_MAIN: &str = r#"// License notice: this template links the AGPL engine crates
+// (ledger-sim, ledger-explorer) by path. Building it creates an AGPL-covered
+// binary. Keep SUT logic behind the Apache-2.0 ldgr-rt IPC boundary
+// (ldgr_rt::run_named over rt-server) when you need a non-AGPL result; use
+// this direct link only for in-workspace exploration.
+use ledger_explorer::reference::mini_raft;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, Simulation};
 use ledger_explorer::oracle::{Oracle, PropertyOracle};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut seed = [0u8; 32];
+    let mut seed = EntryHash([0u8; 32]);
     if let Some(arg) = std::env::args().nth(1) {
         // A non-numeric seed argument falls back to the all-zero default.
         if let Ok(v) = arg.parse::<u64>() {
-            seed[..8].copy_from_slice(&v.to_le_bytes());
+            seed.0[..8].copy_from_slice(&v.to_le_bytes());
         }
     }
     let mut findings = 0;
     for attempt in 0..16 {
         let mut s = seed;
-        s[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
+        s.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let cfg = RunConfig::builder().seed(s).policy(Policy::Random).max_steps(4096).build();
         let (builders, oracle) = mini_raft();
         let run = Simulation::with_tasks(cfg, builders).run()?;
@@ -33,15 +39,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 "#;
 
-const KV_MAIN: &str = r#"use ledger_explorer::search::search;
+const KV_MAIN: &str = r#"// License notice: this template links the AGPL engine crates
+// (ledger-sim, ledger-explorer) by path. Building it creates an AGPL-covered
+// binary. Keep SUT logic behind the Apache-2.0 ldgr-rt IPC boundary
+// (ldgr_rt::run_named over rt-server) when you need a non-AGPL result; use
+// this direct link only for in-workspace exploration.
+use ledger_explorer::search::search;
 use ledger_explorer::workloads::MiniKvWorkload;
 use ledger_explorer::{HistoryOracle, KeyValueSpec};
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let w = MiniKvWorkload;
     let o = HistoryOracle::new(&w, KeyValueSpec::default());
-    let cfg = RunConfig::builder().seed([0; 32]).policy(Policy::Random).max_steps(256).build();
+    let cfg = RunConfig::builder().seed(EntryHash([0; 32])).policy(Policy::Random).max_steps(256).build();
     if let Some(f) = search(&w, &o, cfg, 100)? {
         println!("finding: {}", f.verdict.reason);
         println!("findings: 1");
@@ -52,15 +64,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 "#;
 
-const TWO_PC_MAIN: &str = r#"use ledger_explorer::search::search;
+const TWO_PC_MAIN: &str = r#"// License notice: this template links the AGPL engine crates
+// (ledger-sim, ledger-explorer) by path. Building it creates an AGPL-covered
+// binary. Keep SUT logic behind the Apache-2.0 ldgr-rt IPC boundary
+// (ldgr_rt::run_named over rt-server) when you need a non-AGPL result; use
+// this direct link only for in-workspace exploration.
+use ledger_explorer::search::search;
 use ledger_explorer::workloads::TwoPhaseCommitWorkload;
 use ledger_explorer::oracle::AssertionOracle;
+use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let w = TwoPhaseCommitWorkload;
     let o = AssertionOracle;
-    let cfg = RunConfig::builder().seed([0; 32]).policy(Policy::Random).max_steps(256).build();
+    let cfg = RunConfig::builder().seed(EntryHash([0; 32])).policy(Policy::Random).max_steps(256).build();
     if let Some(f) = search(&w, &o, cfg, 100)? {
         println!("finding: {}", f.verdict.reason);
         println!("findings: 1");
@@ -100,10 +118,13 @@ pub fn scaffold_consensus(
     let package_name = sanitize_package_name(dir);
     let explorer_path = locate_crate_path(dir, "crates/ledger-explorer");
     let sim_path = locate_crate_path(dir, "crates/ledger-sim");
-    let cargo = consensus_cargo_toml(&package_name, &explorer_path, &sim_path);
+    let rt_path = locate_crate_path(dir, "crates/ldgr-rt");
+    let cargo = consensus_cargo_toml(&package_name, &explorer_path, &sim_path, &rt_path);
+    let readme = consensus_readme(&package_name);
     let targets: Vec<(PathBuf, Vec<u8>)> = vec![
         (dir.join("Cargo.toml"), cargo.into_bytes()),
         (src_dir.join("main.rs"), chosen.as_bytes().to_vec()),
+        (dir.join("README.md"), readme.into_bytes()),
     ];
     if !force {
         for (path, _) in &targets {
@@ -215,26 +236,54 @@ fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
     }
 }
 
-fn consensus_cargo_toml(package_name: &str, explorer_path: &str, sim_path: &str) -> String {
+fn consensus_cargo_toml(
+    package_name: &str,
+    explorer_path: &str,
+    sim_path: &str,
+    rt_path: &str,
+) -> String {
     format!(
-        r#"[package]
+        r#"# License notice: path dependencies on ledger-explorer and ledger-sim
+# link AGPL-3.0-or-later engine code. Building this scaffold creates an
+# AGPL-covered binary. To keep your SUT Apache-2.0, put its logic behind the
+# ldgr-rt IPC boundary (ldgr_rt::run_named over rt-server) and use this
+# direct engine link only for in-workspace exploration.
+[package]
 name = "{package_name}"
 version = "0.1.0"
 edition = "2024"
-description = "Scaffolded ledger consensus example"
+description = "Scaffolded ledger consensus example (AGPL engine link; see notice above)"
 
 [dependencies]
 ledger-explorer = {{ path = "{explorer_path}" }}
 ledger-sim = {{ path = "{sim_path}" }}
+# Apache-2.0 IPC facade for SUT logic that must stay non-AGPL.
+ldgr-rt = {{ path = "{rt_path}" }}
 
 [workspace]
 "#
     )
 }
 
+fn consensus_readme(package_name: &str) -> String {
+    format!(
+        r#"# {package_name}
+
+Scaffolded by `ledger scaffold consensus`.
+
+License notice: this scaffold links the AGPL-3.0-or-later engine crates
+(`ledger-sim`, `ledger-explorer`) by path. Building it creates an AGPL-covered
+binary. There is no silent AGPL linkage: if you need an Apache-2.0 result,
+keep your system under test behind the `ldgr-rt` IPC boundary
+(`ldgr_rt::run_named` over `rt-server`, Apache-2.0) and use this direct engine
+link only for in-workspace exploration and search.
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CONSENSUS_MAIN, KV_MAIN, TWO_PC_MAIN};
+    use super::{CONSENSUS_MAIN, KV_MAIN, TWO_PC_MAIN, consensus_cargo_toml, consensus_readme};
 
     #[test]
     fn templates_under_100_lines() {
@@ -273,6 +322,40 @@ mod tests {
         assert!(
             TWO_PC_MAIN.contains("TwoPhaseCommitWorkload"),
             "2pc template must contain TwoPhaseCommitWorkload"
+        );
+    }
+
+    #[test]
+    fn templates_carry_agpl_notice_and_ipc_preference() {
+        for main in [CONSENSUS_MAIN, KV_MAIN, TWO_PC_MAIN] {
+            assert!(
+                main.contains("AGPL"),
+                "generated mains must warn about AGPL linkage"
+            );
+            assert!(
+                main.contains("ldgr-rt") && main.contains("IPC"),
+                "generated mains must prefer the ldgr-rt IPC boundary"
+            );
+        }
+        let cargo =
+            consensus_cargo_toml("demo", "../ledger-explorer", "../ledger-sim", "../ldgr-rt");
+        assert!(cargo.contains("AGPL"), "Cargo must warn about AGPL linkage");
+        assert!(
+            cargo.contains("ldgr-rt"),
+            "Cargo must wire the Apache IPC facade"
+        );
+        let readme = consensus_readme("demo");
+        assert!(
+            readme.contains("AGPL"),
+            "README must warn about AGPL linkage"
+        );
+        assert!(
+            readme.contains("ldgr_rt::run_named"),
+            "README must prefer IPC wiring"
+        );
+        assert!(
+            readme.contains("no silent AGPL linkage"),
+            "README must state there is no silent linkage"
         );
     }
 }

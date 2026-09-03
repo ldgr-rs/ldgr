@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ledger_explorer::search::Workload;
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use ledger_sim::{Instruction, Simulation};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -54,7 +54,7 @@ pub struct WorkerResult {
     /// Task identifier.
     pub task_id: String,
     /// Journal root hash after execution.
-    pub journal_root: Hash,
+    pub journal_root: EntryHash,
     /// Number of steps executed.
     pub steps: usize,
     /// Findings count from the pre-run explorer campaign.
@@ -64,7 +64,7 @@ pub struct WorkerResult {
     /// `None` when the worker build data is incomplete (no source revision
     /// captured at compile time); such results must be treated as
     /// identity-incomplete by the control plane.
-    pub execution_identity: Option<Hash>,
+    pub execution_identity: Option<EntryHash>,
 }
 
 /// Errors from worker execution.
@@ -115,6 +115,10 @@ pub enum WorkerError {
     /// The explorer pre-run campaign failed.
     #[error(transparent)]
     Campaign(#[from] ledger_explorer::services::ServiceError),
+    /// The execution identity exceeded its encoding caps; the task cannot
+    /// be bound to an identity.
+    #[error("execution identity encoding failed: {0}")]
+    IdentityEncoding(#[from] ledger_journal::JournalError),
     /// The deterministic simulation run failed.
     #[error("simulation failed: {0}")]
     Sim(#[from] ledger_sim::RuntimeError),
@@ -270,10 +274,13 @@ pub fn publish_result_certificate(
     };
     let checksum = checksum_hex(&cert);
     match sink.upload(&result.task_id, "certificate.json", &cert, &checksum) {
-        Ok(url) => eprintln!(
-            "ledger-worker: published certificate.json for {} to {url}",
-            result.task_id
-        ),
+        Ok(url) => {
+            let sanitized = url.split('?').next().unwrap_or(&url);
+            eprintln!(
+                "ledger-worker: published certificate.json for {} to {sanitized}",
+                result.task_id
+            );
+        }
         Err(err) => eprintln!(
             "ledger-worker: certificate upload for {} skipped (best-effort): {err}",
             result.task_id
@@ -413,11 +420,12 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
 ///
 /// The build segment comes from the worker binary's compile-time capture; the
 /// run segment comes from the task's run config and workload selector. Returns
-/// `None` when the worker build data is incomplete.
+/// `None` when the worker build data is incomplete, `Err` when the identity
+/// exceeds its encoding caps.
 fn task_identity(
     task: &crate::queue::Task,
-    run_config_digest: Hash,
-) -> Result<Option<Hash>, WorkerError> {
+    run_config_digest: EntryHash,
+) -> Result<Option<EntryHash>, WorkerError> {
     use ledger_explorer::identity::{EngineBuild, IdentityContext};
     let build = EngineBuild::detect();
     let context = IdentityContext {
@@ -428,7 +436,7 @@ fn task_identity(
         workload_id: task.workload.clone(),
         // The program selector binds which program set was chosen; the
         // workload provider owns the program-by-program binding.
-        program_digest: *blake3::hash(task.workload.as_bytes()).as_bytes(),
+        program_digest: EntryHash(*blake3::hash(task.workload.as_bytes()).as_bytes()),
         input_digests: Vec::new(),
         backend: "sim".to_string(),
         runtime_profile: crate::RuntimeProfile::detect().fingerprint_hex8(),
@@ -441,7 +449,7 @@ fn task_identity(
             max_steps: task.run_config.max_steps() as u64,
         },
     };
-    Ok(ledger_explorer::identity::assemble_identity(&build, &context).digest())
+    Ok(ledger_explorer::identity::assemble_identity(&build, &context).digest()?)
 }
 
 pub fn workload_for(name: &str) -> Result<SmallWorkload, WorkerError> {
@@ -488,7 +496,7 @@ mod tests {
         // because the assembled identity differs (any build). Both arms are
         // fail-closed; neither lets a mismatched task execute.
         let mut task = Task::new("pinned", RunConfig::default(), "kv");
-        task.execution_identity = Some([0xab; 32]);
+        task.execution_identity = Some(EntryHash([0xab; 32]));
         let error = execute_task(task).expect_err("pinned identity must reject the task");
         assert!(
             matches!(
@@ -514,7 +522,9 @@ mod tests {
     fn run_one_produces_deterministic_root() {
         let config = WorkerConfig::default();
         let mut q = InMemoryQueue::new(Duration::from_secs(30));
-        let run_config = RunConfig::builder().seed([11u8; 32]).build();
+        let run_config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([11u8; 32]))
+            .build();
         q.push(Task::new("task-1", run_config.clone(), "kv"));
         q.push(Task::new("task-2", run_config, "kv"));
         let mut worker = Worker::new(config, Box::new(q));
@@ -536,13 +546,15 @@ mod tests {
     fn run_one_validates_queued_hash() {
         let config = WorkerConfig::default();
         let mut q = InMemoryQueue::new(Duration::from_secs(30));
-        let run_config = RunConfig::builder().seed([9u8; 32]).build();
+        let run_config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([9u8; 32]))
+            .build();
         // Push correctly hashes at queue layer.
         q.push(Task::new("ok", run_config.clone(), "kv"));
         let mut worker = Worker::new(config, Box::new(q));
         assert!(worker.run_one().unwrap().is_some());
         // Now craft a task with tampered hash to ensure boundary rejects mismatch.
-        let bad_hash = [0xffu8; 32];
+        let bad_hash = EntryHash([0xffu8; 32]);
         let mut bad_task = crate::queue::Task::new("bad", run_config.clone(), "kv");
         bad_task.run_config_hash = Some(bad_hash);
         // Directly inject bad task via a custom queue to bypass push hashing.
@@ -566,7 +578,9 @@ mod tests {
         // Pins the fake-root removal: a blake3(task_id) value must never
         // equal a real journal root, so a reintroduced stub fallback on any
         // transport would fail loudly against this boundary.
-        let run_config = RunConfig::builder().seed([17u8; 32]).build();
+        let run_config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([17u8; 32]))
+            .build();
         let workload = SmallWorkload(vec![vec![
             Instruction::Set(0),
             Instruction::Outcome,
@@ -577,7 +591,7 @@ mod tests {
             .unwrap()
             .journal
             .root_hash();
-        let fabricated_root = *blake3::hash(b"task-1").as_bytes();
+        let fabricated_root = EntryHash(*blake3::hash(b"task-1").as_bytes());
         assert_ne!(
             real_root, fabricated_root,
             "blake3(task_id) must not equal a real simulation root"
@@ -602,7 +616,7 @@ mod tests {
         }
         // The tampered hash forces the execution error; routing wraps it.
         let mut doomed = Task::new("doomed", RunConfig::default(), "kv");
-        doomed.run_config_hash = Some([0xffu8; 32]);
+        doomed.run_config_hash = Some(EntryHash([0xffu8; 32]));
         let queue = FailingQueue {
             leased: Some(doomed),
         };

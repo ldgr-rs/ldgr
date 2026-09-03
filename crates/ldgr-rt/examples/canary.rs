@@ -7,18 +7,20 @@
 //! journaled by the engine; the canary prints the final journal root and
 //! entry count to stdout.
 //!
-//! Usage: `rt-canary --socket PATH --identity HEX`
+//! Usage: `rt-canary --socket PATH --identity HEX [--actor ID]`
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ldgr_rt::proto::{Effect, EffectResult, Goodbye};
 use ldgr_rt::{EngineSession, ShimError};
+use ledger_format::{ActorId, EntryHash};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let mut socket: Option<PathBuf> = None;
-    let mut identity = [0u8; 32];
+    let mut identity = EntryHash([0u8; 32]);
+    let mut actor = ActorId(0);
 
     let mut i = 1;
     while i < args.len() {
@@ -35,20 +37,31 @@ fn main() -> ExitCode {
                     identity = bytes;
                 }
             }
+            "--actor" => {
+                i += 1;
+                match args.get(i).map(|s| s.parse::<u32>()) {
+                    Some(Ok(id)) if id <= ldgr_rt::proto::MAX_ACTOR => actor = ActorId(id),
+                    _ => {
+                        eprintln!("rt-canary: invalid --actor (must be 0..=1048576)");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             _ => {}
         }
         i += 1;
     }
 
     let Some(socket) = socket else {
-        eprintln!("usage: rt-canary --socket PATH --identity HEX");
+        eprintln!("usage: rt-canary --socket PATH --identity HEX [--actor ID]");
         return ExitCode::from(2);
     };
 
-    match run_canary(&socket, identity) {
+    match run_canary(&socket, identity, actor) {
         Ok(goodbye) => {
             println!("root {}", hex(&goodbye.root));
             println!("entries {}", goodbye.entries);
+            println!("actor {}", actor.0);
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -59,8 +72,8 @@ fn main() -> ExitCode {
 }
 
 /// The canary's deterministic business logic.
-fn run_canary(socket: &Path, identity: [u8; 32]) -> Result<Goodbye, ShimError> {
-    let mut session = EngineSession::connect(socket, identity)?;
+fn run_canary(socket: &Path, identity: EntryHash, actor: ActorId) -> Result<Goodbye, ShimError> {
+    let mut session = EngineSession::connect(socket, identity, actor)?;
 
     // Clock: read the virtual clock.
     let clock = session.effect(Effect::Clock)?;
@@ -125,10 +138,10 @@ fn run_canary(socket: &Path, identity: [u8; 32]) -> Result<Goodbye, ShimError> {
     session.finish()
 }
 
-fn decode_hex(hex: &str) -> Option<[u8; 32]> {
+fn decode_hex(hex: &str) -> Option<EntryHash> {
     ledger_format::hash_from_hex(hex).ok()
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
+fn hex(bytes: &EntryHash) -> String {
     ledger_format::hash_to_hex(bytes)
 }

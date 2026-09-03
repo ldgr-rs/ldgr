@@ -127,7 +127,7 @@ fn ingest_golden() -> ledger_adapters::IngestedJournal {
         .unwrap_or_else(|error| panic!("golden ingest must succeed: {error}"))
 }
 
-fn map_outcomes(journal: &Journal) -> HashMap<String, ledger_format::Hash> {
+fn map_outcomes(journal: &Journal) -> HashMap<String, ledger_format::EntryHash> {
     let mut out = HashMap::new();
     for entry in journal.entries() {
         if entry.data.kind == EntryKind::Outcome
@@ -253,7 +253,8 @@ fn golden_ingest_preserves_lineage_causality() {
                 parent_entry.id
             );
             assert!(
-                child_entry.vector_clock.get(1) > parent_entry.vector_clock.get(1),
+                child_entry.vector_clock.get(ledger_format::ActorId(1))
+                    > parent_entry.vector_clock.get(ledger_format::ActorId(1)),
                 "child {} clock must dominate parent {}",
                 span.name,
                 parent_name
@@ -380,7 +381,8 @@ fn golden_ingest_reordered_input_still_preserves_causality() {
                 parent_name
             );
             assert!(
-                child_entry.vector_clock.get(1) > parent_entry.vector_clock.get(1),
+                child_entry.vector_clock.get(ledger_format::ActorId(1))
+                    > parent_entry.vector_clock.get(ledger_format::ActorId(1)),
                 "reordered ingest: clock must still dominate"
             );
         }
