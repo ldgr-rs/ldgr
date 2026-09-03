@@ -1,14 +1,7 @@
-//! Sim-throughput benchmark.
+//! Sim-throughput benchmark: >= 10^6 entries/s on the 4-task workload.
 // ledger-lint:allow (host-side benchmark drives the sim to measure throughput; it is not simulation code)
 //!
-//! Target: >= 10^6 events/s single-thread. An "event" is one
-//! journaled entry. The workload is a 4-task message-passing program that
-//! journals Send/Recv/SendTimed/TimerSet/TimerFire entries.
-//!
-//! ENTRIES_PER_RUN is the measured journal size for this workload (5045
-//! entries at 500 steps/task); the CI bench-gate parses the criterion `time:`
-//! and computes events/s = ENTRIES_PER_RUN / time. The batch asserts the run
-//! journaled at least this many entries so drift fails loudly.
+//! `ENTRIES_PER_RUN` pins the journal size so drift fails loudly.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use ledger_sim::{Instruction, Policy, RunConfig, Simulation};

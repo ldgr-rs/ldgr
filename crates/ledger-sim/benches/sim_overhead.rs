@@ -1,23 +1,5 @@
-//! Sim-overhead benchmark.
-//!
-//! Two measurements:
-//!
-//! 1. `cpu_at_100k_entries_per_second` (binding gate): the sim is
-//!    single-threaded, so one core sustains the measured throughput and the
-//!    CPU cost of running at 100k entries/s is `100_000 / events_per_second`
-//!    of one core. The target is <= 10% CPU at 100k entries/s, which is
-//!    equivalent to >= 10^6 events/s. The CI bench-gate parses this bench and
-//!    asserts the throughput.
-//!
-//! 2. `journal_share_of_sim_cost` (informational): the marginal cost of the
-//!    journal layer (canonical encode + BLAKE3 + VC merge + append) against
-//!    the full sim, so the overhead-vs-unjournaled split is measured, not
-//!    guessed. This number is reported, not gated: per-entry canonical
-//!    hashing is a normative design, so the journal is expected to
-//!    dominate the sim cost. Future throughput work targets the split.
-//!
-//! The workload is the 4-task message-passing program from `sim_throughput`
-//! (5045 entries at 500 steps/task).
+//! Sim-overhead benchmark: CPU at 100k entries/s plus the journal share of
+//! cost, on the 4-task workload (5045 entries at 500 steps/task).
 // ledger-lint:allow (host-side benchmark measures the sim; it is not simulation code)
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};

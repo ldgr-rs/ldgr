@@ -1,45 +1,10 @@
 //! Wasm backend: wasmtime host boundary forwarding to the sim Effects.
 //!
-//! WASI host calls are the scheduling points. A guest compiled to
-//! `wasm32-wasip1` crosses the effect boundary through the `ledger` host
-//! function module implemented here, which forwards every crossing to the same
-//! `SimBackend` that the native backend drives. The journal, seed tree,
-//! virtual clock, and observable output stay identical across backends.
-//!
-//! WASI determinism virtualization:
-//! - `random_get` is served from a seed-tree-derived ChaCha20 stream via
-//!   `WasiCtxBuilder::secure_random`.
-//! - `clock_time_get` serves virtual time via custom `HostWallClock` /
-//!   `HostMonotonicClock` implementations reading the shared tick sink that
-//!   `SimBackend` publishes on every clock read and time advance.
-//! - Guest `fd_write` to stdout is captured deterministically into the output
-//!   buffer so host-side output stays byte-identical across backends; byte
-//!   identity is pinned by the differential oracle, not folded into journal
-//!   hashes (no `Output` entry kind exists).
-//! - Bounded execution via fuel: a runaway guest traps at the fuel budget
-//!   instead of looping forever.
-//! - NaN canonicalization and relaxed-SIMD determinism close the two CPU
-//!   nondeterminism sources.
-//!
-//! The wasmtime engine runs with `Config::rr(RRConfig::Recording)`, which
-//! enables engine-enforced execution-trace determinism
-//! (`validate_rr_determinism_conflicts` rejects settings that allow
-//! nondeterminism).
-//!
-//! The backend is preview1-only: all workloads (`run`, `run_boundary`,
-//! `run_virtualized`, ...) run `wasm32-wasip1` core modules. The former
-//! WASIp2 component-model scaffold was removed because no component guest
-//! consumes it; the wasmtime component-model feature is enabled only
-//! transitively (wasmtime-wasi preview1 depends on it) and no component
-//! API is used directly.
-//!
-//! Backend-portable decision-trace replay (a journal recorded on native
-//! replaying on Wasm) is deferred. Replay in the native path pins scheduler
-//! ready-list choices (`Simulation::with_replay`); mirroring that on the Wasm
-//! backend would require a decision-trace replay protocol inside the guest,
-//! which is not yet specified. The differential port-validation oracle covers
-//! the same ground: the same workload runs natively and in the guest with one
-//! seed, and the journals must hash identically.
+//! Guests cross through the `ledger` host module into the same `SimBackend`
+//! the native path drives. `random_get` serves a seed-tree stream,
+//! `clock_time_get` serves virtual time, stdout is captured deterministically,
+//! and fuel plus NaN/relaxed-SIMD settings bound execution deterministically.
+//! Preview1-only; native/Wasm journals must hash identically.
 
 use crate::backend_sim::{SimBackend, record_first_journal_error};
 use crate::effects::{Effects, Fs, Net};
@@ -91,12 +56,7 @@ const WASI_ERRNO_INVAL: u32 = 28;
 /// WASI preview1 errno for an I/O failure (`EIO`).
 const WASI_ERRNO_IO: u32 = 29;
 
-/// Validate and gather the payload of one `fd_write` call.
-///
-/// Applies the iovec-count and payload-size caps. A memory out-of-bounds
-/// keeps the wasmtime-trap convention and maps to `Err(None)`; a cap
-/// violation reports the WASI errno in `Err(Some(errno))`. The result never
-/// depends on host state, so the valid path is byte-identical.
+/// Validate one `fd_write` payload against the iovec and size caps.
 fn gather_write_payload(
     memory: &[u8],
     iovs_ptr: u32,
@@ -212,13 +172,7 @@ impl WasiJournal {
     }
 }
 
-/// WASI wall clock backed by virtual time.
-///
-/// Reports virtual time in nanosecond ticks, so `clock_time_get(Realtime)` is
-/// deterministic across runs. Each read journals one `ClockRead` entry
-/// because WASI `clock_time_get` is an observable cross-boundary effect;
-/// `SimBackend::clock()` stays non-journaled (see its docs) to keep the
-/// native send path byte-identical.
+/// WASI wall clock serving virtual time; each read journals `ClockRead`.
 struct VirtualWallClock {
     ticks: Arc<Mutex<u64>>,
     journal: WasiJournal,
@@ -237,11 +191,7 @@ impl wasmtime_wasi::HostWallClock for VirtualWallClock {
     }
 }
 
-/// WASI monotonic clock backed by virtual time.
-///
-/// Each read journals one `ClockRead` entry carrying the tick count. This
-/// matches `Boundary::read_clock` journaling; `SimBackend::clock()` and
-/// `Boundary::clock()` stay non-journaled by design.
+/// WASI monotonic clock serving virtual time; each read journals `ClockRead`.
 struct VirtualMonotonicClock {
     ticks: Arc<Mutex<u64>>,
     journal: WasiJournal,
@@ -260,11 +210,7 @@ impl wasmtime_wasi::HostMonotonicClock for VirtualMonotonicClock {
     }
 }
 
-/// A stdout sink that appends guest `fd_write` output to a shared buffer.
-///
-/// The shared buffer is drained into the store's output after each call, so
-/// guest-observable output is deterministic across backends; its byte identity
-/// is pinned by the differential oracle, not by journal hashes.
+/// Stdout sink appending guest output to a shared buffer for byte-identical capture.
 struct CapturedStdout {
     sink: Arc<Mutex<Vec<u8>>>,
 }
@@ -312,41 +258,22 @@ impl tokio::io::AsyncWrite for SinkWriter {
     }
 }
 
-/// Store data for the wasmtime store.
-///
-/// The type must be `Send + Sync` because wasmtime host functions require it.
-/// The inner `SimBackend` is the same effects implementation the native
-/// backend uses; `SimBackend` is `Send + Sync` because all mutable state sits
-/// behind an uncontended `Mutex`.
+/// Store data; `Send + Sync` for wasmtime host functions.
 struct WasmStoreData {
     effects: SimBackend,
     wasi: Mutex<WasiP1Ctx>,
     output: Vec<u8>,
     stdout_sink: Arc<Mutex<Vec<u8>>>,
-    /// Seed-tree-derived stream serving WASI `random_get`.
-    ///
-    /// The guest's `random_get` import is shadowed by a host function that
-    /// draws here and journals one `RngDraw` per crossing, so WASI randomness
-    /// is deterministic and the crossing is journaled exactly once.
+    /// Seed-tree stream serving WASI `random_get`; one `RngDraw` per crossing.
     wasi_random: ChaCha20Rng,
     /// Virtual filesystem fd table: deterministic fd -> SimFs path key.
     wasi_fs: Mutex<WasiFdTable>,
 }
 
-/// Wasm backend: wraps a wasmtime engine, store, and guest instances.
+/// Wasm backend delegating `Effects` to the inner `SimBackend`.
 ///
-/// Implements the `Effects` surface by delegating to the inner `SimBackend`.
-/// The guest crosses the boundary through the `ledger` host functions, which
-/// forward to the same effects; WASI `random_get`, `clock_time_get`, and
-/// stdout are virtualized onto the seed tree, virtual clock, and output
-/// buffer respectively.
-///
-/// Mixed topology (W2): the backend can host multiple named guest instances
-/// in one `Store`. All instances share the same `SeedTree` derivation and
-/// virtual clock, so a mixed run (e.g. Go + Zig) remains deterministic:
-/// same seed produces byte-identical journal roots. Scheduling points remain
-/// host-call boundaries; interleaving across guests is host-driven via
-/// sequential `run_export_on` calls, not preemptive threads.
+/// Hosts multiple named guests in one `Store` sharing one seed tree and
+/// clock, so mixed runs stay deterministic with host-call scheduling points.
 pub struct WasmBackend {
     engine: Engine,
     store: Store<WasmStoreData>,
@@ -493,22 +420,12 @@ impl WasmBackend {
         self.run_export("run_boundary")
     }
 
-    /// Run a guest entry point by name and return its logged output.
-    ///
-    /// The output buffer is cleared before the call, so the returned bytes are
-    /// exactly what this invocation logged (both the `ledger.log` boundary and
-    /// WASI stdout). Delegates to [`Self::run_export_on`] with the default
-    /// instance name "main".
+    /// Run a guest entry on the default instance; returns this call's output.
     pub fn run_export(&mut self, entry: &str) -> WasmResult<Vec<u8>> {
         self.run_export_on("main", entry)
     }
 
-    /// Run an entry point on a named guest instance and return its logged output.
-    ///
-    /// Reuses the same `Store` fuel and output logic as [`Self::run_export`],
-    /// so fuel budgeting and output capture behave identically across named
-    /// instances. The journal is shared across instances, so cross-guest runs
-    /// append to one deterministic causal DAG.
+    /// Run an entry on a named instance; shares fuel, output, and journal.
     pub fn run_export_on(&mut self, name: &str, entry: &str) -> WasmResult<Vec<u8>> {
         // Prefer the named map; fall back to the legacy single-instance field
         // so callers that only used `load_guest` keep working even if the map
@@ -554,11 +471,7 @@ impl WasmBackend {
         self.store.data().output.clone()
     }
 
-    /// Return an immutable snapshot of the journaled history of the inner
-    /// sim backend.
-    ///
-    /// The snapshot is a full copy taken under the backend's internal lock;
-    /// it never aliases live state and never changes the run.
+    /// Immutable copy of the inner backend journal.
     pub fn journal_snapshot(&self) -> Journal {
         self.store.data().effects.journal_snapshot()
     }
@@ -568,14 +481,7 @@ impl WasmBackend {
         self.store.data().effects.journal_error()
     }
 
-    /// Build the deterministic wasmtime configuration.
-    ///
-    /// NaN canonicalization and relaxed-SIMD determinism close the two CPU
-    /// nondeterminism sources. Fuel
-    /// enables bounded execution: a runaway guest traps at the budget. The rr
-    /// recording mode enables wasmtime's engine-enforced execution-trace
-    /// determinism (`validate_rr_determinism_conflicts` rejects settings that
-    /// allow nondeterminism, and the compiled trace checksum detects drift).
+    /// Deterministic wasmtime config: NaN/SIMD determinism, fuel, RR trace.
     fn deterministic_config() -> Config {
         let mut config = Config::new();
         config.cranelift_nan_canonicalization(true);

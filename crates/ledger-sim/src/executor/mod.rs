@@ -1,16 +1,8 @@
 //! Deterministic single-threaded poll-based async executor.
 //!
-//! The executor drives real async tasks against the causal journal with the
-//! same run-loop discipline as the instruction VM in [`crate::runtime`]: a
-//! scheduler chooses among ready tasks, each scheduling decision is journaled
-//! as an `RngDraw` entry, and the chosen task is polled exactly once per step.
-//! Blocking effects (`sleep`, `recv`) park the task until a timer fires or a
-//! message arrives; the executor journals the corresponding `TimerFire`,
-//! `Wake`, and delivery entries in the same order the VM would.
-//!
-//! The executor is intentionally not `Send`: it is a single-threaded,
-//! cooperative runtime and uses `Rc`-based interior mutability. Driving real
-//! OS threads would break the determinism invariant.
+//! One scheduling decision per step is journaled as `RngDraw`; blocking
+//! effects park until a timer or message wakes them. Intentionally not
+//! `Send`: `Rc` state plus OS threads would break determinism.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -75,10 +67,7 @@ pub(crate) struct TaskEntry {
     stream_rngs: BTreeMap<StreamId, ChaCha20Rng>,
 }
 
-/// Shared executor state reachable from task boundaries.
-///
-/// Interior mutability via `RefCell` keeps the boundary `&self`-callable while
-/// the executor mutates the journal, timers, network, and task table.
+/// Shared state; `RefCell` keeps the `&self` boundary callable.
 pub(crate) struct ExecutorShared {
     journal: RefCell<Journal>,
     time: RefCell<VirtualTime>,
@@ -102,10 +91,8 @@ pub(crate) struct ExecutorShared {
     /// Per-task count of journaled Send entries; feeds
     /// `MessageId.sender_sequence` (the sender entry sequence).
     send_seq: RefCell<Vec<u64>>,
-    /// Per-actor count of journaled entries, for the coverage check.
-    ///
-    /// Every journal write funnels through [`Self::journal_append`], so the
-    /// journal can never gain an entry the boundary did not report.
+    /// Per-actor entry counts for the coverage check; all writes funnel
+    /// through append so the ledger stays exact.
     // ledger-lint:allow:HashMap ledger-lint:allow:HashSet (coverage is keyed
     // lookup and collected in sorted order at the run tail; fault classes are
     // membership and len only)
@@ -122,11 +109,7 @@ pub(crate) struct ExecutorShared {
     /// `DropAllUnsynced` default.
     #[cfg(feature = "sim-fs-journaling")]
     fs_journaling: Option<crate::simfs::JournalingMode>,
-    /// First journal-append failure from a path that cannot return `Err`.
-    ///
-    /// A dropped append silently breaks byte-identical replay, so every
-    /// non-propagating append failure lands here once and surfaces through
-    /// [`RunResult::journal_error`] at run end.
+    /// First append failure from a non-`Err` path; surfaces via `journal_error`.
     journal_error: RefCell<Option<ledger_journal::JournalError>>,
 }
 
@@ -139,15 +122,10 @@ pub struct Executor {
     protection_mode: Option<crate::sentinel::ProtectionMode>,
 }
 
-/// The executor itself drives all wakeups: a fired timer or a deliverable
-/// message pushes the task onto the ready set. The waker passed to `poll` is
-/// therefore a no-op; the future must never rely on the waker to resume it.
-/// Using a no-op waker keeps the executor free of `Send`/`Sync` bounds on its
-/// `Rc`-shared state.
+/// Wakeups come from the executor itself, so `poll` gets a no-op waker and
+/// futures must never rely on it; this keeps `Rc` state free of `Send` bounds.
 impl Executor {
-    /// Create an executor from a config and a set of root task futures.
-    ///
-    /// All tasks are inserted up front with their ids equal to their index.
+    /// Create an executor from root futures; task ids equal their indices.
     pub fn new(config: RunConfig, tasks: Vec<Pin<Box<dyn Future<Output = ()> + 'static>>>) -> Self {
         Self::with_shared(config, |shared| {
             for future in tasks {
@@ -157,12 +135,8 @@ impl Executor {
         })
     }
 
-    /// Create an executor whose root futures are built from the shared state.
-    ///
-    /// The builder runs after the shared state exists, so root futures can
-    /// capture [`Boundary`] handles (which need the shared state) before any
-    /// task is inserted. Each boundary must use `task` values equal to the
-    /// index the future will occupy in the task table.
+    /// Build roots from shared state; each boundary `task` must equal its
+    /// future index in the task table.
     pub(crate) fn with_shared(
         config: RunConfig,
         builder: impl FnOnce(&Rc<ExecutorShared>),
@@ -170,9 +144,7 @@ impl Executor {
         Self::with_shared_and_replay(config, Vec::new(), builder)
     }
 
-    /// Create an executor with a recorded replay decision sequence.
-    ///
-    /// The replay-exhaustion fallback defaults to [`Policy::Random`].
+    /// Create a replay executor; the fallback defaults to `Random`.
     pub(crate) fn with_shared_and_replay(
         config: RunConfig,
         replay: Vec<usize>,
@@ -191,10 +163,7 @@ impl Executor {
         Self::with_shared_and_replay_and_fallback_inner(config, replay, fallback, false, builder)
     }
 
-    /// Create a strict executor with a recorded replay decision sequence.
-    ///
-    /// The replay-exhaustion fallback is unused in strict mode; exhausted or
-    /// out-of-range decisions surface as [`crate::runtime::RuntimeError::StrictReplay`].
+    /// Strict replay executor; exhausted/out-of-range surfaces as `StrictReplay`.
     pub(crate) fn with_shared_and_replay_strict(
         config: RunConfig,
         replay: Vec<usize>,
@@ -558,20 +527,8 @@ impl Executor {
         Ok(())
     }
 
-    /// Fire timers at quiescence and wake the released tasks, exactly as the
-    /// VM does, including a post-fire message wake.
-    ///
-    /// Each `TimerFire` and its chained `Wake` form one journaled step group.
-    /// All fired groups append through a single batch: ids stay byte-identical
-    /// to per-entry appends (see [`Journal::append_batch`]), and scheduler
-    /// notifications keep their per-entry order afterwards. Nothing between
-    /// the old per-timer appends read state that feeds back into journal
-    /// content, so grouping them is order-safe.
-    ///
-    /// Kept separate from `SimBackend::sleep` on purpose: the executor parks
-    /// tasks and fires at quiescence in batch, while the single-actor backend
-    /// fires inline with no scheduler. Both journal the same
-    /// `TimerSet -TimerFire -> Wake` chain; the sleep-parity test pins this.
+    /// Fire timers at quiescence; batches stay byte-identical to per-entry
+    /// appends and journal the same chain as `SimBackend::sleep`.
     fn advance_quiescent(&self) -> Result<(), RuntimeError> {
         let timer_deadline = self.shared.time.borrow().next_deadline();
         let net_deadline = self.shared.net.borrow().earliest_delivery_time();
@@ -1551,18 +1508,7 @@ mod swarm_tests {
         assert!(a.monitor_issues.is_empty());
     }
 
-    /// An append failure inside a program future must reject the run, so no
-    /// finding, certificate, or minimized repro can derive from the broken
-    /// journal.
-    ///
-    /// Coverage note: this test drives the `Recv` instruction through
-    /// `Boundary::recv_now`, whose append failure (`MissingParent` on a
-    /// never-journaled `send_id`) is recorded by `recv_now` itself
-    /// (executor.rs `recv_now`), not by the adapter Poll arm. The Poll arm
-    /// is not reachable from the hosted instruction set: every `?`-instruction
-    /// appends with empty parents and canonical payloads, so no in-memory
-    /// append can fail. The Poll arm's exact call is covered at the sink level
-    /// by `boundary_record_journal_error_fills_slot`.
+    /// Append failure in a program future must reject the run.
     #[test]
     fn program_future_append_failure_rejects_the_run() {
         use crate::adapter::program_future;
@@ -1596,14 +1542,7 @@ mod swarm_tests {
         );
     }
 
-    /// The sink the adapter Poll arm calls on an `execute_one` error:
-    /// [`Boundary::record_journal_error`] must fill the run's
-    /// `journal_error` slot with the exact typed error.
-    ///
-    /// The Poll arm's `?`-error branch cannot be driven through the hosted
-    /// instruction set (every `?`-instruction appends with empty parents and
-    /// canonical payloads, and the journal heads are private cross-crate
-    /// state), so this test locks the arm's exact call at the sink level.
+    /// The error sink fills the run slot with the exact typed error.
     #[test]
     fn boundary_record_journal_error_fills_slot() {
         let config = base_config(78);
@@ -2022,6 +1961,129 @@ mod delay_fault_regression {
             zero.journal.root_hash(),
             first.journal.root_hash(),
             "delay 0 keeps byte-identical journals"
+        );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_fault_regression {
+    use crate::config::{Policy, RunConfig, SimFault};
+    use crate::runtime::{Instruction, Simulation};
+    use ledger_format::{EntryKind, EntryPayload, FaultPayload};
+
+    fn dup_programs() -> Vec<Vec<Instruction>> {
+        vec![
+            vec![Instruction::Send { to: 1, payload: 99 }, Instruction::Done],
+            vec![
+                Instruction::Receive,
+                Instruction::Receive,
+                Instruction::Done,
+            ],
+        ]
+    }
+
+    #[test]
+    fn duplicate_send_yields_two_recvs_and_one_fault() {
+        let base = RunConfig::builder()
+            .seed(ledger_format::EntryHash([42; 32]))
+            .policy(Policy::Random)
+            .max_steps(512)
+            .build();
+        let probe = Simulation::new(base, dup_programs())
+            .run()
+            .expect("probe run");
+        let send_id = probe
+            .journal
+            .entries()
+            .find(|e| matches!(e.data.kind, EntryKind::Send))
+            .expect("Send entry exists")
+            .id;
+        let dup_cfg = RunConfig::builder()
+            .seed(ledger_format::EntryHash([42; 32]))
+            .policy(Policy::Random)
+            .max_steps(512)
+            .fault_schedule(vec![SimFault::Duplicate { send: send_id }])
+            .build();
+        let first = Simulation::new(dup_cfg.clone(), dup_programs())
+            .run()
+            .expect("duplicate run");
+        assert!(
+            first.applied_faults.contains(&send_id),
+            "Duplicate fault must be marked applied"
+        );
+        assert!(
+            first.monitor_issues.is_empty(),
+            "monitor issues: {:?}",
+            first.monitor_issues
+        );
+        assert!(
+            first.journal_error.is_none(),
+            "journal must stay clean: {:?}",
+            first.journal_error
+        );
+        let recvs = first
+            .journal
+            .entries()
+            .filter(|e| matches!(e.data.kind, EntryKind::Recv))
+            .count();
+        assert_eq!(recvs, 2, "duplicate must deliver two copies");
+        let mut dup_faults = first.journal.entries().filter(|e| {
+            matches!(
+                &e.data.payload,
+                EntryPayload::Fault(FaultPayload::DuplicateMessage { .. })
+            )
+        });
+        let fault = dup_faults.next().expect("one DuplicateMessage fault");
+        assert!(dup_faults.next().is_none(), "exactly one duplicate fault");
+        match &fault.data.payload {
+            EntryPayload::Fault(FaultPayload::DuplicateMessage {
+                message_id,
+                copy_ordinal,
+            }) => {
+                assert_eq!(*copy_ordinal, 1);
+                assert_eq!(fault.data.parents.as_slice(), &[send_id]);
+                let send = probe
+                    .journal
+                    .entries()
+                    .find(|e| e.id == send_id)
+                    .expect("probe send");
+                match &send.data.payload {
+                    EntryPayload::Send(frame) => assert_eq!(*message_id, frame.message_id),
+                    other => panic!("send entry has wrong payload: {other:?}"),
+                }
+            }
+            other => panic!("expected DuplicateMessage, got {other:?}"),
+        }
+        assert_eq!(
+            first.outcome,
+            crate::RunOutcome::Completed,
+            "two receives must complete"
+        );
+        let second = Simulation::new(dup_cfg.clone(), dup_programs())
+            .run()
+            .expect("second duplicate run");
+        assert_eq!(
+            first.journal.root_hash(),
+            second.journal.root_hash(),
+            "duplicate must stay deterministic"
+        );
+        assert_eq!(first.decisions, second.decisions);
+        let strict = Simulation::with_replay_strict(
+            RunConfig::builder()
+                .seed(ledger_format::EntryHash([42; 32]))
+                .policy(Policy::Replay)
+                .max_steps(512)
+                .fault_schedule(vec![SimFault::Duplicate { send: send_id }])
+                .build(),
+            dup_programs(),
+            first.decisions.clone(),
+        )
+        .run()
+        .expect("strict replay of duplicate must pass");
+        assert_eq!(
+            strict.journal.root_hash(),
+            first.journal.root_hash(),
+            "strict replay must match"
         );
     }
 }

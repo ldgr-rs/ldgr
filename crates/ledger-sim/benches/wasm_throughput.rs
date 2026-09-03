@@ -1,20 +1,6 @@
-//! Wasm throughput benchmark.
+//! Wasm throughput benchmark: >= 100k entries/s on `run_throughput`.
 //!
-//! Target: >= 100k journaled entries/s at ~10k guest instructions/entry. The
-//! guest `run_throughput` entry journals one `RngDraw` per ~10k-instruction
-//! compute loop. This benchmark measures how many of those journaled entries
-//! the Wasm backend sustains per second, including wasmtime execution, host
-//! boundary crossing, and journal hashing.
-//!
-//! The empty-export bench isolates pure wasmtime trampoline cost (no host
-//! calls, no journaling). Together the two benches show whether crossing cost
-//! justifies a batch descriptor export (A3) or the dominant cost is journal
-//! hashing.
-//!
-//! Methodology: release guest artifact only; engine and module compiled once
-//! outside the timed section; criterion `iter_batched` with `SmallInput` to
-//! isolate steady-state dispatch; 10 samples, 2s warmup. All rates are
-//! wall-clock host time, never an input to simulation.
+//! Release guest only; engine compiled once outside the timed section.
 // ledger-lint:allow (host-side benchmark reads the guest artifact from disk; it is not simulation code)
 #![cfg(feature = "backend-wasm")]
 

@@ -210,15 +210,7 @@ fn dpor_respects_max_runs() {
     );
 }
 
-/// The equivalence-class property: the driver explores each causally distinct
-/// alternative exactly once and never explores a reordering of two tasks that
-/// are already causally ordered at the branch point (a member of the base
-/// run's own class).
-///
-/// `explored_flip_keys` must be exactly the set of `(step, alt)` pairs whose
-/// two tasks are concurrent as of the branch point, computed independently
-/// from the base journal's per-step boundaries. Any divergence means the
-/// sleep-set was misapplied at some step of the run.
+/// Each causally distinct alternative is explored exactly once.
 #[test]
 fn dpor_explores_each_causal_class_once() {
     let programs = ordered_chain_programs();

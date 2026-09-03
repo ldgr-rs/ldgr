@@ -23,10 +23,7 @@ pub enum LeakClass {
     EnvVarEntropy,
 }
 
-/// Activation state of the process belt for one sim run.
-///
-/// The semantic variant is the primary value; [`Display`] is only the
-/// presentation view. No production code may branch on the rendered text.
+/// Belt state for one run; match on the variant, never on `Display` text.
 #[derive(Debug, Clone)]
 pub enum BeltStatus {
     /// Belt unavailable: non-Linux platform or the `sentinel` feature is off.
@@ -165,13 +162,7 @@ impl From<EffectiveProtection> for Option<ProtectionMode> {
     }
 }
 
-/// Pure env parsing for `LEDGER_SENTINEL_BELT`.
-///
-/// `None` means the variable is unset. The value is compared
-/// case-insensitively after lossy UTF-8 conversion: `required` maps to
-/// `Required`, `1`/`true`/`on`/`yes` map to `BestEffort`, everything else
-/// maps to `Disabled`. The parse never reads ambient state beyond its
-/// argument, so it is deterministic and testable.
+/// Pure parse of `LEDGER_SENTINEL_BELT`; deterministic and testable.
 pub(crate) fn belt_env_mode(value: Option<&OsStr>) -> BeltMode {
     match value {
         None => BeltMode::Disabled,
@@ -211,11 +202,7 @@ pub enum SentinelError {
     ShimMissing(std::path::PathBuf),
     /// A prctl operation failed with the given errno.
     Prctl(&'static str, i32),
-    /// An I/O error while spawning the probe or parsing its log.
-    ///
-    /// `std::io::Error` is not `Clone`; the `Arc` keeps the status record
-    /// (`OnceLock::get().cloned()`) cloneable without flattening the error
-    /// into a string.
+    /// Probe/log I/O error; `Arc` keeps the status cloneable.
     Io(std::sync::Arc<std::io::Error>),
     /// The probe exited without the expected zero status.
     NonZeroExit(std::process::ExitStatus),
@@ -256,10 +243,7 @@ impl PartialEq for SentinelError {
 
 impl Eq for SentinelError {}
 
-/// Belt hook no-op for platforms without the belt.
-///
-/// The no-op keeps the call site identical across builds so the run path can
-/// invoke the hook unconditionally.
+/// Belt hook no-op; keeps the call site identical across builds.
 #[cfg(not(all(feature = "sentinel", target_os = "linux")))]
 pub fn activate_process_belt() -> BeltStatus {
     BeltStatus::Unavailable
@@ -325,9 +309,7 @@ impl Sentinel {
 mod tests {
     use super::*;
 
-    /// Recover the semantic variant and payload from a status; production
-    /// code consumes BeltStatus exactly this way, by variant match, never by
-    /// parsing the rendered text.
+    /// Match on the variant, never on rendered text.
     fn typed_payload(status: &BeltStatus) -> Option<&SentinelError> {
         match status {
             BeltStatus::Failed(error) => Some(error),
@@ -335,8 +317,7 @@ mod tests {
         }
     }
 
-    /// Every variant round-trips through clone and equality; the semantic
-    /// variant, not rendered text, is the comparison key.
+    /// Variants round-trip through clone and compare by variant only.
     #[test]
     fn belt_status_variants_round_trip() {
         let cases = [
@@ -374,8 +355,7 @@ mod tests {
         }
     }
 
-    /// Display is the presentation view: it derives from the typed variant
-    /// and never replaces it as the dispatch key.
+    /// Display derives from the variant and never replaces it.
     #[test]
     fn belt_status_display_is_presentation_only() {
         let active = BeltStatus::Active {
@@ -398,8 +378,7 @@ mod tests {
         assert_eq!(not_armed.to_string(), "not armed");
     }
 
-    /// The Failed round-trip recovers the exact typed error, unchanged by
-    /// any string rendering in between.
+    /// `Failed` recovers the exact typed error.
     #[test]
     fn failed_carries_typed_error_not_a_flattened_string() {
         let status = BeltStatus::Failed(SentinelError::Io(std::sync::Arc::new(

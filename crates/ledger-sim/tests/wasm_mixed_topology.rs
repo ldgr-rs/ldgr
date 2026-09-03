@@ -1,19 +1,5 @@
-//! Mixed-topology Wasm test: multiple polyglot guests in one Store.
-//!
-//! Loads prebuilt polyglot guests (Go via TinyGo, Zig, C via clang,
-//! Emscripten) as named instances in one [`WasmBackend`] and runs them.
-//! Every present prebuilt guest is executed and must print its marker
-//! deterministically; the two-guest topology check also asserts
-//! hash-deterministic journals across two fresh runs with the same seed.
-//! When prebuilt artifacts are absent the tests print a skip notice and
-//! pass, so other CI jobs without the polyglot toolchains stay green.
-//!
-//! Prebuilt artifacts are optional drop-ins at `guests/prebuilt/*.wasm`. Build
-//! them when toolchains are present (see `guests/README.md`):
-//!   tinygo build -o guests/prebuilt/go.wasm -target wasi guests/go/main.go
-//!   zig build-exe -target wasm32-freestanding -O ReleaseSmall -fno-entry --export=run -femit-bin=guests/prebuilt/zig.wasm guests/zig/main.zig
-//!   clang --target=wasm32 -nostdlib -Wl,--no-entry -Wl,--export=run -o guests/prebuilt/c.wasm guests/c/main.c
-//!   emcc guests/emscripten/main.c -O3 -o guests/prebuilt/emscripten.wasm -sSTANDALONE_WASM -sEXPORTED_FUNCTIONS=_run --no-entry
+//! Mixed-topology Wasm test: polyglot guests in one `Store` print markers
+//! deterministically; absent prebuilt artifacts skip green.
 #![cfg(feature = "backend-wasm")]
 
 use std::path::Path;

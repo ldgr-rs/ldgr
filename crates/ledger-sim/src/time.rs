@@ -35,11 +35,7 @@ pub struct TimerFired {
     pub enabler: Option<EntryHash>,
 }
 
-/// Snapshot of the virtual clock.
-///
-/// Production backends wrap their ambient time as a tick value; simulation
-/// backends report the current discrete virtual time. One tick is one
-/// microsecond.
+/// Snapshot of the virtual clock; one tick is one microsecond.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clock {
     ticks: u64,
@@ -68,10 +64,7 @@ impl VirtualTime {
         self.now
     }
 
-    /// Build a virtual clock fixed at a tick value.
-    ///
-    /// Used by production pass-through backends to present their ambient time
-    /// as a virtual-clock snapshot.
+    /// Build a clock fixed at a tick value for pass-through backends.
     pub fn from_ticks(now: u64) -> Self {
         Self {
             now,
@@ -85,10 +78,7 @@ impl VirtualTime {
         self.set_with_enabler(delay, task, None);
     }
 
-    /// Add a timer for a task, recording the journal entry that enabled it.
-    ///
-    /// The enabler becomes the parent of the `TimerFire` entry journaled when
-    /// this timer fires.
+    /// Add a timer; the enabler becomes the `TimerFire` parent when it fires.
     pub fn set_with_enabler(&mut self, delay: u64, task: usize, enabler: Option<EntryHash>) {
         self.sequence += 1;
         self.timers.push(Timer {
@@ -154,10 +144,8 @@ impl VirtualTime {
         ready
     }
 
-    /// Jump the clock forward to a deadline.
-    ///
-    /// The caller must have already fired every timer with an earlier
-    /// deadline. Time advances only when no task can run (quiescence).
+    /// Jump forward to a deadline; call only at quiescence with earlier
+    /// timers already fired.
     pub fn advance_to(&mut self, deadline: u64) {
         assert!(deadline >= self.now, "virtual time cannot move backward");
         self.now = deadline;

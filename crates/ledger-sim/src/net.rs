@@ -15,8 +15,7 @@ pub struct Message {
     pub from: usize,
     /// Receiving actor/task ID.
     pub to: usize,
-    /// Content bytes; a scalar caller encodes its value explicitly at the
-    /// API boundary.
+    /// Content bytes; scalar callers encode the value at the API boundary.
     pub content: Vec<u8>,
     /// Journal entry ID of the corresponding Send event.
     pub send_id: EntryHash,
@@ -36,11 +35,8 @@ impl Message {
     }
 }
 
-/// What a bounded link does when its queue is full.
-///
-/// `Drop` discards the newest message and journals a `Drop` fault.
-/// `Block` refuses the send without journaling a drop so the sender can
-/// retry later; the `bool` send surface still reports `false`.
+/// What a bounded link does when full: `Drop` journals a drop, `Block`
+/// refuses without journaling so the sender can retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueueFullPolicy {
     /// Discard the overflowing message (default, preserves history).
@@ -75,21 +71,11 @@ pub enum NetError {
     },
 }
 
-/// Upper bound for a reorder window.
-///
-/// Windows at or below this bound always clamp to the ready count.
-/// Larger windows are rejected by the validated setters and the
-/// fallible recv paths so a misconfigured window fails closed.
+/// Upper bound for a reorder window; larger windows fail closed.
 pub const MAX_REORDER_WINDOW: usize = 65_536;
 
-/// Per-link transport configuration.
-///
-/// All fields default to the zero config, which consumes no seed-stream draws
-/// and keeps journals byte-identical to the unconfigured path. `capacity` is
-/// `None` by default, which means unbounded and preserves the historical
-/// behavior; set `Some(n)` to bound the queued messages for one directed
-/// link. `queue_policy` selects drop (journaled) or block (backpressure)
-/// when a bounded queue is full.
+/// Per-link transport config; the zero value draws nothing and journals
+/// byte-identically to the unconfigured path.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinkConfig {
     /// Deterministic base latency in ticks added to every send on this link.
@@ -119,11 +105,7 @@ impl Default for LinkConfig {
     }
 }
 
-/// Deterministic hostname-to-actor resolution table.
-///
-/// The table is config-driven and never touched by the ambient host: a name
-/// maps to exactly one task id, so resolution is identical for every run that
-/// shares the config. Names that are absent resolve to `None`.
+/// Deterministic hostname-to-actor table; absent names resolve to `None`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DnsTable {
     names: BTreeMap<String, usize>,
@@ -149,10 +131,7 @@ impl DnsTable {
         self.names.contains_key(name)
     }
 
-    /// Sorted iterator over hostname entries (BTreeMap order, deterministic).
-    ///
-    /// Exposed for the deterministic boundary hash (RunConfig canonical bytes);
-    /// same config produces same hash even after DNS changes.
+    /// Sorted hostname entries for the deterministic config hash.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &usize)> {
         self.names.iter().map(|(k, v)| (k.as_str(), v))
     }
@@ -168,11 +147,7 @@ impl DnsTable {
     }
 }
 
-/// Deterministic exponential backoff delay for retry attempt `retry`.
-///
-/// The delay is `base * 2^retry` in microseconds, capped at `max_delay`. The
-/// sequence is purely arithmetic: it draws nothing and needs no RNG, so
-/// identical inputs always produce identical delays.
+/// Deterministic backoff `base * 2^retry` capped at `max_delay`; draws nothing.
 pub fn backoff(base: Duration, retry: u32, max_delay: Duration) -> Duration {
     let base_ticks = base.as_micros().min(u64::MAX as u128) as u64;
     let max_ticks = max_delay.as_micros().min(u64::MAX as u128) as u64;
@@ -182,14 +157,8 @@ pub fn backoff(base: Duration, retry: u32, max_delay: Duration) -> Duration {
     Duration::from_micros(ticks)
 }
 
-/// Deterministic exponential backoff with jitter drawn from a seeded stream.
-///
-/// Computes [`backoff`] for the attempt, then draws one uniform value in
-/// `[0, delay)` from `rng` and adds it, clamping the total to `max_delay`.
-/// `rng` must come from the seed tree (for example `SeedTree::rng` or the
-/// boundary's per-stream RNG) so the draw replays byte-identically. An
-/// unjittered retry sequence is a subset of this: feed a stream that always
-/// draws zero.
+/// Backoff plus one uniform draw in `[0, delay)`; `rng` must come from the
+/// seed tree so the draw replays identically.
 pub fn backoff_jittered(
     base: Duration,
     retry: u32,
@@ -209,9 +178,7 @@ pub struct SimNet {
     // ledger-lint:allow:HashSet (partition pairs are membership-checked;
     // the set is never iterated)
     partitions: HashSet<(usize, usize)>,
-    /// Optional reorder window: when nonzero, up to this many messages sharing
-    /// a delivery tick are served newest-first instead of FIFO (UDP-style
-    /// unordered delivery). Zero keeps strict FIFO.
+    /// Reorder window; nonzero serves newest-first within the window, zero is FIFO.
     reorder_window: usize,
     /// Per-link transport configuration. Absent links use [`LinkConfig::default`].
     links: BTreeMap<(usize, usize), LinkConfig>,
@@ -222,10 +189,7 @@ impl SimNet {
         Self::default()
     }
 
-    /// Configure the transport properties of one directed link.
-    ///
-    /// Links without an explicit config keep the zero config: no latency, no
-    /// jitter, no loss, and the global reorder window.
+    /// Configure one directed link; absent links use the zero config.
     pub fn set_link(&mut self, from: usize, to: usize, cfg: LinkConfig) {
         self.links.insert((from, to), cfg);
     }
@@ -254,11 +218,7 @@ impl SimNet {
         Ok(())
     }
 
-    /// Return the effective reorder window: per-link override or the global.
-    ///
-    /// A per-link `0` inherits the global window; any nonzero per-link value
-    /// wins. Use a global `0` plus explicit per-link windows when one link
-    /// must stay FIFO while others reorder.
+    /// Return the effective window: nonzero per-link wins, else the global.
     pub fn effective_reorder_window(&self, from: usize, to: usize) -> usize {
         let per_link = self
             .links
@@ -310,12 +270,8 @@ impl SimNet {
             .unwrap_or(QueueFullPolicy::Drop)
     }
 
-    /// Fallible send honoring link capacity, jitter, and loss.
-    ///
-    /// The capacity check runs before any seed draw, so a full queue never
-    /// perturbs the draw stream. `Ok(true)` means queued, `Ok(false)` means
-    /// refused by partition or sampled loss, `Err` means the bounded queue
-    /// is full. This is the [`NetError::QueueFull`] producer.
+    /// Fallible send; capacity is checked before any draw so a full queue
+    /// never perturbs the draw stream.
     ///
     /// # Errors
     /// Returns [`NetError::QueueFull`] when the link is at capacity.
@@ -353,15 +309,8 @@ impl SimNet {
         Ok(true)
     }
 
-    /// Send a message honoring the link config, drawing jitter and loss from
-    /// the caller's seeded source.
-    ///
-    /// `draw(bound)` returns a uniform value in `[0, bound)`. Draws happen ONLY
-    /// when the link has nonzero jitter or loss; an unconfigured link consumes
-    /// zero draws. Returns `false` when the message is dropped (partitioned,
-    /// lost, or queue-full), `true` when queued. The `deliver_at` field of `message` is
-    /// recomputed from `now` plus the effective latency. Queue-full collapses
-    /// to `false` here; use [`Self::try_send_via_link`] to distinguish it.
+    /// Send honoring the link config; unconfigured links draw nothing.
+    /// Queue-full collapses to `false`; see [`Self::try_send_via_link`].
     pub fn send_via_link(
         &mut self,
         message: Message,
@@ -419,14 +368,7 @@ impl SimNet {
         Ok(())
     }
 
-    /// Enable a deterministic reorder window on this link.
-    ///
-    /// When `window` is nonzero, messages whose `deliver_at` ties are served
-    /// in reverse insertion order within a window of `window` messages, which
-    /// is deterministic for a fixed send sequence. The default (0) is strict
-    /// FIFO and matches the historical journal output exactly. Windows above
-    /// [`MAX_REORDER_WINDOW`] are rejected by [`Self::try_set_reorder_window`];
-    /// this setter keeps the historical infallible shape for existing callers.
+    /// Enable a reorder window; nonzero is newest-first, zero is FIFO.
     pub fn set_reorder_window(&mut self, window: usize) {
         self.reorder_window = window;
     }
@@ -532,16 +474,7 @@ impl SimNet {
             .any(|msg| msg.to == task && msg.deliver_at <= now)
     }
 
-    /// Return the journal entry id of the deliverable message the deterministic
-    /// recv path would serve next for `task`.
-    ///
-    /// The message stays queued; the id feeds the `Wake` entry parent when a
-    /// blocked task is released. Unlike the historical FIFO peek, this honors
-    /// the effective reorder window, so the `Wake` parent matches the message
-    /// [`Self::recv_at`] will actually deliver. The seeded-draw path
-    /// ([`Self::recv_at_drawn`]) cannot be peeked without consuming a draw,
-    /// so the wake trigger stays deterministic while the `Recv` entry carries
-    /// the true drawn lineage.
+    /// Send id the deterministic recv path would serve next; stays queued.
     pub fn peek_ready_send_id(&self, task: usize, now: u64) -> Option<EntryHash> {
         self.peek_index(task, now)
             .map(|idx| self.queue[idx].send_id)
@@ -587,10 +520,7 @@ impl SimNet {
         Ok(self.recv_with_window(task, now, window))
     }
 
-    /// Validated drawn recv inside the bounded window.
-    ///
-    /// Window zero draws nothing and serves FIFO. A nonzero window draws
-    /// exactly once.
+    /// Validated drawn recv; window zero draws nothing and serves FIFO.
     ///
     /// # Errors
     /// Returns [`NetError::InvalidReorderWindow`] when the effective window
@@ -667,14 +597,8 @@ impl SimNet {
         self.queue.remove(index)
     }
 
-    /// Take the first deliverable message for `task` available at `now`.
-    ///
-    /// With a nonzero effective reorder window (per-link override or global),
-    /// the eligible set is the bounded suffix of the ready queue: the last
-    /// `window` ready messages. The newest of that suffix wins. Window zero
-    /// preserves queue order (strict FIFO). Windows above
-    /// [`MAX_REORDER_WINDOW`] clamp here for historical callers; use
-    /// [`Self::try_recv_at`] to reject them with [`NetError`].
+    /// Take the next deliverable message; nonzero window serves the newest
+    /// of the bounded suffix, zero serves FIFO.
     pub fn recv_at(&mut self, task: usize, now: u64) -> Option<Message> {
         let first = self
             .queue
@@ -692,13 +616,8 @@ impl SimNet {
         self.recv_with_window(task, now, window)
     }
 
-    /// Take one ready message for `task`, drawing a seeded pick inside the
-    /// exact bounded candidate window.
-    ///
-    /// Window zero draws nothing and serves the queue head (FIFO). A nonzero
-    /// window limits the candidate set to the last `window` ready messages
-    /// on this link and serves `candidate[draw(candidate.len())]`. Oversized
-    /// windows clamp here; use [`Self::try_recv_at_drawn`] to reject them.
+    /// Take one ready message via a seeded pick inside the window; window
+    /// zero serves the head without drawing.
     pub fn recv_at_drawn(
         &mut self,
         task: usize,

@@ -1,9 +1,9 @@
 //! Versioned canonical encoding for [`RunConfig`].
 //!
-//! Format version 1 layout, RFC 8949 Core Deterministic CBOR:
+//! Format version 2 layout, RFC 8949 Core Deterministic CBOR:
 //!
 //! ```text
-//! document := [ 1, { fields } ]
+//! document := [ 2, { fields } ]
 //! ```
 //!
 //! The outer array carries the format version as its first item and the field
@@ -30,7 +30,7 @@
 //!
 //! ```text
 //! dns             := [ [ text name, unsigned actor ], ... ]  sorted by name
-//! seed            := bytes(32)
+//! seed            := bytes(34) framed hash ([0x1e, 0x20] + 32-byte digest)
 //! links           := [ [ unsigned from, unsigned to,
 //!                        [ unsigned base_delay, unsigned jitter,
 //!                          float loss_probability, unsigned reorder_window
@@ -42,7 +42,7 @@
 //! policy          := [ unsigned tag, ...payload ]
 //! monitor         := bool
 //! max_steps       := unsigned
-//! dropped_events  := [ bytes(32), ... ]
+//! dropped_events  := [ bytes(34), ... ]  framed hashes
 //! fs_journaling   := null | unsigned mode      (0 = writeback, 1 = ordered, 2 = data)
 //! fault_schedule  := [ [ unsigned tag, ...payload ], ... ]
 //! reorder_draw    := bool                      (optional, default false)
@@ -50,9 +50,14 @@
 //! max_resident_bytes := null | unsigned        (optional, default null)
 //! ```
 //!
+//! Every hash byte field (seed, dropped events, fault ids) carries the framed
+//! 34-byte form `[0x1e, 0x20] + digest` via `EntryHash::to_framed_bytes`; the
+//! decoder enforces framing via `EntryHash::from_framed_bytes` and rejects
+//! raw 32-byte hashes.
+//!
 //! Link capacity encoding: a link with the default bounded-queue config
 //! (`capacity` none, `queue_policy` drop) encodes as the historical 4-item
-//! array, byte-identical to format-version-1 documents written before bounded
+//! array, byte-identical to format-version-2 documents written before bounded
 //! queues existed. A link with a bound or a non-default policy encodes as a
 //! 6-item array with `capacity` (`null` for explicit unbounded, unsigned
 //! otherwise) and `queue_policy` (`0` drop, `1` block) appended. The decoder
@@ -75,12 +80,13 @@
 //! Fault tags and payloads:
 //!
 //! ```text
-//! 0 drop        := [ 0, bytes(32) id ]
-//! 1 delay       := [ 1, bytes(32) send, unsigned ticks ]
+//! 0 drop        := [ 0, bytes(34) id ]
+//! 1 delay       := [ 1, bytes(34) send, unsigned ticks ]
 //! 2 partition   := [ 2, unsigned src, unsigned dst ]
-//! 3 crash       := [ 3, bytes(32) id ]
-//! 4 corrupt     := [ 4, bytes(32) write, unsigned xor_mask ]
-//! 5 crash_state := [ 5, bytes(32) write, unsigned state ]
+//! 3 crash       := [ 3, bytes(34) id ]
+//! 4 corrupt     := [ 4, bytes(34) write, unsigned xor_mask ]
+//! 5 crash_state := [ 5, bytes(34) write, unsigned state ]
+//! 6 duplicate   := [ 6, bytes(34) send ]
 //! ```
 //!
 //! Float rules: every float is a minimal-width canonical CBOR float
@@ -94,7 +100,7 @@
 //! whose `fs_journaling` is not `null`, so the canonical bytes of an equal
 //! config are identical across feature builds.
 //!
-//! The version 1 bytes supersede the unversioned legacy encoder that lived in
+//! The version 2 bytes supersede the unversioned legacy encoder that lived in
 //! `ledger-worker::proto` (see `tests/canonical_config.rs` for the frozen
 //! legacy fixtures). `max_steps`, actor ids, and link endpoints are unsigned
 //! CBOR integers; the decoder converts with checked `try_from` so the bytes
@@ -106,7 +112,7 @@ use crate::config::{Policy, Probability, RunConfig, SimFault, SwarmConfig};
 use crate::net::LinkConfig;
 
 /// Current format version of the canonical RunConfig bytes.
-pub const FORMAT_VERSION: u64 = 1;
+pub const FORMAT_VERSION: u64 = 2;
 
 /// Hard bound on one encoded DNS name, in bytes.
 ///
@@ -128,7 +134,7 @@ pub enum ConfigCanonicalError {
     MissingField(&'static str),
     /// A field holds a value of the wrong CBOR kind.
     WrongFieldType(&'static str),
-    /// A 32-byte hash field (seed, dropped event, fault id) has another length.
+    /// A framed 34-byte hash field (seed, dropped event, fault id) has another length.
     InvalidHashLength {
         /// Field name carrying the bad hash.
         field: &'static str,
@@ -185,7 +191,7 @@ impl core::fmt::Display for ConfigCanonicalError {
             Self::MissingField(field) => write!(f, "missing run-config field: {field}"),
             Self::WrongFieldType(field) => write!(f, "wrong type for run-config field: {field}"),
             Self::InvalidHashLength { field, len } => {
-                write!(f, "{field} must be 32 bytes, got {len}")
+                write!(f, "{field} must be 34 framed bytes, got {len}")
             }
             Self::InvalidPolicyTag(tag) => write!(f, "unknown policy tag: {tag}"),
             Self::InvalidFaultTag(tag) => write!(f, "unknown fault tag: {tag}"),
@@ -430,7 +436,7 @@ fn fields(config: &RunConfig) -> Result<Vec<(CborValue, CborValue)>, ConfigCanon
             })
             .collect(),
     );
-    let seed = CborValue::Bytes(config.seed().0.to_vec());
+    let seed = CborValue::Bytes(config.seed().to_framed_bytes().to_vec());
     let links = CborValue::Array(
         config
             .links()
@@ -452,7 +458,7 @@ fn fields(config: &RunConfig) -> Result<Vec<(CborValue, CborValue)>, ConfigCanon
         config
             .dropped_events()
             .iter()
-            .map(|hash| CborValue::Bytes(hash.0.to_vec()))
+            .map(|hash| CborValue::Bytes(hash.to_framed_bytes().to_vec()))
             .collect(),
     );
     let fs_journaling = fs_journaling_value(config);
@@ -579,11 +585,11 @@ fn fault_value(fault: &SimFault) -> Result<CborValue, ConfigCanonicalError> {
     Ok(match fault {
         SimFault::Drop(id) => CborValue::Array(vec![
             CborValue::Unsigned(0),
-            CborValue::Bytes(id.0.to_vec()),
+            CborValue::Bytes(id.to_framed_bytes().to_vec()),
         ]),
         SimFault::Delay { send, ticks } => CborValue::Array(vec![
             CborValue::Unsigned(1),
-            CborValue::Bytes(send.0.to_vec()),
+            CborValue::Bytes(send.to_framed_bytes().to_vec()),
             CborValue::Unsigned(*ticks),
         ]),
         SimFault::Partition { src, dst } => CborValue::Array(vec![
@@ -593,17 +599,21 @@ fn fault_value(fault: &SimFault) -> Result<CborValue, ConfigCanonicalError> {
         ]),
         SimFault::Crash(id) => CborValue::Array(vec![
             CborValue::Unsigned(3),
-            CborValue::Bytes(id.0.to_vec()),
+            CborValue::Bytes(id.to_framed_bytes().to_vec()),
         ]),
         SimFault::Corrupt { write, xor_mask } => CborValue::Array(vec![
             CborValue::Unsigned(4),
-            CborValue::Bytes(write.0.to_vec()),
+            CborValue::Bytes(write.to_framed_bytes().to_vec()),
             CborValue::Unsigned(*xor_mask),
         ]),
         SimFault::CrashState { write, state } => CborValue::Array(vec![
             CborValue::Unsigned(5),
-            CborValue::Bytes(write.0.to_vec()),
+            CborValue::Bytes(write.to_framed_bytes().to_vec()),
             CborValue::Unsigned(*state),
+        ]),
+        SimFault::Duplicate { send } => CborValue::Array(vec![
+            CborValue::Unsigned(6),
+            CborValue::Bytes(send.to_framed_bytes().to_vec()),
         ]),
     })
 }
@@ -700,12 +710,12 @@ fn probability_of(
 
 fn decode_hash(value: &CborValue, field: &'static str) -> Result<EntryHash, ConfigCanonicalError> {
     match value {
-        CborValue::Bytes(bytes) => <[u8; 32]>::try_from(bytes.as_slice())
-            .map(EntryHash)
-            .map_err(|_| ConfigCanonicalError::InvalidHashLength {
+        CborValue::Bytes(bytes) => EntryHash::from_framed_bytes(bytes.as_slice()).map_err(|_| {
+            ConfigCanonicalError::InvalidHashLength {
                 field,
                 len: bytes.len(),
-            }),
+            }
+        }),
         _ => Err(ConfigCanonicalError::WrongFieldType(field)),
     }
 }
@@ -922,6 +932,12 @@ fn decode_fault(value: &CborValue) -> Result<SimFault, ConfigCanonicalError> {
                 state: u64_of(&rest[1], "fault_schedule.crash_state.state")?,
             })
         }
+        6 => {
+            expect_len(rest, 1, "fault_schedule")?;
+            Ok(SimFault::Duplicate {
+                send: decode_hash(&rest[0], "fault_schedule.duplicate.send")?,
+            })
+        }
         other => Err(ConfigCanonicalError::InvalidFaultTag(*other)),
     }
 }
@@ -976,7 +992,10 @@ mod probability_tests {
     fn minimal_fields() -> Vec<(&'static str, CborValue)> {
         vec![
             ("dns", CborValue::Array(Vec::new())),
-            ("seed", CborValue::Bytes(vec![0u8; 32])),
+            (
+                "seed",
+                CborValue::Bytes(EntryHash([0u8; 32]).to_framed_bytes().to_vec()),
+            ),
             ("links", CborValue::Array(Vec::new())),
             (
                 "swarm",
@@ -1079,7 +1098,10 @@ mod probability_tests {
         {
             let fields = vec![
                 ("dns", CborValue::Array(Vec::new())),
-                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                (
+                    "seed",
+                    CborValue::Bytes(EntryHash([0u8; 32]).to_framed_bytes().to_vec()),
+                ),
                 ("links", CborValue::Array(Vec::new())),
                 (
                     "swarm",
@@ -1137,7 +1159,10 @@ mod probability_tests {
             );
             let fields = vec![
                 ("dns", CborValue::Array(Vec::new())),
-                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                (
+                    "seed",
+                    CborValue::Bytes(EntryHash([0u8; 32]).to_framed_bytes().to_vec()),
+                ),
                 ("links", CborValue::Array(Vec::new())),
                 (
                     "swarm",
@@ -1195,7 +1220,10 @@ mod probability_tests {
             );
             let fields = vec![
                 ("dns", CborValue::Array(Vec::new())),
-                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                (
+                    "seed",
+                    CborValue::Bytes(EntryHash([0u8; 32]).to_framed_bytes().to_vec()),
+                ),
                 (
                     "links",
                     CborValue::Array(vec![CborValue::Array(vec![
@@ -1244,7 +1272,10 @@ mod probability_tests {
             );
             let fields = vec![
                 ("dns", CborValue::Array(Vec::new())),
-                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                (
+                    "seed",
+                    CborValue::Bytes(EntryHash([0u8; 32]).to_framed_bytes().to_vec()),
+                ),
                 (
                     "links",
                     CborValue::Array(vec![CborValue::Array(vec![
@@ -1311,7 +1342,10 @@ mod probability_tests {
             );
             let fields = vec![
                 ("dns", CborValue::Array(Vec::new())),
-                ("seed", CborValue::Bytes(vec![0u8; 32])),
+                (
+                    "seed",
+                    CborValue::Bytes(EntryHash([0u8; 32]).to_framed_bytes().to_vec()),
+                ),
                 ("links", CborValue::Array(Vec::new())),
                 (
                     "swarm",
@@ -1568,6 +1602,142 @@ mod probability_tests {
         assert_eq!(
             from_canonical_bytes(&bytes).expect_err("5-item link"),
             ConfigCanonicalError::WrongFieldType("links")
+        );
+    }
+}
+
+#[cfg(test)]
+mod duplicate_canonical_tests {
+    use super::*;
+
+    fn local_minimal_fields() -> Vec<(&'static str, CborValue)> {
+        vec![
+            ("dns", CborValue::Array(Vec::new())),
+            (
+                "seed",
+                CborValue::Bytes(EntryHash([0u8; 32]).to_framed_bytes().to_vec()),
+            ),
+            ("links", CborValue::Array(Vec::new())),
+            (
+                "swarm",
+                CborValue::Array(vec![
+                    CborValue::Float(0.0),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(0),
+                    CborValue::Float(0.0),
+                    CborValue::Unsigned(2),
+                ]),
+            ),
+            ("policy", CborValue::Array(vec![CborValue::Unsigned(0)])),
+            ("monitor", CborValue::Bool(true)),
+            ("max_steps", CborValue::Unsigned(10_000)),
+            ("dropped_events", CborValue::Array(Vec::new())),
+            ("fs_journaling", CborValue::Null),
+            ("fault_schedule", CborValue::Array(Vec::new())),
+        ]
+    }
+
+    fn local_craft(fields: Vec<(&str, CborValue)>) -> Vec<u8> {
+        let entries = fields
+            .into_iter()
+            .map(|(name, value)| (CborValue::Text(name.to_string()), value))
+            .collect();
+        CborValue::Array(vec![
+            CborValue::Unsigned(FORMAT_VERSION),
+            CborValue::Map(entries),
+        ])
+        .try_to_canonical_bytes()
+        .expect("crafted document encodes")
+    }
+
+    fn with_fault(fault: CborValue) -> Vec<u8> {
+        let mut fields = local_minimal_fields();
+        for (name, slot) in fields.iter_mut() {
+            if *name == "fault_schedule" {
+                *slot = CborValue::Array(vec![fault.clone()]);
+            }
+        }
+        local_craft(fields)
+    }
+
+    #[test]
+    fn duplicate_tag_six_round_trips() {
+        let send = EntryHash([0x33; 32]);
+        let config = RunConfig::builder()
+            .fault_schedule(vec![SimFault::Duplicate { send }])
+            .build();
+        let bytes = to_canonical_bytes(&config).expect("encodes");
+        let decoded = from_canonical_bytes(&bytes).expect("decodes");
+        assert_eq!(decoded.fault_schedule(), &[SimFault::Duplicate { send }]);
+        let reencoded = to_canonical_bytes(&decoded).expect("re-encodes");
+        assert_eq!(bytes, reencoded);
+        assert_eq!(
+            canonical_hash(&config).expect("hash"),
+            canonical_hash(&decoded).expect("hash decoded")
+        );
+    }
+
+    #[test]
+    fn duplicate_tag_six_rejects_bad_shapes_and_versions() {
+        let framed = EntryHash([0x33; 32]).to_framed_bytes().to_vec();
+        // Unknown fault tag stays rejected.
+        let bytes = with_fault(CborValue::Array(vec![
+            CborValue::Unsigned(7),
+            CborValue::Bytes(framed.clone()),
+        ]));
+        assert_eq!(
+            from_canonical_bytes(&bytes).expect_err("tag 7"),
+            ConfigCanonicalError::InvalidFaultTag(7)
+        );
+        // Tag 6 with missing payload is a shape error.
+        let bytes = with_fault(CborValue::Array(vec![CborValue::Unsigned(6)]));
+        assert_eq!(
+            from_canonical_bytes(&bytes).expect_err("tag 6 empty"),
+            ConfigCanonicalError::WrongFieldType("fault_schedule")
+        );
+        // Tag 6 with an extra item is a shape error.
+        let bytes = with_fault(CborValue::Array(vec![
+            CborValue::Unsigned(6),
+            CborValue::Bytes(framed.clone()),
+            CborValue::Unsigned(0),
+        ]));
+        assert_eq!(
+            from_canonical_bytes(&bytes).expect_err("tag 6 long"),
+            ConfigCanonicalError::WrongFieldType("fault_schedule")
+        );
+        // Tag 6 with a raw 32-byte hash rejects framing.
+        let bytes = with_fault(CborValue::Array(vec![
+            CborValue::Unsigned(6),
+            CborValue::Bytes(vec![0u8; 32]),
+        ]));
+        assert_eq!(
+            from_canonical_bytes(&bytes).expect_err("tag 6 raw hash"),
+            ConfigCanonicalError::InvalidHashLength {
+                field: "fault_schedule.duplicate.send",
+                len: 32,
+            }
+        );
+        // Version is checked before fault tags: a v1 document carrying a
+        // duplicate-shaped fault still fails as unsupported version.
+        let mut fields = local_minimal_fields();
+        for (name, slot) in fields.iter_mut() {
+            if *name == "fault_schedule" {
+                *slot = CborValue::Array(vec![CborValue::Array(vec![
+                    CborValue::Unsigned(6),
+                    CborValue::Bytes(framed.clone()),
+                ])]);
+            }
+        }
+        let entries = fields
+            .into_iter()
+            .map(|(name, value)| (CborValue::Text(name.to_string()), value))
+            .collect();
+        let bytes = CborValue::Array(vec![CborValue::Unsigned(1), CborValue::Map(entries)])
+            .try_to_canonical_bytes()
+            .expect("v1 document encodes");
+        assert_eq!(
+            from_canonical_bytes(&bytes).expect_err("version 1"),
+            ConfigCanonicalError::UnsupportedVersion(1)
         );
     }
 }

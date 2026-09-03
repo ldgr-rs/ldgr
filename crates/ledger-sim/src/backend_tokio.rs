@@ -12,15 +12,9 @@ use std::path::{Path, PathBuf};
 
 /// Host-side virtual time and entropy override for deterministic testing.
 ///
-/// When `LEDGER_VIRTUAL_TICKS_PATH` is set, the backend clock reads the file
-/// on each `clock().now()` call and uses its decimal micros value instead of
-/// `SystemTime::now`. When `LEDGER_VIRTUAL_SEED_HEX` is set (64 hex chars),
-/// the backend RNG serves a deterministic SplitMix64 stream seeded from the
-/// first 8 bytes of the seed, matching the C shim's algorithm. Transitive
-/// dependencies that call libc `clock_gettime`/`getrandom` directly are covered
-/// by the `LD_PRELOAD` shim (`sentinel_shim.c`) using the same env vars and
-/// the same PRNG algorithm, so both the Rust `Effects` path and the libc path
-/// virtualize consistently.
+/// `LEDGER_VIRTUAL_TICKS_PATH` virtualizes the clock, `LEDGER_VIRTUAL_SEED_HEX`
+/// virtualizes entropy; the `LD_PRELOAD` shim applies the same vars to libc
+/// callers so both paths virtualize consistently.
 #[derive(Debug, Clone, Default)]
 pub struct VirtualOverride {
     /// Path to a file containing virtual time as decimal microseconds.
@@ -51,14 +45,7 @@ impl VirtualOverride {
     }
 }
 
-/// Deterministic SplitMix64 RNG seeded from a hex seed.
-///
-/// Seeded from the first 8 bytes (16 hex chars) of `LEDGER_VIRTUAL_SEED_HEX`
-/// in big-endian order. Each `next_u64` advances state by
-/// `0x9e3779b97f4a7c15` and mixes with the SplitMix64 constants
-/// `0xbf58476d1ce4e5b9` and `0x94d049bb133111eb`. This matches the C shim's
-/// `splitmix64_next` so a Rust backend and an `LD_PRELOAD`-interposed
-/// subprocess produce the same byte stream for the same seed.
+/// Deterministic SplitMix64 RNG matching the C shim's `splitmix64_next`.
 #[derive(Debug, Clone)]
 struct VirtualRng {
     state: u64,
@@ -132,9 +119,7 @@ impl rand_core::TryRng for HostRng {
     }
 }
 
-/// Failure to read the virtual clock override input. Every failing input
-/// class keeps its driving source so operators can diagnose the override
-/// file without parsing text.
+/// Virtual clock override failure; keeps its source for diagnosis.
 #[derive(Debug)]
 enum TickOverrideError {
     /// The override file could not be opened.
@@ -179,19 +164,8 @@ impl std::error::Error for TickOverrideError {
     }
 }
 
-/// Production host backend implementing the Effects boundary.
-///
-/// RECORD-ONLY mode for the network and storage surfaces. `net()` and `fs()`
-/// serve the deterministic in-memory scaffolding ([`SimNet`] / [`SimFs`]) and
-/// journal every crossing into a throwaway journal; they never touch the
-/// ambient host. `clock`, `sleep`, and `rng` do serve the ambient host (wall
-/// clock, tokio real time, OS entropy) unless a [`VirtualOverride`] is active.
-/// When virtualized, `clock` reads `LEDGER_VIRTUAL_TICKS_PATH` and `rng`
-/// serves the deterministic seed from `LEDGER_VIRTUAL_SEED_HEX`. The
-/// `LD_PRELOAD` shim covers transitive dependencies that read libc directly.
-/// Real TCP and filesystem passthrough adapters for the `Net` / `Fs` trait
-/// shapes are future work; production use must provide its own ambient
-/// adapters for those two surfaces.
+/// Production host backend: record-only net/fs, ambient clock/sleep/entropy
+/// unless a [`VirtualOverride`] is active.
 #[derive(Debug)]
 pub struct TokioBackend {
     journal: RefCell<Journal>,
@@ -233,12 +207,8 @@ impl TokioBackend {
         }
     }
 
-    /// Return the first virtual-override input failure, if any.
-    ///
-    /// When `LEDGER_VIRTUAL_TICKS_PATH` or `LEDGER_VIRTUAL_SEED_HEX` is armed
-    /// but its input cannot be read or parsed, the clock serves the
-    /// last-known-good tick value instead of ambient time and this slot
-    /// records why, so the nondeterminism is observable rather than silent.
+    /// First virtual-override input failure, if any; the clock holds
+    /// last-known-good ticks while set so failure stays observable.
     pub fn virtual_override_error(&self) -> Option<String> {
         self.override_error.borrow().clone()
     }
@@ -272,13 +242,10 @@ impl TokioBackend {
         }
     }
 
-    /// Read the virtual tick override. The read is capped at 256 bytes,
-    /// mirroring the C shim contract, so an oversized or special file cannot
-    /// balloon memory.
+    /// Read the virtual tick override, capped at 256 bytes per the C shim contract.
     ///
     /// # Errors
-    /// Returns the typed override error with the driving source preserved for
-    /// every failing input class.
+    /// Returns the typed override error with its source preserved.
     fn read_virtual_micros(path: &Path) -> Result<u64, TickOverrideError> {
         let file = std::fs::File::open(path).map_err(TickOverrideError::Open)?;
         let mut raw = [0u8; 256];
@@ -423,9 +390,7 @@ mod tests {
     use super::*;
     use std::error::Error as _;
 
-    /// Record-only net/fs crossings are deterministic: two backends performing
-    /// the same journaled operations produce byte-identical journals. The
-    /// ambient surfaces (`clock`, `sleep`, `rng`) are never touched here.
+    /// Record-only net/fs crossings journal identically across runs.
     #[test]
     fn record_only_net_and_fs_are_deterministic() {
         let run = || {
@@ -486,8 +451,7 @@ mod tests {
         std::env::temp_dir().join(name)
     }
 
-    /// A missing override file must surface as the typed `Open` variant with
-    /// the io source in the chain, never a bare message.
+    /// Missing file surfaces as typed `Open` with its source.
     #[test]
     fn tick_override_open_failure_is_typed_with_source() {
         let missing = unique_temp_file("missing");
@@ -496,8 +460,7 @@ mod tests {
         assert!(err.source().is_some(), "io source must stay in the chain");
     }
 
-    /// A file filling the whole fixed cap is a typed oversized error, not a
-    /// parse attempt on unbounded text.
+    /// Full-cap file surfaces as typed oversized, not a parse attempt.
     #[test]
     fn tick_override_oversized_is_typed() {
         let path = unique_temp_file("oversized");
@@ -514,7 +477,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Non-UTF-8 bytes are a typed utf8 failure with the source preserved.
+    /// Non-UTF-8 bytes surface as typed utf8 with source preserved.
     #[test]
     fn tick_override_invalid_utf8_is_typed() {
         let path = unique_temp_file("utf8");
@@ -525,8 +488,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Non-numeric text is a typed parse failure carrying the offending text
-    /// and the ParseIntError source.
+    /// Non-numeric text surfaces as typed parse with text and source.
     #[test]
     fn tick_override_parse_failure_is_typed_with_source() {
         let path = unique_temp_file("parse");
@@ -549,7 +511,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The happy path still parses decimal micros after the typing change.
+    /// Valid decimal micros still parse.
     #[test]
     fn tick_override_valid_value_parses() {
         let path = unique_temp_file("valid");

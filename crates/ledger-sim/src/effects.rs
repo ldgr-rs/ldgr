@@ -12,18 +12,12 @@ pub type TaskId = u64;
 
 /// Network boundary exposed to systems under test.
 ///
-/// Implementors serve the deterministic simulated network surface: message
-/// send, timed receive, and readiness checks. State is interior-mutable so the
-/// boundary can be reached through a shared reference.
+/// Interior-mutable so it is reachable through a shared reference.
 pub trait Net {
     /// Queue a message for delivery. Returns false if the link is partitioned.
     fn send(&self, message: Message) -> bool;
 
-    /// Queue a message for delivery, recording where the send came from.
-    ///
-    /// The origin lands in the session side channel keyed by the Send entry
-    /// hash; journal bytes are unchanged. The default drops the origin so
-    /// existing implementations stay correct without code changes.
+    /// Queue a message with its origin; the default drops the origin.
     fn send_loc(&self, message: Message, at: OriginSource) -> bool {
         let _ = at;
         self.send(message)
@@ -35,8 +29,7 @@ pub trait Net {
     fn has_ready_message(&self, task: usize, now: u64) -> bool;
 }
 
-/// Tracked aliases for the network boundary: same behavior, plus origin
-/// capture into the session side channel when the backend supports it.
+/// Tracked network aliases with origin capture.
 pub trait NetExt: Net {
     #[track_caller]
     fn send_tracked(&self, message: Message) -> bool {
@@ -85,14 +78,12 @@ impl FsError {
 
 /// Storage boundary exposed to systems under test.
 ///
-/// Implementors serve the layered simulated storage surface: page-cache write,
-/// fsync flush, and provenance-tracked read. Journaling is handled by the
-/// backend, so the caller never sees the journal.
+/// The backend handles journaling; the caller never sees the journal.
 pub trait Fs {
     /// Write a value to the page cache and return its journal entry id.
     fn write(&self, path: &str, value: u64) -> Result<EntryHash, FsError>;
 
-    /// Write with origin capture; see [`Net::send_loc`]. Default delegates.
+    /// Write with origin capture; default delegates to [`Fs::write`].
     fn write_loc(&self, path: &str, value: u64, at: OriginSource) -> Result<EntryHash, FsError> {
         let _ = at;
         self.write(path, value)
@@ -101,7 +92,7 @@ pub trait Fs {
     /// Flush all dirty page-cache entries to durable synced storage.
     fn fsync(&self) -> Result<EntryHash, FsError>;
 
-    /// Flush with origin capture; see [`Net::send_loc`]. Default delegates.
+    /// Flush with origin capture; default delegates to [`Fs::fsync`].
     fn fsync_loc(&self, at: OriginSource) -> Result<EntryHash, FsError> {
         let _ = at;
         self.fsync()
@@ -113,16 +104,15 @@ pub trait Fs {
     /// Crash storage into the deterministic post-crash state.
     fn crash(&self);
 
-    /// Crash with origin capture; see [`Net::send_loc`]. Default delegates.
+    /// Crash with origin capture; default delegates to [`Fs::crash`].
     fn crash_loc(&self, at: OriginSource) {
         let _ = at;
         self.crash()
     }
 }
 
-/// Tracked aliases for the storage boundary. Read is deliberately absent:
-/// its provenance entries are appended inside the fs layer, so there is no
-/// entry id observable at this boundary to key an origin against.
+/// Tracked storage aliases; `read` has no tracked form since its provenance
+/// entries stay inside the fs layer with no entry id to key against.
 pub trait FsExt: Fs {
     #[track_caller]
     fn write_tracked(&self, path: &str, value: u64) -> Result<EntryHash, FsError> {
@@ -144,29 +134,20 @@ impl<T: Fs + ?Sized> FsExt for T {}
 
 /// Effect boundary implemented by simulation and production backends.
 ///
-/// Simulation backends drive the journal; production backends forward to the
-/// ambient host. The trait is not object-safe: systems under test take it
-/// generically or concretely.
-///
-/// The returned RNG handles are infallible `rand_core::Rng` values (the
-/// rand_core 0.10 replacement for the deprecated `RngCore`). Simulation
-/// backends journal every draw; production backends serve OS entropy.
+/// Simulation backends journal; production backends forward to the host. Not
+/// object-safe. Simulation RNG draws journal as `RngDraw`; production serves
+/// OS entropy.
 pub trait Effects {
     /// Return a handle to the current virtual clock.
     fn clock(&self) -> Clock;
 
     /// Return an RNG handle for a labeled stream.
     ///
-    /// Simulation backends serve a deterministic, seed-tree-derived stream and
-    /// journal each draw as an `RngDraw { stream }` entry so the consumption
-    /// order is replayable. Production backends serve OS entropy.
+    /// Simulation streams are seed-tree-derived and journaled; production
+    /// serves OS entropy.
     fn rng(&mut self, stream: StreamId) -> &mut impl Rng;
 
-    /// Sleep for a duration measured in virtual ticks.
-    ///
-    /// One tick is one microsecond; simulation backends convert the duration
-    /// to ticks before registering the timer. The returned future carries no
-    /// `Send` bound because the sim is single-threaded.
+    /// Sleep for a duration in virtual ticks (one tick is one microsecond).
     #[allow(async_fn_in_trait)] // this trait predates edition-2024 async fn support
     async fn sleep(&self, d: core::time::Duration);
 

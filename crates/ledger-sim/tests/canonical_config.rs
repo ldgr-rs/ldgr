@@ -1,21 +1,7 @@
-//! Golden fixtures for canonical RunConfig bytes.
+//! Golden fixtures for canonical RunConfig bytes: frozen legacy `v0` plus
+//! versioned `v2` (shared with the Go conformance corpus).
 //!
-//! Two encoders are covered:
-//!
-//! - The frozen legacy `v0` encoder, byte-for-byte the unversioned codec that
-//!   lived in `ledger-worker/src/proto.rs` before the v1 migration. The
-//!   fixtures capture the exact bytes and blake3 hashes the legacy codec
-//!   produced on this host (x86_64, 64-bit `usize`). The `baseline` section
-//!   matches a build without `sim-fs-journaling`; the `sim-fs-journaling`
-//!   section matches a build with it. That feature divergence is exactly what
-//!   v1 removes.
-//! - The versioned `v1` encoder in `ledger-sim::config_canonical`. The v1
-//!   fixture file lives under `crates/ledger-format/tests/fixtures/run-config/`
-//!   so the Go conformance runner in that crate's `tests/go/golden` consumes
-//!   the same machine-readable corpus.
-//!
-//! `regenerate_v0_fixtures` and `regenerate_v1_fixtures` are `#[ignore]`d
-//! writers; run them on purpose after an approved format change.
+//! `regenerate_*` writers are `#[ignore]`d; run after an approved format change.
 
 use std::path::Path;
 
@@ -33,14 +19,14 @@ fn fixtures_dir() -> std::path::PathBuf {
 }
 
 /// Cross-crate fixture corpus shared with the Go conformance runner.
-fn v1_fixture_path() -> std::path::PathBuf {
+fn v2_fixture_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("ledger-format")
         .join("tests")
         .join("fixtures")
         .join("run-config")
-        .join("run_config_v1.json")
+        .join("run_config_v2.json")
 }
 
 fn hex_bytes(text: &str) -> Vec<u8> {
@@ -66,7 +52,7 @@ fn blake3_hex(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// One fixed representative shape. The same shapes freeze the legacy v0 bytes
-/// and pin the v1 bytes, so the migration delta is visible in both corpora.
+/// and pin the v2 bytes, so the migration delta is visible in both corpora.
 fn shapes() -> Vec<RunConfig> {
     let list = vec![
         RunConfig::default(),
@@ -207,6 +193,9 @@ fn rich() -> RunConfig {
                 write: ledger_format::EntryHash([0x22; 32]),
                 state: 2,
             },
+            SimFault::Duplicate {
+                send: ledger_format::EntryHash([0x33; 32]),
+            },
         ])
         .monitor(false)
         .build();
@@ -289,6 +278,9 @@ fn description(config: &RunConfig) -> serde_json::Value {
                 "write": to_hex(&write.0),
                 "state": state,
             }),
+            SimFault::Duplicate { send } => {
+                serde_json::json!({"tag": "duplicate", "send": to_hex(&send.0)})
+            }
         })
         .collect::<Vec<_>>();
     #[cfg(feature = "sim-fs-journaling")]
@@ -408,6 +400,9 @@ fn config_from_description(desc: &serde_json::Value) -> RunConfig {
             "crash_state" => SimFault::CrashState {
                 write: hash_from_hex(fault["write"].as_str().expect("write")).expect("write"),
                 state: fault["state"].as_u64().expect("state"),
+            },
+            "duplicate" => SimFault::Duplicate {
+                send: hash_from_hex(fault["send"].as_str().expect("send")).expect("send"),
             },
             other => panic!("unknown fault tag {other:?}"),
         })
@@ -535,8 +530,16 @@ fn v0_canonical_bytes(config: &RunConfig) -> Vec<u8> {
         out.extend_from_slice(name_bytes);
         out.extend_from_slice(&(*actor as u64).to_le_bytes());
     }
-    out.extend_from_slice(&(config.fault_schedule().len() as u64).to_le_bytes());
-    for fault in config.fault_schedule() {
+    // The frozen codec predates duplicate delivery: only faults it can
+    // encode are counted, so post-legacy shapes project to their legacy
+    // prefix byte-identically. Unknown classes are absent, never stubbed.
+    let v0_faults: Vec<_> = config
+        .fault_schedule()
+        .iter()
+        .filter(|fault| !matches!(fault, SimFault::Duplicate { .. }))
+        .collect();
+    out.extend_from_slice(&(v0_faults.len() as u64).to_le_bytes());
+    for fault in v0_faults {
         v0_encode_fault(fault, &mut out);
     }
     #[cfg(feature = "sim-fs-journaling")]
@@ -612,6 +615,11 @@ fn v0_encode_fault(fault: &SimFault, out: &mut Vec<u8>) {
             out.push(5);
             out.extend_from_slice(&write.0);
             out.extend_from_slice(&state.to_le_bytes());
+        }
+        SimFault::Duplicate { .. } => {
+            // The frozen v0 codec predates duplicate delivery: unknown fault
+            // classes are absent from its bytes, so legacy fixtures stay
+            // byte-identical. v2 covers Duplicate under tag 6.
         }
     }
 }
@@ -704,7 +712,7 @@ fn regenerate_v0_fixtures() {
 }
 
 /// The frozen v0 encoder still reproduces the captured legacy bytes, and the
-/// captured blake3 hash still matches, before and after the v1 migration.
+/// captured blake3 hash still matches, before and after the v2 migration.
 #[test]
 fn frozen_v0_encoder_reproduces_legacy_fixtures() {
     let fixtures = read_v0_fixtures();
@@ -729,22 +737,22 @@ fn v0_fixture_descriptions_rebuild_the_shapes() {
     }
 }
 
-/// v1 bytes differ from the legacy bytes on every shape, proving the migration
+/// v2 bytes differ from the legacy bytes on every shape, proving the migration
 /// actually changed the canonical bytes and therefore the hashes.
 #[test]
-fn v1_bytes_differ_from_legacy_v0_bytes() {
+fn v2_bytes_differ_from_legacy_v0_bytes() {
     for (config, name) in shapes().into_iter().zip(shape_names()) {
         let v0 = v0_canonical_bytes(&config);
-        let v1 = to_canonical_bytes(&config).expect("v1 encodes");
-        assert_ne!(v0, v1, "v1 must differ from v0 for {name}");
+        let v2 = to_canonical_bytes(&config).expect("v2 encodes");
+        assert_ne!(v0, v2, "v2 must differ from v0 for {name}");
     }
 }
 
 // ---------------------------------------------------------------------------
-// v1 fixture capture and assertions
+// v2 fixture capture and assertions
 // ---------------------------------------------------------------------------
 
-/// Regenerate the v1 fixture corpus under `crates/ledger-format/tests/fixtures`.
+/// Regenerate the v2 fixture corpus under `crates/ledger-format/tests/fixtures`.
 ///
 /// Must run with `sim-fs-journaling` enabled so the journaling-FS shapes are
 /// included; the encoding itself is feature-independent. `#[ignore]`d because
@@ -752,12 +760,12 @@ fn v1_bytes_differ_from_legacy_v0_bytes() {
 #[test]
 #[ignore]
 #[cfg(feature = "sim-fs-journaling")]
-fn regenerate_v1_fixtures() {
+fn regenerate_v2_fixtures() {
     let shapes = shapes()
         .into_iter()
         .zip(shape_names())
         .map(|(config, name)| {
-            let bytes = to_canonical_bytes(&config).expect("v1 encodes");
+            let bytes = to_canonical_bytes(&config).expect("v2 encodes");
             serde_json::json!({
                 "name": name,
                 "config": description(&config),
@@ -774,19 +782,19 @@ fn regenerate_v1_fixtures() {
         "hash_algorithm": "blake3",
         "shapes": shapes,
     });
-    let path = v1_fixture_path();
+    let path = v2_fixture_path();
     std::fs::create_dir_all(path.parent().expect("fixture dir"))
         .expect("create run-config fixture dir");
     std::fs::write(
         &path,
         serde_json::to_string_pretty(&document).expect("json"),
     )
-    .expect("write v1 fixtures");
+    .expect("write v2 fixtures");
     eprintln!("wrote {}", path.display());
 }
 
-/// The v1 corpus must cover every shape of the current build, so a new shape
-/// without a regenerated `run_config_v1.json` fails here instead of staying
+/// The v2 corpus must cover every shape of the current build, so a new shape
+/// without a regenerated `run_config_v2.json` fails here instead of staying
 /// silently green.
 ///
 /// With `sim-fs-journaling` the expected set is all twelve shapes. Without the
@@ -794,7 +802,7 @@ fn regenerate_v1_fixtures() {
 /// absent from the buildable set (their decode rejection is asserted
 /// separately), so the corpus must equal the ten buildable names plus exactly
 /// those two entries.
-fn assert_v1_corpus_covers_shapes(fixtures: &[ShapeFixture]) {
+fn assert_v2_corpus_covers_shapes(fixtures: &[ShapeFixture]) {
     let mut fixture_names = fixtures
         .iter()
         .map(|fixture| fixture.name.as_str())
@@ -803,7 +811,7 @@ fn assert_v1_corpus_covers_shapes(fixtures: &[ShapeFixture]) {
     let mut expected = shape_names();
     expected.sort_unstable();
     #[cfg(feature = "sim-fs-journaling")]
-    assert_eq!(fixture_names, expected, "v1 corpus must cover every shape");
+    assert_eq!(fixture_names, expected, "v2 corpus must cover every shape");
     #[cfg(not(feature = "sim-fs-journaling"))]
     {
         let journaling: Vec<&str> = fixture_names
@@ -823,14 +831,14 @@ fn assert_v1_corpus_covers_shapes(fixtures: &[ShapeFixture]) {
         );
         assert_eq!(
             buildable, expected,
-            "v1 corpus must cover every buildable shape"
+            "v2 corpus must cover every buildable shape"
         );
     }
 }
 
-fn read_v1_fixtures() -> Vec<ShapeFixture> {
-    let text = std::fs::read_to_string(v1_fixture_path()).expect("read v1 fixture file");
-    let document: serde_json::Value = serde_json::from_str(&text).expect("parse v1 fixtures");
+fn read_v2_fixtures() -> Vec<ShapeFixture> {
+    let text = std::fs::read_to_string(v2_fixture_path()).expect("read v2 fixture file");
+    let document: serde_json::Value = serde_json::from_str(&text).expect("parse v2 fixtures");
     assert_eq!(
         document["format_version"].as_u64(),
         Some(FORMAT_VERSION),
@@ -850,28 +858,28 @@ fn read_v1_fixtures() -> Vec<ShapeFixture> {
 }
 
 #[test]
-fn v1_fixtures_encode_decode_and_hash_match() {
-    let fixtures = read_v1_fixtures();
-    assert_v1_corpus_covers_shapes(&fixtures);
+fn v2_fixtures_encode_decode_and_hash_match() {
+    let fixtures = read_v2_fixtures();
+    assert_v2_corpus_covers_shapes(&fixtures);
     for fixture in &fixtures {
         let has_journaling_mode =
             !matches!(fixture.config["fs_journaling"], serde_json::Value::Null);
         if has_journaling_mode && !cfg!(feature = "sim-fs-journaling") {
             // Without the feature the config cannot be built and decode is
             // asserted to reject the document (see
-            // v1_decode_rejects_journaling_modes_without_the_feature).
+            // v2_decode_rejects_journaling_modes_without_the_feature).
             continue;
         }
         let config = config_from_description(&fixture.config);
-        let bytes = to_canonical_bytes(&config).expect("v1 encodes");
-        assert_eq!(to_hex(&bytes), fixture.hex, "v1 bytes for {}", fixture.name);
+        let bytes = to_canonical_bytes(&config).expect("v2 encodes");
+        assert_eq!(to_hex(&bytes), fixture.hex, "v2 bytes for {}", fixture.name);
         assert_eq!(
             blake3_hex(&bytes),
             fixture.hash,
-            "v1 hash for {}",
+            "v2 hash for {}",
             fixture.name
         );
-        let decoded = from_canonical_bytes(&bytes).expect("v1 decodes");
+        let decoded = from_canonical_bytes(&bytes).expect("v2 decodes");
         assert_config_eq(&config, &decoded);
         // Decode the fixture bytes directly and re-encode: idempotent.
         let decoded = from_canonical_bytes(&hex_bytes(&fixture.hex)).expect("fixture decodes");
@@ -885,8 +893,8 @@ fn v1_fixtures_encode_decode_and_hash_match() {
 /// of silently dropping data on a decode-encode round trip.
 #[test]
 #[cfg(not(feature = "sim-fs-journaling"))]
-fn v1_decode_rejects_journaling_modes_without_the_feature() {
-    let fixtures = read_v1_fixtures();
+fn v2_decode_rejects_journaling_modes_without_the_feature() {
+    let fixtures = read_v2_fixtures();
     for fixture in &fixtures {
         if matches!(fixture.config["fs_journaling"], serde_json::Value::Null) {
             continue;
@@ -906,10 +914,10 @@ fn v1_decode_rejects_journaling_modes_without_the_feature() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn versioned_bytes_start_with_version_one() {
+fn versioned_bytes_start_with_version_two() {
     let bytes = to_canonical_bytes(&RunConfig::default()).expect("encodes");
-    // Outer array of two items: 0x82, then unsigned 1 (0x01), then the map.
-    assert_eq!(&bytes[..2], &[0x82, 0x01], "document [1, map]");
+    // Outer array of two items: 0x82, then unsigned 2 (0x02), then the map.
+    assert_eq!(&bytes[..2], &[0x82, 0x02], "document [2, map]");
 }
 
 #[test]
@@ -977,7 +985,7 @@ fn encode_rejects_non_finite_floats() {
     {
         let mut raw = Vec::new();
         ledger_format::cbor::array(&mut raw, 2);
-        ledger_format::cbor::unsigned(&mut raw, 1);
+        ledger_format::cbor::unsigned(&mut raw, FORMAT_VERSION);
         raw.push(0xfb);
         raw.extend_from_slice(&f64::NAN.to_bits().to_be_bytes());
         let err = from_canonical_bytes(&raw).expect_err("nan bits");
@@ -1112,7 +1120,7 @@ fn decode_rejects_unrepresentable_link_jitter() {
 // primitives, so every rejected byte pattern is explicit)
 // ---------------------------------------------------------------------------
 
-/// Craft a structurally valid v1 document with arbitrary field values.
+/// Craft a structurally valid v2 document with arbitrary field values.
 ///
 /// The caller controls the map entries, so malformed shapes are easy to build
 /// without depending on the encode path.
@@ -1143,7 +1151,14 @@ fn set_field(fields: &mut Vec<(&'static str, CborValue)>, name: &'static str, va
 fn minimal_fields() -> Vec<(&'static str, CborValue)> {
     vec![
         ("dns", CborValue::Array(Vec::new())),
-        ("seed", CborValue::Bytes(vec![0u8; 32])),
+        (
+            "seed",
+            CborValue::Bytes(
+                ledger_format::EntryHash([0u8; 32])
+                    .to_framed_bytes()
+                    .to_vec(),
+            ),
+        ),
         ("links", CborValue::Array(Vec::new())),
         (
             "swarm",
@@ -1170,11 +1185,19 @@ fn valid_document() -> Vec<u8> {
 
 #[test]
 fn decode_rejects_wrong_version() {
+    // The current version is 2; the previous version 1 and a future version 3
+    // must both be rejected.
     let mut bytes = valid_document();
-    bytes[1] = 0x02; // version 2 in place of version 1
+    bytes[1] = 0x01; // version 1 in place of version 2
     assert_eq!(
-        from_canonical_bytes(&bytes).expect_err("version 2"),
-        ConfigCanonicalError::UnsupportedVersion(2)
+        from_canonical_bytes(&bytes).expect_err("version 1"),
+        ConfigCanonicalError::UnsupportedVersion(1)
+    );
+    let mut bytes = valid_document();
+    bytes[1] = 0x03; // version 3 in place of version 2
+    assert_eq!(
+        from_canonical_bytes(&bytes).expect_err("version 3"),
+        ConfigCanonicalError::UnsupportedVersion(3)
     );
 }
 
@@ -1204,7 +1227,7 @@ fn decode_rejects_non_document_shapes() {
     // Single-item array: not [version, map].
     let mut out = Vec::new();
     cbor::array(&mut out, 1);
-    cbor::unsigned(&mut out, 1);
+    cbor::unsigned(&mut out, FORMAT_VERSION);
     assert_eq!(
         from_canonical_bytes(&out).expect_err("one item"),
         ConfigCanonicalError::WrongDocumentShape
@@ -1212,7 +1235,7 @@ fn decode_rejects_non_document_shapes() {
     // Second item not a map.
     let mut out = Vec::new();
     cbor::array(&mut out, 2);
-    cbor::unsigned(&mut out, 1);
+    cbor::unsigned(&mut out, FORMAT_VERSION);
     cbor::unsigned(&mut out, 0);
     assert_eq!(
         from_canonical_bytes(&out).expect_err("version plus unsigned"),
@@ -1226,7 +1249,7 @@ fn decode_rejects_nan_and_infinity_float_bits() {
     // surfaced as the typed Cbor wrapper.
     let mut raw = Vec::new();
     cbor::array(&mut raw, 2);
-    cbor::unsigned(&mut raw, 1);
+    cbor::unsigned(&mut raw, FORMAT_VERSION);
     raw.push(0xfb); // float64 header
     raw.extend_from_slice(&f64::NAN.to_bits().to_be_bytes());
     let error = from_canonical_bytes(&raw).expect_err("nan bits");
@@ -1259,7 +1282,7 @@ fn decode_rejects_oversized_declared_lengths() {
     // reader must fail with LengthOverflow instead of over-reading.
     let mut raw = Vec::new();
     cbor::array(&mut raw, 2);
-    cbor::unsigned(&mut raw, 1);
+    cbor::unsigned(&mut raw, FORMAT_VERSION);
     cbor::map(&mut raw, 1_000_000);
     let error = from_canonical_bytes(&raw).expect_err("oversized map");
     assert!(matches!(error, ConfigCanonicalError::Cbor(_)));
@@ -1268,7 +1291,7 @@ fn decode_rejects_oversized_declared_lengths() {
     // hold must also fail in the CBOR layer.
     let mut raw = Vec::new();
     cbor::array(&mut raw, 2);
-    cbor::unsigned(&mut raw, 1);
+    cbor::unsigned(&mut raw, FORMAT_VERSION);
     cbor::map(&mut raw, 1);
     cbor::text(&mut raw, "dropped_events");
     raw.push(0x97); // array with 2^40 declared items
@@ -1283,7 +1306,7 @@ fn decode_rejects_unsorted_and_duplicate_map_keys() {
     // canonical reader rejects unsorted keys.
     let mut raw = Vec::new();
     cbor::array(&mut raw, 2);
-    cbor::unsigned(&mut raw, 1);
+    cbor::unsigned(&mut raw, FORMAT_VERSION);
     let entries = [
         "fault_schedule",
         "fs_journaling",
@@ -1306,7 +1329,7 @@ fn decode_rejects_unsorted_and_duplicate_map_keys() {
 
     let mut raw = Vec::new();
     cbor::array(&mut raw, 2);
-    cbor::unsigned(&mut raw, 1);
+    cbor::unsigned(&mut raw, FORMAT_VERSION);
     cbor::map(&mut raw, 2);
     cbor::text(&mut raw, "seed");
     cbor::null(&mut raw);
@@ -1351,6 +1374,19 @@ fn decode_rejects_wrong_field_types() {
             len: 31,
         }
     );
+
+    // The pre-v2 raw 32-byte shape is no longer accepted; hashes must be
+    // framed 34-byte `[0x1e, 0x20] + digest` values.
+    let mut fields = minimal_fields();
+    set_field(&mut fields, "seed", CborValue::Bytes(vec![0u8; 32]));
+    let error = from_canonical_bytes(&craft_document(fields)).expect_err("seed raw 32 bytes");
+    assert_eq!(
+        error,
+        ConfigCanonicalError::InvalidHashLength {
+            field: "seed",
+            len: 32,
+        }
+    );
 }
 
 #[test]
@@ -1370,7 +1406,11 @@ fn decode_rejects_unknown_policy_and_fault_tags() {
         "fault_schedule",
         CborValue::Array(vec![CborValue::Array(vec![
             CborValue::Unsigned(99),
-            CborValue::Bytes(vec![0u8; 32]),
+            CborValue::Bytes(
+                ledger_format::EntryHash([0u8; 32])
+                    .to_framed_bytes()
+                    .to_vec(),
+            ),
         ])]),
     );
     let error = from_canonical_bytes(&craft_document(fields)).expect_err("fault tag 99");
@@ -1495,13 +1535,63 @@ fn decode_rejects_non_canonical_integer_widths() {
     // non-canonical and the CBOR layer must reject it.
     let mut raw = Vec::new();
     cbor::array(&mut raw, 2);
-    cbor::unsigned(&mut raw, 1);
+    cbor::unsigned(&mut raw, FORMAT_VERSION);
     cbor::map(&mut raw, 2);
     cbor::text(&mut raw, "seed");
-    cbor::bytes(&mut raw, &[0u8; 32]);
+    cbor::bytes(
+        &mut raw,
+        &ledger_format::EntryHash([0u8; 32]).to_framed_bytes(),
+    );
     cbor::text(&mut raw, "max_steps");
     raw.push(0x19); // uint16 header
     raw.extend_from_slice(&7u16.to_be_bytes());
     let error = from_canonical_bytes(&raw).expect_err("non-canonical width");
     assert!(matches!(error, ConfigCanonicalError::Cbor(_)));
+}
+
+#[test]
+fn duplicate_description_round_trips() {
+    let send = ledger_format::EntryHash([0x33; 32]);
+    let config = RunConfig::builder()
+        .fault_schedule(vec![SimFault::Duplicate { send }])
+        .build();
+    let desc = description(&config);
+    assert_eq!(
+        desc["fault_schedule"][0]["tag"],
+        serde_json::json!("duplicate")
+    );
+    assert_eq!(
+        desc["fault_schedule"][0]["send"],
+        serde_json::json!(to_hex(&send.0))
+    );
+    let rebuilt = config_from_description(&desc);
+    assert_eq!(rebuilt.fault_schedule(), &[SimFault::Duplicate { send }]);
+    let bytes = to_canonical_bytes(&rebuilt).expect("encodes");
+    let decoded = from_canonical_bytes(&bytes).expect("decodes");
+    assert_eq!(decoded.fault_schedule(), &[SimFault::Duplicate { send }]);
+}
+
+#[test]
+fn duplicate_canonical_tag_six_round_trips() {
+    let send = ledger_format::EntryHash([0x33; 32]);
+    let config = RunConfig::builder()
+        .fault_schedule(vec![SimFault::Duplicate { send }])
+        .build();
+    let bytes = to_canonical_bytes(&config).expect("encodes");
+    let decoded = from_canonical_bytes(&bytes).expect("decodes");
+    assert_eq!(decoded.fault_schedule(), &[SimFault::Duplicate { send }]);
+    // Tag 7 stays unknown.
+    let mut fields = minimal_fields();
+    set_field(
+        &mut fields,
+        "fault_schedule",
+        CborValue::Array(vec![CborValue::Array(vec![
+            CborValue::Unsigned(7),
+            CborValue::Bytes(send.to_framed_bytes().to_vec()),
+        ])]),
+    );
+    assert_eq!(
+        from_canonical_bytes(&craft_document(fields)).expect_err("tag 7"),
+        ConfigCanonicalError::InvalidFaultTag(7)
+    );
 }

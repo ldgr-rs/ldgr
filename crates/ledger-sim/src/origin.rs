@@ -1,11 +1,7 @@
-//! Effect origin capture: where in system-under-test source a journaled
-//! effect happened.
+//! Effect origin capture: SUT source location per journaled effect.
 //!
-//! Origins live in a per-session side channel keyed by entry hash. They never
-//! enter journal bytes, hashes, or roots: two runs with capture enabled and
-//! disabled must produce byte-identical journals. Wasm guests and programmatic
-//! runs report [`OriginSource::Unknown`]; native callers get source locations
-//! through the tracked aliases on [`crate::effects::{NetExt, FsExt}`].
+//! Origins stay in a per-session side channel keyed by entry hash and never
+//! enter journal bytes, so capture on/off yields byte-identical journals.
 
 use core::panic::Location;
 
@@ -20,8 +16,7 @@ pub struct EffectOrigin {
 }
 
 impl EffectOrigin {
-    /// Capture the current call site. Only meaningful on functions marked
-    /// `#[track_caller]`.
+    /// Capture the current call site; requires `#[track_caller]`.
     #[track_caller]
     pub fn caller() -> Self {
         Self::from(Location::caller())
@@ -38,11 +33,7 @@ impl From<&'static Location<'static>> for EffectOrigin {
     }
 }
 
-/// Provenance of one journaled effect.
-///
-/// The Span variant is where OpenTelemetry ingest lands later (span name plus
-/// trace id instead of a Rust call site); it is declared now so adding it to
-/// the wire-adjacent surface later stays additive.
+/// Provenance of one journaled effect; `Span` reserves the OTel ingest shape.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum OriginSource {
     /// Native caller captured through `#[track_caller]`.
@@ -60,11 +51,7 @@ impl From<&'static Location<'static>> for OriginSource {
     }
 }
 
-/// Side-channel log of effect origins, keyed by journal entry hash.
-///
-/// Never serialized into journals or manifests; lives only as long as the
-/// backend session. Deterministic by construction: the same seed produces the
-/// same entries, so replay repopulates the same origins.
+/// Side-channel origin log keyed by entry hash; never serialized.
 #[derive(Default)]
 pub(crate) struct OriginLog {
     // ledger-lint:allow:HashMap (keyed by entry hash; append order comes

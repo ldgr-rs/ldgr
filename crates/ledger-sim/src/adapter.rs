@@ -1,16 +1,9 @@
 //! Instruction-program adapter driving the deterministic async executor.
 //!
-//! The executor polls real futures; the reference workloads are instruction
-//! programs. This adapter turns one `Vec<Instruction>` into a future that, on
-//! each poll, executes EXACTLY ONE instruction and yields to the scheduler,
-//! reproducing the instruction VM's one-scheduling-decision-per-instruction
-//! discipline so journals stay byte-identical (see the executor parity test).
-//!
-//! Blocking instructions park the future: a `Sleep` registers a timer and
-//! suspends until it fires; a `Receive` with no deliverable message re-queues
-//! itself and suspends until the executor wakes the task. Resuming after a
-//! park resumes at the next instruction (or re-runs the parked `Receive`),
-//! never re-executing the instruction that parked.
+//! Each poll executes exactly one instruction so journals stay byte-identical
+//! to the instruction VM (see the executor parity test). A blocking `Sleep`
+//! or `Receive` parks the future; resume continues past the parked instruction
+//! without re-executing it.
 
 use std::collections::VecDeque;
 use std::future::Future;

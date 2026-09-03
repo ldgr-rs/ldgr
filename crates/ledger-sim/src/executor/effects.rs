@@ -1,10 +1,4 @@
-//! Effects boundary of the executor.
-//!
-//! [`Boundary`] is the task-facing handle that journals deterministic
-//! effects (send, recv, sleep, clock, rng, storage) against the shared
-//! executor state. The `Effects`/`Net`/`Fs` trait implementations and the
-//! sleeping/receiving futures live here; the orchestration loop, the task
-//! table, and the shared state stay in the module root.
+//! Executor task boundary journaling deterministic effects.
 use crate::origin::OriginSource;
 use std::future::Future;
 use std::pin::Pin;
@@ -22,19 +16,13 @@ use rand_core::{Rng, TryRng};
 
 use super::{BlockedOn, ExecutorShared, TaskEntry};
 
-/// Schema digest bound in `ExecutionIdentity` for scalar outcome values.
-///
-/// Domain-separated BLAKE3 over `ldgr.sim.outcome.v1`, so outcome entries
-/// never collide with the zero digest or with assert predicates.
+/// Schema digest for scalar outcomes; domain-separated so entries never collide.
 pub(crate) const OUTCOME_SCHEMA: EntryHash = EntryHash([
     0x67, 0xc9, 0x3d, 0x0f, 0xb1, 0x85, 0x81, 0x56, 0xad, 0xf7, 0x35, 0x4e, 0x3e, 0x31, 0xc7, 0x8b,
     0xae, 0xba, 0x7f, 0x50, 0x63, 0x62, 0xce, 0xbf, 0xf5, 0x90, 0x43, 0x64, 0x6a, 0xf2, 0x01, 0xbc,
 ]);
 
-/// Predicate digest for scalar assertion values.
-///
-/// Domain-separated BLAKE3 over `ldgr.sim.assert.v1`, distinct from
-/// [`OUTCOME_SCHEMA`] by construction.
+/// Predicate digest for scalar assertions; distinct from [`OUTCOME_SCHEMA`].
 pub(crate) const ASSERT_SCHEMA: EntryHash = EntryHash([
     0x2b, 0x60, 0xdd, 0xa5, 0xdb, 0x69, 0x7b, 0x0a, 0x05, 0xe0, 0x85, 0xf2, 0x38, 0xdd, 0xa7, 0x58,
     0xfb, 0x08, 0x94, 0x91, 0x78, 0xd4, 0x7a, 0xb6, 0xb0, 0x00, 0x70, 0x76, 0x06, 0xda, 0x35, 0x26,
@@ -60,20 +48,12 @@ pub(crate) enum SendOutcome {
     QueueFull,
 }
 
-/// Boundary through which a task calls deterministic effects.
-///
-/// A task owns one boundary for the duration of its body. The boundary is
-/// `Clone` and `Rc`-shared, so child tasks spawned through it keep accessing
-/// the same journal, timers, network, and storage.
+/// Task-facing effects handle; `Clone` shares the journal and tables.
 #[derive(Clone)]
 pub struct Boundary {
     pub(crate) shared: Rc<ExecutorShared>,
     task: usize,
-    /// Live RNG handles, one slot per stream id.
-    ///
-    /// Each handle clones the shared state, so cloning a boundary never
-    /// duplicates draw state: every stream's ChaCha20 lives in the shared task
-    /// table, keyed by stream id.
+    /// Live RNG handles; cloning the boundary never duplicates draw state.
     rng_streams: Vec<Option<StreamRng>>,
 }
 
@@ -87,9 +67,7 @@ impl Boundary {
         }
     }
 
-    /// Record a journal append failure from a call site that cannot return
-    /// `Err` (mirrors `ExecutorShared::record_journal_error`). The first
-    /// failure wins; later failures never overwrite it.
+    /// Record an append failure; first failure wins.
     pub fn record_journal_error(&self, error: ledger_journal::JournalError) {
         self.shared.record_journal_error(error);
     }
@@ -138,12 +116,8 @@ impl Boundary {
         value as f64 / u64::MAX as f64
     }
 
-    /// Apply a swarm drop or delay decision to a send, journaling a `Drop`
-    /// fault when the message is lost.
-    ///
-    /// With the default zero-probability swarm this consumes no draws and
-    /// returns [`SwarmAction::Deliver`] unchanged, keeping journals
-    /// byte-identical to the pre-swarm path.
+    /// Apply swarm drop/delay; zero probabilities draw nothing and journals
+    /// stay byte-identical.
     fn swarm_send_policy(&self, send_id: EntryHash, message_id: MessageId) -> SwarmAction {
         let swarm = &self.shared.swarm;
         if swarm.drop_probability.get() > 0.0 && self.net_draw() < swarm.drop_probability.get() {
@@ -166,12 +140,7 @@ impl Boundary {
         SwarmAction::Deliver
     }
 
-    /// Draw a swarm delay in `0 ..= max_delay_ticks` from the `net` stream.
-    ///
-    /// `u64::MAX` is the one bound whose modulus (`max + 1`) does not fit
-    /// `u64`; there the raw draw already spans the full `0 ..= u64::MAX`
-    /// range, so it is returned unchanged. Every smaller bound uses the plain
-    /// remainder, which cannot overflow or wrap.
+    /// Draw a delay in `0 ..= max`; `u64::MAX` returns the raw draw.
     pub(crate) fn net_draw_delay(&self, max_delay_ticks: u64) -> u64 {
         let mut offset = self.shared.net_offset.borrow_mut();
         let value = self.shared.seed_tree.draw_u64("net", *offset);
@@ -182,12 +151,7 @@ impl Boundary {
         }
     }
 
-    /// Apply a swarm crash-state sample after a storage write, when configured.
-    ///
-    /// With `crash_probability == 0.0` this consumes no draws and returns
-    /// `Ok(())`, keeping journals byte-identical to the pre-swarm path. On a
-    /// sampled crash it applies a deterministic crash operator and journals
-    /// `Fault { CrashState(k) }`.
+    /// Maybe crash after a write; zero probability draws nothing.
     fn maybe_crash_on_write(
         &self,
         path: &str,
@@ -259,12 +223,7 @@ impl Boundary {
         Ok(())
     }
 
-    /// Apply the configured crash model to the simulated storage.
-    ///
-    /// With a journaling mode configured the write-ahead journal replays
-    /// before the crash operator drops unsynced state; without one the
-    /// black-box `DropAllUnsynced` operator applies. The default (no mode)
-    /// stays byte-identical to the historical crash path.
+    /// Apply the crash model; default stays byte-identical to the black-box path.
     fn fs_crash(&self) {
         #[cfg(feature = "sim-fs-journaling")]
         if self.shared.fs_journaling.is_some() {
@@ -285,11 +244,7 @@ impl Boundary {
         self.shared.journal_append(actor, kind, parents, payload)
     }
 
-    /// Receive a message, journaling `Recv` or parking with a `Block` entry.
-    ///
-    /// This is an inherent method (not on the `Effects` trait): only the
-    /// executor boundary can suspend on a message, so `SimBackend` and
-    /// `TokioBackend` do not need to implement it.
+    /// Executor-only recv; backends without suspension do not implement it.
     pub async fn recv(&self) -> u64 {
         RecvFuture {
             shared: Rc::clone(&self.shared),
@@ -316,12 +271,7 @@ impl Boundary {
         self.shared.net.borrow().has_ready_message(self.task, now)
     }
 
-    /// Resolve a hostname to a task id from the deterministic DNS table.
-    ///
-    /// The table is config-driven, so the result is identical across runs
-    /// that share the config. An unknown name resolves to `None`. Resolution
-    /// is a pure lookup: it journals nothing and never touches the ambient
-    /// host.
+    /// Resolve a hostname; pure config lookup that journals nothing.
     pub fn resolve(&self, name: &str) -> Option<usize> {
         self.shared.dns.resolve(name)
     }
@@ -331,8 +281,7 @@ impl Boundary {
         self.send_inner(to, payload, None)
     }
 
-    /// Send with origin capture: the caller's source location lands in the
-    /// session side channel keyed by the Send entry hash.
+    /// Send with origin capture into the session side channel.
     #[track_caller]
     pub fn send_tracked(&self, to: usize, payload: u64) -> bool {
         self.send_inner(to, payload, Some(core::panic::Location::caller().into()))
@@ -343,8 +292,7 @@ impl Boundary {
         self.shared.origins.borrow().snapshot()
     }
 
-    /// Give a Recv entry the origin of the Send that produced it, keeping
-    /// lineage continuous across the network boundary.
+    /// Inherit the `Send` origin onto its `Recv` entry.
     fn inherit_recv_origin(&self, recv_id: Option<EntryHash>, send_id: EntryHash) {
         if let Some(id) = recv_id {
             // Clone out before re-locking; the mutex is not reentrant.
@@ -361,14 +309,8 @@ impl Boundary {
         self.send_core(to, payload, 0, at)
     }
 
-    /// Toggle a directed partition at the current point of the run.
-    ///
-    /// The toggle journals a `Fault { Partition { src, dst } }` entry and
-    /// applies it to the live network immediately: subsequent sends on the
-    /// (src, dst) link are refused until the same pair is toggled again. The
-    /// journaled entry is the causal record of the matrix change, so a replay
-    /// applies the same faults in causal order. A config-scheduled partition
-    /// seeds the same matrix from run start.
+    /// Toggle a directed partition; journals `Fault { Partition }` and applies
+    /// immediately so replay follows causal order.
     pub fn apply_partition(
         &self,
         src: usize,
@@ -404,20 +346,12 @@ impl Boundary {
         Ok(id)
     }
 
-    /// Send a message with a virtual-time delivery delay.
-    ///
-    /// Deterministic fixed-delay send used by reference simulations. The
-    /// delay is added to the current virtual time, so identical seeds yield
-    /// identical delivery order.
+    /// Timed send; identical seeds yield identical delivery order.
     pub fn send_timed(&self, to: usize, payload: u64, delay: u64) -> bool {
         self.send_core(to, payload, delay, None)
     }
 
-    /// Single send path for `send` and `send_timed`.
-    ///
-    /// Journals `Send`, applies the fault and swarm policies, then delivers
-    /// through the configured link or the direct queue. Delay 0 keeps
-    /// unfaulted journals byte-identical.
+    /// Single send path; delay 0 keeps unfaulted journals byte-identical.
     fn send_core(
         &self,
         to: usize,
@@ -428,9 +362,7 @@ impl Boundary {
         self.send_bytes_inner(to, payload.to_le_bytes().to_vec(), base_delay, at)
     }
 
-    /// Single byte-send path: journals `Send` with the authoritative sender
-    /// sequence identity, applies the fault and swarm policies, then delivers
-    /// through the configured link or the direct queue.
+    /// Byte-send path with the authoritative sender-sequence identity.
     fn send_bytes_inner(
         &self,
         to: usize,
@@ -492,41 +424,45 @@ impl Boundary {
                 .saturating_add(injected_delay),
             SwarmAction::Deliver => base_delay.saturating_add(injected_delay),
         };
-        let outcome = if self.shared.net.borrow().link_configured(self.task, to) {
-            self.send_via_link_checked(
-                Message {
-                    from: self.task,
-                    to,
-                    content,
+        let outcome = self.transmit_once(to, content.clone(), message_id, id, now, total_delay);
+        // Duplicate rule: a Queued first transmission (delivered or lost,
+        // retry semantics) with a Duplicate target journals
+        // DuplicateMessage{ordinal 1} parented by the send, then re-transmits
+        // the identical Message on the same branch. Each transmission journals
+        // its own loss/queue fate. QueueFull backpressure wins (no duplicate);
+        // early Drop/swarm-drop returns above never duplicate. The second
+        // transmission draws in fixed order, so replay stays identical.
+        if let SendOutcome::Queued(first_delivered) = outcome
+            && self.duplicate_targets(id)
+        {
+            self.mark_fault_applied(id);
+            if let Err(error) = self.append(
+                EntryKind::Fault,
+                [id],
+                EntryPayload::Fault(FaultPayload::DuplicateMessage {
                     message_id,
-                    send_id: id,
-                    deliver_at: now,
-                },
-                now,
-                total_delay,
-            )
-        } else {
-            match self.shared.net.borrow_mut().try_send_at_with_identity(
-                Message {
-                    from: self.task,
-                    to,
-                    content,
-                    message_id,
-                    send_id: id,
-                    deliver_at: now,
-                },
-                now,
-                total_delay,
+                    copy_ordinal: 1,
+                }),
             ) {
-                Ok(delivered) => SendOutcome::Queued(delivered),
-                Err(crate::net::NetError::QueueFull { .. }) => SendOutcome::QueueFull,
-                Err(crate::net::NetError::InvalidReorderWindow { .. }) => {
-                    // Reorder windows never gate sends; treat as queued-false
-                    // without a drop fault (unreachable via validated setters).
-                    SendOutcome::Queued(false)
-                }
+                self.shared.record_journal_error(error);
             }
-        };
+            let second = self.transmit_once(to, content, message_id, id, now, total_delay);
+            if !first_delivered {
+                self.journal_net_loss(id, to, message_id);
+            }
+            return match second {
+                SendOutcome::Queued(second_delivered) => {
+                    if !second_delivered {
+                        self.journal_net_loss(id, to, message_id);
+                    }
+                    first_delivered || second_delivered
+                }
+                SendOutcome::QueueFull => {
+                    self.journal_queue_full(id, to, message_id);
+                    first_delivered
+                }
+            };
+        }
         match outcome {
             SendOutcome::Queued(delivered) => {
                 if !delivered {
@@ -613,6 +549,62 @@ impl Boundary {
         }
     }
 
+    /// One network transmission on the configured branch.
+    ///
+    /// Link-configured pairs use the checked link path; others use the
+    /// direct identity path. Both shapes report `QueueFull` without draws.
+    fn transmit_once(
+        &self,
+        to: usize,
+        content: Vec<u8>,
+        message_id: MessageId,
+        send_id: EntryHash,
+        now: u64,
+        total_delay: u64,
+    ) -> SendOutcome {
+        if self.shared.net.borrow().link_configured(self.task, to) {
+            self.send_via_link_checked(
+                Message {
+                    from: self.task,
+                    to,
+                    content,
+                    message_id,
+                    send_id,
+                    deliver_at: now,
+                },
+                now,
+                total_delay,
+            )
+        } else {
+            match self.shared.net.borrow_mut().try_send_at_with_identity(
+                Message {
+                    from: self.task,
+                    to,
+                    content,
+                    message_id,
+                    send_id,
+                    deliver_at: now,
+                },
+                now,
+                total_delay,
+            ) {
+                Ok(delivered) => SendOutcome::Queued(delivered),
+                Err(crate::net::NetError::QueueFull { .. }) => SendOutcome::QueueFull,
+                Err(crate::net::NetError::InvalidReorderWindow { .. }) => {
+                    SendOutcome::Queued(false)
+                }
+            }
+        }
+    }
+
+    /// Whether any `Duplicate` fault targets `id`.
+    fn duplicate_targets(&self, id: EntryHash) -> bool {
+        self.shared.fault_schedule.iter().any(|fault| match fault {
+            SimFault::Duplicate { send } => *send == id,
+            _ => false,
+        })
+    }
+
     /// Return the scheduled fault injection targeting `id`, if any.
     fn schedule_injection_for(&self, id: EntryHash) -> Option<&SimFault> {
         self.shared
@@ -621,6 +613,7 @@ impl Boundary {
             .find(|injection| match injection {
                 SimFault::Drop(target)
                 | SimFault::Delay { send: target, .. }
+                | SimFault::Duplicate { send: target }
                 | SimFault::Crash(target)
                 | SimFault::Corrupt { write: target, .. }
                 | SimFault::CrashState { write: target, .. } => *target == id,
@@ -946,13 +939,7 @@ impl Boundary {
     }
 }
 
-/// One deterministic RNG stream handle sharing the boundary's draw state.
-///
-/// The handle clones the executor shared state, so the returned `&mut` handle
-/// lives inside the boundary while the per-stream ChaCha20 state stays in the
-/// task table. No `Weak` is needed: the boundary owns the handle, and the
-/// shared state never points back to the boundary. Cloning a handle clones the
-/// `Rc`, never the draw state.
+/// One RNG handle; cloning clones the `Rc`, never the draw state.
 #[derive(Clone)]
 struct StreamRng {
     shared: Rc<ExecutorShared>,

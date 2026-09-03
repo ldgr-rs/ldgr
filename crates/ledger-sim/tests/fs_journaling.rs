@@ -1,9 +1,4 @@
-//! Journaling-FS crash model wired through the executor's crash path.
-//!
-//! The crash model is selected per run through `RunConfig::fs_journaling`.
-//! With a mode configured the executor's crash path replays the write-ahead
-//! journal before dropping unsynced state; without one it keeps the black-box
-//! `DropAllUnsynced` operator byte-identical to the historical path.
+//! Journaling-FS crash model through the executor crash path.
 #![cfg(feature = "sim-fs-journaling")]
 
 use ledger_format::{CanonicalValue, EntryKind, EntryPayload, OutcomePayload};

@@ -1,22 +1,10 @@
 //! Bounded single-trace single-base source-DPOR exploration driver.
 //!
-//! The driver runs one base execution under a `Dpor` policy (which behaves like
-//! `Random`), records its scheduler trace, and re-runs each causally plausible
-//! alternative choice at every trace step with a partial replay. A sleep-set
-//! test prunes flips between causally ordered tasks using each task's vector
-//! clock as of the branch point (the journal records the per-step boundary, so
-//! the driver reconstructs per-step clocks rather than using end-of-run
-//! clocks). Two tasks are pruned only when one strictly happens before the
-//! other; equal clocks are treated as concurrent. The sleep-set is applied at
-//! every trace step of the whole run, so each causal equivalence class is
-//! represented by at most one flip per branch point and same-class reorderings
-//! of already-ordered tasks are never explored.
-//!
-//! This is a bounded single-trace single-base variant: it explores schedule
-//! flips around one base trace only and never re-analyzes flip runs as new
-//! bases. It therefore makes no completeness claim; it does not guarantee one
-//! execution per causal equivalence class, only bounded exploration of
-//! alternative schedules around the single base run.
+//! Runs one base execution, then re-runs each causally plausible alternative
+//! at every trace step with a partial replay. A sleep-set test prunes flips
+//! between causally ordered tasks using per-step vector clocks; equal clocks
+//! count as concurrent. Bounded to one base trace with no recursive
+//! re-analysis, so no completeness is claimed.
 
 use std::collections::{HashMap, HashSet};
 
@@ -62,15 +50,10 @@ pub struct DporReport {
     pub explored_flip_keys: Vec<(usize, usize)>,
 }
 
-/// Explore causally distinct schedules around one base run (bounded
-/// single-trace single-base DPOR).
+/// Explore alternative schedules around one base run (bounded DPOR).
 ///
-/// The base run is the first entry of the report. Each subsequent run forces a
-/// decision different from the base run's at one trace step and lets the
-/// `Random` fallback continue. This is bounded single-base DPOR: only flips
-/// around the single base trace are explored, with no recursive re-analysis
-/// of flip runs, so no completeness guarantee is claimed. The same seed
-/// produces an identical report.
+/// The base run leads the report; each flip forces one alternative decision
+/// and continues with `Random`. Same seed yields an identical report.
 pub fn run_dpor(
     programs: Vec<Vec<Instruction>>,
     cfg: &DporConfig,
@@ -167,12 +150,8 @@ pub fn run_dpor(
     Ok(report)
 }
 
-/// Sleep-set test: skip the flip when the two tasks are already causally
-/// ordered by the events that precede the branch point.
-///
-/// `last_vc` maps each task to its vector clock as of the branch point. Two
-/// tasks with strictly ordered clocks are pruned; a task with no journaled
-/// entry yet, or two tasks with equal clocks, are treated as concurrent.
+/// Sleep-set test: prunes the flip when the tasks are causally ordered as of
+/// the branch point; missing or equal clocks count as concurrent.
 fn sleep_set_pruned(
     task_last_vc: &HashMap<ActorId, VectorClock>,
     chosen_task: usize,

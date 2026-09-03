@@ -1,22 +1,11 @@
 //! Journal append handling and the error slot.
-//!
-//! All journal writes funnel through [`ExecutorShared::journal_append`] and
-//! [`ExecutorShared::journal_append_batch`] so the coverage ledger and the
-//! single-shot journal-error slot stay exact. The first append failure from
-//! a call site that cannot return `Err` lands in
-//! [`ExecutorShared::journal_error`] and surfaces through
-//! [`crate::runtime::RunResult::journal_error`] at run end.
 use super::ExecutorShared;
 use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::BatchEntry;
 
 impl ExecutorShared {
-    /// Take one ready message for `task`, honoring the configured reorder
-    /// semantics: the deterministic newest-first pick by default, or a
-    /// seeded draw inside the bounded candidate window when `reorder_draw`
-    /// is set. The draw consumes from the `net` seed stream only when a
-    /// window is actually configured, keeping window-zero journals
-    /// byte-identical to the plain path.
+    /// Take one ready message honoring reorder semantics; window-zero draws
+    /// nothing so journals stay byte-identical to the plain path.
     pub(crate) fn recv_at_effective(&self, task: usize, now: u64) -> Option<crate::net::Message> {
         let mut net = self.net.borrow_mut();
         if !self.reorder_draw {
@@ -48,13 +37,8 @@ impl ExecutorShared {
         Ok(id)
     }
 
-    /// Append a group of entries in order and count each against its actor's
+    /// Append a batch; byte-identical to looping append with all-or-nothing
     /// coverage.
-    ///
-    /// Byte-identical to looping [`Self::journal_append`]; see
-    /// [`Journal::append_batch`] for the equality contract. Coverage counts
-    /// only land on full success, matching the all-or-nothing use of a run
-    /// that hits an append error (the run is terminal then).
     pub(crate) fn journal_append_batch(
         &self,
         batch: Vec<BatchEntry>,
@@ -79,12 +63,8 @@ impl ExecutorShared {
         Some(u64::from_le_bytes(bytes))
     }
 
-    /// Forward an entry emission to the scheduler novelty model.
-    ///
-    /// The vector-clock signature is derived from the journaled entry, so the
-    /// bandit can reward novel VC branch patterns. Only the bandit policy
-    /// consumes novelty, so the signature hash is skipped under every other
-    /// policy. Journal contents are unaffected by the skip.
+    /// Forward an emission to novelty; the VC hash is skipped unless the
+    /// bandit is active, which never affects journal contents.
     pub(crate) fn notify_entry(
         &self,
         actor: ActorId,
@@ -102,11 +82,7 @@ impl ExecutorShared {
             .on_entry_emitted(actor, kind, task_id, signature);
     }
 
-    /// Record a failed append from a call site that cannot return `Err`.
-    ///
-    /// The first failure wins; later failures never overwrite it. The debug
-    /// assert catches double-recording early, because a second append failure
-    /// means the journal is already unusable for replay.
+    /// Record a failed append; first failure wins.
     pub(crate) fn record_journal_error(&self, error: ledger_journal::JournalError) {
         let mut slot = self.journal_error.borrow_mut();
         debug_assert!(

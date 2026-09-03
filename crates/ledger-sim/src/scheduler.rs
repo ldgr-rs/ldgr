@@ -6,10 +6,6 @@ use ledger_format::{ActorId, EntryKind};
 use std::collections::{HashMap, HashSet};
 
 /// One scheduler decision and the ready set it saw (DPOR trace unit).
-///
-/// `ready` is a snapshot of stable task ids; `chosen` is a position into
-/// `ready`. The [`crate::dpor::run_dpor`] driver walks these records to find
-/// alternative schedules.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepTrace {
     /// Scheduler step index.
@@ -18,18 +14,12 @@ pub struct StepTrace {
     pub ready: Vec<usize>,
     /// Position into `ready` chosen by the policy.
     pub chosen: usize,
-    /// Journal length immediately after this step executed.
-    ///
-    /// The DPOR driver uses the boundary between steps to reconstruct each
-    /// task's vector clock as of a branch point, instead of the end-of-run
-    /// clock. Recorded by the executor after the step's poll completes.
+    /// Journal length after this step; the DPOR driver rebuilds per-step
+    /// clocks from these boundaries.
     pub journal_len: usize,
 }
 
-/// Tracks observed execution motifs to guide exploration toward novel causal states.
-///
-/// All bookkeeping is keyed by TASK ID, never by ready-list position: the ready
-/// list is reordered by `swap_remove`, so a position is not a stable identity.
+/// Novelty bookkeeping keyed by task id, never by ready position.
 #[derive(Debug, Clone, Default)]
 pub struct NoveltyModel {
     // ledger-lint:allow:HashMap ledger-lint:allow:HashSet (membership and keyed
@@ -48,11 +38,7 @@ impl NoveltyModel {
         Self::default()
     }
 
-    /// Record an entry emission and calculate its novelty reward.
-    ///
-    /// The reward is attributed to `task_id`, the stable task identity.
-    /// `vc_signature` is a stable hash of the journaled entry's vector clock
-    /// shape; a new signature earns the VC-branch novelty reward.
+    /// Record an emission for `task_id` and return its novelty reward.
     pub fn record_emission(
         &mut self,
         actor: ActorId,
@@ -103,19 +89,13 @@ impl NoveltyModel {
     }
 }
 
-/// Dedicated offset region in the `bandit` stream for the PCT-mix draw.
-///
-/// The pure UCB1 tie-break draws at offset `step`. The mix and PCT perturbation
-/// draws use the high bits of the offset, so a `pct_mix` of `0.0` leaves the
-/// tie-break stream untouched.
+/// Offset regions separating bandit tie-break, mix, and PCT draws so
+/// `pct_mix == 0.0` leaves the tie-break stream untouched.
 const MIX_OFFSET_BIT: u64 = 1 << 63;
-/// Dedicated offset region in the `bandit` stream for PCT-style perturbations.
+/// Dedicated offset region for PCT-style perturbations.
 const PCT_OFFSET_BIT: u64 = 1 << 62;
 
-/// Typed violation for strict replay.
-///
-/// Strict replay rejects an out-of-range decision, an exhausted stream, or
-/// a trailing leftover instead of normalizing or falling back.
+/// Strict-replay rejection: out-of-range, exhausted, or trailing leftover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayViolation {
     /// Decision value is outside the ready set.
@@ -252,10 +232,7 @@ impl Scheduler {
         self.violation.take()
     }
 
-    /// Check for a trailing leftover after the run, recording a violation if present.
-    ///
-    /// `steps` must be the number of decisions consumed, not poll count, to
-    /// avoid misreporting if they diverge.
+    /// Check for trailing replay leftover; `steps` is decisions consumed.
     pub(crate) fn check_trailing(&mut self, steps: usize) -> Option<ReplayViolation> {
         if self.strict && self.replay.len() > steps {
             let trailing = self.replay.len() - steps;
@@ -267,12 +244,8 @@ impl Scheduler {
         }
     }
 
-    /// Select an index from the ready task list.
-    ///
-    /// `ready` carries the stable task ids currently runnable. The returned
-    /// value is a position into `ready`; the bandit policy scores each position
-    /// by the task id it holds, so rewards recorded per task are never
-    /// misattributed after a `swap_remove` reordering.
+    /// Select a position into `ready`; bandit scores by task id so
+    /// `swap_remove` reordering never misattributes rewards.
     pub fn choose(&mut self, ready: &[usize], step: usize) -> usize {
         assert!(!ready.is_empty(), "scheduler requires a ready task");
         // Strict path rejects out-of-range and exhausted decisions without
@@ -330,18 +303,14 @@ impl Scheduler {
         choice
     }
 
-    /// Record the journal length after the most recent step executed.
-    ///
-    /// The executor calls this after each poll; the DPOR driver consumes the
-    /// boundary to compute per-step vector clocks.
+    /// Record the journal length after the latest step for the DPOR driver.
     pub(crate) fn note_step_journal_len(&mut self, journal_len: usize) {
         if let Some(last) = self.trace.last_mut() {
             last.journal_len = journal_len;
         }
     }
 
-    /// Select per `policy` for the direct policy arms and the exhausted-replay
-    /// fallback. `Policy::Replay` degrades to `Random` to prevent recursion.
+    /// Policy selection; `Replay` degrades to `Random` to avoid recursion.
     fn select_fallback(&mut self, ready: &[usize], step: usize, policy: Policy) -> usize {
         match policy {
             Policy::Random | Policy::Dpor | Policy::Replay => {
@@ -366,16 +335,8 @@ impl Scheduler {
         }
     }
 
-    /// Pure PCT selection with a bounded preemption budget.
-    ///
-    /// Every ready task holds a priority drawn from the `pct` stream, and the
-    /// highest-priority task is chosen at each step. When the previously
-    /// chosen task is still ready next to at least one other task and the
-    /// preemption budget is not exhausted, the policy preempts it: all ready
-    /// priorities are re-assigned from fresh draws and the budget advances.
-    /// Once the budget is spent no further preemptions occur and the schedule
-    /// is a fixed-priority order, matching the PCT guarantee that at most `k`
-    /// preemptions happen in one run.
+    /// PCT selection with a bounded preemption budget; at most `k`
+    /// preemptions per run, then a fixed-priority order.
     fn select_pct(&mut self, ready: &[usize], priority_changes: usize) -> usize {
         // Grow the priority table and draw a priority for any task seen for
         // the first time in the current generation.
@@ -423,11 +384,8 @@ impl Scheduler {
         best_index
     }
 
-    /// Draw one PCT priority from the `pct` stream at a deterministic offset.
-    ///
-    /// The offset mixes the re-prioritization generation and the task id, so
-    /// distinct (generation, task) pairs draw independent values and the
-    /// stream never collides with `sched` or `bandit`.
+    /// Draw one PCT priority; the offset keeps (`generation`, `task`) draws
+    /// independent of `sched` and `bandit`.
     fn pct_priority_draw(&self, generation: u64, task: usize) -> u64 {
         let mut offset = generation ^ 0x9E37_79B9_7F4A_7C15;
         offset = offset
@@ -466,10 +424,7 @@ impl Scheduler {
         }
     }
 
-    /// PCT-style perturbation that preempts with a fresh priority burst.
-    ///
-    /// Priority draws come from a dedicated region of the `bandit` stream so
-    /// they never collide with the pure UCB1 tie-break offsets.
+    /// PCT perturbation with draws from a dedicated `bandit` region.
     fn select_bandit_pct(&mut self, ready: &[usize], step: usize) -> usize {
         let mut priorities = vec![0u64; ready.len()];
         let changes = (ready.len() / 2).max(1);
@@ -485,10 +440,7 @@ impl Scheduler {
             .map_or(0, |(index, _)| index)
     }
 
-    /// Notify the scheduler of an entry emission to update novelty scores.
-    ///
-    /// `vc_signature` is a stable hash of the journaled entry's vector clock
-    /// shape; see [`NoveltyModel::record_emission`].
+    /// Forward an emission to the novelty model.
     pub fn on_entry_emitted(
         &mut self,
         actor: ActorId,
@@ -508,13 +460,8 @@ impl Scheduler {
         &self.trace
     }
 
-    /// Whether the bandit novelty model is consulted by this run's effective
-    /// policy.
-    ///
-    /// Only the bandit policy reads novelty scores. Other policies never
-    /// consume the model, so the executor can skip the per-entry vector-clock
-    /// signature hash unless the bandit is active (including a bandit used as
-    /// the replay-exhaustion fallback).
+    /// Whether novelty scores are consulted; lets the executor skip the
+    /// per-entry VC signature hash when inactive.
     pub(crate) fn novelty_active(&self) -> bool {
         match self.policy {
             Policy::Bandit { .. } => true,

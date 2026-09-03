@@ -1,9 +1,4 @@
-//! Determinism self-check: 10^4 consecutive runs of the same seed must produce
-//! byte-identical journal roots.
-//!
-//! Every CI run of a sim test is already a determinism check; this test makes
-//! the bound explicit and large. A single divergence anywhere in the executor,
-//! scheduler, seed tree, or journaling breaks the root equality.
+//! Determinism self-check: 10^4 same-seed runs share one journal root.
 
 use ledger_sim::{Instruction, Policy, RunConfig, Simulation};
 

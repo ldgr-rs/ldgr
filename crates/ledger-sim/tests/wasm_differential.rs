@@ -1,15 +1,5 @@
-//! Native and Wasm backends produce identical behavior.
-//!
-//! The guest `run_boundary` entry crosses the ledger host-function boundary:
-//! `ledger.rng_u64` (seed tree + journaled `RngDraw`), `ledger.log` (observable
-//! output), and `ledger.sleep` (virtual time). Each crossing is forwarded to
-//! the same `SimBackend` the native backend drives.
-//!
-//! This test runs the same workload natively (a Rust twin over `SimBackend`)
-//! and through the Wasm sandbox (`WasmBackend`), then asserts:
-//! - observable output is byte-identical,
-//! - the journal root hashes match,
-//! - both journals pass the correctness monitor.
+//! Native/Wasm parity: same workload on both backends yields identical
+//! output, journal roots, and monitor-clean journals.
 #![cfg(feature = "backend-wasm")]
 
 mod common;

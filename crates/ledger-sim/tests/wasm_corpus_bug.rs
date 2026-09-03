@@ -1,18 +1,5 @@
-//! Corpus-bug reproduction through a Wasm guest.
-//!
-//! The guest `run_stale` implements a stale-read: it reads a key twice and
-//! serves the cached first value for the second read. The oracle flags the
-//! `STALE_DIVERGENCE` marker. A native twin draws the same stream; the two
-//! journals must be byte-identical.
-//!
-//! Beyond that synthetic case, the corpus-v1 gate enumerates the committed
-//! manifests under `corpora/bug-corpus-v1/` (the same enumeration the
-//! explorer-side `corpus_v1_gate.rs` pins) and requires every registered
-//! scenario to reproduce through the Wasm backend: the planted-bug marker
-//! fires, a second instantiation under the same seed journals
-//! byte-identically, and the journal shape stays pinned. A manifest without
-//! a guest export, or an export that stops firing, fails the gate with the
-//! scenario name and error; nothing skips.
+//! Corpus-bug reproduction through Wasm guests; every registered scenario
+//! must fire its marker and replay byte-identically.
 #![cfg(feature = "backend-wasm")]
 
 mod common;
@@ -73,16 +60,7 @@ fn corpus_bug_native_wasm_zero_false_divergence() {
     );
 }
 
-/// One corpus-v1 scenario as a guest export: manifest name, guest entry
-/// point, planted-bug marker line, and the pinned journal entry count of a
-/// fresh run at the manifest seed.
-///
-/// The entry-count pins are part of the gate: a scenario whose guest
-/// program silently gains or loses a host-boundary call fails here, exactly
-/// like the explorer gate fails when a native manifest stops reproducing.
-/// The counts were pinned from the first green run; each entry is one
-/// journaled host-boundary call (Send, Recv, TimerSet/TimerFire/Wake per
-/// sleep, or RngDraw).
+/// One corpus scenario: manifest, guest entry, marker, and pinned entry count.
 const CORPUS_TO_GUEST: &[(&str, &str, &str, u64)] = &[
     (
         "mini-zab-split-brain",

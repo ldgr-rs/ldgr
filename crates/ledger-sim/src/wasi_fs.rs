@@ -9,12 +9,7 @@ use ledger_journal::{Journal, JournalError};
 use crate::backend_sim::record_first_journal_error;
 use crate::simfs::SimFs;
 
-/// SimFs-backed host for WASI filesystem operations.
-///
-/// Shares the same `SimFs` and journal as `SimBackend`, so WASI file effects
-/// land in the same causal DAG the native boundary writes. Each operation
-/// journals through `SimFs::write`/`read`/`fsync` which append `FsWrite`,
-/// `FsRead`, `FsFsync` entries via the shared journal.
+/// SimFs-backed host for WASI file ops; shares the backend journal DAG.
 #[derive(Clone)]
 pub struct SimFsHost {
     fs: Arc<Mutex<SimFs>>,
@@ -101,10 +96,7 @@ impl SimFsHost {
     }
 }
 
-/// Parse guest bytes into the `u64` stored in `SimFs`.
-///
-/// Tries decimal UTF-8 first (`"42"`), then first 8 bytes LE, then hashes the
-/// byte slice via `blake3` into a `u64`. Deterministic and total.
+/// Parse guest bytes to `u64`: decimal UTF-8, then LE bytes, then blake3 hash.
 pub fn bytes_to_u64(bytes: &[u8]) -> u64 {
     // Best-effort UTF-8/decimal interpretation; non-decimal bytes fall
     // through to the LE and hash forms below.
@@ -136,11 +128,7 @@ pub fn bytes_to_u64(bytes: &[u8]) -> u64 {
     0
 }
 
-/// In-memory fd table mapping virtual fds to `SimFs` path keys.
-///
-/// v2 open-file model: handles are monotonic from 3 and are never reused
-/// during one actor run; each description carries its cursor, append mode,
-/// granted rights, open flags, and closed state.
+/// In-memory fd table; handles are monotonic from 3 and never reused.
 #[derive(Debug, Default)]
 pub struct WasiFdTable {
     // ledger-lint:allow:HashMap (fd-to-description lookups only; never
@@ -216,10 +204,7 @@ impl WasiFdTable {
         }
     }
 
-    /// Open `path` and return a monotonic handle from 3.
-    ///
-    /// Handles are not reused during one actor run; table exhaustion returns
-    /// [`FdError::FdTableFull`].
+    /// Open `path`; handles are monotonic and exhaustion returns `FdTableFull`.
     pub fn open(&mut self, path: &str) -> Result<u32, FdError> {
         self.open_with_flags(path, FdRights::default(), FdFlags::default())
     }
@@ -289,8 +274,7 @@ impl WasiFdTable {
         Ok(())
     }
 
-    /// Check that `fd` is open and grants the requested direction before any
-    /// guest I/O runs on it.
+    /// Check `fd` grants the direction before guest I/O runs.
     pub fn check_io(&self, fd: u32, write: bool) -> Result<(), FdError> {
         let description = self.get(fd).ok_or(FdError::NotOpen)?;
         if description.closed {

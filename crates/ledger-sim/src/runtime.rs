@@ -1,10 +1,7 @@
 //! Deterministic single-threaded simulation runtime.
 //!
-//! [`Simulation`] is the public entry point for instruction-program workloads.
-//! It is a thin wrapper over the async [`Executor`]: each instruction program
-//! becomes a cooperative future driven by the executor's poll loop, which
-//! reproduces the classic one-scheduling-decision-per-instruction discipline
-//! (see [`crate::adapter`]).
+//! [`Simulation`] wraps the async [`Executor`]: each program becomes a
+//! cooperative future polled once per scheduling decision (see [`crate::adapter`]).
 
 use std::fmt;
 use std::future::Future;
@@ -16,12 +13,8 @@ use crate::scheduler::StepTrace;
 use ledger_format::{ActorId, StreamId};
 use ledger_journal::{Journal, JournalError, MonitorIssue};
 
-/// Stream id journaled for scheduler-owned scheduling draws.
-///
-/// The `sched` stream is reserved for scheduling; every scheduler decision
-/// consumes one draw from it. The journaled `RngDraw` entry records the
-/// resolved ready-list position, not the raw draw, so a replayed run journal
-/// stays hash-identical to the original.
+/// Stream id for scheduler draws; journals the resolved position so replays
+/// stay hash-identical.
 pub const SCHED_STREAM: ledger_format::StreamId = StreamId(0);
 
 /// Actor id reserved for scheduler-owned journal entries.
@@ -40,17 +33,9 @@ pub enum Instruction {
     SendTimed { to: usize, payload: u64, delay: u64 },
     /// Receive a message or block.
     Receive,
-    /// Record a value in the task-local register.
-    ///
-    /// Shorthand for [`Instruction::Input`] with zeroed generator and replay
-    /// keys. Kept for compatibility: existing workloads and golden journals
-    /// use this legacy form, and it journals byte-identically.
+    /// Record a value; legacy alias for [`Instruction::Input`] with zeroed keys.
     Set(u64),
-    /// Record a value in the task-local register under real PBT keys.
-    ///
-    /// Journaled as an `InputStep { generator, replay }` entry carrying the
-    /// value. The keys pin the input axis: `generator` selects the PBT
-    /// generator, `replay` indexes the value within that generator's stream.
+    /// Record a value under PBT `generator`/`replay` keys as `InputStep`.
     Input {
         generator: u64,
         replay: u64,
@@ -64,11 +49,7 @@ pub enum Instruction {
     FsFsync,
     /// Read a key-value entry from SimFs.
     FsRead { path: String },
-    /// Trigger a storage crash in SimFs.
-    ///
-    /// Journaled as `Fault { fault: FaultSpec::CrashState(0) }`: the crash
-    /// operator (DropAllUnsynced) has exactly one deterministic post-crash
-    /// state, indexed 0.
+    /// Trigger storage crash; journals `Fault { CrashState(0) }`.
     FsCrash,
     /// Record an assertion.
     Assert(bool),
@@ -153,12 +134,7 @@ pub struct RunResult {
     pub journal: Journal,
     /// Scheduler decisions by step.
     pub decisions: Vec<usize>,
-    /// Scheduler step traces (ready snapshot plus chosen position).
-    ///
-    /// Consumed by the source-DPOR driver ([`crate::dpor::run_dpor`]) to find
-    /// alternative schedules; recording-only, it never perturbs decisions.
-    /// Recorded only when the run's policy is `Dpor` (the driver's base run);
-    /// every other policy leaves this empty.
+    /// Scheduler step traces; only `Dpor` runs record them.
     pub trace: Vec<StepTrace>,
     /// Final task registers.
     pub registers: Vec<u64>,
@@ -176,20 +152,10 @@ pub struct RunResult {
     /// Effect origins keyed by entry hash, in append order. Empty unless the
     /// run flowed through origin-capturing calls (crate::origin).
     pub origins: Vec<(ledger_format::EntryHash, crate::origin::OriginSource)>,
-    /// First journal-append failure observed on a path that cannot propagate.
-    ///
-    /// Append failures on non-`Result` surfaces (send helpers, spawn, crash)
-    /// cannot abort the run mid-flight, so the first one is recorded here and
-    /// the executor rejects the finished run with [`RuntimeError::Journal`].
-    /// A populated slot means the journal is incomplete and byte-identical
-    /// replay is broken; on the `Ok` path this field is always `None` (kept
-    /// for API stability and inspection).
+    /// First journal-append failure on a non-`Result` path; a populated slot
+    /// rejects the run with [`RuntimeError::Journal`].
     pub journal_error: Option<JournalError>,
     /// Belt protection status for this run.
-    ///
-    /// Reports the per-run `BeltStatus` even for `BestEffort` where the run
-    /// continues despite `NotArmed` or `Failed`. `Required` runs that fail
-    /// never produce a `RunResult`; the error carries the status.
     pub protection: crate::sentinel::BeltStatus,
 }
 
@@ -198,12 +164,8 @@ pub struct RunResult {
 pub enum RuntimeError {
     /// Journal invariant failed.
     Journal(JournalError),
-    /// The instruction budget was exhausted.
-    ///
-    /// No longer produced: budget exhaustion is now reported through
-    /// [`RunResult::outcome`] so the partial journal stays inspectable.
-    /// The variant remains because the runtime facade maps it in its
-    /// public contract.
+    /// Instruction budget exhausted; now reported via [`RunResult::outcome`],
+    /// kept for the facade contract.
     StepLimit { limit: usize },
     /// Strict replay rejected a decision or trailing leftover.
     StrictReplay(crate::scheduler::ReplayViolation),
@@ -266,10 +228,8 @@ impl Simulation {
         Self::with_replay_and_fallback(config, programs, replay, Policy::Random)
     }
 
-    /// Create a strict simulation that follows recorded choices exactly.
-    ///
-    /// Out-of-range, exhausted, or trailing decisions surface as
-    /// [`RuntimeError::StrictReplay`] and never fall back to a seeded policy.
+    /// Create a strict simulation; out-of-range, exhausted, or trailing
+    /// decisions surface as [`RuntimeError::StrictReplay`].
     pub fn with_replay_strict(
         config: RunConfig,
         programs: Vec<Vec<Instruction>>,
@@ -281,10 +241,7 @@ impl Simulation {
         Self { executor }
     }
 
-    /// Create a simulation with an explicit replay-exhaustion fallback policy.
-    ///
-    /// Used by the source-DPOR driver: a partial replay pins the forced prefix,
-    /// then the fallback continues the schedule deterministically.
+    /// Create a simulation with an explicit replay-exhaustion fallback.
     pub fn with_replay_and_fallback(
         config: RunConfig,
         programs: Vec<Vec<Instruction>>,
@@ -302,11 +259,7 @@ impl Simulation {
         Self { executor }
     }
 
-    /// Attach a mid-run step monitor.
-    ///
-    /// The monitor is invoked after each scheduling step with the journal and
-    /// the start index of the delta. A `Halt` stops the run with
-    /// `MonitorHalt`.
+    /// Attach a mid-run monitor; `Halt` stops the run with `MonitorHalt`.
     pub fn with_step_monitor(mut self, monitor: StepMonitor) -> Self {
         self.executor = self.executor.with_step_monitor(monitor);
         self
@@ -321,9 +274,7 @@ impl Simulation {
         self
     }
 
-    /// Run until all tasks finish, the budget is reached, or a monitor halts.
-    ///
-    /// Belt activation is enforced in the common executor boundary.
+    /// Run until tasks finish, the budget binds, or a monitor halts.
     pub fn run(self) -> Result<RunResult, RuntimeError> {
         self.executor.run()
     }
@@ -370,12 +321,7 @@ mod tests {
     use super::*;
     use ledger_format::{EntryKind, EntryPayload};
 
-    /// A run whose journal-error slot is populated is rejected end to end:
-    /// no [`RunResult`] (and therefore no finding, certificate, or minimized
-    /// repro) can derive from a poisoned journal. Every explorer run helper
-    /// propagates the `?` on `Simulation::run`, so the rejection reaches
-    /// search, campaign, quad, bandit, joint, minimizer, and the corpus
-    /// probe without per-helper gates.
+    /// A poisoned journal-error slot rejects the run end to end.
     #[test]
     fn poisoned_journal_cannot_yield_a_run() {
         use crate::executor::Boundary;

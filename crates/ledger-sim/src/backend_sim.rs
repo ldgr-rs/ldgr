@@ -14,20 +14,12 @@ use rand_core::{Rng, TryRng};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-/// Lock a simulation-owned mutex, recovering the value from a poisoned lock.
-///
-/// The simulator is single-threaded, so a poisoned lock cannot occur in
-/// practice. Recovering the inner value keeps the boundary total even if a
-/// panic ever interrupts a host call.
+/// Lock a sim mutex, recovering from poisoning so the boundary stays total.
 fn lock<T>(guard: &Mutex<T>) -> MutexGuard<'_, T> {
     guard.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Record the first journal-append failure into a shared slot.
-///
-/// Later failures never overwrite the first: the same first-wins contract as
-/// the executor's `ExecutorShared::record_journal_error`, so every backend
-/// reports the failure that first broke the run.
+/// Record the first journal-append failure; later failures never overwrite it.
 pub(crate) fn record_first_journal_error(slot: &Mutex<Option<JournalError>>, error: &JournalError) {
     let mut guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
     if guard.is_none() {
@@ -35,11 +27,7 @@ pub(crate) fn record_first_journal_error(slot: &Mutex<Option<JournalError>>, err
     }
 }
 
-/// One deterministic RNG stream handle owning its ChaCha20 stream.
-///
-/// The handle holds the same journal and error slot as the backend, so every
-/// draw journals exactly one `RngDraw` entry. Each (backend, stream) owns an
-/// independent stream, so draws in one stream never perturb another.
+/// One deterministic RNG stream; every draw journals one `RngDraw` entry.
 pub struct SimStreamRng {
     rng: ChaCha20Rng,
     journal: Arc<Mutex<Journal>>,
@@ -87,14 +75,11 @@ impl TryRng for SimStreamRng {
     }
 }
 
-/// Deterministic simulation backend driving discrete virtual time, the seed
-/// tree, and the causal journal.
+/// Deterministic simulation backend driving virtual time, seed tree, and journal.
 ///
-/// The journal, network, and storage state are interior-mutable so the
-/// shared-reference `Effects` methods can journal and mutate them. All mutable
-/// state sits behind a `Mutex`: the sim is single-threaded, so the mutex is
-/// never contended, and `SimBackend` stays `Send + Sync`, which wasmtime host
-/// functions require when the backend is stored inside a wasmtime `Store`.
+/// Interior-mutable behind `Mutex` so shared `Effects` refs can journal; the
+/// sim stays single-threaded so the lock is uncontended and `Send + Sync`
+/// holds for wasmtime host functions.
 pub struct SimBackend {
     time: Mutex<VirtualTime>,
     seed_tree: SeedTree,
@@ -143,17 +128,12 @@ impl SimBackend {
         }
     }
 
-    /// Attach a shared tick sink updated on every clock read and time advance.
-    ///
-    /// WASI virtual clocks in the Wasm backend read this sink so `clock_time_get`
-    /// serves virtual time rather than the ambient wall clock.
-    /// Serve a seeded draw inside the configured reorder window instead of
-    /// the deterministic newest-first pick. Defaults to `false`; the native
-    /// executor selects this from [`crate::RunConfig::reorder_draw`].
+    /// Serve a seeded draw inside the reorder window instead of newest-first.
     pub fn set_reorder_draw(&mut self, reorder_draw: bool) {
         self.reorder_draw = reorder_draw;
     }
 
+    /// Attach a tick sink so WASI clocks serve virtual time.
     pub fn attach_tick_sink(&mut self, sink: Arc<Mutex<u64>>) {
         self.tick_sink = Some(sink);
     }
@@ -166,12 +146,7 @@ impl SimBackend {
         }
     }
 
-    /// Return an immutable snapshot of the journaled history.
-    ///
-    /// The snapshot is a full copy taken under the internal lock, so it cannot
-    /// alias live backend state and never changes the run. Inspection paths
-    /// (entry iteration, `root_hash`, audits) use this instead of locking the
-    /// shared journal.
+    /// Return an immutable copy of the journaled history.
     pub fn journal_snapshot(&self) -> Journal {
         lock(&self.journal).clone()
     }
@@ -227,14 +202,10 @@ impl SimBackend {
 }
 
 impl Effects for SimBackend {
-    /// Returns virtual time without journaling.
+    /// Non-journaled clock read for internal scheduling.
     ///
-    /// `clock()` is a non-journaled read for internal scheduling (e.g. send
-    /// `deliver_at`). Journaled reads use `Instruction::ReadClock` or
-    /// `Boundary::read_clock`, which emit `ClockRead`. This keeps sends
-    /// byte-identical to the pre-journaling path. WASI `clock_time_get` in
-    /// `WasmBackend` journals `ClockRead` because it is an observable
-    /// cross-boundary effect; the two surfaces are intentionally distinct.
+    /// Journaled reads use `Instruction::ReadClock` (`ClockRead`); WASI
+    /// `clock_time_get` journals as an observable crossing.
     fn clock(&self) -> Clock {
         self.publish_ticks();
         Clock::new(lock(&self.time).now())
@@ -254,14 +225,8 @@ impl Effects for SimBackend {
             })
     }
 
-    /// Single-actor inline sleep.
-    ///
-    /// Kept separate from the executor's batched quiescent firing on purpose:
-    /// this backend has no scheduler loop, so it must advance time and journal
-    /// `TimerFire`/`Wake` synchronously. The executor parks the task and fires
-    /// at quiescence via `advance_quiescent` batching. Both paths journal the
-    /// same `TimerSet -TimerFire -> Wake` chain with the `TimerSet` id as the
-    /// `TimerFire` parent; see the sleep-parity test pinning this.
+    /// Single-actor inline sleep; journals the same timer chain as the
+    /// executor batch path (see the sleep-parity test).
     async fn sleep(&self, d: core::time::Duration) {
         let ticks = d.as_micros() as u64;
         let timer_set = self.append(
@@ -591,13 +556,7 @@ mod tests {
         assert!(backend.journal_error().is_none());
     }
 
-    /// Sleep parity between the inline backend and the executor batch path.
-    ///
-    /// Both journal the same `TimerSet -TimerFire -> Wake` chain with the
-    /// `TimerSet` id as the `TimerFire` parent and the `TimerFire` id as the
-    /// `Wake` parent. The backend fires inline (no scheduler); the executor
-    /// parks and fires at quiescence in batch. This pins the chain shape so
-    /// the two paths cannot drift.
+    /// Pins the `TimerSet -TimerFire -> Wake` chain shape on both paths.
     #[test]
     fn inline_sleep_matches_quiescent_timer_chain() {
         use ledger_format::EntryPayload;

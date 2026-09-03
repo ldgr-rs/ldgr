@@ -294,17 +294,21 @@
         "links": [
           {
             "base_delay": 5,
+            "capacity": null,
             "from": 0,
             "jitter": 2,
             "loss_probability": "0.5",
+            "queue_policy": "drop",
             "reorder_window": 3,
             "to": 1
           },
           {
             "base_delay": 9,
+            "capacity": null,
             "from": 1,
             "jitter": 1,
             "loss_probability": "0.1",
+            "queue_policy": "drop",
             "reorder_window": 0,
             "to": 0
           }

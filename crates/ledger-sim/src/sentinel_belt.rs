@@ -1,11 +1,8 @@
 //! Process-belt leak sentinel: LD_PRELOAD shim, seccomp denylist, RDTSC trap,
 //! and hardware-entropy opcode scan.
 //!
-//! The belt runs ambient-API probes in subprocesses so its filters can never
-//! break the test harness that drives them. The runtime hooks
-//! `activate_process_belt` at the sim run entry; with the `sentinel` feature
-//! compiled in on Linux it installs the seccomp denylist and the RDTSC trap by
-//! default before the sim starts.
+//! Probes run in subprocesses so filters never break the harness; the run
+//! entry hooks `activate_process_belt` before the sim starts on Linux.
 // ledger-lint:allow:env::var (belt harness reads LD_PRELOAD to prepend the shim)
 // ledger-lint:allow:std::fs:: (belt harness writes and parses the shim log file)
 // ledger-lint:allow:rdrand (the leak-class table must name the tsc-class intrinsics)
@@ -35,14 +32,8 @@ const SECCOMP_ARCH_OFFSET: u32 = 4;
 /// seccomp_data syscall-number field offset in bytes.
 const SECCOMP_NR_OFFSET: u32 = 0;
 
-/// Function names the interposition shim records in the log file.
-///
-/// All five are the syscall-surface ambient APIs. On glibc,
-/// `clock_gettime`, `gettimeofday`, and `time` are normally served from the
-/// vDSO without a syscall; the shim still catches them because it interposes
-/// the PLT symbol before the libc definition is reached. Only code that
-/// bypasses the PLT (a direct `__vdso_clock_gettime` call or an inlined
-/// copy) escapes the shim.
+/// Shim-logged ambient APIs; the shim interposes the PLT, so only direct
+/// `__vdso` calls or inlined copies escape it.
 const INTERPOSED_CALLS: &[&str] = &[
     "getrandom",
     "getentropy",
@@ -109,28 +100,13 @@ pub fn shim_path() -> PathBuf {
     PathBuf::from(env!("SENTINEL_SHIM_PATH"))
 }
 
-/// Install a seccomp filter that kills any process issuing an ambient syscall.
+/// Install a seccomp denylist killing the process on ambient syscalls.
 ///
-/// The filter blocks the OS-entropy and ambient-clock syscalls (plus the
-/// 32-bit time64 variant where applicable) and allows everything else.
-/// It requires no_new_privs, so it cannot be installed by an unprivileged
-/// process that later needs capabilities. Call this only inside a subprocess.
-///
-/// The filter is process-wide and irrevocable once installed. The action is
-/// `SECCOMP_RET_KILL_PROCESS`, not `SECCOMP_RET_USER_NOTIF`. USER_NOTIF
-/// requires a supervising thread that owns the listener fd and services every
-/// notification with a SECCOMP_IOCTL_NOTIF_RECV loop; without that thread the
-/// kernel blocks the syscall and the process deadlocks. The sim is
-/// single-threaded by invariant (determinism rules forbid OS threads inside a
-/// simulation), so no supervisor exists to answer notifications. KILL_PROCESS
-/// keeps the denylist effective without a second thread: an ambient syscall
-/// terminates the process instead of leaking nondeterminism into the journal.
-/// Because the kill is delivered by the kernel as a process-wide termination,
-/// it kills the whole sim process mid-run and that outcome can never become a
-/// normal run error (no `RunResult` or `RuntimeError` can be produced from a
-/// killed process). Hardware-entropy reads (RDRAND/RDSEED) are instructions and
-/// stay outside seccomp either way; `scan_rdrand_rdseed` reports their
-/// presence.
+/// Blocks OS-entropy and ambient-clock syscalls; call only in a subprocess.
+/// Irrevocable and process-wide. `KILL_PROCESS` is used because the
+/// single-threaded sim has no supervisor for `USER_NOTIF`; a kill can never
+/// become a `RunResult`. RDRAND/RDSEED are instructions outside seccomp; see
+/// `scan_rdrand_rdseed`.
 pub fn install_seccomp_denylist() -> Result<(), SentinelError> {
     let Some(arch) = native_audit_arch() else {
         return Err(SentinelError::UnsupportedArch);
@@ -172,10 +148,7 @@ pub fn install_seccomp_denylist() -> Result<(), SentinelError> {
     Ok(())
 }
 
-/// Trap RDTSC reads with SIGSEGV through prctl PR_SET_TSC.
-///
-/// Any subsequent RDTSC/RDTSCP instruction faults, so a probe that issues one
-/// dies before it can leak the timestamp. Call this only inside a subprocess.
+/// Trap RDTSC reads with SIGSEGV; call only inside a subprocess.
 pub fn trap_rdtsc() -> Result<(), SentinelError> {
     #[allow(unsafe_code)] // seccomp/prctl ffi: kernel contract requires raw syscall pointers
     unsafe {
@@ -199,7 +172,7 @@ pub fn allow_rdtsc() -> Result<(), SentinelError> {
     Ok(())
 }
 
-/// Scoped RAII guard that traps RDTSC reads during simulation and restores PR_TSC_ENABLE on drop.
+/// RAII guard trapping RDTSC while armed; restores `PR_TSC_ENABLE` on drop.
 #[derive(Debug)]
 pub struct TscTrapGuard {
     active: bool,
@@ -207,20 +180,13 @@ pub struct TscTrapGuard {
 }
 
 impl TscTrapGuard {
-    /// Enter a section where RDTSC reads are trapped with SIGSEGV if the belt is armed.
-    ///
-    /// The guard is active only when the trap really installed. A failed
-    /// activation stays queryable via [`TscTrapGuard::activation_error`] so
-    /// the run entry can propagate the typed error instead of pretending the
-    /// trap is in place.
+    /// Arm when the belt is armed; failures stay queryable via
+    /// [`TscTrapGuard::activation_error`].
     pub fn arm_if_armed() -> Self {
         Self::arm_for_effective(effective_protection_from_env())
     }
 
-    /// Enter a section where RDTSC reads are trapped when effective protection demands it.
-    ///
-    /// When effective protection is `Some`, the trap is attempted regardless of the
-    /// env arming gate; when `None` (env Disabled with no host option) the guard stays inactive.
+    /// Arm when effective protection demands it; `None` stays inactive.
     pub fn arm_for_effective(effective: EffectiveProtection) -> Self {
         if effective.is_enabled() {
             match trap_rdtsc() {
@@ -241,9 +207,7 @@ impl TscTrapGuard {
         }
     }
 
-    /// Enter a section where RDTSC reads are trapped for a host-requested mode.
-    ///
-    /// Host option `Some` overrides env; `None` falls back to env mode.
+    /// Arm for a host mode; `Some` overrides env, `None` falls back to env.
     pub fn arm_for_host(host: Option<ProtectionMode>) -> Self {
         Self::arm_for_effective(effective_protection(host))
     }
@@ -274,15 +238,8 @@ pub fn arm_belt() {
     ARMED.store(true, Ordering::Relaxed);
 }
 
-/// Return true when the process belt is armed.
-///
-/// The belt is armed by `arm_belt` or by a truthy `LEDGER_SENTINEL_BELT`
-/// environment value (`1`, `true`, `on`, `yes`, `required`). By default, the
-/// belt is not armed so it does not install permanent seccomp filters on the
-/// host process. The env read is a host-side gate at run entry: it never feeds
-/// the journal, the scheduler, or any simulated effect, so it cannot perturb a
-/// deterministic run. Env parsing is delegated to [`crate::sentinel::belt_env_mode`]
-/// so callers can test the pure mapping.
+/// Armed by `arm_belt` or a truthy `LEDGER_SENTINEL_BELT`; the env read is a
+/// host-side gate that never feeds the journal.
 #[cfg(test)]
 fn belt_armed() -> bool {
     if ARMED.load(Ordering::Relaxed) {
@@ -318,16 +275,8 @@ fn effective_protection(host: Option<ProtectionMode>) -> EffectiveProtection {
     crate::sentinel::belt_env_mode(std::env::var_os("LEDGER_SENTINEL_BELT").as_deref()).into()
 }
 
-/// Warm the per-thread entropy caches the sim runtime relies on.
-///
-/// `std::collections::HashMap` and `HashSet` (and hashbrown's default hasher)
-/// seed their hasher from OS entropy, once per thread. This
-/// function constructs one map on the current thread so that seeding happens
-/// here, BEFORE the seccomp denylist installs. The call is a deliberate,
-/// host-side, one-time action at run entry; it is not part of a simulation,
-/// so it does not violate the determinism rules. Without the warm-up, the
-/// first collection created after installation would hit the blocked syscall
-/// and the kernel would kill the process.
+/// Seed the thread hasher before the denylist installs; otherwise the first
+/// post-install collection would hit the blocked syscall and die.
 fn pre_warm_ambient_entropy() {
     // Deliberate discard: the map exists only to seed the hasher here.
     // ledger-lint:allow:HashMap (compile probe; never populated)
@@ -349,32 +298,15 @@ pub fn install_process_belt() -> Result<ProcessBeltStatus, SentinelError> {
     })
 }
 
-/// Run-entry belt hook wired into `Simulation::run`.
-///
-/// Warms this thread's entropy caches, then installs the seccomp denylist and
-/// the RDTSC trap when the process belt is armed. The belt is NOT armed by
-/// default: `LEDGER_SENTINEL_BELT` must be set to `1`, `true`, `on`, `yes`, or
-/// `required`, or [`arm_belt`] must be called. Installation happens once per
-/// process: seccomp filters cannot be removed, so the denylist is process-wide
-/// and irrevocable; stacking identical filters is wasteful; a status record
-/// accompanies the install so later calls report it instead of reinstalling.
-/// The filter uses `SECCOMP_RET_KILL_PROCESS`, which kills the whole sim
-/// process mid-run if an ambient syscall is issued after activation and that
-/// termination can never become a normal `RunResult` or `RuntimeError`.
-/// The returned status is the report a caller can log or assert; on failures
-/// the hook also emits a warning line.
+/// Run-entry hook: warms entropy caches, then installs denylist and RDTSC
+/// trap when armed. Once-per-process; a kill from the filter can never
+/// become a `RunResult`.
 pub fn activate_process_belt() -> BeltStatus {
     activate_process_belt_for_effective(effective_protection_from_env())
 }
 
-/// Attempt belt installation for a host-requested protection mode.
-///
-/// When `host` is `Some`, installation is attempted regardless of the env gate.
-/// When `host` is `None`, env mode is used and `Disabled` keeps not-armed behavior.
-/// `Required` must be `Active` to succeed; `BestEffort` always returns status.
-///
-/// This is the common execution boundary entry: both `Simulation::run` and
-/// direct `Executor::run` route through it so no path bypasses enforcement.
+/// Belt install for a host mode; `Some` attempts regardless of env,
+/// `Required` must reach `Active`. Shared by `Simulation` and `Executor`.
 pub fn activate_process_belt_for_effective(effective: EffectiveProtection) -> BeltStatus {
     // Warm this thread's entropy caches before the filter installs, so the
     // sim's own collections never hit the blocked OS-entropy syscall.
@@ -459,16 +391,8 @@ fn record_belt_status(status: &BeltStatus) {
     }
 }
 
-/// Return true when RDRAND or RDSEED opcodes appear in an executable mapping.
-///
-/// RDRAND/RDSEED are CPU instructions, invisible to seccomp, and masking them
-/// in user space would need a hypervisor or a signal-based instruction
-/// emulator. This scan implements the detectable half of that residual: it
-/// walks /proc/self/maps for executable, file-backed
-/// mappings and scans the mapped bytes for the encodings `0F C7 F0..FF`
-/// (RDRAND r32 is ModRM /6, RDSEED r32 is ModRM /7). A true result is a
-/// warning that the encodings are present, not a proof that entropy was read;
-/// unrelated data can contain the same three bytes.
+/// True when RDRAND/RDSEED encodings appear in an executable mapping.
+/// Presence warns only; unrelated bytes can match.
 pub fn scan_rdrand_rdseed() -> Result<bool, SentinelError> {
     let maps = std::fs::read_to_string("/proc/self/maps")
         .map_err(|error| SentinelError::Io(std::sync::Arc::new(error)))?;
@@ -529,22 +453,14 @@ pub fn scan_rdrand_rdseed() -> Result<bool, SentinelError> {
     Ok(found)
 }
 
-/// Return true when the RDRAND/RDSEED byte pattern occurs in `bytes`.
-///
-/// RDRAND r32 is ModRM /6 (`11 110 rrr` = 0xF0..0xF7), RDSEED r32 is ModRM
-/// /7 (`11 111 rrr` = 0xF8..0xFF); both share the high 4 bits, so the mask
-/// `0xF0` covers the full `0F C7 F0..FF` span.
+/// True when `bytes` holds the `0F C7 F0..FF` RDRAND/RDSEED pattern.
 fn scan_for_rdrand_rdseed(bytes: &[u8]) -> bool {
     bytes.windows(3).any(|window| {
         window[0] == RDRAND_PREFIX && window[1] == RDRAND_OPCODE && (window[2] & 0xF0) == 0xF0
     })
 }
 
-/// Run `cmd` under the interposition shim and report which ambient calls fired.
-///
-/// Sets LD_PRELOAD to the shim (prepending any existing value) and points
-/// LEDGER_SENTINEL_LOG at a fresh temp file. Waits for the probe, parses the
-/// log, and returns the sorted, deduplicated function names that were called.
+/// Run `cmd` under the shim and report which ambient calls fired.
 pub fn run_detected(cmd: &mut Command) -> Result<DetectionReport, SentinelError> {
     let shim = shim_path();
     if !shim.is_file() {
@@ -582,9 +498,7 @@ pub fn run_detected(cmd: &mut Command) -> Result<DetectionReport, SentinelError>
 }
 
 impl Sentinel {
-    /// Build a sentinel from a process-belt detection report.
-    ///
-    /// Maps each flagged function name to its determinism leak class.
+    /// Build a sentinel from a detection report.
     pub fn from_detection(report: &DetectionReport) -> Self {
         let mut sentinel = Sentinel::new();
         for call in &report.detected_calls {
@@ -694,11 +608,8 @@ mod tests {
         assert!(!scan_for_rdrand_rdseed(&[0x0F, 0xC7, 0xE0]));
     }
 
-    /// The belt-mark/status-record ordering and the fall-through rule: even
-    /// when the installed mark is present without a local record (the
-    /// first-call race), the hook must resolve through the real installer and
-    /// report its actual scan result - never a fabricated `Active` claim with
-    /// a made-up scan.
+    /// Never fabricates `Active`: the installed mark without a record still
+    /// resolves through the real installer.
     #[test]
     fn installed_mark_without_record_never_fabricates_active() {
         // Reset global for this test: separate immutable installed flag from
@@ -783,10 +694,7 @@ mod tests {
         assert!(BELT_INSTALLED.load(Ordering::Relaxed));
     }
 
-    /// The TSC guard must never claim an active trap it did not install, and
-    /// a failed activation must surface the typed error instead of being
-    /// swallowed. The guard's shape follows the belt state; on kernels
-    /// without `PR_SET_TSC` the armed path reports a typed `Prctl` failure.
+    /// Guard reports a typed failure instead of claiming an uninstalled trap.
     #[test]
     fn tsc_guard_state_matches_belt_state() {
         let was_armed = belt_armed();

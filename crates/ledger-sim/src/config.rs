@@ -89,13 +89,9 @@ impl core::str::FromStr for Probability {
 
 /// One deterministic fault at an exact causal position (a journal entry id).
 ///
-/// The Explorer converts LDFI hypothesis cuts into these schedules; the
-/// executor applies each injection when it journals the targeted entry. The
-/// name `SimFault` keeps this engine type distinct from the string-targeted
-/// [`ledger_faultspec::FaultInjection`]; the bridge in `ledger-explorer`
-/// converts between the two at the porting seam.
-/// Derived `Ord` gives fault schedules one canonical deterministic order
-/// without string keys; the variant declaration order defines the rank.
+/// The Explorer converts LDFI cuts into these; the executor injects at the
+/// targeted entry. `Ord` gives schedules one canonical order from declaration
+/// order.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimFault {
     /// Drop the message sent by this `Send` entry.
@@ -110,17 +106,16 @@ pub enum SimFault {
     Corrupt { write: EntryHash, xor_mask: u64 },
     /// Apply the crash-state operator at index `state` after this `FsWrite`.
     CrashState { write: EntryHash, state: u64 },
+    /// Duplicate the message sent by this `Send` entry.
+    Duplicate { send: EntryHash },
 }
 
 impl SimFault {
-    /// The canonical crash operation this fault requests, when it is a
-    /// crash-type fault. The executor applies exactly this operation and
-    /// journals it; replay verifies the journaled operation against this
-    /// same derivation, so the two sides cannot drift.
+    /// Canonical crash operation for crash-type faults; replay derives the
+    /// same operation so the sides cannot drift.
     ///
-    /// Returns `None` for non-crash faults, `Ok(op)` for the canonical
-    /// operation, and `Err(identifier)` for an unknown crash-state
-    /// identifier that must fail closed.
+    /// Returns `None` for non-crash faults and `Err(id)` for an unknown
+    /// crash-state identifier, which must fail closed.
     pub fn crash_operation_for(
         &self,
         write_path: &str,
@@ -155,41 +150,23 @@ impl SimFault {
 pub enum Policy {
     /// Select a ready task from the seeded stream.
     Random,
-    /// Use a bounded probabilistic concurrency schedule (PCT).
-    ///
-    /// `priority_changes` is the preemption budget `k`: at most `k` preemptions
-    /// happen per run, and each preemption re-assigns the ready tasks'
-    /// priorities. A budget of `0` never preempts and reduces to a fixed
-    /// priority order. See [`crate::scheduler::Scheduler`].
+    /// Bounded PCT schedule: at most `priority_changes` preemptions per run.
+    /// `0` never preempts. See [`crate::scheduler::Scheduler`].
     Pct { priority_changes: usize },
-    /// Journal-novelty guided bandit with UCB1 exploration constant.
-    ///
-    /// `pct_mix` is the probability in `0.0 ..= 1.0` of injecting a PCT-style
-    /// preemption instead of a pure UCB1 choice. Default is `0.1`.
+    /// Journal-novelty bandit; `pct_mix` is the PCT-preemption probability.
     Bandit {
         exploration_constant: f64,
         pct_mix: Probability,
     },
-    /// Follow a previously recorded task decision sequence.
-    ///
-    /// When the replay sequence is exhausted the scheduler delegates to its
-    /// fallback policy ([`crate::scheduler::Scheduler::with_fallback`]).
+    /// Follow a recorded decision sequence; fallback applies when exhausted.
     Replay,
-    /// Source-DPOR exploration base for a single run.
-    ///
-    /// One `Simulation::run()` under `Dpor` behaves exactly like `Random`; the
-    /// [`crate::dpor::run_dpor`] driver uses the recorded trace to explore
-    /// causally distinct schedules around this base run.
+    /// Source-DPOR base: one run behaves like `Random`; see [`crate::dpor::run_dpor`].
     Dpor,
 }
 
 impl Eq for Policy {}
 
-/// Swarm parameters for randomized fault and network configuration.
-///
-/// The executor boundary consumes these: drop and delay draws gate `SimNet`
-/// delivery, and the crash probability selects a post-crash state on storage
-/// write.
+/// Swarm parameters for randomized faults and network behavior.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwarmConfig {
     /// Drop probability for network messages (0.0 .. 1.0).
@@ -200,11 +177,7 @@ pub struct SwarmConfig {
     pub max_delay_ticks: u64,
     /// Crash probability on storage write (0.0 .. 1.0).
     pub crash_probability: Probability,
-    /// Campaign budget on distinct fault classes sampled per run.
-    ///
-    /// This is a budget, not a semantic guarantee: once this many distinct
-    /// post-crash state classes have been applied, further sampled crashes are
-    /// skipped. Minimum 1.
+    /// Budget on distinct fault classes sampled per run (minimum 1).
     pub fault_classes_per_run: usize,
 }
 
@@ -220,13 +193,7 @@ impl Default for SwarmConfig {
     }
 }
 
-/// Immutable configuration for one simulation.
-///
-/// Construction is stable via [`RunConfig::builder`]. Direct field access is
-/// crate-private; external crates use the builder and the read accessors.
-/// This keeps the layout stable across features: the `fs_journaling` field
-/// only exists with `sim-fs-journaling` and is handled inside the builder, so
-/// callers do not need `#[cfg]` guards at construction sites.
+/// Immutable configuration for one simulation; build via [`RunConfig::builder`].
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub(crate) seed: EntryHash,
@@ -298,10 +265,7 @@ impl RunConfig {
         self.policy
     }
 
-    /// Maximum number of executed instructions.
-    ///
-    /// The executor expects `max_steps >= 1`; a budget of `0` yields an
-    /// immediate `StepLimit { limit: 0 }` (deterministic, no work runs).
+    /// Maximum instruction budget; `0` yields an immediate `StepLimit`.
     pub fn max_steps(&self) -> usize {
         self.max_steps
     }
@@ -336,8 +300,7 @@ impl RunConfig {
         self.monitor
     }
 
-    /// Whether a configured reorder window serves a seeded draw instead of
-    /// the deterministic newest-first message.
+    /// Whether the reorder window serves a seeded draw instead of newest-first.
     pub fn reorder_draw(&self) -> bool {
         self.reorder_draw
     }
@@ -352,10 +315,7 @@ impl RunConfig {
         self.max_resident_bytes
     }
 
-    /// Journaling-FS crash model.
-    ///
-    /// `None` keeps the black-box `DropAllUnsynced` operator (the byte-identical
-    /// default). When set, the executor replays the write-ahead journal on crash.
+    /// Journaling-FS crash model; `None` keeps the `DropAllUnsynced` default.
     #[cfg(feature = "sim-fs-journaling")]
     pub fn fs_journaling(&self) -> Option<crate::simfs::JournalingMode> {
         self.fs_journaling
@@ -441,12 +401,7 @@ impl RunConfig {
     }
 }
 
-/// Builder for [`RunConfig`] with stable, additive setters.
-///
-/// Defaults mirror [`RunConfig::default`]. Call [`RunConfigBuilder::build`]
-/// to finish. The `fs_journaling` setter is only available with the
-/// `sim-fs-journaling` feature; without it the field stays at its default and
-/// no caller `#[cfg]` is required.
+/// Builder for [`RunConfig`]; defaults mirror [`RunConfig::default`].
 #[derive(Debug, Clone)]
 pub struct RunConfigBuilder {
     seed: EntryHash,
@@ -504,10 +459,7 @@ impl RunConfigBuilder {
         self
     }
 
-    /// Set the instruction budget.
-    ///
-    /// Expect `max_steps >= 1`; a budget of `0` yields an immediate
-    /// `StepLimit { limit: 0 }` (deterministic, no work runs).
+    /// Set the instruction budget; `0` yields an immediate `StepLimit`.
     pub fn max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
         self
@@ -549,27 +501,21 @@ impl RunConfigBuilder {
         self
     }
 
-    /// Set the journaling-FS crash model.
-    ///
-    /// `None` keeps the black-box operator. Handled inside the builder so
-    /// callers need no `#[cfg]` guard; without the feature this setter does
-    /// not exist and the builder stays at its default.
+    /// Set the journaling-FS crash model; `None` keeps the default operator.
     #[cfg(feature = "sim-fs-journaling")]
     pub fn fs_journaling(mut self, fs_journaling: Option<crate::simfs::JournalingMode>) -> Self {
         self.fs_journaling = fs_journaling;
         self
     }
 
-    /// Serve a seeded draw inside the configured reorder window instead of
-    /// the deterministic newest-first pick. Defaults to `false`.
+    /// Serve a seeded draw inside the reorder window. Defaults to `false`.
     pub fn reorder_draw(mut self, reorder_draw: bool) -> Self {
         self.reorder_draw = reorder_draw;
         self
     }
 
-    /// Set per-run filesystem budgets: a file-extent cap in bytes and an
-    /// optional resident budget. `None` for the extent means the format hard
-    /// limit; `None` for the resident budget means unlimited.
+    /// Set filesystem budgets; `None` extent means the format limit, `None`
+    /// resident means unlimited.
     pub fn fs_budgets(
         mut self,
         max_file_extent: Option<u64>,

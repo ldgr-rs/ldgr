@@ -1,32 +1,11 @@
-//! Wasm throughput gate: the backend must sustain >= 100k journaled
-//! entries/s on the throughput guest workload.
-//!
-//! The guest `run_throughput` entry journals one `RngDraw` per ~10k-instruction
-//! compute loop (2,000 entries per invocation). The gate measures steady-state
-//! entries appended per second over several invocations: wasmtime execution,
-//! host boundary crossing, and journal hashing included, module compilation
-//! excluded (the module is compiled once up front, like the bench).
-//!
-//! The 100k bar is the W1 budget (100k entries/s) measured locally against the release guest: 1.54M entries/s in
-//! this gate and ~1.83M entries/s on the criterion bench, quick sampling,
-//! 2026-08-24), so
-//! a 12x headroom keeps shared CI runners from flaking while a real regression
-//! below one-tenth of the measured rate still fails the gate.
-//!
-//! A per-run minimum entry count rules out a vacuous pass: a degenerate
-//! fast no-op guest cannot satisfy it while "tripling" the rate. Wall-clock
-//! timing is test-side ambient time (`std::time::Instant`), the measured
-//! quantity of this gate, never an input to any simulation.
+//! Wasm throughput gate: >= 100k entries/s on `run_throughput`, with a
+//! minimum entry count ruling out vacuous passes.
 #![cfg(feature = "backend-wasm")]
 
 use ledger_sim::{SeedTree, WasmBackend};
 use std::time::Instant;
 
-/// Load the optimized (release) guest module, following the shared
-/// `tests/common/mod.rs` artifact-location pattern.
-///
-/// Throughput must be measured against an optimized guest artifact; build it
-/// with `cargo build --release --target wasm32-wasip1 -p wasm-guest`.
+/// Load the release guest artifact.
 fn release_guest_wasm_bytes() -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/wasm32-wasip1/release/wasm_guest.wasm");

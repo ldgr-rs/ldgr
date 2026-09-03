@@ -15,9 +15,7 @@ impl SeedTree {
         Self { root_seed }
     }
 
-    /// Derive an independent stream key for a labeled subsystem.
-    ///
-    /// Implements `stream_key(label) = BLAKE3_kdf(root_seed, label)`.
+    /// Derive stream key `BLAKE3_kdf(root_seed, label)` for one subsystem.
     pub fn derive(&self, label: &str) -> EntryHash {
         EntryHash(blake3::derive_key(label, &self.root_seed.0))
     }
@@ -26,18 +24,12 @@ impl SeedTree {
         ChaCha20Rng::from_seed(self.derive(label).0)
     }
 
-    /// Build the deterministic per-generator input stream for a PBT generator.
-    ///
-    /// The stream key is `gen/<generator>`, so every PBT generator gets its
-    /// own independent, reproducible stream. Used by the explorer PBT bridge.
+    /// Deterministic per-generator stream `gen/<generator>` for PBT.
     pub fn gen_stream(&self, generator: &str) -> ChaCha20Rng {
         self.rng(&format!("gen/{generator}"))
     }
 
-    /// Draw a deterministic unsigned integer from a labeled stream at an offset.
-    ///
-    /// This keyed-mode helper is for scheduler draws. The general stream
-    /// construction is [`Self::derive`] feeding a ChaCha20 RNG ([`Self::rng`]).
+    /// Keyed scheduler draw of one `u64` from `label` at `offset`.
     pub fn draw_u64(&self, label: &str, offset: u64) -> u64 {
         let mut hasher = blake3::Hasher::new_keyed(&self.root_seed.0);
         hasher.update(label.as_bytes());

@@ -1,14 +1,5 @@
-//! A Wasm guest compiled to `wasm32-wasip1` replays bit-exactly.
-//!
-//! The guest `run` entry draws from a fixed seed embedded in the guest and
-//! writes deterministic lines to stdout through WASI `fd_write`. This test
-//! instantiates the guest twice under the deterministic wasmtime config and
-//! asserts the captured stdout is byte-identical, and that it matches a golden
-//! output computed on the host from the same algorithm.
-//!
-//! Determinism comes from the guest-side fixed seed plus host-side NaN
-//! canonicalization and relaxed-SIMD determinism, with no ambient randomness
-//! anywhere.
+//! Wasm replay: the guest `run` entry reproduces byte-identical stdout twice
+//! and matches the host-computed golden.
 #![cfg(feature = "backend-wasm")]
 
 mod common;
