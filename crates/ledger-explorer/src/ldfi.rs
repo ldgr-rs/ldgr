@@ -35,10 +35,16 @@ pub fn solve_with(
 
 /// Hypothesis cut to executable schedule. Recv/FsRead fault the observed
 /// write; every class per kind; each target once.
+///
+/// Sends with journaled duplicate evidence map to `Duplicate` alone: the
+/// witness already shows the extra delivery, so re-injection is the most
+/// specific reproduction. All other sends map to the Drop/Delay/Partition
+/// triple exactly as before.
 pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<SimFault> {
     let mut schedule = Vec::new();
     let mut seen = HashSet::new();
     let mut seen_classes = HashSet::new();
+    let duplicates = crate::lineage::duplicate_senders(journal);
     let push = |schedule: &mut Vec<SimFault>,
                 seen_classes: &mut HashSet<(u8, EntryHash)>,
                 injection: SimFault| {
@@ -56,6 +62,14 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<S
         };
         match entry.data.kind {
             EntryKind::Send => {
+                if duplicates.contains(event) {
+                    push(
+                        &mut schedule,
+                        &mut seen_classes,
+                        SimFault::Duplicate { send: *event },
+                    );
+                    continue;
+                }
                 push(&mut schedule, &mut seen_classes, SimFault::Drop(*event));
                 push(
                     &mut schedule,
@@ -79,6 +93,14 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<S
             }
             EntryKind::Recv => {
                 if let Some(parent) = send_parent(entry.data.parents.as_slice(), journal) {
+                    if duplicates.contains(&parent) {
+                        push(
+                            &mut schedule,
+                            &mut seen_classes,
+                            SimFault::Duplicate { send: parent },
+                        );
+                        continue;
+                    }
                     push(&mut schedule, &mut seen_classes, SimFault::Drop(parent));
                     push(
                         &mut schedule,
@@ -282,5 +304,108 @@ mod tests {
             .solve(&journal, &verdict)
             .expect("concrete must succeed");
         assert_eq!(via_trait, direct);
+    }
+
+    fn duplicate_journal() -> (Journal, EntryHash) {
+        let mut journal = Journal::new();
+        let message_id = ledger_format::MessageId::new(ActorId(1), 0);
+        let send = journal
+            .append(
+                EntryKind::Send,
+                ActorId(1),
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id,
+                    from: ActorId(1),
+                    to: ActorId(2),
+                    original_content: 7u64.to_le_bytes().to_vec(),
+                }),
+            )
+            .expect("append must succeed");
+        for _ in 0..2 {
+            journal
+                .append(
+                    EntryKind::Recv,
+                    ActorId(2),
+                    [send],
+                    EntryPayload::Recv(ledger_format::RecvFrame {
+                        message_id,
+                        from: ActorId(1),
+                        to: ActorId(2),
+                        observed_content: 7u64.to_le_bytes().to_vec(),
+                    }),
+                )
+                .expect("append must succeed");
+        }
+        journal
+            .append(
+                EntryKind::Fault,
+                ActorId(1),
+                [send],
+                EntryPayload::Fault(ledger_format::FaultPayload::DuplicateMessage {
+                    message_id,
+                    copy_ordinal: 1,
+                }),
+            )
+            .expect("append must succeed");
+        (journal, send)
+    }
+
+    #[test]
+    fn duplicate_marked_send_maps_to_duplicate_only() {
+        let (journal, send) = duplicate_journal();
+        let hyp = FaultHypothesis {
+            events: vec![send],
+            total_cost: 2,
+            explanation: String::new(),
+        };
+        assert_eq!(
+            hypothesis_to_schedule(&hyp, &journal),
+            vec![SimFault::Duplicate { send }]
+        );
+    }
+
+    #[test]
+    fn unmarked_send_maps_to_triple() {
+        let mut journal = Journal::new();
+        let send = journal
+            .append(
+                EntryKind::Send,
+                ActorId(1),
+                [],
+                EntryPayload::Send(ledger_format::SendFrame {
+                    message_id: ledger_format::MessageId::new(ActorId(1), 0),
+                    from: ActorId(1),
+                    to: ActorId(2),
+                    original_content: 7u64.to_le_bytes().to_vec(),
+                }),
+            )
+            .expect("append must succeed");
+        let hyp = FaultHypothesis {
+            events: vec![send],
+            total_cost: 2,
+            explanation: String::new(),
+        };
+        let schedule = hypothesis_to_schedule(&hyp, &journal);
+        assert_eq!(schedule.len(), 3, "unmarked sends keep the triple");
+        assert!(schedule.contains(&SimFault::Drop(send)));
+    }
+
+    #[test]
+    fn duplicate_detector_ignores_mismatched_message() {
+        let (mut journal, _) = duplicate_journal();
+        journal
+            .append(
+                EntryKind::Fault,
+                ActorId(1),
+                [],
+                EntryPayload::Fault(ledger_format::FaultPayload::DuplicateMessage {
+                    message_id: ledger_format::MessageId::new(ActorId(9), 9),
+                    copy_ordinal: 1,
+                }),
+            )
+            .expect("append must succeed");
+        let marked = crate::lineage::duplicate_senders(&journal);
+        assert_eq!(marked.len(), 1, "only the matching send marks");
     }
 }

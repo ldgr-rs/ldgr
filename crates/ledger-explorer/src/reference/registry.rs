@@ -230,6 +230,7 @@ pub fn scenario_class(name: &str) -> Option<ScenarioClass> {
         "mini-cloud-dual-region-commit" => Some(ScenarioClass::CloudInfra),
         "mini-cloud-canary-promote" => Some(ScenarioClass::CloudInfra),
         "mini-cloud-duplicate-redelivery" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-duplicate-delivery" => Some(ScenarioClass::CloudInfra),
         _ => None,
     }
 }

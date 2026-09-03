@@ -295,6 +295,42 @@ impl LineageIndex {
     }
 }
 
+/// Sends with journaled duplicate evidence: a `Fault(DuplicateMessage)`
+/// entry names a message id, and at least one `Send` with that id exists.
+///
+/// The mapping layer replays these sends with `SimFault::Duplicate` instead
+/// of the Drop/Delay/Partition triple: the witness already shows the extra
+/// delivery, so re-injection is the most specific reproduction. Sends
+/// without this evidence map exactly as before.
+pub fn duplicate_senders(journal: &Journal) -> BTreeSet<EntryHash> {
+    use ledger_format::{EntryKind, EntryPayload};
+    let mut send_ids: std::collections::HashMap<ledger_format::MessageId, EntryHash> =
+        std::collections::HashMap::new();
+    for entry in journal.entries() {
+        if entry.data.kind == EntryKind::Send
+            && let EntryPayload::Send(frame) = &entry.data.payload
+        {
+            send_ids.entry(frame.message_id).or_insert(entry.id);
+        }
+    }
+    let mut marked = BTreeSet::new();
+    for entry in journal.entries() {
+        if entry.data.kind != EntryKind::Fault {
+            continue;
+        }
+        let EntryPayload::Fault(ledger_format::FaultPayload::DuplicateMessage {
+            message_id, ..
+        }) = &entry.data.payload
+        else {
+            continue;
+        };
+        if let Some(send) = send_ids.get(message_id) {
+            marked.insert(*send);
+        }
+    }
+    marked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,15 +1,16 @@
 //! Fault-triggered corpus v2: the counted Stage-2 non-vacuous scenario set.
 //!
-//! Every scenario is a fault-dependent storage-semantics plant: the no-fault
-//! baseline at the pinned seed passes, and only the pinned fault schedule on
-//! the critical write causes the violation. The cut names the faulted write
-//! and strict replay with the cut reproduces.
+//! Every scenario is a fault-dependent plant: the no-fault baseline at the
+//! pinned seed passes, and only the pinned fault schedule causes the
+//! violation. Most scenarios are single-task storage semantics; the
+//! duplicate-delivery scenario is a two-task message pass. The cut names
+//! the faulted event and strict replay with the cut reproduces.
 //!
 //! Each scenario pins three derivations from its no-fault baseline journal:
 //! `trigger`, `fault_space`, and `support` (evaluated on the witness).
 //!
-//! Decoys widen the fault space; programs are single-task and deterministic,
-//! so the baseline journal is identical at every seed.
+//! Decoys widen the fault space; programs are deterministic, so the
+//! baseline journal is identical at every seed.
 
 use super::ScenarioClass;
 use crate::oracle::{Oracle, PropertyOracle};
@@ -201,6 +202,63 @@ fn final_value_oracle(expected: u64, name: &'static str) -> Box<dyn Oracle> {
         property: move |journal: &Journal| super::outcome_values(journal).last() == Some(&expected),
         name: name.to_string(),
     })
+}
+
+/// First `Send` of `actor`: the critical send the read-back observes.
+fn first_send(baseline: &Journal, actor: ledger_format::ActorId) -> ledger_format::EntryHash {
+    baseline
+        .entries()
+        .find(|entry| {
+            entry.data.kind == ledger_format::EntryKind::Send && entry.data.actor == actor
+        })
+        .map(|entry| entry.id)
+        .unwrap_or_else(|| panic!("probe journal must contain a Send of actor {actor:?}"))
+}
+
+/// Declared vocabulary: one Drop, Delay, and Duplicate candidate per `Send`
+/// of the baseline. Parent edges never imply support; the encoding
+/// traverses the declared support.
+fn message_fault_space(seed: EntryHash, workload: &dyn Workload) -> Vec<SimFault> {
+    let journal = probe_journal(seed, workload);
+    journal
+        .entries()
+        .filter(|entry| entry.data.kind == ledger_format::EntryKind::Send)
+        .flat_map(|entry| {
+            let send = entry.id;
+            vec![
+                SimFault::Drop(send),
+                SimFault::Delay { send, ticks: 1 },
+                SimFault::Duplicate { send },
+            ]
+        })
+        .collect()
+}
+
+/// Oracle: exactly one numeric outcome holding `expected`.
+fn exactly_one_outcome_oracle(expected: u64, name: &'static str) -> Box<dyn Oracle> {
+    Box::new(PropertyOracle {
+        property: move |journal: &Journal| super::outcome_values(journal) == vec![expected],
+        name: name.to_string(),
+    })
+}
+
+/// Support: every send observed by any receive in the witness journal.
+fn support_observed_sends(journal: &Journal) -> SupportExpr {
+    let mut sends = std::collections::BTreeSet::new();
+    for entry in journal.entries() {
+        if entry.data.kind != ledger_format::EntryKind::Recv {
+            continue;
+        }
+        for parent in entry.data.parents.iter() {
+            if journal
+                .get(parent)
+                .is_some_and(|send| send.data.kind == ledger_format::EntryKind::Send)
+            {
+                sends.insert(*parent);
+            }
+        }
+    }
+    all_of_ids(sends)
 }
 
 fn support_last_fs_write(journal: &Journal, actor: ledger_format::ActorId) -> SupportExpr {
@@ -466,6 +524,46 @@ fn canary_promote() -> Box<dyn Workload> {
     )
 }
 
+/// Duplicate delivery: one critical send, decoy chatter, two receives.
+/// Without a fault the second receive blocks, so the baseline journals
+/// exactly one outcome. A duplicate transmission unblocks it and the second
+/// outcome violates exactly-once.
+///
+/// Decoys go to a third actor that never receives: they widen the declared
+/// fault space (diluting the random control) without entering support
+/// (unobserved sends never rank) and without touching the oracle (their
+/// duplicates sit queued, outcomes stay `[7]`).
+fn duplicate_delivery() -> Box<dyn Workload> {
+    struct W;
+    impl Workload for W {
+        fn programs(&self) -> Vec<Vec<ledger_sim::Instruction>> {
+            let mut sender = vec![ledger_sim::Instruction::Send { to: 1, payload: 7 }];
+            for index in 0..34u64 {
+                sender.push(ledger_sim::Instruction::Send {
+                    to: 2,
+                    payload: index,
+                });
+            }
+            sender.push(ledger_sim::Instruction::Done);
+            vec![
+                sender,
+                vec![
+                    ledger_sim::Instruction::Receive,
+                    ledger_sim::Instruction::Outcome,
+                    ledger_sim::Instruction::Receive,
+                    ledger_sim::Instruction::Outcome,
+                    ledger_sim::Instruction::Done,
+                ],
+                vec![ledger_sim::Instruction::Done],
+            ]
+        }
+        fn history(&self, _run: &RunResult) -> Vec<crate::oracle::HistoryOperation> {
+            Vec::new()
+        }
+    }
+    Box::new(W)
+}
+
 /// Duplicate redelivery: at-least-once redelivery without an idempotent
 /// apply marker executes twice, so the read-back observes the torn marker.
 /// Mirrors the simplest dedup workload: decoys, one critical marker write,
@@ -656,6 +754,20 @@ fn redelivery_space() -> Vec<SimFault> {
     write_fault_space(EntryHash([30; 32]), duplicate_redelivery().as_ref())
 }
 
+fn delivery_trigger(baseline: &Journal) -> Vec<SimFault> {
+    vec![SimFault::Duplicate {
+        send: first_send(baseline, ledger_format::ActorId(0)),
+    }]
+}
+
+fn delivery_support(journal: &Journal) -> SupportExpr {
+    support_observed_sends(journal)
+}
+
+fn delivery_space() -> Vec<SimFault> {
+    message_fault_space(EntryHash([31; 32]), duplicate_delivery().as_ref())
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -772,6 +884,16 @@ pub fn faultdep_scenarios() -> Vec<FaultDepScenario> {
             fault_space: redelivery_space,
             trigger: redelivery_trigger,
             support: redelivery_support,
+        },
+        FaultDepScenario {
+            name: "mini-cloud-duplicate-delivery",
+            base_seed: EntryHash([31; 32]),
+            class: ScenarioClass::CloudInfra,
+            workload: duplicate_delivery,
+            oracle: || exactly_one_outcome_oracle(7, "one send must journal one outcome"),
+            fault_space: delivery_space,
+            trigger: delivery_trigger,
+            support: delivery_support,
         },
     ]
 }
