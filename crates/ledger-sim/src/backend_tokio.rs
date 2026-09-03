@@ -5,7 +5,7 @@ use crate::effects::{Effects, Fs, Net};
 use crate::net::{Message, SimNet};
 use crate::simfs::SimFs;
 use crate::time::Clock;
-use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, StreamId};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, FaultPayload, StreamId};
 use ledger_journal::{Journal, JournalError};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -251,10 +251,14 @@ impl TokioBackend {
     fn append(
         &self,
         kind: EntryKind,
-        parents: impl IntoIterator<Item = Hash>,
+        parents: impl IntoIterator<Item = EntryHash>,
         payload: EntryPayload,
-    ) -> Option<Hash> {
-        match self.journal.borrow_mut().append(kind, 0, parents, payload) {
+    ) -> Option<EntryHash> {
+        match self
+            .journal
+            .borrow_mut()
+            .append(kind, ActorId(0), parents, payload)
+        {
             Ok(id) => Some(id),
             Err(error) => {
                 // First-wins, matching the executor slot contract: the first
@@ -349,8 +353,8 @@ impl Net for TokioBackend {
             [],
             EntryPayload::Send(ledger_format::SendFrame {
                 message_id: message.message_id,
-                from: message.from as ActorId,
-                to: message.to as ActorId,
+                from: ActorId(message.from as u32),
+                to: ActorId(message.to as u32),
                 original_content: message.content.clone(),
             }),
         ) else {
@@ -369,8 +373,8 @@ impl Net for TokioBackend {
             [message.send_id],
             EntryPayload::Recv(ledger_format::RecvFrame {
                 message_id: message.message_id,
-                from: message.from as ActorId,
-                to: task as ActorId,
+                from: ActorId(message.from as u32),
+                to: ActorId(task as u32),
                 observed_content: message.content.clone(),
             }),
         );
@@ -383,22 +387,22 @@ impl Net for TokioBackend {
 }
 
 impl Fs for TokioBackend {
-    fn write(&self, path: &str, value: u64) -> Result<Hash, crate::effects::FsError> {
+    fn write(&self, path: &str, value: u64) -> Result<EntryHash, crate::effects::FsError> {
         let mut journal = self.journal.borrow_mut();
         let mut fs = self.fs.borrow_mut();
-        Ok(fs.write(&mut journal, 0, path, value)?)
+        Ok(fs.write(&mut journal, ActorId(0), path, value)?)
     }
 
-    fn fsync(&self) -> Result<Hash, crate::effects::FsError> {
+    fn fsync(&self) -> Result<EntryHash, crate::effects::FsError> {
         let mut journal = self.journal.borrow_mut();
         let mut fs = self.fs.borrow_mut();
-        Ok(fs.fsync(&mut journal, 0)?)
+        Ok(fs.fsync(&mut journal, ActorId(0))?)
     }
 
     fn read(&self, path: &str) -> Result<Option<u64>, crate::effects::FsError> {
         let mut journal = self.journal.borrow_mut();
         let fs = self.fs.borrow();
-        Ok(fs.read(&mut journal, 0, path)?)
+        Ok(fs.read(&mut journal, ActorId(0), path)?)
     }
 
     fn crash(&self) {
@@ -406,7 +410,7 @@ impl Fs for TokioBackend {
             EntryKind::Fault,
             [],
             EntryPayload::Fault(FaultPayload::CrashActor {
-                actor: 0,
+                actor: ActorId(0),
                 crash_operation: ledger_format::CrashOperation::DropAllUnsynced,
             }),
         );
@@ -431,8 +435,8 @@ mod tests {
                 from: 0,
                 to: 1,
                 content: 7u64.to_le_bytes().to_vec(),
-                message_id: ledger_format::MessageId::new(0, 0),
-                send_id: [0; 32],
+                message_id: ledger_format::MessageId::new(ActorId(0), 0),
+                send_id: ledger_format::EntryHash([0; 32]),
                 deliver_at: now,
             }));
             assert_eq!(backend.net().recv(1, now).map(|m| m.payload()), Some(7));

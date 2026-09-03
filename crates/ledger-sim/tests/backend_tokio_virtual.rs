@@ -62,8 +62,12 @@ fn virtual_override_clock_and_rng_deterministic() {
     // RNG must be deterministic: two backends with same seed produce same sequence.
     let mut backend_a = TokioBackend::new();
     let mut backend_b = TokioBackend::new();
-    let seq_a: Vec<u64> = (0..5).map(|_| backend_a.rng(0).next_u64()).collect();
-    let seq_b: Vec<u64> = (0..5).map(|_| backend_b.rng(0).next_u64()).collect();
+    let seq_a: Vec<u64> = (0..5)
+        .map(|_| backend_a.rng(ledger_format::StreamId(0)).next_u64())
+        .collect();
+    let seq_b: Vec<u64> = (0..5)
+        .map(|_| backend_b.rng(ledger_format::StreamId(0)).next_u64())
+        .collect();
     assert_eq!(
         seq_a, seq_b,
         "RNG sequences must be identical for same seed"

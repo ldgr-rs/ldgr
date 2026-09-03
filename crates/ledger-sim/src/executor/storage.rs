@@ -7,7 +7,7 @@
 //! [`ExecutorShared::journal_error`] and surfaces through
 //! [`crate::runtime::RunResult::journal_error`] at run end.
 use super::ExecutorShared;
-use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 use ledger_journal::BatchEntry;
 
 impl ExecutorShared {
@@ -36,9 +36,9 @@ impl ExecutorShared {
         &self,
         actor: ActorId,
         kind: EntryKind,
-        parents: impl IntoIterator<Item = Hash>,
+        parents: impl IntoIterator<Item = EntryHash>,
         payload: EntryPayload,
-    ) -> Result<Hash, ledger_journal::JournalError> {
+    ) -> Result<EntryHash, ledger_journal::JournalError> {
         let id = self
             .journal
             .borrow_mut()
@@ -58,7 +58,7 @@ impl ExecutorShared {
     pub(crate) fn journal_append_batch(
         &self,
         batch: Vec<BatchEntry>,
-    ) -> Result<Vec<Hash>, ledger_journal::JournalError> {
+    ) -> Result<Vec<EntryHash>, ledger_journal::JournalError> {
         let actors: Vec<ActorId> = batch.iter().map(|entry| entry.actor).collect();
         let ids = self.journal.borrow_mut().append_batch(batch)?;
         let mut coverage = self.coverage.borrow_mut();
@@ -71,7 +71,7 @@ impl ExecutorShared {
     /// Hash the vector-clock shape of a journaled entry into a stable u64.
     ///
     /// Returns `None` when the entry is absent from the journal.
-    fn entry_vc_signature(&self, id: Hash) -> Option<u64> {
+    fn entry_vc_signature(&self, id: EntryHash) -> Option<u64> {
         let journal = self.journal.borrow();
         let entry = journal.get(&id)?;
         let digest = blake3::hash(&entry.vector_clock.encode());
@@ -90,7 +90,7 @@ impl ExecutorShared {
         actor: ActorId,
         kind: EntryKind,
         task_id: usize,
-        entry_id: Option<Hash>,
+        entry_id: Option<EntryHash>,
     ) {
         let bandit_active = self.scheduler.borrow().novelty_active();
         if !bandit_active {

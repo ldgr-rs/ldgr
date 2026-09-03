@@ -7,21 +7,24 @@
 //! ```
 //!
 //! The outer array carries the format version as its first item and the field
-//! map as its second. The map has exactly ten keys, all unconditionally
-//! present; the encoder emits them in canonical key order and the decoder
-//! rejects any unsorted, duplicate, unknown, or missing key.
+//! map as its second. The map has exactly thirteen keys, ten required and
+//! three optional with defaults; the encoder emits them in canonical key
+//! order and the decoder rejects any unsorted, duplicate, or unknown key and
+//! any missing required key.
 //!
 //! Canonical key order (RFC 8949 section 4.2.3: encoded key length, then
 //! bytewise):
 //!
 //! ```text
 //! dns, seed, links, swarm, policy, monitor, max_steps,
-//! fs_journaling, dropped_events, fault_schedule
+//! reorder_draw, fs_journaling, dropped_events, fault_schedule,
+//! max_file_extent, max_resident_bytes
 //! ```
 //!
-//! The 13-byte `fs_journaling` key precedes the 14-byte `dropped_events` and
-//! `fault_schedule` keys even though `d` sorts before `f` bytewise; encoded
-//! length dominates the comparison.
+//! The 12-byte `reorder_draw` key precedes the 13-byte `fs_journaling` key,
+//! which precedes the 14-byte `dropped_events` and `fault_schedule` keys even
+//! though `d` sorts before `f` bytewise; encoded length dominates the
+//! comparison.
 //!
 //! Field encodings:
 //!
@@ -30,7 +33,9 @@
 //! seed            := bytes(32)
 //! links           := [ [ unsigned from, unsigned to,
 //!                        [ unsigned base_delay, unsigned jitter,
-//!                          float loss_probability, unsigned reorder_window ] ], ... ]
+//!                          float loss_probability, unsigned reorder_window
+//!                          (, null | unsigned capacity,
+//!                             unsigned queue_policy)? ] ], ... ]
 //! swarm           := [ float drop_probability, float delay_probability,
 //!                      unsigned max_delay_ticks, float crash_probability,
 //!                      unsigned fault_classes_per_run ]
@@ -40,7 +45,22 @@
 //! dropped_events  := [ bytes(32), ... ]
 //! fs_journaling   := null | unsigned mode      (0 = writeback, 1 = ordered, 2 = data)
 //! fault_schedule  := [ [ unsigned tag, ...payload ], ... ]
+//! reorder_draw    := bool                      (optional, default false)
+//! max_file_extent := null | unsigned           (optional, default null)
+//! max_resident_bytes := null | unsigned        (optional, default null)
 //! ```
+//!
+//! Link capacity encoding: a link with the default bounded-queue config
+//! (`capacity` none, `queue_policy` drop) encodes as the historical 4-item
+//! array, byte-identical to format-version-1 documents written before bounded
+//! queues existed. A link with a bound or a non-default policy encodes as a
+//! 6-item array with `capacity` (`null` for explicit unbounded, unsigned
+//! otherwise) and `queue_policy` (`0` drop, `1` block) appended. The decoder
+//! accepts 4 (defaults) or 6 (explicit) and rejects any other length, so a
+//! configured capacity always changes the canonical bytes and therefore the
+//! [`canonical_hash`] digest.
+//!
+//! Queue policy tags: `0` drop, `1` block.
 //!
 //! Policy tags and payloads:
 //!
@@ -80,7 +100,7 @@
 //! CBOR integers; the decoder converts with checked `try_from` so the bytes
 //! are portable across pointer widths.
 
-use ledger_format::{CborError, CborValue, Hash};
+use ledger_format::{ActorId, CborError, CborValue, EntryHash};
 
 use crate::config::{Policy, Probability, RunConfig, SimFault, SwarmConfig};
 use crate::net::LinkConfig;
@@ -139,6 +159,10 @@ pub enum ConfigCanonicalError {
     /// saturates as a direct-construction fallback, but the canonical codec
     /// rejects the value outright.
     InvalidLinkJitter(u64),
+    /// A link reorder window exceeds the representable bound.
+    InvalidReorderWindow(usize),
+    /// A link queue-policy tag is not `0` (drop) or `1` (block).
+    InvalidQueuePolicyTag(u64),
     /// A DNS name exceeds [`MAX_DNS_NAME_LEN`] bytes.
     DnsNameTooLong(usize),
     /// Two DNS entries carry the same name; the table would collapse them.
@@ -180,6 +204,12 @@ impl core::fmt::Display for ConfigCanonicalError {
             ),
             Self::InvalidLinkJitter(ticks) => {
                 write!(f, "links.jitter {ticks} has no representable draw modulus")
+            }
+            Self::InvalidReorderWindow(window) => {
+                write!(f, "links.reorder_window {window} exceeds the bound")
+            }
+            Self::InvalidQueuePolicyTag(tag) => {
+                write!(f, "unknown links.queue_policy tag: {tag}")
             }
             Self::DnsNameTooLong(len) => {
                 write!(f, "DNS name exceeds {MAX_DNS_NAME_LEN} bytes, got {len}")
@@ -382,9 +412,9 @@ fn take_field<T>(field: Option<T>, name: &'static str) -> Result<T, ConfigCanoni
 /// # Errors
 /// Returns [`ConfigCanonicalError`] when [`to_canonical_bytes`] rejects the
 /// config.
-pub fn canonical_hash(config: &RunConfig) -> Result<Hash, ConfigCanonicalError> {
+pub fn canonical_hash(config: &RunConfig) -> Result<EntryHash, ConfigCanonicalError> {
     let bytes = to_canonical_bytes(config)?;
-    Ok(*blake3::hash(&bytes).as_bytes())
+    Ok(EntryHash(*blake3::hash(&bytes).as_bytes()))
 }
 
 fn fields(config: &RunConfig) -> Result<Vec<(CborValue, CborValue)>, ConfigCanonicalError> {
@@ -400,7 +430,7 @@ fn fields(config: &RunConfig) -> Result<Vec<(CborValue, CborValue)>, ConfigCanon
             })
             .collect(),
     );
-    let seed = CborValue::Bytes(config.seed().to_vec());
+    let seed = CborValue::Bytes(config.seed().0.to_vec());
     let links = CborValue::Array(
         config
             .links()
@@ -422,7 +452,7 @@ fn fields(config: &RunConfig) -> Result<Vec<(CborValue, CborValue)>, ConfigCanon
         config
             .dropped_events()
             .iter()
-            .map(|hash| CborValue::Bytes(hash.to_vec()))
+            .map(|hash| CborValue::Bytes(hash.0.to_vec()))
             .collect(),
     );
     let fs_journaling = fs_journaling_value(config);
@@ -479,12 +509,35 @@ fn link_value(link: &LinkConfig) -> Result<CborValue, ConfigCanonicalError> {
     if link.jitter == u64::MAX {
         return Err(ConfigCanonicalError::InvalidLinkJitter(link.jitter));
     }
-    Ok(CborValue::Array(vec![
+    if link.reorder_window > crate::net::MAX_REORDER_WINDOW {
+        return Err(ConfigCanonicalError::InvalidReorderWindow(
+            link.reorder_window,
+        ));
+    }
+    let mut items = vec![
         CborValue::Unsigned(link.base_delay),
         CborValue::Unsigned(link.jitter),
         float(link.loss_probability.get(), "links.loss_probability")?,
         CborValue::Unsigned(u64_of_usize(link.reorder_window)),
-    ]))
+    ];
+    // Default bounded-queue config keeps the historical 4-item shape so
+    // existing documents stay byte-identical. Any bound or non-drop policy
+    // appends the capacity and policy, which then join the canonical hash.
+    let is_default_queue =
+        link.capacity.is_none() && link.queue_policy == crate::net::QueueFullPolicy::Drop;
+    if !is_default_queue {
+        let capacity = match link.capacity {
+            Some(cap) => CborValue::Unsigned(u64_of_usize(cap)),
+            None => CborValue::Null,
+        };
+        let policy = match link.queue_policy {
+            crate::net::QueueFullPolicy::Drop => CborValue::Unsigned(0),
+            crate::net::QueueFullPolicy::Block => CborValue::Unsigned(1),
+        };
+        items.push(capacity);
+        items.push(policy);
+    }
+    Ok(CborValue::Array(items))
 }
 
 fn swarm_value(swarm: &SwarmConfig) -> Result<CborValue, ConfigCanonicalError> {
@@ -524,30 +577,32 @@ fn policy_value(policy: &Policy) -> Result<CborValue, ConfigCanonicalError> {
 
 fn fault_value(fault: &SimFault) -> Result<CborValue, ConfigCanonicalError> {
     Ok(match fault {
-        SimFault::Drop(id) => {
-            CborValue::Array(vec![CborValue::Unsigned(0), CborValue::Bytes(id.to_vec())])
-        }
+        SimFault::Drop(id) => CborValue::Array(vec![
+            CborValue::Unsigned(0),
+            CborValue::Bytes(id.0.to_vec()),
+        ]),
         SimFault::Delay { send, ticks } => CborValue::Array(vec![
             CborValue::Unsigned(1),
-            CborValue::Bytes(send.to_vec()),
+            CborValue::Bytes(send.0.to_vec()),
             CborValue::Unsigned(*ticks),
         ]),
         SimFault::Partition { src, dst } => CborValue::Array(vec![
             CborValue::Unsigned(2),
-            CborValue::Unsigned(u64::from(*src)),
-            CborValue::Unsigned(u64::from(*dst)),
+            CborValue::Unsigned(u64::from(src.0)),
+            CborValue::Unsigned(u64::from(dst.0)),
         ]),
-        SimFault::Crash(id) => {
-            CborValue::Array(vec![CborValue::Unsigned(3), CborValue::Bytes(id.to_vec())])
-        }
+        SimFault::Crash(id) => CborValue::Array(vec![
+            CborValue::Unsigned(3),
+            CborValue::Bytes(id.0.to_vec()),
+        ]),
         SimFault::Corrupt { write, xor_mask } => CborValue::Array(vec![
             CborValue::Unsigned(4),
-            CborValue::Bytes(write.to_vec()),
+            CborValue::Bytes(write.0.to_vec()),
             CborValue::Unsigned(*xor_mask),
         ]),
         SimFault::CrashState { write, state } => CborValue::Array(vec![
             CborValue::Unsigned(5),
-            CborValue::Bytes(write.to_vec()),
+            CborValue::Bytes(write.0.to_vec()),
             CborValue::Unsigned(*state),
         ]),
     })
@@ -643,14 +698,14 @@ fn probability_of(
     }
 }
 
-fn decode_hash(value: &CborValue, field: &'static str) -> Result<Hash, ConfigCanonicalError> {
+fn decode_hash(value: &CborValue, field: &'static str) -> Result<EntryHash, ConfigCanonicalError> {
     match value {
-        CborValue::Bytes(bytes) => <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-            ConfigCanonicalError::InvalidHashLength {
+        CborValue::Bytes(bytes) => <[u8; 32]>::try_from(bytes.as_slice())
+            .map(EntryHash)
+            .map_err(|_| ConfigCanonicalError::InvalidHashLength {
                 field,
                 len: bytes.len(),
-            }
-        }),
+            }),
         _ => Err(ConfigCanonicalError::WrongFieldType(field)),
     }
 }
@@ -658,7 +713,7 @@ fn decode_hash(value: &CborValue, field: &'static str) -> Result<Hash, ConfigCan
 fn decode_hash_list(
     value: &CborValue,
     field: &'static str,
-) -> Result<Vec<Hash>, ConfigCanonicalError> {
+) -> Result<Vec<EntryHash>, ConfigCanonicalError> {
     let CborValue::Array(items) = value else {
         return Err(ConfigCanonicalError::WrongFieldType(field));
     };
@@ -740,11 +795,38 @@ fn decode_link(value: &CborValue) -> Result<(usize, usize, LinkConfig), ConfigCa
     let CborValue::Array(link_items) = &items[2] else {
         return Err(ConfigCanonicalError::WrongFieldType("links"));
     };
-    expect_len(link_items, 4, "links")?;
+    if link_items.len() != 4 && link_items.len() != 6 {
+        return Err(ConfigCanonicalError::WrongFieldType("links"));
+    }
     let jitter = u64_of(&link_items[1], "links.jitter")?;
     if jitter == u64::MAX {
         return Err(ConfigCanonicalError::InvalidLinkJitter(jitter));
     }
+    let reorder_window = usize_of(&link_items[3], "links.reorder_window")?;
+    if reorder_window > crate::net::MAX_REORDER_WINDOW {
+        return Err(ConfigCanonicalError::InvalidReorderWindow(reorder_window));
+    }
+    let (capacity, queue_policy) = if link_items.len() == 4 {
+        (None, crate::net::QueueFullPolicy::Drop)
+    } else {
+        let capacity = match &link_items[4] {
+            CborValue::Null => None,
+            CborValue::Unsigned(cap) => Some(
+                usize::try_from(*cap)
+                    .map_err(|_| ConfigCanonicalError::IntegerOutOfRange("links.capacity"))?,
+            ),
+            _ => return Err(ConfigCanonicalError::WrongFieldType("links.capacity")),
+        };
+        let queue_policy = match &link_items[5] {
+            CborValue::Unsigned(0) => crate::net::QueueFullPolicy::Drop,
+            CborValue::Unsigned(1) => crate::net::QueueFullPolicy::Block,
+            CborValue::Unsigned(tag) => {
+                return Err(ConfigCanonicalError::InvalidQueuePolicyTag(*tag));
+            }
+            _ => return Err(ConfigCanonicalError::WrongFieldType("links.queue_policy")),
+        };
+        (capacity, queue_policy)
+    };
     Ok((
         usize_of(&items[0], "links.from")?,
         usize_of(&items[1], "links.to")?,
@@ -752,7 +834,9 @@ fn decode_link(value: &CborValue) -> Result<(usize, usize, LinkConfig), ConfigCa
             base_delay: u64_of(&link_items[0], "links.base_delay")?,
             jitter,
             loss_probability: probability_of(&link_items[2], "links.loss_probability")?,
-            reorder_window: usize_of(&link_items[3], "links.reorder_window")?,
+            reorder_window,
+            capacity,
+            queue_policy,
         },
     ))
 }
@@ -813,8 +897,8 @@ fn decode_fault(value: &CborValue) -> Result<SimFault, ConfigCanonicalError> {
         2 => {
             expect_len(rest, 2, "fault_schedule")?;
             Ok(SimFault::Partition {
-                src: u32_of(&rest[0], "fault_schedule.partition.src")?,
-                dst: u32_of(&rest[1], "fault_schedule.partition.dst")?,
+                src: ActorId(u32_of(&rest[0], "fault_schedule.partition.src")?),
+                dst: ActorId(u32_of(&rest[1], "fault_schedule.partition.dst")?),
             })
         }
         3 => {
@@ -1308,6 +1392,8 @@ mod probability_tests {
                                         jitter: 0,
                                         loss_probability: Probability::new(loss).unwrap(),
                                         reorder_window: 0,
+                                        capacity: None,
+                                        queue_policy: crate::net::QueueFullPolicy::Drop,
                                     },
                                 )])
                                 .policy(crate::config::Policy::Bandit {
@@ -1333,5 +1419,155 @@ mod probability_tests {
             let bytes2 = to_canonical_bytes(&decoded).expect("re-encodes");
             assert_eq!(bytes, bytes2);
         }
+    }
+
+    #[test]
+    fn document_holds_thirteen_keys_in_canonical_order() {
+        use ledger_format::CborValue;
+        let bytes = to_canonical_bytes(&crate::config::RunConfig::default()).expect("encodes");
+        let document = CborValue::from_canonical_bytes(&bytes).expect("canonical bytes decode");
+        let CborValue::Array(items) = document else {
+            panic!("document is [version, map]");
+        };
+        assert_eq!(items.len(), 2);
+        let CborValue::Map(fields) = &items[1] else {
+            panic!("second item is the field map");
+        };
+        let names: Vec<String> = fields
+            .iter()
+            .map(|(key, _)| match key {
+                CborValue::Text(name) => name.clone(),
+                _ => panic!("field key is text"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "dns",
+                "seed",
+                "links",
+                "swarm",
+                "policy",
+                "monitor",
+                "max_steps",
+                "reorder_draw",
+                "fs_journaling",
+                "dropped_events",
+                "fault_schedule",
+                "max_file_extent",
+                "max_resident_bytes",
+            ]
+        );
+        assert_eq!(fields.len(), 13, "ten required plus three optional");
+    }
+
+    #[test]
+    fn bounded_capacity_round_trips_and_joins_the_hash() {
+        use crate::net::{LinkConfig, QueueFullPolicy};
+        let base = crate::config::RunConfig::builder()
+            .links(vec![(
+                0,
+                1,
+                LinkConfig {
+                    reorder_window: 2,
+                    ..LinkConfig::default()
+                },
+            )])
+            .build();
+        let bounded = crate::config::RunConfig::builder()
+            .links(vec![(
+                0,
+                1,
+                LinkConfig {
+                    reorder_window: 2,
+                    capacity: Some(4),
+                    queue_policy: QueueFullPolicy::Block,
+                    ..LinkConfig::default()
+                },
+            )])
+            .build();
+        let base_bytes = to_canonical_bytes(&base).expect("base encodes");
+        let bounded_bytes = to_canonical_bytes(&bounded).expect("bounded encodes");
+        assert_ne!(
+            base_bytes, bounded_bytes,
+            "capacity must join the canonical bytes"
+        );
+        assert_ne!(
+            canonical_hash(&base).expect("hash"),
+            canonical_hash(&bounded).expect("hash"),
+            "capacity must join the boundary hash"
+        );
+        let decoded = from_canonical_bytes(&bounded_bytes).expect("decodes");
+        assert_eq!(decoded.links(), bounded.links());
+        assert_eq!(
+            to_canonical_bytes(&decoded).expect("re-encodes"),
+            bounded_bytes
+        );
+        // Default queue config stays byte-identical to the 4-item shape.
+        let plain = crate::config::RunConfig::builder()
+            .links(vec![(0, 1, LinkConfig::default())])
+            .build();
+        let plain_bytes = to_canonical_bytes(&plain).expect("encodes");
+        let decoded = from_canonical_bytes(&plain_bytes).expect("decodes");
+        assert_eq!(decoded.links()[0].2.capacity, None);
+        assert_eq!(decoded.links()[0].2.queue_policy, QueueFullPolicy::Drop);
+    }
+
+    #[test]
+    fn canonical_rejects_oversized_window_and_bad_policy() {
+        use crate::net::{LinkConfig, MAX_REORDER_WINDOW};
+        let bad = crate::config::RunConfig::builder()
+            .links(vec![(
+                0,
+                1,
+                LinkConfig {
+                    reorder_window: MAX_REORDER_WINDOW + 1,
+                    ..LinkConfig::default()
+                },
+            )])
+            .build();
+        assert_eq!(
+            to_canonical_bytes(&bad).expect_err("oversized window"),
+            ConfigCanonicalError::InvalidReorderWindow(MAX_REORDER_WINDOW + 1)
+        );
+        // Craft a 6-item link with an unknown queue-policy tag.
+        let link = CborValue::Array(vec![
+            CborValue::Unsigned(0),
+            CborValue::Unsigned(0),
+            CborValue::Array(vec![
+                CborValue::Unsigned(0),
+                CborValue::Unsigned(0),
+                CborValue::Float(0.0),
+                CborValue::Unsigned(0),
+                CborValue::Null,
+                CborValue::Unsigned(7),
+            ]),
+        ]);
+        let mut fields = minimal_fields();
+        set_field(&mut fields, "links", CborValue::Array(vec![link]));
+        let bytes = craft_document(fields);
+        assert_eq!(
+            from_canonical_bytes(&bytes).expect_err("bad policy tag"),
+            ConfigCanonicalError::InvalidQueuePolicyTag(7)
+        );
+        // A 5-item link array is neither legacy (4) nor extended (6).
+        let short = CborValue::Array(vec![
+            CborValue::Unsigned(0),
+            CborValue::Unsigned(1),
+            CborValue::Array(vec![
+                CborValue::Unsigned(0),
+                CborValue::Unsigned(0),
+                CborValue::Float(0.0),
+                CborValue::Unsigned(0),
+                CborValue::Null,
+            ]),
+        ]);
+        let mut fields = minimal_fields();
+        set_field(&mut fields, "links", CborValue::Array(vec![short]));
+        let bytes = craft_document(fields);
+        assert_eq!(
+            from_canonical_bytes(&bytes).expect_err("5-item link"),
+            ConfigCanonicalError::WrongFieldType("links")
+        );
     }
 }

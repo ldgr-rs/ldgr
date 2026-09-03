@@ -48,7 +48,7 @@ use crate::seedtree::SeedTree;
 use crate::time::Clock;
 use crate::wasi_fs::{WasiFdTable, bytes_to_u64};
 use futures::executor::block_on;
-use ledger_format::{ActorId, EntryKind, EntryPayload, Hash, StreamId};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, StreamId};
 use ledger_journal::{Journal, JournalError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::Rng;
@@ -69,7 +69,7 @@ const NS_PER_TICK: u64 = 1_000;
 /// Every `random_get` call journals one `RngDraw` entry on this stream; the
 /// payload records the number of bytes requested. The value is high enough to
 /// stay clear of application streams.
-pub const WASI_RANDOM_STREAM: StreamId = 0xF000;
+pub const WASI_RANDOM_STREAM: StreamId = StreamId(0xF000);
 
 /// Upper bound on the iovec count of one wasm `fd_write` or `fd_read` call.
 ///
@@ -199,7 +199,7 @@ impl WasiJournal {
     fn append(
         &self,
         kind: EntryKind,
-        parents: impl IntoIterator<Item = Hash>,
+        parents: impl IntoIterator<Item = EntryHash>,
         payload: EntryPayload,
     ) {
         let mut journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
@@ -599,7 +599,11 @@ impl WasmBackend {
             "ledger",
             "ledger_rng_u64",
             |mut caller: Caller<'_, WasmStoreData>, stream: u32| -> u64 {
-                caller.data_mut().effects.rng(stream).next_u64()
+                caller
+                    .data_mut()
+                    .effects
+                    .rng(ledger_format::StreamId(stream))
+                    .next_u64()
             },
         )?;
 
@@ -645,11 +649,11 @@ impl WasmBackend {
                 let now = caller.data().effects.clock().now();
                 let from = caller.data().effects.actor();
                 let accepted = caller.data().effects.net().send(Message {
-                    from: from as usize,
+                    from: from.0 as usize,
                     to: peer as usize,
                     content: payload.to_le_bytes().to_vec(),
                     message_id: ledger_format::MessageId::new(from, 0),
-                    send_id: [0; 32],
+                    send_id: ledger_format::EntryHash([0; 32]),
                     deliver_at: now,
                 });
                 if accepted { 0 } else { 1 }
@@ -1177,7 +1181,10 @@ mod fd_write_boundary_tests {
         // A second failure never overwrites: the slot reports the first
         // typed cause, matching the executor's first-wins contract (a second
         // broken append does not change which failure invalidated the run).
-        let second = record_write_failure(&slot, JournalError::MissingParent([3u8; 32]));
+        let second = record_write_failure(
+            &slot,
+            JournalError::MissingParent(ledger_format::EntryHash([3u8; 32])),
+        );
         assert_eq!(second, WASI_ERRNO_IO);
         match slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(JournalError::InvariantViolation(cause)) => assert_eq!(cause, "injected"),
@@ -1259,8 +1266,11 @@ mod fd_write_boundary_tests {
     #[test]
     fn fd_write_host_error_and_valid_paths() {
         let engine = WasmBackend::new_engine().expect("engine");
-        let mut backend = WasmBackend::with_engine(engine.clone(), SeedTree::new([0x42; 32]))
-            .expect("store scaffolding");
+        let mut backend = WasmBackend::with_engine(
+            engine.clone(),
+            SeedTree::new(ledger_format::EntryHash([0x42; 32])),
+        )
+        .expect("store scaffolding");
         let linker = WasmBackend::build_linker(&engine).expect("linker");
         let module = forwarder_module(&engine);
         let instance = linker

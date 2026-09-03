@@ -15,7 +15,7 @@ fn post_crash_value(
     mode: Option<JournalingMode>,
     write: bool,
     fsync: bool,
-    seed: [u8; 32],
+    seed: ledger_format::EntryHash,
 ) -> Option<u64> {
     let mut program = Vec::new();
     if write {
@@ -57,7 +57,7 @@ fn post_crash_value(
 /// mode even an unfsynced write survives while the black-box default drops it.
 #[test]
 fn journaled_crash_is_fsync_bounded_and_distinct_from_black_box() {
-    let seed = [21; 32];
+    let seed = ledger_format::EntryHash([21; 32]);
     assert_eq!(
         post_crash_value(Some(JournalingMode::Data), true, false, seed),
         Some(0),
@@ -86,7 +86,7 @@ fn journaled_crash_is_fsync_bounded_and_distinct_from_black_box() {
 fn journaled_crash_is_deterministic() {
     let config = |mode: JournalingMode| {
         RunConfig::builder()
-            .seed([22; 32])
+            .seed(ledger_format::EntryHash([22; 32]))
             .policy(Policy::Random)
             .max_steps(256)
             .fs_journaling(Some(mode))

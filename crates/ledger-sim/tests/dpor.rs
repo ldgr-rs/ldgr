@@ -52,7 +52,7 @@ fn ordered_chain_programs() -> Vec<Vec<Instruction>> {
 #[test]
 fn dpor_explores_causally_distinct_schedules() {
     let cfg = DporConfig {
-        seed: [3; 32],
+        seed: ledger_format::EntryHash([3; 32]),
         max_steps: 256,
         max_runs: 8,
     };
@@ -90,7 +90,7 @@ fn dpor_explores_causally_distinct_schedules() {
 #[test]
 fn dpor_is_deterministic() {
     let cfg = DporConfig {
-        seed: [9; 32],
+        seed: ledger_format::EntryHash([9; 32]),
         max_steps: 256,
         max_runs: 8,
     };
@@ -127,7 +127,7 @@ fn dpor_sleep_set_prunes_ordered_tasks() {
         ],
     ];
     let cfg = DporConfig {
-        seed: [24; 32],
+        seed: ledger_format::EntryHash([24; 32]),
         max_steps: 512,
         max_runs: 64,
     };
@@ -166,7 +166,7 @@ fn dpor_sleep_set_prunes_ordered_tasks() {
 fn dpor_explores_flip_before_tasks_become_ordered() {
     let programs = ordered_chain_programs();
     let cfg = DporConfig {
-        seed: [5; 32],
+        seed: ledger_format::EntryHash([5; 32]),
         max_steps: 512,
         max_runs: 64,
     };
@@ -194,7 +194,7 @@ fn dpor_explores_flip_before_tasks_become_ordered() {
 #[test]
 fn dpor_respects_max_runs() {
     let cfg = DporConfig {
-        seed: [11; 32],
+        seed: ledger_format::EntryHash([11; 32]),
         max_steps: 256,
         max_runs: 2,
     };
@@ -223,7 +223,7 @@ fn dpor_respects_max_runs() {
 fn dpor_explores_each_causal_class_once() {
     let programs = ordered_chain_programs();
     let cfg = DporConfig {
-        seed: [5; 32],
+        seed: ledger_format::EntryHash([5; 32]),
         max_steps: 512,
         max_runs: 64,
     };
@@ -268,8 +268,8 @@ fn concurrent_alt_pairs(base: &ledger_sim::RunResult) -> HashSet<(usize, usize)>
                 continue;
             }
             let ordered = match (
-                last_vc.get(&(chosen_task as ActorId)),
-                last_vc.get(&(*alt as ActorId)),
+                last_vc.get(&ActorId(chosen_task as u32)),
+                last_vc.get(&ActorId(*alt as u32)),
             ) {
                 (Some(chosen), Some(alt)) => {
                     chosen.happens_before(alt) || alt.happens_before(chosen)
@@ -294,7 +294,7 @@ fn concurrent_alt_pairs(base: &ledger_sim::RunResult) -> HashSet<(usize, usize)>
 #[test]
 fn dpor_does_not_report_unrun_flips() {
     let cfg = DporConfig {
-        seed: [13; 32],
+        seed: ledger_format::EntryHash([13; 32]),
         max_steps: 256,
         max_runs: 1,
     };

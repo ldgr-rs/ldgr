@@ -2,7 +2,7 @@
 
 use crate::net::{DnsTable, LinkConfig};
 use crate::seedtree::SeedTree;
-use ledger_format::{ActorId, Hash};
+use ledger_format::{ActorId, EntryHash};
 
 /// Error from [`Probability::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,17 +99,17 @@ impl core::str::FromStr for Probability {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimFault {
     /// Drop the message sent by this `Send` entry.
-    Drop(Hash),
+    Drop(EntryHash),
     /// Delay delivery of this `Send` entry by `ticks`.
-    Delay { send: Hash, ticks: u64 },
+    Delay { send: EntryHash, ticks: u64 },
     /// Partition the directed link (applied when the executor starts).
     Partition { src: ActorId, dst: ActorId },
     /// Crash storage immediately after this `FsWrite` entry.
-    Crash(Hash),
+    Crash(EntryHash),
     /// Corrupt the stored value after this `FsWrite` entry with an xor mask.
-    Corrupt { write: Hash, xor_mask: u64 },
+    Corrupt { write: EntryHash, xor_mask: u64 },
     /// Apply the crash-state operator at index `state` after this `FsWrite`.
-    CrashState { write: Hash, state: u64 },
+    CrashState { write: EntryHash, state: u64 },
 }
 
 impl SimFault {
@@ -229,10 +229,10 @@ impl Default for SwarmConfig {
 /// callers do not need `#[cfg]` guards at construction sites.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub(crate) seed: Hash,
+    pub(crate) seed: EntryHash,
     pub(crate) policy: Policy,
     pub(crate) max_steps: usize,
-    pub(crate) dropped_events: Vec<Hash>,
+    pub(crate) dropped_events: Vec<EntryHash>,
     pub(crate) swarm: SwarmConfig,
     pub(crate) links: Vec<(usize, usize, LinkConfig)>,
     pub(crate) dns: DnsTable,
@@ -254,7 +254,7 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
-            seed: [0; 32],
+            seed: EntryHash([0; 32]),
             policy: Policy::Random,
             max_steps: 10_000,
             dropped_events: Vec::new(),
@@ -289,7 +289,7 @@ impl RunConfig {
     // -----------------------------------------------------------------------
 
     /// Root seed for all independent streams.
-    pub fn seed(&self) -> Hash {
+    pub fn seed(&self) -> EntryHash {
         self.seed
     }
 
@@ -307,7 +307,7 @@ impl RunConfig {
     }
 
     /// Journal event hashes whose effects must be dropped.
-    pub fn dropped_events(&self) -> &[Hash] {
+    pub fn dropped_events(&self) -> &[EntryHash] {
         &self.dropped_events
     }
 
@@ -362,7 +362,7 @@ impl RunConfig {
     }
 
     /// Consuming setter for the root seed.
-    pub fn with_seed(mut self, seed: Hash) -> Self {
+    pub fn with_seed(mut self, seed: EntryHash) -> Self {
         self.seed = seed;
         self
     }
@@ -410,7 +410,7 @@ impl RunConfig {
     }
 
     /// Consuming setter for dropped events.
-    pub fn with_dropped_events(mut self, dropped_events: Vec<Hash>) -> Self {
+    pub fn with_dropped_events(mut self, dropped_events: Vec<EntryHash>) -> Self {
         self.dropped_events = dropped_events;
         self
     }
@@ -449,10 +449,10 @@ impl RunConfig {
 /// no caller `#[cfg]` is required.
 #[derive(Debug, Clone)]
 pub struct RunConfigBuilder {
-    seed: Hash,
+    seed: EntryHash,
     policy: Policy,
     max_steps: usize,
-    dropped_events: Vec<Hash>,
+    dropped_events: Vec<EntryHash>,
     swarm: SwarmConfig,
     links: Vec<(usize, usize, LinkConfig)>,
     dns: DnsTable,
@@ -468,7 +468,7 @@ pub struct RunConfigBuilder {
 impl Default for RunConfigBuilder {
     fn default() -> Self {
         Self {
-            seed: [0; 32],
+            seed: EntryHash([0; 32]),
             policy: Policy::Random,
             max_steps: 10_000,
             dropped_events: Vec::new(),
@@ -493,7 +493,7 @@ impl RunConfigBuilder {
     }
 
     /// Set the root seed.
-    pub fn seed(mut self, seed: Hash) -> Self {
+    pub fn seed(mut self, seed: EntryHash) -> Self {
         self.seed = seed;
         self
     }
@@ -514,7 +514,7 @@ impl RunConfigBuilder {
     }
 
     /// Set the dropped-events list.
-    pub fn dropped_events(mut self, dropped_events: Vec<Hash>) -> Self {
+    pub fn dropped_events(mut self, dropped_events: Vec<EntryHash>) -> Self {
         self.dropped_events = dropped_events;
         self
     }
@@ -631,12 +631,12 @@ mod tests {
 
     #[test]
     fn builder_round_trips_all_fields() {
-        let seed = [7u8; 32];
+        let seed = EntryHash([7u8; 32]);
         let policy = Policy::Pct {
             priority_changes: 3,
         };
         let max_steps = 42_042;
-        let dropped = vec![[1u8; 32], [2u8; 32]];
+        let dropped = vec![EntryHash([1u8; 32]), EntryHash([2u8; 32])];
         let swarm = SwarmConfig {
             drop_probability: Probability::new(0.3).unwrap(),
             delay_probability: Probability::new(0.2).unwrap(),
@@ -652,12 +652,17 @@ mod tests {
                 jitter: 2,
                 loss_probability: Probability::new(0.1).unwrap(),
                 reorder_window: 3,
+                capacity: None,
+                queue_policy: crate::net::QueueFullPolicy::Drop,
             },
         )];
         let mut dns = DnsTable::new();
         dns.insert("alpha.test", 1);
         dns.insert("beta.test", 2);
-        let faults = vec![SimFault::Partition { src: 0, dst: 1 }];
+        let faults = vec![SimFault::Partition {
+            src: ActorId(0),
+            dst: ActorId(1),
+        }];
         let cfg = RunConfig::builder()
             .seed(seed)
             .policy(policy)

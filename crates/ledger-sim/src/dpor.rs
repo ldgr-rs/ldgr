@@ -22,14 +22,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::{Policy, RunConfig};
 use crate::runtime::{Instruction, RuntimeError, Simulation};
-use ledger_format::{ActorId, Hash};
+use ledger_format::{ActorId, EntryHash};
 use ledger_journal::VectorClock;
 
 /// Configuration for one source-DPOR exploration campaign.
 #[derive(Debug, Clone)]
 pub struct DporConfig {
     /// Root seed shared by the base run and every re-run.
-    pub seed: Hash,
+    pub seed: EntryHash,
     /// Instruction budget per run.
     pub max_steps: usize,
     /// Maximum number of runs, base run included.
@@ -39,7 +39,7 @@ pub struct DporConfig {
 /// One explored run: the root it reached and the decisions that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DporRun {
-    pub root_hash: Hash,
+    pub root_hash: EntryHash,
     pub decisions: Vec<usize>,
     /// Length of the forced replay prefix, or 0 for the base run.
     ///
@@ -178,8 +178,8 @@ fn sleep_set_pruned(
     chosen_task: usize,
     alt: usize,
 ) -> bool {
-    let chosen_vc = task_last_vc.get(&(chosen_task as ActorId));
-    let alt_vc = task_last_vc.get(&(alt as ActorId));
+    let chosen_vc = task_last_vc.get(&ActorId(chosen_task as u32));
+    let alt_vc = task_last_vc.get(&ActorId(alt as u32));
     match (chosen_vc, alt_vc) {
         (Some(chosen), Some(alt)) => chosen.happens_before(alt) || alt.happens_before(chosen),
         _ => false,

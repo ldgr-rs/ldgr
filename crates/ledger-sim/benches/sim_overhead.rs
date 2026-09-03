@@ -21,7 +21,7 @@
 // ledger-lint:allow (host-side benchmark measures the sim; it is not simulation code)
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use ledger_format::{EntryKind, EntryPayload, MessageId, RecvFrame, SendFrame};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, MessageId, RecvFrame, SendFrame};
 use ledger_journal::Journal;
 use ledger_sim::{Instruction, Policy, RunConfig, Simulation};
 
@@ -53,7 +53,7 @@ fn throughput_programs(steps_per_task: u64) -> Vec<Vec<Instruction>> {
 fn bench_cpu_at_100k(c: &mut Criterion) {
     let programs = throughput_programs(500);
     let config = RunConfig::builder()
-        .seed([1; 32])
+        .seed(ledger_format::EntryHash([1; 32]))
         .policy(Policy::Random)
         .max_steps(200_000)
         .build();
@@ -78,12 +78,8 @@ fn bench_cpu_at_100k(c: &mut Criterion) {
 /// Append one representative entry kind of the workload, cycling actors so the
 /// journal exercises head churn like the sim does. Recv and TimerFire carry an
 /// observed parent (the previous append), matching the sim's read provenance.
-fn append_one(
-    journal: &mut Journal,
-    step: u64,
-    last: Option<ledger_format::Hash>,
-) -> ledger_format::Hash {
-    let actor = (step % 4) as u32;
+fn append_one(journal: &mut Journal, step: u64, last: Option<EntryHash>) -> EntryHash {
+    let actor = ActorId((step % 4) as u32);
     let observed = last.into_iter().collect::<Vec<_>>();
     match step % 4 {
         0 => journal
@@ -94,7 +90,7 @@ fn append_one(
                 EntryPayload::Send(SendFrame {
                     message_id: MessageId::new(actor, step),
                     from: actor,
-                    to: (actor + 1) % 4,
+                    to: ActorId(((step % 4) as u32 + 1) % 4),
                     original_content: step.to_le_bytes().to_vec(),
                 }),
             )
@@ -105,8 +101,8 @@ fn append_one(
                 actor,
                 observed,
                 EntryPayload::Recv(RecvFrame {
-                    message_id: MessageId::new((actor + 1) % 4, step),
-                    from: (actor + 1) % 4,
+                    message_id: MessageId::new(ActorId(((step % 4) as u32 + 1) % 4), step),
+                    from: ActorId(((step % 4) as u32 + 1) % 4),
                     to: actor,
                     observed_content: step.to_le_bytes().to_vec(),
                 }),
@@ -143,7 +139,7 @@ fn bench_journal_share(c: &mut Criterion) {
         b.iter_batched(
             Journal::new,
             |mut journal| {
-                let mut last: Option<ledger_format::Hash> = None;
+                let mut last: Option<EntryHash> = None;
                 for step in 0..2000 {
                     last = Some(append_one(&mut journal, step, last));
                 }

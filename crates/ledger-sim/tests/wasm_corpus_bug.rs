@@ -23,8 +23,8 @@ use rand_core::Rng;
 use std::fs;
 use std::path::Path;
 
-const SEED: [u8; 32] = [11; 32];
-const STALE_STREAM: u32 = 11;
+const SEED: ledger_format::EntryHash = ledger_format::EntryHash([11; 32]);
+const STALE_STREAM: ledger_format::StreamId = ledger_format::StreamId(11);
 
 /// Native twin of the guest's stale-read workload, drawing the same stream.
 fn native_twin() -> (Vec<u8>, ledger_journal::Journal) {
@@ -159,7 +159,7 @@ fn reproduce_through_wasm(
     scenario: &str,
     export: &str,
     wasm: &[u8],
-    seed: [u8; 32],
+    seed: ledger_format::EntryHash,
 ) -> Result<(String, ledger_journal::Journal), String> {
     let mut backend = WasmBackend::from_wasm(SeedTree::new(seed), wasm)
         .map_err(|error| format!("{scenario}: Wasm instantiation failed: {error}"))?
@@ -320,6 +320,6 @@ fn corpus_manifests_reproduce_through_wasm_backend() {
     );
 }
 
-fn hex(hash: &[u8; 32]) -> String {
-    hash.iter().map(|b| format!("{b:02x}")).collect()
+fn hex(hash: &ledger_format::EntryHash) -> String {
+    hash.0.iter().map(|b| format!("{b:02x}")).collect()
 }

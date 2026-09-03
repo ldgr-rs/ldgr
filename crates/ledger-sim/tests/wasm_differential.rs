@@ -20,9 +20,9 @@ use ledger_sim::{Effects, SeedTree, SimBackend, WasmBackend};
 use rand_core::Rng;
 
 /// Root seed shared by both backends.
-const SEED: [u8; 32] = [9; 32];
+const SEED: ledger_format::EntryHash = ledger_format::EntryHash([9; 32]);
 /// Stream id drawn by both the guest and the native twin.
-const STREAM: StreamId = 7;
+const STREAM: StreamId = StreamId(7);
 /// Number of draws in the workload.
 const DRAW_COUNT: u64 = 4;
 /// Virtual-time sleep in the workload.
@@ -86,9 +86,11 @@ fn wasm_guest_matches_native_twin() {
 #[test]
 fn wasi_random_and_clock_are_deterministic() {
     let wasm = common::guest_wasm_bytes();
-    let mut first = WasmBackend::from_wasm(SeedTree::new([4; 32]), &wasm).unwrap();
+    let mut first =
+        WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([4; 32])), &wasm).unwrap();
     let first_output = first.run_export("run_virtualized").unwrap();
-    let mut second = WasmBackend::from_wasm(SeedTree::new([4; 32]), &wasm).unwrap();
+    let mut second =
+        WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([4; 32])), &wasm).unwrap();
     let second_output = second.run_export("run_virtualized").unwrap();
 
     assert_eq!(
@@ -112,11 +114,11 @@ fn wasi_random_and_clock_are_deterministic() {
 #[test]
 fn wasi_random_differs_across_seeds() {
     let wasm = common::guest_wasm_bytes();
-    let a = WasmBackend::from_wasm(SeedTree::new([1; 32]), &wasm)
+    let a = WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([1; 32])), &wasm)
         .unwrap()
         .run_export("run_virtualized")
         .unwrap();
-    let b = WasmBackend::from_wasm(SeedTree::new([2; 32]), &wasm)
+    let b = WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([2; 32])), &wasm)
         .unwrap()
         .run_export("run_virtualized")
         .unwrap();
@@ -131,7 +133,8 @@ fn wasi_random_differs_across_seeds() {
 #[test]
 fn fuel_bounds_runaway_guest() {
     let wasm = common::guest_wasm_bytes();
-    let mut backend = WasmBackend::from_wasm(SeedTree::new([3; 32]), &wasm).unwrap();
+    let mut backend =
+        WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([3; 32])), &wasm).unwrap();
     let result = backend.run_export("run_forever");
     assert!(
         matches!(result, Err(ledger_sim::WasmError::FuelExhausted)),
@@ -144,7 +147,8 @@ fn fuel_bounds_runaway_guest() {
 #[test]
 fn wasi_stdout_is_captured() {
     let wasm = common::guest_wasm_bytes();
-    let mut backend = WasmBackend::from_wasm(SeedTree::new([5; 32]), &wasm).unwrap();
+    let mut backend =
+        WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([5; 32])), &wasm).unwrap();
     let output = backend.run_export("run_virtualized").unwrap();
     assert!(
         !output.is_empty(),
@@ -202,7 +206,8 @@ fn rr_recording_backend_is_deterministic() {
 #[test]
 fn wasi_random_and_clock_journal_entries() {
     let wasm = common::guest_wasm_bytes();
-    let mut first = WasmBackend::from_wasm(SeedTree::new([4; 32]), &wasm).unwrap();
+    let mut first =
+        WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([4; 32])), &wasm).unwrap();
     let _ = first.run_export("run_virtualized").unwrap();
     let journal = first.journal_snapshot();
     assert!(
@@ -232,7 +237,8 @@ fn wasi_random_and_clock_journal_entries() {
         "clock_time_get must journal one ClockRead; got {kinds:?}"
     );
 
-    let mut second = WasmBackend::from_wasm(SeedTree::new([4; 32]), &wasm).unwrap();
+    let mut second =
+        WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([4; 32])), &wasm).unwrap();
     let _ = second.run_export("run_virtualized").unwrap();
     assert_eq!(
         first.journal_snapshot().root_hash(),
@@ -250,8 +256,8 @@ fn native_pingpong() -> (Vec<u8>, Journal) {
         from: 0,
         to: 0,
         content: PING_PAYLOAD.to_le_bytes().to_vec(),
-        message_id: ledger_format::MessageId::new(0, 0),
-        send_id: [0; 32],
+        message_id: ledger_format::MessageId::new(ledger_format::ActorId(0), 0),
+        send_id: ledger_format::EntryHash([0; 32]),
         deliver_at: now,
     });
     let received_payload = backend

@@ -9,7 +9,7 @@
 
 use core::panic::Location;
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 
 /// Source location of the system-under-test call that produced an effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,12 +69,12 @@ impl From<&'static Location<'static>> for OriginSource {
 pub(crate) struct OriginLog {
     // ledger-lint:allow:HashMap (keyed by entry hash; append order comes
     // from the side Vec, never from map iteration)
-    map: std::collections::HashMap<Hash, OriginSource>,
-    order: Vec<Hash>,
+    map: std::collections::HashMap<EntryHash, OriginSource>,
+    order: Vec<EntryHash>,
 }
 
 impl OriginLog {
-    pub fn record(&mut self, id: Hash, source: OriginSource) {
+    pub fn record(&mut self, id: EntryHash, source: OriginSource) {
         if matches!(source, OriginSource::Unknown) {
             return;
         }
@@ -83,12 +83,12 @@ impl OriginLog {
         }
     }
 
-    pub fn get(&self, id: &Hash) -> Option<&OriginSource> {
+    pub fn get(&self, id: &EntryHash) -> Option<&OriginSource> {
         self.map.get(id)
     }
 
     /// Snapshot in append order.
-    pub fn snapshot(&self) -> Vec<(Hash, OriginSource)> {
+    pub fn snapshot(&self) -> Vec<(EntryHash, OriginSource)> {
         self.order
             .iter()
             .map(|id| (*id, self.map[id].clone()))

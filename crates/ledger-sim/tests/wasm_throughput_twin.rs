@@ -14,9 +14,9 @@ use rand_core::Rng;
 /// Throughput constants must match `wasm-guest/src/lib.rs`.
 const THROUGHPUT_DRAWS: u32 = 2_000;
 const THROUGHPUT_LOOP_ITERS: u32 = 1_500;
-const THROUGHPUT_STREAM: u32 = 9;
+const THROUGHPUT_STREAM: ledger_format::StreamId = ledger_format::StreamId(9);
 
-fn native_throughput(seed: [u8; 32]) -> (Vec<u8>, ledger_journal::Journal) {
+fn native_throughput(seed: ledger_format::EntryHash) -> (Vec<u8>, ledger_journal::Journal) {
     let mut backend = SimBackend::new(SeedTree::new(seed));
     let mut accumulator: u64 = 0;
     for _ in 0..THROUGHPUT_DRAWS {
@@ -38,7 +38,7 @@ fn native_throughput(seed: [u8; 32]) -> (Vec<u8>, ledger_journal::Journal) {
 
 #[test]
 fn throughput_native_twin_root_equality() {
-    let seed = [7u8; 32];
+    let seed = ledger_format::EntryHash([7u8; 32]);
     let (native_output, native_journal) = native_throughput(seed);
 
     let wasm = common::guest_wasm_bytes();
@@ -80,7 +80,7 @@ fn throughput_native_twin_root_equality() {
 
 #[test]
 fn throughput_native_twin_is_deterministic() {
-    let seed = [42u8; 32];
+    let seed = ledger_format::EntryHash([42u8; 32]);
     let (a_out, a_journal) = native_throughput(seed);
     let (b_out, b_journal) = native_throughput(seed);
     assert_eq!(a_out, b_out);

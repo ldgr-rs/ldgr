@@ -3,7 +3,7 @@
 //! Version 0.2: DnsTable exposes sorted `iter()` for deterministic RunConfig hashing.
 
 use crate::config::Probability;
-use ledger_format::{FaultSpec, Hash, MessageId};
+use ledger_format::{ActorId, EntryHash, FaultSpec, MessageId};
 use rand_core::Rng;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -19,7 +19,7 @@ pub struct Message {
     /// API boundary.
     pub content: Vec<u8>,
     /// Journal entry ID of the corresponding Send event.
-    pub send_id: Hash,
+    pub send_id: EntryHash,
     /// Message identity copied from the Send entry.
     pub message_id: MessageId,
     /// Virtual timestamp at which this message becomes deliverable.
@@ -36,10 +36,60 @@ impl Message {
     }
 }
 
+/// What a bounded link does when its queue is full.
+///
+/// `Drop` discards the newest message and journals a `Drop` fault.
+/// `Block` refuses the send without journaling a drop so the sender can
+/// retry later; the `bool` send surface still reports `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QueueFullPolicy {
+    /// Discard the overflowing message (default, preserves history).
+    #[default]
+    Drop,
+    /// Refuse the send as backpressure (no drop fault journaled).
+    Block,
+}
+
+/// Typed network failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NetError {
+    /// A bounded link queue already holds `queued` messages at capacity.
+    #[error("queue full on link {from}->{to}: {queued}/{capacity}")]
+    QueueFull {
+        /// Sending actor.
+        from: usize,
+        /// Receiving actor.
+        to: usize,
+        /// Configured capacity.
+        capacity: usize,
+        /// Messages already queued for this link.
+        queued: usize,
+    },
+    /// A reorder window exceeds the representable bound.
+    #[error("invalid reorder window {window}: {reason}")]
+    InvalidReorderWindow {
+        /// Rejected window.
+        window: usize,
+        /// Why the window is invalid.
+        reason: &'static str,
+    },
+}
+
+/// Upper bound for a reorder window.
+///
+/// Windows at or below this bound always clamp to the ready count.
+/// Larger windows are rejected by the validated setters and the
+/// fallible recv paths so a misconfigured window fails closed.
+pub const MAX_REORDER_WINDOW: usize = 65_536;
+
 /// Per-link transport configuration.
 ///
 /// All fields default to the zero config, which consumes no seed-stream draws
-/// and keeps journals byte-identical to the unconfigured path.
+/// and keeps journals byte-identical to the unconfigured path. `capacity` is
+/// `None` by default, which means unbounded and preserves the historical
+/// behavior; set `Some(n)` to bound the queued messages for one directed
+/// link. `queue_policy` selects drop (journaled) or block (backpressure)
+/// when a bounded queue is full.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinkConfig {
     /// Deterministic base latency in ticks added to every send on this link.
@@ -50,6 +100,10 @@ pub struct LinkConfig {
     pub loss_probability: Probability,
     /// Per-link reorder window override; `0` uses the global window.
     pub reorder_window: usize,
+    /// Bound on queued messages for this directed link; `None` is unbounded.
+    pub capacity: Option<usize>,
+    /// Full-queue behavior for a bounded link.
+    pub queue_policy: QueueFullPolicy,
 }
 
 impl Default for LinkConfig {
@@ -59,6 +113,8 @@ impl Default for LinkConfig {
             jitter: 0,
             loss_probability: Probability::ZERO,
             reorder_window: 0,
+            capacity: None,
+            queue_policy: QueueFullPolicy::Drop,
         }
     }
 }
@@ -183,7 +239,26 @@ impl SimNet {
         self.links.get(&(from, to)).copied().unwrap_or_default()
     }
 
+    /// Validate a reorder window against the representable bound.
+    ///
+    /// # Errors
+    /// Returns [`NetError::InvalidReorderWindow`] when `window` exceeds
+    /// [`MAX_REORDER_WINDOW`].
+    pub fn validate_reorder_window(window: usize) -> Result<(), NetError> {
+        if window > MAX_REORDER_WINDOW {
+            return Err(NetError::InvalidReorderWindow {
+                window,
+                reason: "window exceeds the representable bound",
+            });
+        }
+        Ok(())
+    }
+
     /// Return the effective reorder window: per-link override or the global.
+    ///
+    /// A per-link `0` inherits the global window; any nonzero per-link value
+    /// wins. Use a global `0` plus explicit per-link windows when one link
+    /// must stay FIFO while others reorder.
     pub fn effective_reorder_window(&self, from: usize, to: usize) -> usize {
         let per_link = self
             .links
@@ -197,24 +272,65 @@ impl SimNet {
         }
     }
 
-    /// Send a message honoring the link config, drawing jitter and loss from
-    /// the caller's seeded source.
+    /// Count messages currently queued for one directed link.
+    pub fn queued_for(&self, from: usize, to: usize) -> usize {
+        self.queue
+            .iter()
+            .filter(|msg| msg.from == from && msg.to == to)
+            .count()
+    }
+
+    /// Check a link capacity without mutating the queue.
     ///
-    /// `draw(bound)` returns a uniform value in `[0, bound)`. Draws happen ONLY
-    /// when the link has nonzero jitter or loss; an unconfigured link consumes
-    /// zero draws. Returns `false` when the message is dropped (partitioned or
-    /// lost), `true` when queued. The `deliver_at` field of `message` is
-    /// recomputed from `now` plus the effective latency.
-    pub fn send_via_link(
+    /// # Errors
+    /// Returns [`NetError::QueueFull`] when the link has `Some(cap)` and
+    /// already holds at least `cap` messages.
+    pub fn check_capacity(&self, from: usize, to: usize) -> Result<(), NetError> {
+        let cap = match self.links.get(&(from, to)).and_then(|c| c.capacity) {
+            Some(cap) => cap,
+            None => return Ok(()),
+        };
+        let queued = self.queued_for(from, to);
+        if queued >= cap {
+            return Err(NetError::QueueFull {
+                from,
+                to,
+                capacity: cap,
+                queued,
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the full-queue policy for a link (`Drop` when unconfigured).
+    pub fn queue_policy(&self, from: usize, to: usize) -> QueueFullPolicy {
+        self.links
+            .get(&(from, to))
+            .map(|c| c.queue_policy)
+            .unwrap_or(QueueFullPolicy::Drop)
+    }
+
+    /// Fallible send honoring link capacity, jitter, and loss.
+    ///
+    /// The capacity check runs before any seed draw, so a full queue never
+    /// perturbs the draw stream. `Ok(true)` means queued, `Ok(false)` means
+    /// refused by partition or sampled loss, `Err` means the bounded queue
+    /// is full. This is the [`NetError::QueueFull`] producer.
+    ///
+    /// # Errors
+    /// Returns [`NetError::QueueFull`] when the link is at capacity.
+    pub fn try_send_via_link(
         &mut self,
         message: Message,
         now: u64,
         base_delay: u64,
         mut draw: impl FnMut(u64) -> u64,
-    ) -> bool {
+    ) -> Result<bool, NetError> {
         if self.is_partitioned(message.from, message.to) {
-            return false;
+            return Ok(false);
         }
+        // Capacity first: no draws consumed on a full queue.
+        self.check_capacity(message.from, message.to)?;
         let cfg = self.link_config(message.from, message.to);
         let mut total = base_delay.saturating_add(cfg.base_delay);
         if cfg.jitter > 0 {
@@ -228,13 +344,33 @@ impl SimNet {
         if cfg.loss_probability.get() > 0.0
             && draw(1_000_000_000) < (cfg.loss_probability.get() * 1_000_000_000.0) as u64
         {
-            return false;
+            return Ok(false);
         }
         self.queue.push_back(Message {
             deliver_at: now.saturating_add(total),
             ..message
         });
-        true
+        Ok(true)
+    }
+
+    /// Send a message honoring the link config, drawing jitter and loss from
+    /// the caller's seeded source.
+    ///
+    /// `draw(bound)` returns a uniform value in `[0, bound)`. Draws happen ONLY
+    /// when the link has nonzero jitter or loss; an unconfigured link consumes
+    /// zero draws. Returns `false` when the message is dropped (partitioned,
+    /// lost, or queue-full), `true` when queued. The `deliver_at` field of `message` is
+    /// recomputed from `now` plus the effective latency. Queue-full collapses
+    /// to `false` here; use [`Self::try_send_via_link`] to distinguish it.
+    pub fn send_via_link(
+        &mut self,
+        message: Message,
+        now: u64,
+        base_delay: u64,
+        draw: impl FnMut(u64) -> u64,
+    ) -> bool {
+        self.try_send_via_link(message, now, base_delay, draw)
+            .unwrap_or(false)
     }
 
     /// Toggle a directed partition: present becomes absent and vice versa.
@@ -249,11 +385,38 @@ impl SimNet {
     pub fn apply_fault(&mut self, fault: &FaultSpec) -> bool {
         match fault {
             FaultSpec::Partition { src, dst } => {
-                self.toggle_partition(*src as usize, *dst as usize);
+                self.toggle_partition(src.0 as usize, dst.0 as usize);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Validated global reorder-window setter.
+    ///
+    /// # Errors
+    /// Returns [`NetError::InvalidReorderWindow`] when `window` exceeds
+    /// [`MAX_REORDER_WINDOW`].
+    pub fn try_set_reorder_window(&mut self, window: usize) -> Result<(), NetError> {
+        Self::validate_reorder_window(window)?;
+        self.reorder_window = window;
+        Ok(())
+    }
+
+    /// Validated link setter.
+    ///
+    /// # Errors
+    /// Returns [`NetError::InvalidReorderWindow`] when the link window exceeds
+    /// [`MAX_REORDER_WINDOW`].
+    pub fn try_set_link(
+        &mut self,
+        from: usize,
+        to: usize,
+        cfg: LinkConfig,
+    ) -> Result<(), NetError> {
+        Self::validate_reorder_window(cfg.reorder_window)?;
+        self.links.insert((from, to), cfg);
+        Ok(())
     }
 
     /// Enable a deterministic reorder window on this link.
@@ -261,7 +424,9 @@ impl SimNet {
     /// When `window` is nonzero, messages whose `deliver_at` ties are served
     /// in reverse insertion order within a window of `window` messages, which
     /// is deterministic for a fixed send sequence. The default (0) is strict
-    /// FIFO and matches the historical journal output exactly.
+    /// FIFO and matches the historical journal output exactly. Windows above
+    /// [`MAX_REORDER_WINDOW`] are rejected by [`Self::try_set_reorder_window`];
+    /// this setter keeps the historical infallible shape for existing callers.
     pub fn set_reorder_window(&mut self, window: usize) {
         self.reorder_window = window;
     }
@@ -280,12 +445,26 @@ impl SimNet {
     }
 
     /// Queue a message for delivery. Returns true if queued, false if dropped by partition.
+    ///
+    /// A bounded link at capacity also returns `false`; use
+    /// [`Self::try_send`] to distinguish queue-full from partition.
     pub fn send(&mut self, message: Message) -> bool {
+        self.try_send(message).unwrap_or(false)
+    }
+
+    /// Fallible queue respecting per-link capacity.
+    ///
+    /// `Ok(true)` means queued, `Ok(false)` means refused by partition.
+    ///
+    /// # Errors
+    /// Returns [`NetError::QueueFull`] when the link is at capacity.
+    pub fn try_send(&mut self, message: Message) -> Result<bool, NetError> {
         if self.is_partitioned(message.from, message.to) {
-            return false;
+            return Ok(false);
         }
+        self.check_capacity(message.from, message.to)?;
         self.queue.push_back(message);
-        true
+        Ok(true)
     }
 
     /// Send a message with current virtual timestamp and optional delay.
@@ -294,15 +473,32 @@ impl SimNet {
         from: usize,
         to: usize,
         payload: u64,
-        send_id: Hash,
+        send_id: EntryHash,
         now: u64,
         delay: u64,
     ) -> bool {
-        self.send(Message {
+        self.try_send_at(from, to, payload, send_id, now, delay)
+            .unwrap_or(false)
+    }
+
+    /// Fallible timed send respecting per-link capacity.
+    ///
+    /// # Errors
+    /// Returns [`NetError::QueueFull`] when the link is at capacity.
+    pub fn try_send_at(
+        &mut self,
+        from: usize,
+        to: usize,
+        payload: u64,
+        send_id: EntryHash,
+        now: u64,
+        delay: u64,
+    ) -> Result<bool, NetError> {
+        self.try_send(Message {
             from,
             to,
             content: payload.to_le_bytes().to_vec(),
-            message_id: MessageId::new(from as ledger_format::ActorId, 0),
+            message_id: MessageId::new(ActorId(from as u32), 0),
             send_id,
             deliver_at: now.saturating_add(delay),
         })
@@ -310,7 +506,21 @@ impl SimNet {
 
     /// Send a message with an explicit identity and content bytes.
     pub fn send_at_with_identity(&mut self, message: Message, now: u64, delay: u64) -> bool {
-        self.send(Message {
+        self.try_send_at_with_identity(message, now, delay)
+            .unwrap_or(false)
+    }
+
+    /// Fallible identity send respecting per-link capacity.
+    ///
+    /// # Errors
+    /// Returns [`NetError::QueueFull`] when the link is at capacity.
+    pub fn try_send_at_with_identity(
+        &mut self,
+        message: Message,
+        now: u64,
+        delay: u64,
+    ) -> Result<bool, NetError> {
+        self.try_send(Message {
             deliver_at: now.saturating_add(delay),
             ..message
         })
@@ -322,24 +532,119 @@ impl SimNet {
             .any(|msg| msg.to == task && msg.deliver_at <= now)
     }
 
-    /// Return the journal entry id of the first deliverable message for `task`.
+    /// Return the journal entry id of the deliverable message the deterministic
+    /// recv path would serve next for `task`.
     ///
     /// The message stays queued; the id feeds the `Wake` entry parent when a
-    /// blocked task is released.
-    pub fn peek_ready_send_id(&self, task: usize, now: u64) -> Option<Hash> {
-        self.queue
-            .iter()
-            .find(|msg| msg.to == task && msg.deliver_at <= now)
-            .map(|msg| msg.send_id)
+    /// blocked task is released. Unlike the historical FIFO peek, this honors
+    /// the effective reorder window, so the `Wake` parent matches the message
+    /// [`Self::recv_at`] will actually deliver. The seeded-draw path
+    /// ([`Self::recv_at_drawn`]) cannot be peeked without consuming a draw,
+    /// so the wake trigger stays deterministic while the `Recv` entry carries
+    /// the true drawn lineage.
+    pub fn peek_ready_send_id(&self, task: usize, now: u64) -> Option<EntryHash> {
+        self.peek_index(task, now)
+            .map(|idx| self.queue[idx].send_id)
     }
 
-    /// Take the first deliverable message for `task` available at `now`.
+    /// Select the queue index [`Self::recv_at`] would serve, without removing.
+    fn peek_index(&self, task: usize, now: u64) -> Option<usize> {
+        let mut ready = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, msg)| (msg.to == task && msg.deliver_at <= now).then_some(idx));
+        let first = ready.next()?;
+        let sender = self.queue[first].from;
+        let window = self.effective_reorder_window(sender, task);
+        if window == 0 {
+            return Some(first);
+        }
+        // Bounded suffix of this link's ready messages, newest wins.
+        // Collect only matching indices; the queue itself is the bound, so
+        // this allocates at most one entry per queued message.
+        let mut last = first;
+        let mut suffix: Vec<usize> = Vec::new();
+        suffix.push(first);
+        for idx in ready {
+            if self.queue[idx].from == sender {
+                suffix.push(idx);
+                last = idx;
+            }
+        }
+        let _ = last;
+        let start = suffix.len().saturating_sub(window);
+        Some(suffix[suffix.len() - 1].max(suffix[start]))
+    }
+
+    /// Validated deterministic recv.
     ///
-    /// With a nonzero effective reorder window (per-link override or global),
-    /// the eligible set is the bounded suffix of the ready queue: the last
-    /// `window` ready messages. The newest of that suffix wins. Window zero
-    /// preserves queue order (strict FIFO).
-    pub fn recv_at(&mut self, task: usize, now: u64) -> Option<Message> {
+    /// # Errors
+    /// Returns [`NetError::InvalidReorderWindow`] when the effective window
+    /// exceeds [`MAX_REORDER_WINDOW`].
+    pub fn try_recv_at(&mut self, task: usize, now: u64) -> Result<Option<Message>, NetError> {
+        let window = self.effective_window_for_task(task, now)?;
+        Ok(self.recv_with_window(task, now, window))
+    }
+
+    /// Validated drawn recv inside the bounded window.
+    ///
+    /// Window zero draws nothing and serves FIFO. A nonzero window draws
+    /// exactly once.
+    ///
+    /// # Errors
+    /// Returns [`NetError::InvalidReorderWindow`] when the effective window
+    /// exceeds [`MAX_REORDER_WINDOW`].
+    pub fn try_recv_at_drawn(
+        &mut self,
+        task: usize,
+        now: u64,
+        mut draw: impl FnMut(u64) -> u64,
+    ) -> Result<Option<Message>, NetError> {
+        let ready: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.to == task && message.deliver_at <= now)
+            .map(|(index, _)| index)
+            .collect();
+        let Some(first) = ready.first().copied() else {
+            return Ok(None);
+        };
+        let sender = self.queue[first].from;
+        let window = self.effective_reorder_window(sender, task);
+        Self::validate_reorder_window(window)?;
+        let link_candidates: Vec<usize> = ready
+            .into_iter()
+            .filter(|&idx| self.queue[idx].from == sender)
+            .collect();
+        let index = if window == 0 {
+            first
+        } else {
+            let start = link_candidates.len().saturating_sub(window);
+            let suffix = &link_candidates[start..];
+            let n = suffix.len() as u64;
+            suffix[(draw(n) % n) as usize]
+        };
+        Ok(self.queue.remove(index))
+    }
+
+    /// Effective window for the oldest ready message to `task`, validated.
+    fn effective_window_for_task(&self, task: usize, now: u64) -> Result<usize, NetError> {
+        let first = self
+            .queue
+            .iter()
+            .find(|msg| msg.to == task && msg.deliver_at <= now);
+        let Some(msg) = first else {
+            return Ok(0);
+        };
+        let window = self.effective_reorder_window(msg.from, task);
+        Self::validate_reorder_window(window)?;
+        Ok(window)
+    }
+
+    /// Deterministic recv given an already-validated window.
+    fn recv_with_window(&mut self, task: usize, now: u64, window: usize) -> Option<Message> {
         let ready: Vec<usize> = self
             .queue
             .iter()
@@ -349,7 +654,6 @@ impl SimNet {
             .collect();
         let first = *ready.first()?;
         let sender = self.queue[first].from;
-        let window = self.effective_reorder_window(sender, task);
         let link_candidates: Vec<usize> = ready
             .into_iter()
             .filter(|&idx| self.queue[idx].from == sender)
@@ -357,12 +661,35 @@ impl SimNet {
         let index = if window == 0 {
             first
         } else {
-            // The exact bounded candidate window: the last `window` ready
-            // messages for this link, newest-first within it.
             let start = link_candidates.len().saturating_sub(window);
             link_candidates[link_candidates.len() - 1].max(link_candidates[start])
         };
         self.queue.remove(index)
+    }
+
+    /// Take the first deliverable message for `task` available at `now`.
+    ///
+    /// With a nonzero effective reorder window (per-link override or global),
+    /// the eligible set is the bounded suffix of the ready queue: the last
+    /// `window` ready messages. The newest of that suffix wins. Window zero
+    /// preserves queue order (strict FIFO). Windows above
+    /// [`MAX_REORDER_WINDOW`] clamp here for historical callers; use
+    /// [`Self::try_recv_at`] to reject them with [`NetError`].
+    pub fn recv_at(&mut self, task: usize, now: u64) -> Option<Message> {
+        let first = self
+            .queue
+            .iter()
+            .enumerate()
+            .find(|(_, message)| message.to == task && message.deliver_at <= now);
+        let (first_idx, sender) = match first {
+            Some((idx, msg)) => (idx, msg.from),
+            None => return None,
+        };
+        let window = self.effective_reorder_window(sender, task);
+        // Historical clamping path shares the validated helper; oversized
+        // windows clamp to the ready count instead of failing.
+        let _ = first_idx;
+        self.recv_with_window(task, now, window)
     }
 
     /// Take one ready message for `task`, drawing a seeded pick inside the
@@ -370,12 +697,24 @@ impl SimNet {
     ///
     /// Window zero draws nothing and serves the queue head (FIFO). A nonzero
     /// window limits the candidate set to the last `window` ready messages
-    /// on this link and serves `candidate[draw(candidate.len())]`.
+    /// on this link and serves `candidate[draw(candidate.len())]`. Oversized
+    /// windows clamp here; use [`Self::try_recv_at_drawn`] to reject them.
     pub fn recv_at_drawn(
         &mut self,
         task: usize,
         now: u64,
+        draw: impl FnMut(u64) -> u64,
+    ) -> Option<Message> {
+        self.try_recv_at_drawn_validated(task, now, draw, false)
+    }
+
+    /// Shared drawn recv with optional validation.
+    fn try_recv_at_drawn_validated(
+        &mut self,
+        task: usize,
+        now: u64,
         mut draw: impl FnMut(u64) -> u64,
+        validate: bool,
     ) -> Option<Message> {
         let ready: Vec<usize> = self
             .queue
@@ -387,6 +726,9 @@ impl SimNet {
         let first = *ready.first()?;
         let sender = self.queue[first].from;
         let window = self.effective_reorder_window(sender, task);
+        if validate && window > MAX_REORDER_WINDOW {
+            return None;
+        }
         let link_candidates: Vec<usize> = ready
             .into_iter()
             .filter(|&idx| self.queue[idx].from == sender)
@@ -411,10 +753,10 @@ impl SimNet {
 mod tests {
     use super::*;
 
-    fn send_id(n: u8) -> Hash {
-        let mut h = Hash::default();
+    fn send_id(n: u8) -> EntryHash {
+        let mut h = [0u8; 32];
         h[0] = n;
-        h
+        EntryHash(h)
     }
 
     #[test]
@@ -433,7 +775,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 content: 7u64.to_le_bytes().to_vec(),
-                message_id: ledger_format::MessageId::new(0, 0),
+                message_id: ledger_format::MessageId::new(ActorId(0), 0),
                 send_id: send_id(1),
                 deliver_at: 100,
             },
@@ -457,7 +799,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 content: 1u64.to_le_bytes().to_vec(),
-                message_id: ledger_format::MessageId::new(0, 0),
+                message_id: ledger_format::MessageId::new(ActorId(0), 0),
                 send_id: send_id(1),
                 deliver_at: 0
             },
@@ -484,7 +826,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 content: 2u64.to_le_bytes().to_vec(),
-                message_id: ledger_format::MessageId::new(0, 0),
+                message_id: ledger_format::MessageId::new(ActorId(0), 0),
                 send_id: send_id(2),
                 deliver_at: 100
             },
@@ -516,7 +858,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 content: 1u64.to_le_bytes().to_vec(),
-                message_id: ledger_format::MessageId::new(0, 0),
+                message_id: ledger_format::MessageId::new(ActorId(0), 0),
                 send_id: send_id(1),
                 deliver_at: 0
             },
@@ -538,7 +880,7 @@ mod tests {
                 from: 0,
                 to: 1,
                 content: 2u64.to_le_bytes().to_vec(),
-                message_id: ledger_format::MessageId::new(0, 0),
+                message_id: ledger_format::MessageId::new(ActorId(0), 0),
                 send_id: send_id(2),
                 deliver_at: 0
             },
@@ -629,7 +971,7 @@ mod tests {
             from: 0,
             to: 1,
             content: 7u64.to_le_bytes().to_vec(),
-            message_id: ledger_format::MessageId::new(0, 3),
+            message_id: ledger_format::MessageId::new(ActorId(0), 3),
             send_id: send_id(1),
             deliver_at: now + 5,
         });
@@ -637,14 +979,14 @@ mod tests {
             from: 0,
             to: 1,
             content: 8u64.to_le_bytes().to_vec(),
-            message_id: ledger_format::MessageId::new(0, 4),
+            message_id: ledger_format::MessageId::new(ActorId(0), 4),
             send_id: send_id(2),
             deliver_at: now,
         });
         let msg = net.recv_at(1, now + 10).unwrap();
         // Stable identity through delay: the earlier send arrives with its
         // own message identity even after a later send was queued.
-        assert_eq!(msg.message_id, ledger_format::MessageId::new(0, 4));
+        assert_eq!(msg.message_id, ledger_format::MessageId::new(ActorId(0), 4));
         assert_eq!(msg.payload(), 8);
     }
 
@@ -657,7 +999,7 @@ mod tests {
             from: 0,
             to: 1,
             content: Vec::new(),
-            message_id: ledger_format::MessageId::new(0, 0),
+            message_id: ledger_format::MessageId::new(ActorId(0), 0),
             send_id: send_id(1),
             deliver_at: now,
         });
@@ -667,7 +1009,7 @@ mod tests {
             from: 0,
             to: 1,
             content: max.clone(),
-            message_id: ledger_format::MessageId::new(0, 1),
+            message_id: ledger_format::MessageId::new(ActorId(0), 1),
             send_id: send_id(2),
             deliver_at: now,
         });
@@ -683,7 +1025,7 @@ mod tests {
         let mut net = SimNet::new();
         let now = 10;
         let content = vec![1, 2, 3, 4];
-        let id = ledger_format::MessageId::new(2, 7);
+        let id = ledger_format::MessageId::new(ActorId(2), 7);
         let _ = net.send(Message {
             from: 2,
             to: 3,
@@ -713,12 +1055,198 @@ mod tests {
     #[test]
     fn apply_partition_fault_toggles() {
         let mut net = SimNet::new();
-        let fault = FaultSpec::Partition { src: 0, dst: 1 };
+        let fault = FaultSpec::Partition {
+            src: ActorId(0),
+            dst: ActorId(1),
+        };
         assert!(net.apply_fault(&fault));
         assert!(net.is_partitioned(0, 1));
         assert!(
             !net.apply_fault(&FaultSpec::Drop),
             "non-partition faults are not applied"
         );
+    }
+
+    #[test]
+    fn bounded_link_reports_queue_full_without_consuming_draws() {
+        let mut net = SimNet::new();
+        net.set_link(
+            0,
+            1,
+            LinkConfig {
+                capacity: Some(2),
+                ..LinkConfig::default()
+            },
+        );
+        let now = 10;
+        assert!(net.send_at(0, 1, 10, send_id(1), now, 0));
+        assert!(net.send_at(0, 1, 20, send_id(2), now, 0));
+        // Third send exceeds capacity: bool surface collapses to false.
+        assert!(!net.send_at(0, 1, 30, send_id(3), now, 0));
+        // Fallible surface produces the typed QueueFull with counts.
+        let err = net
+            .try_send_at(0, 1, 40, send_id(4), now, 0)
+            .expect_err("full queue must error");
+        assert_eq!(
+            err,
+            NetError::QueueFull {
+                from: 0,
+                to: 1,
+                capacity: 2,
+                queued: 2,
+            }
+        );
+        // Other links are unaffected by one link's bound.
+        assert!(net.send_at(0, 2, 50, send_id(5), now, 0));
+        // Draining one slot reopens the bounded link.
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 10);
+        assert!(net.send_at(0, 1, 30, send_id(3), now, 0));
+    }
+
+    #[test]
+    fn link_via_path_reports_queue_full_before_draws() {
+        let mut net = SimNet::new();
+        net.set_link(
+            0,
+            1,
+            LinkConfig {
+                jitter: 5,
+                capacity: Some(1),
+                ..LinkConfig::default()
+            },
+        );
+        let now = 0;
+        let mut draws = 0usize;
+        let first = net.try_send_via_link(
+            Message {
+                from: 0,
+                to: 1,
+                content: 1u64.to_le_bytes().to_vec(),
+                message_id: ledger_format::MessageId::new(ActorId(0), 0),
+                send_id: send_id(1),
+                deliver_at: now,
+            },
+            now,
+            0,
+            |_| {
+                draws += 1;
+                0
+            },
+        );
+        assert!(first.expect("first send queues"));
+        assert_eq!(draws, 1, "queued send consumes its jitter draw");
+        // Full queue: no draws consumed, typed error surfaces.
+        draws = 0;
+        let err = net
+            .try_send_via_link(
+                Message {
+                    from: 0,
+                    to: 1,
+                    content: 2u64.to_le_bytes().to_vec(),
+                    message_id: ledger_format::MessageId::new(ActorId(0), 1),
+                    send_id: send_id(2),
+                    deliver_at: now,
+                },
+                now,
+                0,
+                |_| {
+                    draws += 1;
+                    0
+                },
+            )
+            .expect_err("full queue must error");
+        assert!(matches!(err, NetError::QueueFull { .. }));
+        assert_eq!(draws, 0, "a full queue must not consume draws");
+    }
+
+    #[test]
+    fn unbounded_default_preserves_historical_behavior() {
+        // Default capacity is None (unbounded): any burst queues.
+        let mut net = SimNet::new();
+        assert_eq!(net.link_config(0, 1).capacity, None);
+        assert_eq!(
+            net.queue_policy(0, 1),
+            QueueFullPolicy::Drop,
+            "unconfigured links drop on the bool surface"
+        );
+        let now = 0;
+        for n in 0..64u8 {
+            assert!(net.send_at(0, 1, u64::from(n), send_id(n), now, 0));
+        }
+        assert_eq!(net.queued_for(0, 1), 64);
+    }
+
+    #[test]
+    fn oversized_reorder_window_fails_closed_on_validated_paths() {
+        let mut net = SimNet::new();
+        let bad = MAX_REORDER_WINDOW + 1;
+        assert_eq!(
+            net.try_set_reorder_window(bad).expect_err("must reject"),
+            NetError::InvalidReorderWindow {
+                window: bad,
+                reason: "window exceeds the representable bound",
+            }
+        );
+        assert_eq!(
+            SimNet::validate_reorder_window(bad).expect_err("must reject"),
+            NetError::InvalidReorderWindow {
+                window: bad,
+                reason: "window exceeds the representable bound",
+            }
+        );
+        assert!(
+            net.try_set_link(
+                0,
+                1,
+                LinkConfig {
+                    reorder_window: bad,
+                    ..LinkConfig::default()
+                },
+            )
+            .is_err(),
+            "link windows validate too"
+        );
+        // Largest representable window sets and clamps to the ready count.
+        net.try_set_reorder_window(MAX_REORDER_WINDOW)
+            .expect("bound itself is valid");
+        let now = 0;
+        let _ = net.send_at(0, 1, 10, send_id(1), now, 0);
+        assert_eq!(net.recv_at(1, now).unwrap().payload(), 10);
+        assert!(
+            net.try_recv_at(1, now).expect("validated recv").is_none(),
+            "empty queue stays empty"
+        );
+    }
+
+    #[test]
+    fn peek_matches_deterministic_recv_under_a_window() {
+        let mut net = SimNet::new();
+        net.set_reorder_window(2);
+        let now = 5;
+        for value in [10u64, 20, 30] {
+            let _ = net.send_at(0, 1, value, send_id(value as u8), now, 0);
+        }
+        // Window 2 over [10, 20, 30]: suffix is [20, 30], newest wins.
+        let peeked = net.peek_ready_send_id(1, now).expect("ready");
+        let delivered = net.recv_at(1, now).unwrap();
+        assert_eq!(peeked, delivered.send_id);
+        assert_eq!(delivered.payload(), 30);
+    }
+
+    #[test]
+    fn per_link_window_overrides_global() {
+        let mut net = SimNet::new();
+        net.set_reorder_window(3);
+        net.set_link(
+            0,
+            1,
+            LinkConfig {
+                reorder_window: 1,
+                ..LinkConfig::default()
+            },
+        );
+        assert_eq!(net.effective_reorder_window(0, 1), 1);
+        assert_eq!(net.effective_reorder_window(0, 2), 3);
+        assert_eq!(net.effective_reorder_window(9, 9), 3);
     }
 }

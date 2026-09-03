@@ -1,6 +1,6 @@
 //! Discrete virtual time and timer queue.
 
-use ledger_format::Hash;
+use ledger_format::EntryHash;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -9,7 +9,7 @@ struct Timer {
     deadline: u64,
     sequence: u64,
     task: usize,
-    enabler: Option<Hash>,
+    enabler: Option<EntryHash>,
 }
 
 impl Ord for Timer {
@@ -32,7 +32,7 @@ impl PartialOrd for Timer {
 pub struct TimerFired {
     pub task: usize,
     /// Journal entry that enabled this timer, if any.
-    pub enabler: Option<Hash>,
+    pub enabler: Option<EntryHash>,
 }
 
 /// Snapshot of the virtual clock.
@@ -89,7 +89,7 @@ impl VirtualTime {
     ///
     /// The enabler becomes the parent of the `TimerFire` entry journaled when
     /// this timer fires.
-    pub fn set_with_enabler(&mut self, delay: u64, task: usize, enabler: Option<Hash>) {
+    pub fn set_with_enabler(&mut self, delay: u64, task: usize, enabler: Option<EntryHash>) {
         self.sequence += 1;
         self.timers.push(Timer {
             deadline: self.now.saturating_add(delay),
@@ -129,12 +129,37 @@ impl VirtualTime {
         ready
     }
 
+    /// Peek the deadline of the earliest pending timer, if any.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.timers.peek().map(|timer| timer.deadline)
+    }
+
+    /// Advance to a specific timestamp, firing any timers whose deadline has arrived.
+    pub fn advance_to_with_enablers(&mut self, target: u64) -> Vec<TimerFired> {
+        assert!(target >= self.now, "virtual time cannot move backward");
+        self.now = target;
+        let mut ready = Vec::new();
+        while self
+            .timers
+            .peek()
+            .is_some_and(|timer| timer.deadline <= self.now)
+        {
+            if let Some(timer) = self.timers.pop() {
+                ready.push(TimerFired {
+                    task: timer.task,
+                    enabler: timer.enabler,
+                });
+            }
+        }
+        ready
+    }
+
     /// Jump the clock forward to a deadline.
     ///
     /// The caller must have already fired every timer with an earlier
     /// deadline. Time advances only when no task can run (quiescence).
     pub fn advance_to(&mut self, deadline: u64) {
-        debug_assert!(deadline >= self.now, "virtual time cannot move backward");
+        assert!(deadline >= self.now, "virtual time cannot move backward");
         self.now = deadline;
     }
 }

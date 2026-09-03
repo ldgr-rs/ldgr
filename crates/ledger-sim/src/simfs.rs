@@ -7,7 +7,7 @@
 //! target prior write entries by content address.
 
 use ledger_format::{
-    CrashOperation, EntryKind, EntryPayload, Hash, ObservedRead, PATH_DOMAIN, PathRef,
+    ActorId, CrashOperation, EntryHash, EntryKind, EntryPayload, ObservedRead, PATH_DOMAIN, PathRef,
 };
 use ledger_journal::{Journal, JournalError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,7 +105,7 @@ pub enum JournalingMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ByteRange {
     content: Vec<u8>,
-    write_id: Hash,
+    write_id: EntryHash,
     state: PageState,
 }
 
@@ -120,7 +120,7 @@ struct File {
     length: u64,
     /// Entry id of the mutation that established existence (allocate or
     /// first write); names the parent of an empty successful read.
-    created_by: Option<Hash>,
+    created_by: Option<EntryHash>,
     /// The file survives a crash when it has been persisted at least once.
     durable_exists: bool,
 }
@@ -178,7 +178,7 @@ pub struct SimFs {
     max_resident_bytes: Option<u64>,
     /// Pending journaled writes that replay on fsync.
     #[cfg(feature = "sim-fs-journaling")]
-    journal: BTreeMap<String, Vec<(u64, Hash)>>,
+    journal: BTreeMap<String, Vec<(u64, EntryHash)>>,
     /// Pending metadata-only renames that commit on fsync.
     #[cfg(feature = "sim-fs-journaling")]
     pending_renames: BTreeMap<String, String>,
@@ -265,11 +265,11 @@ impl SimFs {
     pub fn write_bytes(
         &mut self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         path: &str,
         offset: u64,
         content: Vec<u8>,
-    ) -> Result<Hash, SimFsError> {
+    ) -> Result<EntryHash, SimFsError> {
         let len = content.len() as u64;
         if len > MAX_WRITE_BYTES {
             return Err(SimFsError::WriteTooLarge {
@@ -375,10 +375,10 @@ impl SimFs {
     pub fn write(
         &mut self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         path: &str,
         value: u64,
-    ) -> Result<Hash, JournalError> {
+    ) -> Result<EntryHash, JournalError> {
         self.write_bytes(journal, actor, path, 0, value.to_le_bytes().to_vec())
             .map_err(SimFsError::into_journal)
     }
@@ -391,9 +391,9 @@ impl SimFs {
     pub fn allocate(
         &mut self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         path: &str,
-    ) -> Result<Hash, SimFsError> {
+    ) -> Result<EntryHash, SimFsError> {
         let key = canonical_key(path);
         if self.files.contains_key(&key) {
             return Err(SimFsError::AlreadyExists(path.to_owned()));
@@ -419,7 +419,7 @@ impl SimFs {
     pub fn read_bytes(
         &self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         path: &str,
         offset: u64,
         requested_len: u64,
@@ -473,7 +473,7 @@ impl SimFs {
             out.extend(std::iter::repeat_n(0, (window_end - cursor) as usize));
         }
         debug_assert_eq!(out.len() as u64, take);
-        let mut parent_list: Vec<Hash> = parents.into_iter().collect();
+        let mut parent_list: Vec<EntryHash> = parents.into_iter().collect();
         if parent_list.is_empty()
             && let Some(created) = file.created_by
         {
@@ -500,7 +500,7 @@ impl SimFs {
     pub fn read(
         &self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         path: &str,
     ) -> Result<Option<u64>, JournalError> {
         match self
@@ -521,7 +521,11 @@ impl SimFs {
     ///
     /// The store-level barrier persists every dirty file; the root path is
     /// the canonical identity of that barrier.
-    pub fn fsync(&mut self, journal: &mut Journal, actor: u32) -> Result<Hash, JournalError> {
+    pub fn fsync(
+        &mut self,
+        journal: &mut Journal,
+        actor: ActorId,
+    ) -> Result<EntryHash, JournalError> {
         let id = journal.append(
             EntryKind::FsFsync,
             actor,
@@ -562,9 +566,9 @@ impl SimFs {
     pub fn fsync_path(
         &mut self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         path: &str,
-    ) -> Result<Hash, SimFsError> {
+    ) -> Result<EntryHash, SimFsError> {
         let key = canonical_key(path);
         let Some(file) = self.files.get_mut(&key) else {
             return Err(SimFsError::NotFound(path.to_owned()));
@@ -588,10 +592,10 @@ impl SimFs {
     pub fn rename(
         &mut self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         from: &str,
         to: &str,
-    ) -> Result<Hash, SimFsError> {
+    ) -> Result<EntryHash, SimFsError> {
         let from_key = canonical_key(from);
         let to_key = canonical_key(to);
         if !self.files.contains_key(&from_key) {
@@ -624,10 +628,10 @@ impl SimFs {
     pub fn append_tear(
         &mut self,
         journal: &mut Journal,
-        actor: u32,
+        actor: ActorId,
         path: &str,
         value: u64,
-    ) -> Result<Hash, SimFsError> {
+    ) -> Result<EntryHash, SimFsError> {
         let offset = self.files.get(&canonical_key(path)).map_or(0, |f| f.length);
         self.write_bytes(journal, actor, path, offset, value.to_le_bytes().to_vec())
     }
@@ -760,7 +764,7 @@ impl SimFs {
     }
 
     /// Locate the range carrying `write_entry`, for canonical crash ops.
-    fn target_range_mut(&mut self, write_entry: &Hash) -> Result<&mut ByteRange, SimFsError> {
+    fn target_range_mut(&mut self, write_entry: &EntryHash) -> Result<&mut ByteRange, SimFsError> {
         for file in self.files.values_mut() {
             if let Some(range) = file
                 .cache
@@ -789,19 +793,19 @@ mod tests {
         // observes Present([]) rather than Missing.
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.allocate(&mut journal, 0, "k").unwrap();
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(0));
-        fs.fsync(&mut journal, 0).unwrap();
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(0));
+        fs.allocate(&mut journal, ActorId(0), "k").unwrap();
+        assert_eq!(fs.read(&mut journal, ActorId(0), "k").unwrap(), Some(0));
+        fs.fsync(&mut journal, ActorId(0)).unwrap();
+        assert_eq!(fs.read(&mut journal, ActorId(0), "k").unwrap(), Some(0));
     }
 
     #[test]
     fn allocate_existing_path_fails_and_changes_nothing() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.allocate(&mut journal, 0, "k").unwrap();
+        fs.allocate(&mut journal, ActorId(0), "k").unwrap();
         assert!(matches!(
-            fs.allocate(&mut journal, 0, "k"),
+            fs.allocate(&mut journal, ActorId(0), "k"),
             Err(SimFsError::AlreadyExists(_))
         ));
         assert_eq!(fs.files.len(), 1);
@@ -811,7 +815,7 @@ mod tests {
     fn torn_write_sectors_commits_prefix_only() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        let write_id = fs.write(&mut journal, 0, "k", 100).unwrap();
+        let write_id = fs.write(&mut journal, ActorId(0), "k", 100).unwrap();
         fs.apply_crash_operation(&CrashOperation::TornWrite {
             write_entry: write_id,
             persisted_prefix: 4,
@@ -819,32 +823,34 @@ mod tests {
         .unwrap();
         // One of two 8-byte sectors persists: the first 4 bytes of the LE
         // u64 100, which still decodes to 100.
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(100));
+        assert_eq!(fs.read(&mut journal, ActorId(0), "k").unwrap(), Some(100));
 
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        let write_id = fs.write(&mut journal, 0, "k", 100).unwrap();
+        let write_id = fs.write(&mut journal, ActorId(0), "k", 100).unwrap();
         fs.apply_crash_operation(&CrashOperation::TornWrite {
             write_entry: write_id,
             persisted_prefix: 0,
         })
         .unwrap();
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(0));
+        assert_eq!(fs.read(&mut journal, ActorId(0), "k").unwrap(), Some(0));
     }
 
     #[test]
     fn corrupt_range_flips_in_range_bytes_only() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        let write_id = fs.write(&mut journal, 0, "k", 0xA5A5A5A5A5A5A5A5).unwrap();
-        let original = fs.read(&mut journal, 0, "k").unwrap().unwrap();
+        let write_id = fs
+            .write(&mut journal, ActorId(0), "k", 0xA5A5A5A5A5A5A5A5)
+            .unwrap();
+        let original = fs.read(&mut journal, ActorId(0), "k").unwrap().unwrap();
         fs.apply_crash_operation(&CrashOperation::CorruptRange {
             write_entry: write_id,
             offset: 0,
             xor_bytes: vec![0xFF; 4],
         })
         .unwrap();
-        let corrupted = fs.read(&mut journal, 0, "k").unwrap().unwrap();
+        let corrupted = fs.read(&mut journal, ActorId(0), "k").unwrap().unwrap();
         assert_ne!(corrupted, original);
         // An out-of-range corruption fails closed instead of silently
         // leaving the value unchanged.
@@ -856,17 +862,21 @@ mod tests {
             }),
             Err(SimFsError::UnknownWriteTarget)
         ));
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap().unwrap(), corrupted);
+        assert_eq!(
+            fs.read(&mut journal, ActorId(0), "k").unwrap().unwrap(),
+            corrupted
+        );
     }
 
     #[test]
     fn sparse_write_creates_zero_filled_hole() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write_bytes(&mut journal, 0, "f", 0, vec![1, 2, 3])
+        fs.write_bytes(&mut journal, ActorId(0), "f", 0, vec![1, 2, 3])
             .unwrap();
-        fs.write_bytes(&mut journal, 0, "f", 10, vec![9]).unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "f", 0, 11).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "f", 10, vec![9])
+            .unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "f", 0, 11).unwrap();
         match observed {
             ObservedRead::Present { content } => {
                 assert_eq!(&content[0..3], &[1, 2, 3]);
@@ -881,11 +891,14 @@ mod tests {
     fn zero_length_write_does_not_create_or_extend() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write_bytes(&mut journal, 0, "f", 0, Vec::new()).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "f", 0, Vec::new())
+            .unwrap();
         assert!(!fs.files.contains_key(&canonical_key("f")));
-        fs.write_bytes(&mut journal, 0, "f", 0, vec![1, 2]).unwrap();
-        fs.write_bytes(&mut journal, 0, "f", 2, Vec::new()).unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "f", 0, 8).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "f", 0, vec![1, 2])
+            .unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "f", 2, Vec::new())
+            .unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "f", 0, 8).unwrap();
         assert_eq!(
             observed,
             ObservedRead::Present {
@@ -898,10 +911,11 @@ mod tests {
     fn partial_overwrite_replaces_covered_window() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write_bytes(&mut journal, 0, "f", 0, vec![1, 2, 3, 4])
+        fs.write_bytes(&mut journal, ActorId(0), "f", 0, vec![1, 2, 3, 4])
             .unwrap();
-        fs.write_bytes(&mut journal, 0, "f", 1, vec![9, 9]).unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "f", 0, 4).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "f", 1, vec![9, 9])
+            .unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "f", 0, 4).unwrap();
         assert_eq!(
             observed,
             ObservedRead::Present {
@@ -914,8 +928,10 @@ mod tests {
     fn read_beyond_eof_returns_empty_with_existence_parent() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        let id = fs.write_bytes(&mut journal, 0, "f", 0, vec![7]).unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "f", 5, 3).unwrap();
+        let id = fs
+            .write_bytes(&mut journal, ActorId(0), "f", 0, vec![7])
+            .unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "f", 5, 3).unwrap();
         assert_eq!(
             observed,
             ObservedRead::Present {
@@ -930,10 +946,12 @@ mod tests {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
         let first = fs
-            .write_bytes(&mut journal, 0, "f", 0, vec![1, 2, 3])
+            .write_bytes(&mut journal, ActorId(0), "f", 0, vec![1, 2, 3])
             .unwrap();
-        let second = fs.write_bytes(&mut journal, 0, "f", 3, vec![4, 5]).unwrap();
-        fs.read_bytes(&mut journal, 0, "f", 1, 4).unwrap();
+        let second = fs
+            .write_bytes(&mut journal, ActorId(0), "f", 3, vec![4, 5])
+            .unwrap();
+        fs.read_bytes(&mut journal, ActorId(0), "f", 1, 4).unwrap();
         let read = journal
             .entries()
             .find(|entry| entry.data.kind == EntryKind::FsRead)
@@ -959,24 +977,26 @@ mod tests {
                 expected.push(parent);
             }
         }
-        assert_eq!(read.data.parents, expected);
+        assert_eq!(read.data.parents.as_slice(), expected.as_slice());
     }
 
     #[test]
     fn rename_moves_volatile_namespace_and_replaces_destination() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write_bytes(&mut journal, 0, "a", 0, vec![1]).unwrap();
-        fs.write_bytes(&mut journal, 0, "b", 0, vec![2]).unwrap();
-        fs.rename(&mut journal, 0, "a", "b").unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "b", 0, 1).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "a", 0, vec![1])
+            .unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "b", 0, vec![2])
+            .unwrap();
+        fs.rename(&mut journal, ActorId(0), "a", "b").unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "b", 0, 1).unwrap();
         assert_eq!(observed, ObservedRead::Present { content: vec![1] });
         assert!(matches!(
-            fs.read_bytes(&mut journal, 0, "a", 0, 1),
+            fs.read_bytes(&mut journal, ActorId(0), "a", 0, 1),
             Ok(ObservedRead::Missing)
         ));
         assert!(matches!(
-            fs.rename(&mut journal, 0, "absent", "x"),
+            fs.rename(&mut journal, ActorId(0), "absent", "x"),
             Err(SimFsError::NotFound(_))
         ));
     }
@@ -985,9 +1005,10 @@ mod tests {
     fn rename_to_same_canonical_path_succeeds_without_change() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write_bytes(&mut journal, 0, "a", 0, vec![5]).unwrap();
-        fs.rename(&mut journal, 0, "a", "a").unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "a", 0, 1).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "a", 0, vec![5])
+            .unwrap();
+        fs.rename(&mut journal, ActorId(0), "a", "a").unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "a", 0, 1).unwrap();
         assert_eq!(observed, ObservedRead::Present { content: vec![5] });
     }
 
@@ -996,7 +1017,7 @@ mod tests {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
         let err = fs
-            .write_bytes(&mut journal, 0, "f", MAX_FILE_EXTENT_HARD, vec![1])
+            .write_bytes(&mut journal, ActorId(0), "f", MAX_FILE_EXTENT_HARD, vec![1])
             .unwrap_err();
         assert!(matches!(err, SimFsError::FileExtentTooLarge { .. }));
         assert!(!fs.files.contains_key(&canonical_key("f")));
@@ -1006,17 +1027,20 @@ mod tests {
     fn canonical_drop_paths_restores_only_selected_paths() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write_bytes(&mut journal, 0, "a", 0, vec![1]).unwrap();
-        fs.write_bytes(&mut journal, 0, "b", 0, vec![2]).unwrap();
-        fs.fsync(&mut journal, 0).unwrap();
-        fs.write_bytes(&mut journal, 0, "a", 0, vec![9]).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "a", 0, vec![1])
+            .unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "b", 0, vec![2])
+            .unwrap();
+        fs.fsync(&mut journal, ActorId(0)).unwrap();
+        fs.write_bytes(&mut journal, ActorId(0), "a", 0, vec![9])
+            .unwrap();
         fs.apply_crash_operation(&CrashOperation::DropPaths {
             paths: vec![path_ref("a")],
         })
         .unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "a", 0, 1).unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "a", 0, 1).unwrap();
         assert_eq!(observed, ObservedRead::Present { content: vec![1] });
-        let observed = fs.read_bytes(&mut journal, 0, "b", 0, 1).unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "b", 0, 1).unwrap();
         assert_eq!(observed, ObservedRead::Present { content: vec![2] });
     }
 
@@ -1025,14 +1049,14 @@ mod tests {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
         let id = fs
-            .write_bytes(&mut journal, 0, "f", 0, vec![1, 2, 3, 4])
+            .write_bytes(&mut journal, ActorId(0), "f", 0, vec![1, 2, 3, 4])
             .unwrap();
         fs.apply_crash_operation(&CrashOperation::TornWrite {
             write_entry: id,
             persisted_prefix: 2,
         })
         .unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "f", 0, 4).unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "f", 0, 4).unwrap();
         assert_eq!(
             observed,
             ObservedRead::Present {
@@ -1046,7 +1070,7 @@ mod tests {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
         let id = fs
-            .write_bytes(&mut journal, 0, "f", 0, vec![0x00, 0x00])
+            .write_bytes(&mut journal, ActorId(0), "f", 0, vec![0x00, 0x00])
             .unwrap();
         fs.apply_crash_operation(&CrashOperation::CorruptRange {
             write_entry: id,
@@ -1054,7 +1078,7 @@ mod tests {
             xor_bytes: vec![0xFF],
         })
         .unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "f", 0, 2).unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "f", 0, 2).unwrap();
         assert_eq!(
             observed,
             ObservedRead::Present {
@@ -1067,7 +1091,7 @@ mod tests {
             bit: 1,
         })
         .unwrap();
-        let observed = fs.read_bytes(&mut journal, 0, "f", 0, 2).unwrap();
+        let observed = fs.read_bytes(&mut journal, ActorId(0), "f", 0, 2).unwrap();
         assert_eq!(
             observed,
             ObservedRead::Present {
@@ -1080,7 +1104,7 @@ mod tests {
     fn canonical_ops_fail_closed_on_bad_targets() {
         let _journal = new_journal();
         let mut fs = SimFs::new();
-        let unknown = Hash::default();
+        let unknown = EntryHash([0u8; 32]);
         assert!(matches!(
             fs.apply_crash_operation(&CrashOperation::TornWrite {
                 write_entry: unknown,
@@ -1112,7 +1136,7 @@ mod tests {
         let mut fs = SimFs::new();
         let oversized = vec![0u8; (MAX_WRITE_BYTES + 1) as usize];
         let err = fs
-            .write_bytes(&mut journal, 0, "f", 0, oversized)
+            .write_bytes(&mut journal, ActorId(0), "f", 0, oversized)
             .unwrap_err();
         assert!(matches!(err, SimFsError::WriteTooLarge { .. }));
     }
@@ -1160,13 +1184,15 @@ mod tests {
                     let len = (next() % 24) as usize;
                     let content: Vec<u8> =
                         (0..len).map(|i| ((step + i as u64) % 251) as u8).collect();
-                    fs.write_bytes(&mut journal, 0, "f", offset, content.clone())
+                    fs.write_bytes(&mut journal, ActorId(0), "f", offset, content.clone())
                         .unwrap();
                     reference.write(offset, &content);
                 }
                 1 => {
                     let len = next() % 40;
-                    let observed = fs.read_bytes(&mut journal, 0, "f", offset, len).unwrap();
+                    let observed = fs
+                        .read_bytes(&mut journal, ActorId(0), "f", offset, len)
+                        .unwrap();
                     let expected = reference.read(offset, len);
                     match observed {
                         ObservedRead::Present { content } => assert_eq!(content, expected),
@@ -1176,7 +1202,7 @@ mod tests {
                     }
                 }
                 _ => {
-                    fs.fsync_path(&mut journal, 0, "f").unwrap();
+                    fs.fsync_path(&mut journal, ActorId(0), "f").unwrap();
                 }
             }
         }
@@ -1187,7 +1213,7 @@ mod tests {
         let mut journal = new_journal();
         let fs = SimFs::new();
         let err = fs
-            .read_bytes(&mut journal, 0, "f", 0, MAX_READ_BYTES + 1)
+            .read_bytes(&mut journal, ActorId(0), "f", 0, MAX_READ_BYTES + 1)
             .unwrap_err();
         assert!(matches!(err, SimFsError::ReadTooLarge { .. }));
     }
@@ -1206,9 +1232,9 @@ mod journaling_tests {
     fn journaling_data_mode_loses_unfsynced_writes_on_crash() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write(&mut journal, 0, "k", 7).unwrap();
+        fs.write(&mut journal, ActorId(0), "k", 7).unwrap();
         fs.crash_journaled();
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), None);
+        assert_eq!(fs.read(&mut journal, ActorId(0), "k").unwrap(), None);
     }
 
     #[test]
@@ -1216,19 +1242,19 @@ mod journaling_tests {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
         fs.set_journaling_mode(JournalingMode::Writeback);
-        fs.write(&mut journal, 0, "k", 7).unwrap();
+        fs.write(&mut journal, ActorId(0), "k", 7).unwrap();
         fs.crash_journaled();
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(7));
+        assert_eq!(fs.read(&mut journal, ActorId(0), "k").unwrap(), Some(7));
     }
 
     #[test]
     fn fsync_persists_journaled_writes_in_data_mode() {
         let mut journal = new_journal();
         let mut fs = SimFs::new();
-        fs.write(&mut journal, 0, "k", 7).unwrap();
-        fs.fsync(&mut journal, 0).unwrap();
-        fs.write(&mut journal, 0, "k", 9).unwrap();
+        fs.write(&mut journal, ActorId(0), "k", 7).unwrap();
+        fs.fsync(&mut journal, ActorId(0)).unwrap();
+        fs.write(&mut journal, ActorId(0), "k", 9).unwrap();
         fs.crash_journaled();
-        assert_eq!(fs.read(&mut journal, 0, "k").unwrap(), Some(7));
+        assert_eq!(fs.read(&mut journal, ActorId(0), "k").unwrap(), Some(7));
     }
 }

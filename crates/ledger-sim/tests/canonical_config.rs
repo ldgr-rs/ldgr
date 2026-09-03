@@ -70,7 +70,9 @@ fn blake3_hex(bytes: &[u8]) -> String {
 fn shapes() -> Vec<RunConfig> {
     let list = vec![
         RunConfig::default(),
-        RunConfig::builder().seed([0xab; 32]).build(),
+        RunConfig::builder()
+            .seed(ledger_format::EntryHash([0xab; 32]))
+            .build(),
         RunConfig::builder()
             .policy(Policy::Pct {
                 priority_changes: 7,
@@ -144,12 +146,15 @@ fn shape_names() -> Vec<&'static str> {
 /// Every optional field populated, to exercise every sub-encoding once.
 fn rich() -> RunConfig {
     let config = RunConfig::builder()
-        .seed([0x42; 32])
+        .seed(ledger_format::EntryHash([0x42; 32]))
         .policy(Policy::Pct {
             priority_changes: 3,
         })
         .max_steps(42_042)
-        .dropped_events(vec![[0xaa; 32], [0xbb; 32]])
+        .dropped_events(vec![
+            ledger_format::EntryHash([0xaa; 32]),
+            ledger_format::EntryHash([0xbb; 32]),
+        ])
         .swarm(SwarmConfig {
             drop_probability: ledger_sim::Probability::new(0.1).unwrap(),
             delay_probability: ledger_sim::Probability::new(0.2).unwrap(),
@@ -166,6 +171,8 @@ fn rich() -> RunConfig {
                     jitter: 2,
                     loss_probability: ledger_sim::Probability::new(0.5).unwrap(),
                     reorder_window: 3,
+                    capacity: None,
+                    queue_policy: ledger_sim::QueueFullPolicy::Drop,
                 },
             ),
             (
@@ -176,23 +183,28 @@ fn rich() -> RunConfig {
                     jitter: 1,
                     loss_probability: ledger_sim::Probability::new(0.1).unwrap(),
                     reorder_window: 0,
+                    capacity: None,
+                    queue_policy: ledger_sim::QueueFullPolicy::Drop,
                 },
             ),
         ])
         .fault_schedule(vec![
-            SimFault::Drop([0xcc; 32]),
+            SimFault::Drop(ledger_format::EntryHash([0xcc; 32])),
             SimFault::Delay {
-                send: [0xdd; 32],
+                send: ledger_format::EntryHash([0xdd; 32]),
                 ticks: 3,
             },
-            SimFault::Partition { src: 0, dst: 1 },
-            SimFault::Crash([0xee; 32]),
+            SimFault::Partition {
+                src: ledger_format::ActorId(0),
+                dst: ledger_format::ActorId(1),
+            },
+            SimFault::Crash(ledger_format::EntryHash([0xee; 32])),
             SimFault::Corrupt {
-                write: [0x11; 32],
+                write: ledger_format::EntryHash([0x11; 32]),
                 xor_mask: 0xff,
             },
             SimFault::CrashState {
-                write: [0x22; 32],
+                write: ledger_format::EntryHash([0x22; 32]),
                 state: 2,
             },
         ])
@@ -244,6 +256,11 @@ fn description(config: &RunConfig) -> serde_json::Value {
                 "jitter": link.jitter,
                 "loss_probability": format!("{}", link.loss_probability),
                 "reorder_window": link.reorder_window,
+                "capacity": link.capacity,
+                "queue_policy": match link.queue_policy {
+                    ledger_sim::QueueFullPolicy::Drop => "drop",
+                    ledger_sim::QueueFullPolicy::Block => "block",
+                },
             })
         })
         .collect::<Vec<_>>();
@@ -256,20 +273,20 @@ fn description(config: &RunConfig) -> serde_json::Value {
         .fault_schedule()
         .iter()
         .map(|fault| match fault {
-            SimFault::Drop(id) => serde_json::json!({"tag": "drop", "id": to_hex(id)}),
+            SimFault::Drop(id) => serde_json::json!({"tag": "drop", "id": to_hex(&id.0)}),
             SimFault::Delay { send, ticks } => {
-                serde_json::json!({"tag": "delay", "send": to_hex(send), "ticks": ticks})
+                serde_json::json!({"tag": "delay", "send": to_hex(&send.0), "ticks": ticks})
             }
             SimFault::Partition { src, dst } => {
-                serde_json::json!({"tag": "partition", "src": src, "dst": dst})
+                serde_json::json!({"tag": "partition", "src": src.0, "dst": dst.0})
             }
-            SimFault::Crash(id) => serde_json::json!({"tag": "crash", "id": to_hex(id)}),
+            SimFault::Crash(id) => serde_json::json!({"tag": "crash", "id": to_hex(&id.0)}),
             SimFault::Corrupt { write, xor_mask } => {
-                serde_json::json!({"tag": "corrupt", "write": to_hex(write), "xor_mask": xor_mask})
+                serde_json::json!({"tag": "corrupt", "write": to_hex(&write.0), "xor_mask": xor_mask})
             }
             SimFault::CrashState { write, state } => serde_json::json!({
                 "tag": "crash_state",
-                "write": to_hex(write),
+                "write": to_hex(&write.0),
                 "state": state,
             }),
         })
@@ -284,10 +301,10 @@ fn description(config: &RunConfig) -> serde_json::Value {
     #[cfg(not(feature = "sim-fs-journaling"))]
     let fs_journaling = serde_json::Value::Null;
     serde_json::json!({
-        "seed": to_hex(&config.seed()),
+        "seed": to_hex(&config.seed().0),
         "policy": policy,
         "max_steps": config.max_steps(),
-        "dropped_events": config.dropped_events().iter().map(|hash| to_hex(hash)).collect::<Vec<_>>(),
+        "dropped_events": config.dropped_events().iter().map(|hash| to_hex(&hash.0)).collect::<Vec<_>>(),
         "swarm": swarm_value,
         "links": links,
         "dns": dns,
@@ -327,6 +344,21 @@ fn config_from_description(desc: &serde_json::Value) -> RunConfig {
         .expect("links array")
         .iter()
         .map(|link| {
+            let capacity = match link.get("capacity") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::Number(n)) => Some(n.as_u64().expect("capacity") as usize),
+                Some(other) => panic!("unexpected capacity value {other}"),
+            };
+            let queue_policy = match link.get("queue_policy") {
+                None | Some(serde_json::Value::Null) => ledger_sim::QueueFullPolicy::Drop,
+                Some(serde_json::Value::String(s)) if s == "drop" => {
+                    ledger_sim::QueueFullPolicy::Drop
+                }
+                Some(serde_json::Value::String(s)) if s == "block" => {
+                    ledger_sim::QueueFullPolicy::Block
+                }
+                Some(other) => panic!("unexpected queue_policy value {other}"),
+            };
             (
                 link["from"].as_u64().expect("link from") as usize,
                 link["to"].as_u64().expect("link to") as usize,
@@ -339,6 +371,8 @@ fn config_from_description(desc: &serde_json::Value) -> RunConfig {
                         .parse()
                         .expect("loss parses"),
                     reorder_window: link["reorder_window"].as_u64().expect("reorder") as usize,
+                    capacity,
+                    queue_policy,
                 },
             )
         })
@@ -361,8 +395,8 @@ fn config_from_description(desc: &serde_json::Value) -> RunConfig {
                 ticks: fault["ticks"].as_u64().expect("ticks"),
             },
             "partition" => SimFault::Partition {
-                src: fault["src"].as_u64().expect("src") as u32,
-                dst: fault["dst"].as_u64().expect("dst") as u32,
+                src: ledger_format::ActorId(fault["src"].as_u64().expect("src") as u32),
+                dst: ledger_format::ActorId(fault["dst"].as_u64().expect("dst") as u32),
             },
             "crash" => {
                 SimFault::Crash(hash_from_hex(fault["id"].as_str().expect("id")).expect("id"))
@@ -475,14 +509,14 @@ fn assert_config_eq(expected: &RunConfig, actual: &RunConfig) {
 /// bytes diverge across feature builds; the fixtures capture both variants.
 fn v0_canonical_bytes(config: &RunConfig) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&config.seed());
+    out.extend_from_slice(&config.seed().0);
     v0_encode_policy(&config.policy(), &mut out);
     out.extend_from_slice(&config.max_steps().to_le_bytes());
     out.push(u8::from(config.monitor()));
     v0_encode_swarm(config.swarm(), &mut out);
     out.extend_from_slice(&(config.dropped_events().len() as u64).to_le_bytes());
     for hash in config.dropped_events() {
-        out.extend_from_slice(hash);
+        out.extend_from_slice(&hash.0);
     }
     out.extend_from_slice(&(config.links().len() as u64).to_le_bytes());
     for (from, to, link) in config.links() {
@@ -553,30 +587,30 @@ fn v0_encode_fault(fault: &SimFault, out: &mut Vec<u8>) {
     match fault {
         SimFault::Drop(id) => {
             out.push(0);
-            out.extend_from_slice(id);
+            out.extend_from_slice(&id.0);
         }
         SimFault::Delay { send, ticks } => {
             out.push(1);
-            out.extend_from_slice(send);
+            out.extend_from_slice(&send.0);
             out.extend_from_slice(&ticks.to_le_bytes());
         }
         SimFault::Partition { src, dst } => {
             out.push(2);
-            out.extend_from_slice(&src.to_le_bytes());
-            out.extend_from_slice(&dst.to_le_bytes());
+            out.extend_from_slice(&src.0.to_le_bytes());
+            out.extend_from_slice(&dst.0.to_le_bytes());
         }
         SimFault::Crash(id) => {
             out.push(3);
-            out.extend_from_slice(id);
+            out.extend_from_slice(&id.0);
         }
         SimFault::Corrupt { write, xor_mask } => {
             out.push(4);
-            out.extend_from_slice(write);
+            out.extend_from_slice(&write.0);
             out.extend_from_slice(&xor_mask.to_le_bytes());
         }
         SimFault::CrashState { write, state } => {
             out.push(5);
-            out.extend_from_slice(write);
+            out.extend_from_slice(&write.0);
             out.extend_from_slice(&state.to_le_bytes());
         }
     }
@@ -883,7 +917,7 @@ fn canonical_hash_matches_blake3_of_canonical_bytes() {
     for config in shapes() {
         let hash = canonical_hash(&config).expect("hashes");
         let bytes = to_canonical_bytes(&config).expect("encodes");
-        let expected = *blake3::hash(&bytes).as_bytes();
+        let expected = ledger_format::EntryHash(*blake3::hash(&bytes).as_bytes());
         assert_eq!(hash, expected);
     }
 }
@@ -896,8 +930,14 @@ fn same_dns_different_insert_order_encodes_equal() {
     let mut dns_b = ledger_sim::DnsTable::new();
     dns_b.insert("a.test", 1);
     dns_b.insert("z.test", 2);
-    let a = RunConfig::builder().seed([9u8; 32]).dns(dns_a).build();
-    let b = RunConfig::builder().seed([9u8; 32]).dns(dns_b).build();
+    let a = RunConfig::builder()
+        .seed(ledger_format::EntryHash([9u8; 32]))
+        .dns(dns_a)
+        .build();
+    let b = RunConfig::builder()
+        .seed(ledger_format::EntryHash([9u8; 32]))
+        .dns(dns_b)
+        .build();
     assert_eq!(
         to_canonical_bytes(&a).expect("a"),
         to_canonical_bytes(&b).expect("b"),

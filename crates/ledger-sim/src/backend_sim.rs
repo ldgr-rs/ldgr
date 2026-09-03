@@ -7,10 +7,11 @@ use crate::seedtree::SeedTree;
 use crate::simfs::SimFs;
 use crate::time::{Clock, VirtualTime};
 use core::convert::Infallible;
-use ledger_format::{ActorId, EntryKind, EntryPayload, FaultPayload, Hash, StreamId};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, FaultPayload, StreamId};
 use ledger_journal::{Journal, JournalError};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{Rng, TryRng};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Lock a simulation-owned mutex, recovering the value from a poisoned lock.
@@ -105,7 +106,7 @@ pub struct SimBackend {
     net: Mutex<SimNet>,
     fs: Arc<Mutex<SimFs>>,
     actor: ActorId,
-    rng_streams: Vec<Option<SimStreamRng>>,
+    rng_streams: BTreeMap<StreamId, SimStreamRng>,
     /// Seed-drawn picks inside the configured reorder window; `false` keeps
     /// the deterministic newest-first window.
     reorder_draw: bool,
@@ -121,7 +122,7 @@ pub struct SimBackend {
 impl SimBackend {
     /// Create a new simulation backend from a seed tree for actor 0.
     pub fn new(seed_tree: SeedTree) -> Self {
-        Self::for_actor(seed_tree, 0)
+        Self::for_actor(seed_tree, ActorId(0))
     }
 
     /// Create a new simulation backend for a specific SUT actor.
@@ -134,7 +135,7 @@ impl SimBackend {
             net: Mutex::new(SimNet::new()),
             fs: Arc::new(Mutex::new(SimFs::new())),
             actor,
-            rng_streams: Vec::new(),
+            rng_streams: BTreeMap::new(),
             reorder_draw: false,
             net_offset: Mutex::new(0),
             tick_sink: None,
@@ -186,12 +187,12 @@ impl SimBackend {
     }
 
     /// Snapshot the captured effect origins in append order.
-    pub fn origins_snapshot(&self) -> Vec<(Hash, OriginSource)> {
+    pub fn origins_snapshot(&self) -> Vec<(EntryHash, OriginSource)> {
         lock(&self.origins).snapshot()
     }
 
     /// Look up the origin of one journaled entry.
-    pub fn origin_of(&self, id: &Hash) -> Option<OriginSource> {
+    pub fn origin_of(&self, id: &EntryHash) -> Option<OriginSource> {
         lock(&self.origins).get(id).cloned()
     }
 
@@ -203,18 +204,18 @@ impl SimBackend {
     pub fn journal_append(
         &self,
         kind: EntryKind,
-        parents: impl IntoIterator<Item = Hash>,
+        parents: impl IntoIterator<Item = EntryHash>,
         payload: EntryPayload,
-    ) -> Option<Hash> {
+    ) -> Option<EntryHash> {
         self.append(kind, parents, payload)
     }
 
     fn append(
         &self,
         kind: EntryKind,
-        parents: impl IntoIterator<Item = Hash>,
+        parents: impl IntoIterator<Item = EntryHash>,
         payload: EntryPayload,
-    ) -> Option<Hash> {
+    ) -> Option<EntryHash> {
         match lock(&self.journal).append(kind, self.actor, parents, payload) {
             Ok(id) => Some(id),
             Err(error) => {
@@ -240,21 +241,27 @@ impl Effects for SimBackend {
     }
 
     fn rng(&mut self, stream: StreamId) -> &mut impl rand_core::Rng {
-        let idx = stream as usize;
-        while self.rng_streams.len() <= idx {
-            self.rng_streams.push(None);
-        }
         // The label and the ChaCha20 derivation run only when the handle is
         // first created; later acquisitions reuse the stored stream.
-        self.rng_streams[idx].get_or_insert_with(|| SimStreamRng {
-            rng: self.seed_tree.rng(&format!("app/{stream}")),
-            journal: Arc::clone(&self.journal),
-            journal_error: Arc::clone(&self.journal_error),
-            actor: self.actor,
-            stream,
-        })
+        self.rng_streams
+            .entry(stream)
+            .or_insert_with(|| SimStreamRng {
+                rng: self.seed_tree.rng(&format!("app/{}", stream.0)),
+                journal: Arc::clone(&self.journal),
+                journal_error: Arc::clone(&self.journal_error),
+                actor: self.actor,
+                stream,
+            })
     }
 
+    /// Single-actor inline sleep.
+    ///
+    /// Kept separate from the executor's batched quiescent firing on purpose:
+    /// this backend has no scheduler loop, so it must advance time and journal
+    /// `TimerFire`/`Wake` synchronously. The executor parks the task and fires
+    /// at quiescence via `advance_quiescent` batching. Both paths journal the
+    /// same `TimerSet -TimerFire -> Wake` chain with the `TimerSet` id as the
+    /// `TimerFire` parent; see the sleep-parity test pinning this.
     async fn sleep(&self, d: core::time::Duration) {
         let ticks = d.as_micros() as u64;
         let timer_set = self.append(
@@ -266,7 +273,7 @@ impl Effects for SimBackend {
             },
         );
         let mut time = lock(&self.time);
-        time.set_with_enabler(ticks, self.actor as usize, timer_set);
+        time.set_with_enabler(ticks, self.actor.0 as usize, timer_set);
         for fired in time.advance_with_enablers() {
             let parents = fired.enabler.into_iter().collect::<Vec<_>>();
             if let Some(timer_fire) = self.append(
@@ -327,8 +334,8 @@ impl Net for SimBackend {
             [message.send_id],
             EntryPayload::Recv(ledger_format::RecvFrame {
                 message_id: message.message_id,
-                from: message.from as ActorId,
-                to: task as ActorId,
+                from: ActorId(message.from as u32),
+                to: ActorId(task as u32),
                 observed_content: message.content.clone(),
             }),
         );
@@ -349,14 +356,14 @@ impl Net for SimBackend {
 impl SimBackend {
     /// Append the Send entry and hand the message to the simulated network.
     /// Returns delivery status plus the Send entry id when journaling worked.
-    fn send_impl(&self, message: Message) -> (bool, Option<Hash>) {
+    fn send_impl(&self, message: Message) -> (bool, Option<EntryHash>) {
         let Some(id) = self.append(
             EntryKind::Send,
             [],
             EntryPayload::Send(ledger_format::SendFrame {
                 message_id: message.message_id,
-                from: message.from as ActorId,
-                to: message.to as ActorId,
+                from: ActorId(message.from as u32),
+                to: ActorId(message.to as u32),
                 original_content: message.content.clone(),
             }),
         ) else {
@@ -371,7 +378,7 @@ impl SimBackend {
 }
 
 impl Fs for SimBackend {
-    fn write(&self, path: &str, value: u64) -> Result<Hash, crate::effects::FsError> {
+    fn write(&self, path: &str, value: u64) -> Result<EntryHash, crate::effects::FsError> {
         Ok(self.write_impl(path, value)?)
     }
 
@@ -380,17 +387,17 @@ impl Fs for SimBackend {
         path: &str,
         value: u64,
         at: OriginSource,
-    ) -> Result<Hash, crate::effects::FsError> {
+    ) -> Result<EntryHash, crate::effects::FsError> {
         let id = self.write_impl(path, value)?;
         lock(&self.origins).record(id, at);
         Ok(id)
     }
 
-    fn fsync(&self) -> Result<Hash, crate::effects::FsError> {
+    fn fsync(&self) -> Result<EntryHash, crate::effects::FsError> {
         Ok(self.fsync_impl()?)
     }
 
-    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, crate::effects::FsError> {
+    fn fsync_loc(&self, at: OriginSource) -> Result<EntryHash, crate::effects::FsError> {
         let id = self.fsync_impl()?;
         lock(&self.origins).record(id, at);
         Ok(id)
@@ -414,13 +421,13 @@ impl Fs for SimBackend {
 }
 
 impl SimBackend {
-    fn write_impl(&self, path: &str, value: u64) -> Result<Hash, JournalError> {
+    fn write_impl(&self, path: &str, value: u64) -> Result<EntryHash, JournalError> {
         let mut journal = lock(&self.journal);
         let mut fs = lock(&*self.fs);
         fs.write(&mut journal, self.actor, path, value)
     }
 
-    fn fsync_impl(&self) -> Result<Hash, JournalError> {
+    fn fsync_impl(&self) -> Result<EntryHash, JournalError> {
         let mut journal = lock(&self.journal);
         let mut fs = lock(&*self.fs);
         fs.fsync(&mut journal, self.actor)
@@ -433,7 +440,7 @@ impl SimBackend {
         path: &str,
         offset: u64,
         content: Vec<u8>,
-    ) -> Result<Hash, crate::simfs::SimFsError> {
+    ) -> Result<EntryHash, crate::simfs::SimFsError> {
         let mut journal = lock(&self.journal);
         let mut fs = lock(&*self.fs);
         fs.write_bytes(&mut journal, self.actor, path, offset, content)
@@ -453,7 +460,7 @@ impl SimBackend {
     }
 
     /// Flush all dirty data for `path` to durable state, journaling `FsFsync`.
-    pub fn fs_sync_path(&self, path: &str) -> Result<Hash, crate::simfs::SimFsError> {
+    pub fn fs_sync_path(&self, path: &str) -> Result<EntryHash, crate::simfs::SimFsError> {
         let mut journal = lock(&self.journal);
         let mut fs = lock(&*self.fs);
         fs.fsync_path(&mut journal, self.actor, path)
@@ -461,7 +468,7 @@ impl SimBackend {
 
     /// Append the crash-fault entry and fold storage into the post-crash
     /// state. Returns the entry id when journaling worked.
-    fn crash_impl(&self) -> Option<Hash> {
+    fn crash_impl(&self) -> Option<EntryHash> {
         let id = self.append(
             EntryKind::Fault,
             [],
@@ -485,9 +492,10 @@ mod tests {
 
     #[test]
     fn effects_boundary_journals_a_tiny_sut() {
-        let backend = SimBackend::for_actor(SeedTree::new([5; 32]), 1);
+        let backend =
+            SimBackend::for_actor(SeedTree::new(ledger_format::EntryHash([5; 32])), ActorId(1));
         let mut effects = backend;
-        let drawn = effects.rng(0).next_u64();
+        let drawn = effects.rng(StreamId(0)).next_u64();
         assert_ne!(drawn, 0, "seed tree must serve a deterministic draw");
 
         let now = effects.clock().now();
@@ -495,8 +503,8 @@ mod tests {
             from: 1,
             to: 2,
             content: 42u64.to_le_bytes().to_vec(),
-            message_id: ledger_format::MessageId::new(1, 0),
-            send_id: [0; 32],
+            message_id: ledger_format::MessageId::new(ActorId(1), 0),
+            send_id: ledger_format::EntryHash([0; 32]),
             deliver_at: now,
         });
         let write_id = effects.fs().write("k", 7).unwrap();
@@ -507,7 +515,10 @@ mod tests {
         assert!(journal.entries().any(|e| {
             matches!(
                 &e.data.payload,
-                EntryPayload::RngDraw(ledger_format::RngDrawPayload { stream: 0, .. })
+                EntryPayload::RngDraw(ledger_format::RngDrawPayload {
+                    stream: StreamId(0),
+                    ..
+                })
             )
         }));
         assert!(journal.entries().any(|e| e.data.kind == EntryKind::Send));
@@ -528,18 +539,18 @@ mod tests {
 
     #[test]
     fn app_streams_are_independent_in_sim_backend() {
-        let draws = |other_stream: u32, other_count: u32, target_count: u32| -> Vec<u64> {
-            let mut backend = SimBackend::new(SeedTree::new([9; 32]));
+        let draws = |other_stream: StreamId, other_count: u32, target_count: u32| -> Vec<u64> {
+            let mut backend = SimBackend::new(SeedTree::new(ledger_format::EntryHash([9; 32])));
             for _ in 0..other_count {
                 let _ = backend.rng(other_stream).next_u64();
             }
             (0..target_count)
-                .map(|_| backend.rng(1).next_u64())
+                .map(|_| backend.rng(StreamId(1)).next_u64())
                 .collect()
         };
 
-        let sparse = draws(0, 1, 3);
-        let dense = draws(0, 9, 3);
+        let sparse = draws(StreamId(0), 1, 3);
+        let dense = draws(StreamId(0), 9, 3);
         assert_eq!(
             dense, sparse,
             "stream-1 draws must be identical regardless of stream-0 consumption"
@@ -548,8 +559,8 @@ mod tests {
 
     #[test]
     fn journal_snapshot_matches_live_journal_and_stays_fixed() {
-        let mut backend = SimBackend::new(SeedTree::new([11; 32]));
-        let _ = backend.rng(0).next_u64();
+        let mut backend = SimBackend::new(SeedTree::new(ledger_format::EntryHash([11; 32])));
+        let _ = backend.rng(StreamId(0)).next_u64();
         let before = backend.journal_snapshot();
         let root_before = before.root_hash();
         assert_eq!(
@@ -559,7 +570,7 @@ mod tests {
         );
 
         // The snapshot is a copy: later appends must not alter it.
-        let _ = backend.rng(0).next_u64();
+        let _ = backend.rng(StreamId(0)).next_u64();
         let after = backend.journal_snapshot();
         assert_eq!(
             before.root_hash(),
@@ -578,5 +589,86 @@ mod tests {
         );
         assert_eq!(after.entries().count(), 2);
         assert!(backend.journal_error().is_none());
+    }
+
+    /// Sleep parity between the inline backend and the executor batch path.
+    ///
+    /// Both journal the same `TimerSet -TimerFire -> Wake` chain with the
+    /// `TimerSet` id as the `TimerFire` parent and the `TimerFire` id as the
+    /// `Wake` parent. The backend fires inline (no scheduler); the executor
+    /// parks and fires at quiescence in batch. This pins the chain shape so
+    /// the two paths cannot drift.
+    #[test]
+    fn inline_sleep_matches_quiescent_timer_chain() {
+        use ledger_format::EntryPayload;
+        let backend = SimBackend::new(SeedTree::new(ledger_format::EntryHash([21; 32])));
+        futures::executor::block_on(backend.sleep(core::time::Duration::from_micros(7)));
+        let journal = backend.journal_snapshot();
+        let kinds = journal
+            .entries()
+            .map(|entry| entry.data.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![EntryKind::TimerSet, EntryKind::TimerFire, EntryKind::Wake],
+            "inline sleep journals exactly one timer chain"
+        );
+        let entries: Vec<_> = journal.entries().collect();
+        let set_id = entries[0].id;
+        let fire_id = entries[1].id;
+        match &entries[1].data.payload {
+            EntryPayload::TimerFire { .. } => {}
+            other => panic!("second entry must be TimerFire, got {other:?}"),
+        }
+        assert_eq!(
+            entries[1].data.parents.as_slice(),
+            &[set_id],
+            "TimerFire parents the TimerSet enabler"
+        );
+        assert_eq!(
+            entries[2].data.parents.as_slice(),
+            &[fire_id],
+            "Wake chains the TimerFire"
+        );
+        match &entries[2].data.payload {
+            EntryPayload::Wake(ledger_format::WakePayload::TimerReady { .. }) => {}
+            other => panic!("third entry must be TimerReady wake, got {other:?}"),
+        }
+        assert!(
+            JournalCorrectnessMonitor::audit(&journal).is_empty(),
+            "timer chain must be causally sound"
+        );
+        // Executor parity: one sleeping task produces the same chain shape
+        // (plus scheduler Spawn/RngDraw framing around it).
+        let config = crate::config::RunConfig::builder()
+            .seed(ledger_format::EntryHash([21; 32]))
+            .max_steps(64)
+            .build();
+        let run = crate::runtime::Simulation::with_tasks(
+            config,
+            vec![Box::new(|b: crate::executor::Boundary| {
+                Box::pin(async move {
+                    b.sleep(core::time::Duration::from_micros(7)).await;
+                })
+            })],
+        )
+        .run()
+        .expect("executor sleep run");
+        let chain: Vec<_> = run
+            .journal
+            .entries()
+            .filter(|entry| {
+                matches!(
+                    entry.data.kind,
+                    EntryKind::TimerSet | EntryKind::TimerFire | EntryKind::Wake
+                )
+            })
+            .collect();
+        assert_eq!(chain.len(), 3, "executor journals one timer chain");
+        assert_eq!(chain[0].data.kind, EntryKind::TimerSet);
+        assert_eq!(chain[1].data.kind, EntryKind::TimerFire);
+        assert_eq!(chain[2].data.kind, EntryKind::Wake);
+        assert_eq!(chain[1].data.parents.as_slice(), &[chain[0].id]);
+        assert_eq!(chain[2].data.parents.as_slice(), &[chain[1].id]);
     }
 }

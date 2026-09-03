@@ -61,9 +61,10 @@ fn wasm_throughput_gate_100k_entries_per_second() {
     let module = wasmtime::Module::new(&engine, &wasm).expect("guest module must compile");
 
     let run_once = || {
-        let mut backend = WasmBackend::from_module(SeedTree::new([0; 32]), &module)
-            .expect("backend must instantiate")
-            .with_fuel_budget(FUEL_BUDGET);
+        let mut backend =
+            WasmBackend::from_module(SeedTree::new(ledger_format::EntryHash([0; 32])), &module)
+                .expect("backend must instantiate")
+                .with_fuel_budget(FUEL_BUDGET);
         backend
             .run_export("run_throughput")
             .expect("throughput export must run");

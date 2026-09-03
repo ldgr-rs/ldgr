@@ -13,7 +13,7 @@
 //! OS threads would break the determinism invariant.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -29,7 +29,7 @@ use crate::seedtree::SeedTree;
 use crate::simfs::SimFs;
 use crate::time::VirtualTime;
 use ledger_format::MessageId;
-use ledger_format::{ActorId, EntryKind, EntryPayload, Hash};
+use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, StreamId};
 use ledger_journal::{BatchEntry, Journal, JournalCorrectnessMonitor};
 use rand_chacha::ChaCha20Rng;
 
@@ -52,7 +52,7 @@ pub(crate) fn make_task_entry(future: Pin<Box<dyn Future<Output = ()> + 'static>
         done: false,
         register: 0,
         timer_fired: false,
-        stream_rngs: Vec::new(),
+        stream_rngs: BTreeMap::new(),
     }
 }
 
@@ -72,7 +72,7 @@ pub(crate) struct TaskEntry {
     /// tree. Each stream is independent, so adding or reordering draws in one
     /// stream never perturbs another. State lives in the task table so cloning
     /// a boundary never duplicates draw state.
-    stream_rngs: Vec<Option<ChaCha20Rng>>,
+    stream_rngs: BTreeMap<StreamId, ChaCha20Rng>,
 }
 
 /// Shared executor state reachable from task boundaries.
@@ -89,7 +89,7 @@ pub(crate) struct ExecutorShared {
     scheduler: RefCell<Scheduler>,
     pub(crate) tasks: RefCell<Vec<TaskEntry>>,
     ready: RefCell<Vec<usize>>,
-    dropped_events: Vec<Hash>,
+    dropped_events: Vec<EntryHash>,
     seed_tree: SeedTree,
     /// Swarm probabilities consumed by the boundary.
     swarm: crate::config::SwarmConfig,
@@ -113,7 +113,7 @@ pub(crate) struct ExecutorShared {
     /// Distinct crash-state classes applied this run (campaign budget).
     fault_classes_used: RefCell<HashSet<u64>>,
     /// Event ids whose scheduled fault injections took effect.
-    applied_faults: RefCell<Vec<Hash>>,
+    applied_faults: RefCell<Vec<EntryHash>>,
     /// Effect origins side channel keyed by entry hash (crate::origin).
     origins: RefCell<crate::origin::OriginLog>,
     /// Fault schedule applied at exact causal positions.
@@ -254,7 +254,7 @@ impl Executor {
         }
         for injection in config.fault_schedule() {
             if let SimFault::Partition { src, dst } = injection {
-                net.partition(*src as usize, *dst as usize);
+                net.partition(src.0 as usize, dst.0 as usize);
             }
         }
         let shared = Rc::new(ExecutorShared {
@@ -492,11 +492,11 @@ impl Executor {
         let tasks = self.shared.tasks.borrow();
         for (task_id, _) in tasks.iter().enumerate() {
             self.shared.journal_append(
-                task_id as ActorId,
+                ActorId(task_id as u32),
                 EntryKind::Spawn,
                 [],
                 EntryPayload::Spawn {
-                    child_actor: task_id as ActorId,
+                    child_actor: ActorId(task_id as u32),
                 },
             )?;
         }
@@ -538,15 +538,19 @@ impl Executor {
         for task_id in to_wake {
             let send_id = self.shared.net.borrow().peek_ready_send_id(task_id, now);
             let wake_id = self.shared.journal_append(
-                task_id as ActorId,
+                ActorId(task_id as u32),
                 EntryKind::Wake,
                 send_id.into_iter().collect::<Vec<_>>(),
                 EntryPayload::Wake(ledger_format::WakePayload::MessageReady {
-                    message_id: MessageId::new(task_id as ActorId, 0),
+                    message_id: MessageId::new(ActorId(task_id as u32), 0),
                 }),
             )?;
-            self.shared
-                .notify_entry(task_id as ActorId, EntryKind::Wake, task_id, Some(wake_id));
+            self.shared.notify_entry(
+                ActorId(task_id as u32),
+                EntryKind::Wake,
+                task_id,
+                Some(wake_id),
+            );
             let mut tasks = self.shared.tasks.borrow_mut();
             tasks[task_id].blocked_on = None;
             self.shared.ready.borrow_mut().push(task_id);
@@ -563,14 +567,41 @@ impl Executor {
     /// notifications keep their per-entry order afterwards. Nothing between
     /// the old per-timer appends read state that feeds back into journal
     /// content, so grouping them is order-safe.
+    ///
+    /// Kept separate from `SimBackend::sleep` on purpose: the executor parks
+    /// tasks and fires at quiescence in batch, while the single-actor backend
+    /// fires inline with no scheduler. Both journal the same
+    /// `TimerSet -TimerFire -> Wake` chain; the sleep-parity test pins this.
     fn advance_quiescent(&self) -> Result<(), RuntimeError> {
-        let fired = self.shared.time.borrow_mut().advance_with_enablers();
+        let timer_deadline = self.shared.time.borrow().next_deadline();
+        let net_deadline = self.shared.net.borrow().earliest_delivery_time();
+
+        let target_time = match (timer_deadline, net_deadline) {
+            (Some(t), Some(n)) => Some(t.min(n)),
+            (Some(t), None) => Some(t),
+            (None, Some(n)) => Some(n),
+            (None, None) => None,
+        };
+
+        let Some(target) = target_time else {
+            return self.wake_blocked_with_messages();
+        };
+
+        let now = self.shared.time.borrow().now();
+        let fired = if target > now {
+            self.shared
+                .time
+                .borrow_mut()
+                .advance_to_with_enablers(target)
+        } else {
+            self.shared.time.borrow_mut().advance_with_enablers()
+        };
         if !fired.is_empty() {
             let mut batch = Vec::with_capacity(fired.len() * 2);
             for timer in &fired {
                 let mut timer_entry = BatchEntry::new(
                     EntryKind::TimerFire,
-                    timer.task as ActorId,
+                    ActorId(timer.task as u32),
                     EntryPayload::TimerFire {
                         timer_id: 0,
                         deadline_ticks: 0,
@@ -581,7 +612,7 @@ impl Executor {
                 batch.push(
                     BatchEntry::new(
                         EntryKind::Wake,
-                        timer.task as ActorId,
+                        ActorId(timer.task as u32),
                         EntryPayload::Wake(ledger_format::WakePayload::TimerReady { timer_id: 0 }),
                     )
                     .chained(),
@@ -590,13 +621,13 @@ impl Executor {
             let ids = self.shared.journal_append_batch(batch)?;
             for (timer, id_pair) in fired.iter().zip(ids.chunks_exact(2)) {
                 self.shared.notify_entry(
-                    timer.task as ActorId,
+                    ActorId(timer.task as u32),
                     EntryKind::TimerFire,
                     timer.task,
                     Some(id_pair[0]),
                 );
                 self.shared.notify_entry(
-                    timer.task as ActorId,
+                    ActorId(timer.task as u32),
                     EntryKind::Wake,
                     timer.task,
                     Some(id_pair[1]),
@@ -659,7 +690,7 @@ mod tests {
 
     fn config(seed: u8, max_steps: usize) -> RunConfig {
         RunConfig {
-            seed: [seed; 32],
+            seed: ledger_format::EntryHash([seed; 32]),
             policy: crate::config::Policy::Random,
             max_steps,
             ..RunConfig::default()
@@ -777,7 +808,7 @@ mod tests {
                     done: false,
                     register: 0,
                     timer_fired: false,
-                    stream_rngs: Vec::new(),
+                    stream_rngs: BTreeMap::new(),
                 });
             }
         })
@@ -928,7 +959,7 @@ mod tests {
                     done: false,
                     register: 0,
                     timer_fired: false,
-                    stream_rngs: Vec::new(),
+                    stream_rngs: BTreeMap::new(),
                 });
             }
         });
@@ -995,7 +1026,7 @@ mod tests {
                         done: false,
                         register: 0,
                         timer_fired: false,
-                        stream_rngs: Vec::new(),
+                        stream_rngs: BTreeMap::new(),
                     });
                 }
             });
@@ -1040,7 +1071,7 @@ mod tests {
                 done: false,
                 register: 0,
                 timer_fired: false,
-                stream_rngs: Vec::new(),
+                stream_rngs: BTreeMap::new(),
             });
         });
         let run = executor.run().unwrap();
@@ -1071,7 +1102,8 @@ mod tests {
                 .entries()
                 .filter_map(|entry| match &entry.data.payload {
                     EntryPayload::RngDraw(draw)
-                        if entry.data.kind == EntryKind::RngDraw && draw.stream == 1 =>
+                        if entry.data.kind == EntryKind::RngDraw
+                            && draw.stream == ledger_format::StreamId(1) =>
                     {
                         Some(u64::from_le_bytes(
                             draw.content[..8].try_into().expect("8-byte content"),
@@ -1088,10 +1120,10 @@ mod tests {
             [|mut boundary| {
                 boxed(async move {
                     for _ in 0..3 {
-                        let _ = boundary.rng(0).next_u64();
+                        let _ = boundary.rng(ledger_format::StreamId(0)).next_u64();
                     }
-                    let _ = boundary.rng(1).next_u64();
-                    let _ = boundary.rng(1).next_u64();
+                    let _ = boundary.rng(ledger_format::StreamId(1)).next_u64();
+                    let _ = boundary.rng(ledger_format::StreamId(1)).next_u64();
                     let _ = boundary.outcome(0);
                 })
             }],
@@ -1102,10 +1134,10 @@ mod tests {
             [|mut boundary| {
                 boxed(async move {
                     for _ in 0..7 {
-                        let _ = boundary.rng(0).next_u64();
+                        let _ = boundary.rng(ledger_format::StreamId(0)).next_u64();
                     }
-                    let _ = boundary.rng(1).next_u64();
-                    let _ = boundary.rng(1).next_u64();
+                    let _ = boundary.rng(ledger_format::StreamId(1)).next_u64();
+                    let _ = boundary.rng(ledger_format::StreamId(1)).next_u64();
                     let _ = boundary.outcome(0);
                 })
             }],
@@ -1228,10 +1260,10 @@ mod coverage_tests {
                     .borrow_mut()
                     .append(
                         EntryKind::Outcome,
-                        0,
+                        ActorId(0),
                         [],
                         EntryPayload::Outcome(ledger_format::OutcomePayload {
-                            schema: [0x00; 32],
+                            schema: super::effects::OUTCOME_SCHEMA,
                             value: ledger_format::CanonicalValue::Unsigned(99),
                         }),
                     )
@@ -1251,7 +1283,7 @@ mod coverage_tests {
 
     fn config_for_coverage() -> RunConfig {
         RunConfig {
-            seed: [6; 32],
+            seed: ledger_format::EntryHash([6; 32]),
             policy: crate::config::Policy::Random,
             max_steps: 256,
             ..RunConfig::default()
@@ -1268,7 +1300,7 @@ mod swarm_tests {
 
     fn base_config(seed: u8) -> RunConfig {
         RunConfig {
-            seed: [seed; 32],
+            seed: ledger_format::EntryHash([seed; 32]),
             policy: crate::config::Policy::Random,
             max_steps: 512,
             ..RunConfig::default()
@@ -1547,7 +1579,10 @@ mod swarm_tests {
         // Deliver a message whose send_id is not journaled: the Receive
         // append then fails and must reject the run.
         let shared = shared_holder.borrow().clone().expect("shared captured");
-        shared.net.borrow_mut().send_at(9, 0, 99, [0xAA; 32], 0, 0);
+        shared
+            .net
+            .borrow_mut()
+            .send_at(9, 0, 99, ledger_format::EntryHash([0xAA; 32]), 0, 0);
 
         let run = executor.run();
         assert!(
@@ -1580,7 +1615,7 @@ mod swarm_tests {
         let shared = shared_holder.borrow().clone().expect("shared captured");
         let boundary = Boundary::for_task(Rc::clone(&shared), 0);
         let error = ledger_journal::JournalError::NonMonotonicSequence {
-            actor: 0,
+            actor: ActorId(0),
             expected: 1,
             actual: 2,
         };
@@ -1672,7 +1707,7 @@ mod swarm_tests {
         let mut net = SimNet::new();
         net.set_reorder_window(4);
         let now = 0u64;
-        let send_id = |n: u8| [n; 32];
+        let send_id = |n: u8| ledger_format::EntryHash([n; 32]);
         let first = net.send_at(0, 1, 10, send_id(1), now, 0);
         let second = net.send_at(0, 1, 20, send_id(2), now, 0);
         assert!(first && second);
@@ -1687,7 +1722,7 @@ mod swarm_tests {
         use crate::net::SimNet;
         let mut net = SimNet::new();
         let now = 0u64;
-        let send_id = |n: u8| [n; 32];
+        let send_id = |n: u8| ledger_format::EntryHash([n; 32]);
         let _ = net.send_at(0, 1, 10, send_id(1), now, 0);
         let _ = net.send_at(0, 1, 20, send_id(2), now, 0);
         let msg = net.recv_at(1, now).unwrap();
@@ -1710,7 +1745,7 @@ mod link_integration_tests {
 
     #[test]
     fn configured_link_changes_journal_root() {
-        let seed = [3; 32];
+        let seed = ledger_format::EntryHash([3; 32]);
         let base = RunConfig::builder().seed(seed).max_steps(512).build();
         let default_root = Simulation::new(base.clone(), two_task_programs())
             .run()
@@ -1744,7 +1779,7 @@ mod link_integration_tests {
     fn link_and_swarm_draws_are_deterministic() {
         let make = || {
             RunConfig::builder()
-                .seed([9; 32])
+                .seed(ledger_format::EntryHash([9; 32]))
                 .max_steps(512)
                 .swarm(crate::config::SwarmConfig {
                     delay_probability: crate::config::Probability::new(0.5).unwrap(),
@@ -1766,6 +1801,115 @@ mod link_integration_tests {
         let b = Simulation::new(make(), two_task_programs()).run().unwrap();
         assert_eq!(a.journal.root_hash(), b.journal.root_hash());
         assert_eq!(a.decisions, b.decisions);
+    }
+
+    #[test]
+    fn bounded_drop_link_journals_a_drop_fault() {
+        use crate::net::QueueFullPolicy;
+        use ledger_format::{EntryKind, EntryPayload, FaultPayload};
+        // One receiver that never drains fast enough: two sends race one
+        // capacity-1 link with a delay so both queue before delivery.
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([31; 32]))
+            .max_steps(512)
+            .links(vec![(
+                0,
+                1,
+                LinkConfig {
+                    capacity: Some(1),
+                    queue_policy: QueueFullPolicy::Drop,
+                    ..LinkConfig::default()
+                },
+            )])
+            .build();
+        let programs = vec![
+            vec![
+                Instruction::Send { to: 1, payload: 1 },
+                Instruction::Send { to: 1, payload: 2 },
+                Instruction::Send { to: 1, payload: 3 },
+                Instruction::Done,
+            ],
+            vec![
+                Instruction::Receive,
+                Instruction::Receive,
+                Instruction::Receive,
+                Instruction::Done,
+            ],
+        ];
+        let run = Simulation::new(config, programs).run().unwrap();
+        let drops = run
+            .journal
+            .entries()
+            .filter(|entry| {
+                matches!(
+                    &entry.data.payload,
+                    EntryPayload::Fault(FaultPayload::DropMessage { .. })
+                ) && entry.data.kind == EntryKind::Fault
+            })
+            .count();
+        assert!(
+            drops >= 1,
+            "a full drop-policy queue must journal a Drop fault"
+        );
+        assert!(run.monitor_issues.is_empty());
+    }
+
+    #[test]
+    fn bounded_block_link_journals_backpressure_without_a_drop() {
+        use crate::net::QueueFullPolicy;
+        use ledger_format::{EntryKind, EntryPayload, FaultPayload};
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([32; 32]))
+            .max_steps(512)
+            .links(vec![(
+                0,
+                1,
+                LinkConfig {
+                    capacity: Some(1),
+                    queue_policy: QueueFullPolicy::Block,
+                    ..LinkConfig::default()
+                },
+            )])
+            .build();
+        let programs = vec![
+            vec![
+                Instruction::Send { to: 1, payload: 1 },
+                Instruction::Send { to: 1, payload: 2 },
+                Instruction::Send { to: 1, payload: 3 },
+                Instruction::Done,
+            ],
+            vec![
+                Instruction::Receive,
+                Instruction::Receive,
+                Instruction::Receive,
+                Instruction::Done,
+            ],
+        ];
+        let run = Simulation::new(config, programs).run().unwrap();
+        let drops = run
+            .journal
+            .entries()
+            .filter(|entry| {
+                matches!(
+                    &entry.data.payload,
+                    EntryPayload::Fault(FaultPayload::DropMessage { .. })
+                )
+            })
+            .count();
+        let blocks = run
+            .journal
+            .entries()
+            .filter(|entry| entry.data.kind == EntryKind::Block)
+            .count();
+        assert_eq!(
+            drops, 0,
+            "a block-policy queue must never journal a Drop fault"
+        );
+        assert!(
+            blocks >= 1,
+            "a full block-policy queue must journal backpressure"
+        );
+        assert!(run.monitor_issues.is_empty());
     }
 }
 
@@ -1791,7 +1935,7 @@ mod delay_fault_regression {
     fn delay_fault_on_send_changes_deliver_at_and_marks_applied() {
         // First run without faults to capture the Send entry id.
         let base = RunConfig::builder()
-            .seed([42; 32])
+            .seed(ledger_format::EntryHash([42; 32]))
             .policy(Policy::Random)
             .max_steps(256)
             .build();
@@ -1810,7 +1954,7 @@ mod delay_fault_regression {
         );
         // Replay the same decision sequence with the Delay fault targeting that Send.
         let delayed_cfg = RunConfig::builder()
-            .seed([42; 32])
+            .seed(ledger_format::EntryHash([42; 32]))
             .policy(Policy::Replay)
             .max_steps(256)
             .fault_schedule(vec![SimFault::Delay {
@@ -1855,7 +1999,7 @@ mod delay_fault_regression {
         );
         // Delay 0 must keep journals byte-identical for unfaulted runs.
         let zero_cfg = RunConfig::builder()
-            .seed([42; 32])
+            .seed(ledger_format::EntryHash([42; 32]))
             .policy(Policy::Replay)
             .max_steps(256)
             .fault_schedule(vec![SimFault::Delay {
@@ -1890,7 +2034,10 @@ mod lane_s_direct_executor_protection {
 
     #[test]
     fn direct_executor_required_enforces_belt() {
-        let config = RunConfig::builder().seed([9; 32]).max_steps(16).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([9; 32]))
+            .max_steps(16)
+            .build();
         let executor = Executor::new(config, vec![]).with_protection_mode(ProtectionMode::Required);
         let result = executor.run();
         // On non-linux, Required without belt must be Belt error; on linux with belt, may succeed
@@ -1914,7 +2061,10 @@ mod lane_s_direct_executor_protection {
 
     #[test]
     fn direct_executor_best_effort_reports_protection() {
-        let config = RunConfig::builder().seed([10; 32]).max_steps(16).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([10; 32]))
+            .max_steps(16)
+            .build();
         let executor =
             Executor::new(config, vec![]).with_protection_mode(ProtectionMode::BestEffort);
         let run = executor
@@ -1943,7 +2093,10 @@ mod lane_s_monitor_prefix {
 
     #[test]
     fn monitor_sees_initial_spawn_entries() {
-        let config = RunConfig::builder().seed([11; 32]).max_steps(32).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([11; 32]))
+            .max_steps(32)
+            .build();
         let saw_spawn = Rc::new(Cell::new(false));
         let saw = saw_spawn.clone();
         let executor = Executor::with_shared(config, |shared| {

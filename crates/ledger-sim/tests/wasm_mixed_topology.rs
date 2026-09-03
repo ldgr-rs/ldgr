@@ -38,14 +38,14 @@ fn guest_bytes(path: &Path) -> Vec<u8> {
 }
 
 fn run_two(
-    seed: [u8; 32],
+    seed: ledger_format::EntryHash,
     a_name: &str,
     a_marker: &str,
     a_wasm: &[u8],
     b_name: &str,
     b_marker: &str,
     b_wasm: &[u8],
-) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+) -> (Vec<u8>, Vec<u8>, ledger_format::EntryHash) {
     let mut backend = WasmBackend::new(SeedTree::new(seed)).expect("wasm backend must build");
     backend
         .load_guest_multi(a_name, a_wasm)
@@ -125,7 +125,7 @@ fn mixed_topology_two_guests_hash_deterministic() {
             )
         };
 
-    let seed = [7u8; 32];
+    let seed = ledger_format::EntryHash([7u8; 32]);
     let (a1, b1, root1) = run_two(seed, a_name, a_marker, a_wasm, b_name, b_marker, b_wasm);
     let (a2, b2, root2) = run_two(seed, a_name, a_marker, a_wasm, b_name, b_marker, b_wasm);
 
@@ -153,7 +153,7 @@ fn mixed_topology_every_present_guest_runs() {
             continue;
         }
         let wasm = guest_bytes(&path);
-        let seed = [11u8; 32];
+        let seed = ledger_format::EntryHash([11u8; 32]);
 
         let mut backend = WasmBackend::new(SeedTree::new(seed)).expect("wasm backend must build");
         backend
@@ -212,13 +212,15 @@ fn mixed_topology_single_guest_api_still_works() {
             return;
         }
         let wasm = std::fs::read(&rust_path).unwrap();
-        let mut backend = WasmBackend::from_wasm(SeedTree::new([9; 32]), &wasm)
-            .expect("rust guest must load via from_wasm");
+        let mut backend =
+            WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([9; 32])), &wasm)
+                .expect("rust guest must load via from_wasm");
         let out = backend.run_export("run").expect("run must succeed");
         assert!(!out.is_empty(), "rust guest must produce stdout");
         let root1 = backend.journal_snapshot().root_hash();
         let mut backend2 =
-            WasmBackend::from_wasm(SeedTree::new([9; 32]), &wasm).expect("second run must load");
+            WasmBackend::from_wasm(SeedTree::new(ledger_format::EntryHash([9; 32])), &wasm)
+                .expect("second run must load");
         let out2 = backend2.run_export("run").expect("second run must succeed");
         assert_eq!(out, out2, "single-instance run must be deterministic");
         assert_eq!(
@@ -231,7 +233,7 @@ fn mixed_topology_single_guest_api_still_works() {
 
     // If we reached here we loaded one prebuilt; verify the single-name
     // helper load_guest still works and run_export aliases "main".
-    let mut backend = WasmBackend::new(SeedTree::new([9; 32])).unwrap();
+    let mut backend = WasmBackend::new(SeedTree::new(ledger_format::EntryHash([9; 32]))).unwrap();
     backend.load_guest(&wasm).expect("load_guest must succeed");
     let out = backend.run_export("run").expect("run_export must succeed");
     assert!(
@@ -240,7 +242,7 @@ fn mixed_topology_single_guest_api_still_works() {
     );
     let root1 = backend.journal_snapshot().root_hash();
 
-    let mut backend2 = WasmBackend::new(SeedTree::new([9; 32])).unwrap();
+    let mut backend2 = WasmBackend::new(SeedTree::new(ledger_format::EntryHash([9; 32]))).unwrap();
     backend2
         .load_guest(&wasm)
         .expect("second load_guest must succeed");
@@ -257,7 +259,7 @@ fn mixed_topology_single_guest_api_still_works() {
 
 #[test]
 fn mixed_topology_unknown_guest_is_no_guest() {
-    let mut backend = WasmBackend::new(SeedTree::new([1; 32])).unwrap();
+    let mut backend = WasmBackend::new(SeedTree::new(ledger_format::EntryHash([1; 32]))).unwrap();
     let err = backend.run_export_on("does-not-exist", "run").unwrap_err();
     assert!(
         matches!(err, ledger_sim::WasmError::NoGuest),

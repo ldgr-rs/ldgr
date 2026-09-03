@@ -32,7 +32,7 @@ fn mini_kv_programs() -> Vec<Vec<Instruction>> {
 #[test]
 fn out_of_range_fires_no_modulo() {
     // Ready at step 0 has len 2, value 2 is out of range, lenient would mod to 0.
-    let seed = SeedTree::new([7; 32]);
+    let seed = SeedTree::new(ledger_format::EntryHash([7; 32]));
     let mut strict =
         Scheduler::with_fallback_strict(Policy::Replay, seed.clone(), vec![2], Policy::Random);
     let ready = vec![0, 1];
@@ -62,7 +62,7 @@ fn out_of_range_fires_no_modulo() {
     // Also test value 5 >=2 is rejected, not 5%2==1
     let mut strict2 = Scheduler::with_fallback_strict(
         Policy::Replay,
-        SeedTree::new([7; 32]),
+        SeedTree::new(ledger_format::EntryHash([7; 32])),
         vec![5],
         Policy::Random,
     );
@@ -74,7 +74,7 @@ fn out_of_range_fires_no_modulo() {
 #[test]
 fn exhausted_fires_with_zero_fallback_draws() {
     // Two done tasks need 2 steps, provide only 1 decision.
-    let seed = [9; 32];
+    let seed = ledger_format::EntryHash([9; 32]);
     let config = RunConfig::builder()
         .seed(seed)
         .policy(Policy::Replay)
@@ -105,7 +105,7 @@ fn exhausted_fires_with_zero_fallback_draws() {
 #[test]
 fn trailing_via_finish() {
     let config = RunConfig::builder()
-        .seed([11; 32])
+        .seed(ledger_format::EntryHash([11; 32]))
         .policy(Policy::Random)
         .max_steps(64)
         .build();
@@ -133,7 +133,7 @@ fn trailing_via_finish() {
 #[test]
 fn valid_full_strict_replay_matches_lenient_root() {
     let config = RunConfig::builder()
-        .seed([13; 32])
+        .seed(ledger_format::EntryHash([13; 32]))
         .policy(Policy::Random)
         .max_steps(256)
         .build();
@@ -164,7 +164,7 @@ fn violation_leaves_entry_count_unchanged() {
     // Scheduler strict out-of-range must not push a decision and must not
     // consume a fallback draw; the executor checks take_violation before
     // journal_rng_draw, so entry count stays at spawns only.
-    let seed = SeedTree::new([17; 32]);
+    let seed = SeedTree::new(ledger_format::EntryHash([17; 32]));
     let ready = vec![0, 1];
     let mut strict =
         Scheduler::with_fallback_strict(Policy::Replay, seed.clone(), vec![99], Policy::Random);
@@ -198,7 +198,7 @@ fn violation_leaves_entry_count_unchanged() {
     // Lenient would have pushed a fallback decision.
     let mut lenient = Scheduler::with_fallback(
         Policy::Replay,
-        SeedTree::new([17; 32]),
+        SeedTree::new(ledger_format::EntryHash([17; 32])),
         vec![0],
         Policy::Random,
     );
@@ -206,12 +206,13 @@ fn violation_leaves_entry_count_unchanged() {
     let lenient_choice = lenient.choose(&ready2, 1);
     assert_eq!(lenient.decisions().len(), 2);
     // The lenient fallback choice must be the deterministic Random draw.
-    let expected = (SeedTree::new([17; 32]).draw_u64("sched", 1) as usize) % 2;
+    let expected =
+        (SeedTree::new(ledger_format::EntryHash([17; 32])).draw_u64("sched", 1) as usize) % 2;
     assert_eq!(lenient_choice, expected);
     // Simulation level also proves no journal append: strict with out-of-range
     // at step 0 returns OutOfRange before any RngDraw, while lenient succeeds.
     let config = RunConfig::builder()
-        .seed([17; 32])
+        .seed(ledger_format::EntryHash([17; 32]))
         .policy(Policy::Replay)
         .max_steps(10)
         .build();
@@ -232,7 +233,7 @@ fn violation_leaves_entry_count_unchanged() {
 
 #[test]
 fn scheduler_lenient_still_modulo_and_fallback() {
-    let seed = SeedTree::new([5; 32]);
+    let seed = SeedTree::new(ledger_format::EntryHash([5; 32]));
     let ready = vec![0, 1, 2];
     // Lenient normalizes 5 %3 ==2
     let mut lenient =

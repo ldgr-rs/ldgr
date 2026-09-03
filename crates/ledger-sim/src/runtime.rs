@@ -13,7 +13,7 @@ use std::pin::Pin;
 use crate::config::{Policy, RunConfig};
 use crate::executor::{Boundary, Executor};
 use crate::scheduler::StepTrace;
-use ledger_format::{GenId, InputKey};
+use ledger_format::{ActorId, StreamId};
 use ledger_journal::{Journal, JournalError, MonitorIssue};
 
 /// Stream id journaled for scheduler-owned scheduling draws.
@@ -22,10 +22,10 @@ use ledger_journal::{Journal, JournalError, MonitorIssue};
 /// consumes one draw from it. The journaled `RngDraw` entry records the
 /// resolved ready-list position, not the raw draw, so a replayed run journal
 /// stays hash-identical to the original.
-pub const SCHED_STREAM: ledger_format::StreamId = 0;
+pub const SCHED_STREAM: ledger_format::StreamId = StreamId(0);
 
 /// Actor id reserved for scheduler-owned journal entries.
-pub const SCHED_ACTOR: ledger_format::ActorId = u32::MAX;
+pub const SCHED_ACTOR: ledger_format::ActorId = ActorId(u32::MAX);
 
 /// One cooperative instruction executed by a simulated task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +52,8 @@ pub enum Instruction {
     /// value. The keys pin the input axis: `generator` selects the PBT
     /// generator, `replay` indexes the value within that generator's stream.
     Input {
-        generator: GenId,
-        replay: InputKey,
+        generator: u64,
+        replay: u64,
         value: u64,
     },
     /// Read the current virtual time into the task-local register.
@@ -172,10 +172,10 @@ pub struct RunResult {
     /// to react to them.
     pub monitor_issues: Vec<MonitorIssue>,
     /// Event ids whose scheduled fault injections took effect.
-    pub applied_faults: Vec<ledger_format::Hash>,
+    pub applied_faults: Vec<ledger_format::EntryHash>,
     /// Effect origins keyed by entry hash, in append order. Empty unless the
     /// run flowed through origin-capturing calls (crate::origin).
-    pub origins: Vec<(ledger_format::Hash, crate::origin::OriginSource)>,
+    pub origins: Vec<(ledger_format::EntryHash, crate::origin::OriginSource)>,
     /// First journal-append failure observed on a path that cannot propagate.
     ///
     /// Append failures on non-`Result` surfaces (send helpers, spawn, crash)
@@ -381,7 +381,7 @@ mod tests {
         use crate::executor::Boundary;
         let error = ledger_journal::JournalError::InvalidPayload("test poison".to_string());
         let config = RunConfig::builder()
-            .seed([23; 32])
+            .seed(ledger_format::EntryHash([23; 32]))
             .policy(Policy::Random)
             .max_steps(64)
             .build();
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn clean_mini_kv_run_produces_zero_monitor_issues() {
         let config = RunConfig::builder()
-            .seed([7; 32])
+            .seed(ledger_format::EntryHash([7; 32]))
             .policy(Policy::Random)
             .max_steps(256)
             .build();
@@ -442,7 +442,7 @@ mod tests {
     #[test]
     fn runtime_journals_spawn_wake_timer_and_clock_read_entries() {
         let config = RunConfig::builder()
-            .seed([8; 32])
+            .seed(ledger_format::EntryHash([8; 32]))
             .policy(Policy::Random)
             .max_steps(128)
             .build();
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn replay_follows_recorded_decision_sequence() {
         let config = RunConfig::builder()
-            .seed([9; 32])
+            .seed(ledger_format::EntryHash([9; 32]))
             .policy(Policy::Random)
             .max_steps(256)
             .build();
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn input_step_journals_real_generator_and_replay_keys() {
         let config = RunConfig::builder()
-            .seed([10; 32])
+            .seed(ledger_format::EntryHash([10; 32]))
             .policy(Policy::Random)
             .max_steps(128)
             .build();
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn set_still_journals_zeroed_keys_compatibly() {
         let config = RunConfig::builder()
-            .seed([11; 32])
+            .seed(ledger_format::EntryHash([11; 32]))
             .policy(Policy::Random)
             .max_steps(128)
             .build();
@@ -576,7 +576,10 @@ mod tests {
     fn required_protection_fails_when_belt_not_active() {
         // Require the belt via host option; on platforms without a belt the status
         // is Unavailable, so the run must be rejected with Belt.
-        let config = RunConfig::builder().seed([1; 32]).max_steps(16).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([1; 32]))
+            .max_steps(16)
+            .build();
         let programs = vec![vec![Instruction::Done]];
         let result = Simulation::new(config, programs)
             .with_protection_mode(crate::sentinel::ProtectionMode::Required)
@@ -601,7 +604,10 @@ mod tests {
 
     #[test]
     fn best_effort_with_any_belt_succeeds() {
-        let config = RunConfig::builder().seed([2; 32]).max_steps(16).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([2; 32]))
+            .max_steps(16)
+            .build();
         let programs = vec![vec![Instruction::Done]];
         let result = Simulation::new(config, programs)
             .with_protection_mode(crate::sentinel::ProtectionMode::BestEffort)
@@ -640,7 +646,10 @@ mod tests {
             Instruction::Outcome,
             Instruction::Done,
         ]];
-        let config = RunConfig::builder().seed([11; 32]).max_steps(64).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([11; 32]))
+            .max_steps(64)
+            .build();
         let halted = Simulation::new(config.clone(), programs.clone())
             .with_step_monitor(Box::new(halt_on_99))
             .run()
@@ -667,7 +676,7 @@ mod tests {
         // decisions with max_steps capped to the halt point yields the same
         // root. This proves the monitor consumed no seed draws.
         let replay_cfg = RunConfig::builder()
-            .seed([11; 32])
+            .seed(ledger_format::EntryHash([11; 32]))
             .policy(Policy::Replay)
             .max_steps(halted.steps)
             .build();
@@ -683,7 +692,7 @@ mod tests {
         // Also replay with the same monitor must halt identically.
         let halt_again = Simulation::with_replay(
             RunConfig::builder()
-                .seed([11; 32])
+                .seed(ledger_format::EntryHash([11; 32]))
                 .policy(Policy::Replay)
                 .max_steps(64)
                 .build(),
@@ -721,7 +730,10 @@ mod tests {
             Instruction::Outcome,
             Instruction::Done,
         ]];
-        let config = RunConfig::builder().seed([13; 32]).max_steps(32).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([13; 32]))
+            .max_steps(32)
+            .build();
         let without = Simulation::new(config.clone(), programs.clone())
             .run()
             .expect("without monitor");
@@ -741,7 +753,7 @@ mod tests {
     fn with_replay_strict_forces_replay_policy() {
         // Non-Replay policy with strict must be forced to Replay.
         let config = RunConfig::builder()
-            .seed([99; 32])
+            .seed(ledger_format::EntryHash([99; 32]))
             .policy(Policy::Random)
             .max_steps(16)
             .build();
@@ -770,7 +782,10 @@ mod tests {
 
     #[test]
     fn with_replay_strict_rejects_trailing_via_violation() {
-        let config = RunConfig::builder().seed([11; 32]).max_steps(64).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([11; 32]))
+            .max_steps(64)
+            .build();
         let programs = vec![vec![
             Instruction::Set(1),
             Instruction::Outcome,
@@ -790,7 +805,10 @@ mod tests {
 
     #[test]
     fn best_effort_reports_protection_status() {
-        let config = RunConfig::builder().seed([5; 32]).max_steps(16).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([5; 32]))
+            .max_steps(16)
+            .build();
         let programs = vec![vec![Instruction::Done]];
         let run = Simulation::new(config, programs)
             .with_protection_mode(crate::sentinel::ProtectionMode::BestEffort)
@@ -813,7 +831,10 @@ mod tests {
 
     #[test]
     fn required_rejects_incomplete_installation() {
-        let config = RunConfig::builder().seed([6; 32]).max_steps(16).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([6; 32]))
+            .max_steps(16)
+            .build();
         let programs = vec![vec![Instruction::Done]];
         let result = Simulation::new(config, programs)
             .with_protection_mode(crate::sentinel::ProtectionMode::Required)
@@ -839,7 +860,10 @@ mod tests {
 
     #[test]
     fn monitor_sees_initial_spawn_prefix() {
-        let config = RunConfig::builder().seed([7; 32]).max_steps(32).build();
+        let config = RunConfig::builder()
+            .seed(ledger_format::EntryHash([7; 32]))
+            .max_steps(32)
+            .build();
         let programs = vec![vec![Instruction::Done], vec![Instruction::Done]];
         let saw_spawn = std::cell::Cell::new(false);
         let saw = std::rc::Rc::new(std::cell::Cell::new(false));

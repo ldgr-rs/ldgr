@@ -45,7 +45,7 @@ fn bench_w1_throughput(c: &mut Criterion) {
     c.bench_function("w1_guest_throughput_2000_entries", |b| {
         b.iter_batched(
             || {
-                WasmBackend::from_module(SeedTree::new([0; 32]), &module)
+                WasmBackend::from_module(SeedTree::new(ledger_format::EntryHash([0; 32])), &module)
                     .unwrap()
                     .with_fuel_budget(2_000_000_000)
             },
@@ -70,7 +70,7 @@ fn bench_empty_export_trampoline(c: &mut Criterion) {
     c.bench_function("w1_empty_export_trampoline", |b| {
         b.iter_batched(
             || {
-                WasmBackend::from_module(SeedTree::new([0; 32]), &module)
+                WasmBackend::from_module(SeedTree::new(ledger_format::EntryHash([0; 32])), &module)
                     .unwrap()
                     .with_fuel_budget(2_000_000_000)
             },

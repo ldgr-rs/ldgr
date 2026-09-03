@@ -42,7 +42,10 @@ pub use config_canonical::{
 pub use dpor::{DporConfig, DporReport, DporRun, run_dpor};
 pub use effects::{Effects, Fs, FsError, FsExt, Net, NetExt, TaskId};
 pub use executor::{Boundary, Executor};
-pub use net::{DnsTable, LinkConfig, Message, SimNet, backoff, backoff_jittered};
+pub use net::{
+    DnsTable, LinkConfig, MAX_REORDER_WINDOW, Message, NetError, QueueFullPolicy, SimNet, backoff,
+    backoff_jittered,
+};
 pub use origin::{EffectOrigin, OriginSource};
 pub use runtime::{
     Instruction, OnlineAction, RunOutcome, RunResult, RuntimeError, SCHED_ACTOR, SCHED_STREAM,

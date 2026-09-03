@@ -114,7 +114,7 @@ fn belt() -> ExitCode {
 #[cfg(all(feature = "sentinel", target_os = "linux"))]
 fn simulate() -> ExitCode {
     let config = ledger_sim::RunConfig::builder()
-        .seed([42; 32])
+        .seed(ledger_format::EntryHash([42; 32]))
         .policy(ledger_sim::Policy::Random)
         .max_steps(128)
         .build();

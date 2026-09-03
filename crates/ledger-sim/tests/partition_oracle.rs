@@ -6,7 +6,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use ledger_format::{CanonicalValue, EntryKind, EntryPayload, FaultPayload, Hash, OutcomePayload};
+use ledger_format::{
+    ActorId, CanonicalValue, EntryHash, EntryKind, EntryPayload, FaultPayload, OutcomePayload,
+};
 use ledger_sim::{Boundary, Effects, Policy, RunConfig, Simulation, TaskBuilder};
 
 fn boxed(
@@ -15,7 +17,7 @@ fn boxed(
     Box::pin(future)
 }
 
-fn config(seed: [u8; 32]) -> RunConfig {
+fn config(seed: EntryHash) -> RunConfig {
     RunConfig::builder()
         .seed(seed)
         .policy(Policy::Random)
@@ -49,7 +51,7 @@ fn partition_fault_mid_run_flips_link_and_restores_delivery() {
             })
         }),
     ];
-    let run = Simulation::with_tasks(config([31; 32]), builders)
+    let run = Simulation::with_tasks(config(EntryHash([31; 32])), builders)
         .run()
         .unwrap();
     assert!(
@@ -86,7 +88,9 @@ fn partition_fault_mid_run_flips_link_and_restores_delivery() {
         .journal
         .entries()
         .filter_map(|entry| match &entry.data.payload {
-            EntryPayload::Fault(FaultPayload::Partition { src: 0, dst: 1, .. }) => {
+            EntryPayload::Fault(FaultPayload::Partition { src, dst, .. })
+                if *src == ActorId(0) && *dst == ActorId(1) =>
+            {
                 Some(entry.data.parents.clone())
             }
             _ => None,
@@ -96,7 +100,7 @@ fn partition_fault_mid_run_flips_link_and_restores_delivery() {
         .journal
         .entries()
         .filter_map(|entry| matches!(entry.data.kind, EntryKind::Send).then_some(entry.id))
-        .collect::<Vec<Hash>>();
+        .collect::<Vec<EntryHash>>();
     assert_eq!(send_ids.len(), 3, "three sends must be journaled");
     assert_eq!(
         partition_faults.len(),
@@ -144,10 +148,10 @@ fn partition_fault_is_deterministic() {
             }),
         ]
     };
-    let first = Simulation::with_tasks(config([32; 32]), build())
+    let first = Simulation::with_tasks(config(EntryHash([32; 32])), build())
         .run()
         .unwrap();
-    let second = Simulation::with_tasks(config([32; 32]), build())
+    let second = Simulation::with_tasks(config(EntryHash([32; 32])), build())
         .run()
         .unwrap();
     assert_eq!(

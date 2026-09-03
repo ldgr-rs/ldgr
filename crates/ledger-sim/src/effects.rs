@@ -4,7 +4,7 @@ use crate::net::Message;
 use crate::origin::OriginSource;
 use crate::time::Clock;
 use core::panic::Location;
-use ledger_format::{Hash, StreamId};
+use ledger_format::{EntryHash, StreamId};
 use rand_core::Rng;
 
 /// Identifier for a task spawned through the executor boundary.
@@ -90,19 +90,19 @@ impl FsError {
 /// backend, so the caller never sees the journal.
 pub trait Fs {
     /// Write a value to the page cache and return its journal entry id.
-    fn write(&self, path: &str, value: u64) -> Result<Hash, FsError>;
+    fn write(&self, path: &str, value: u64) -> Result<EntryHash, FsError>;
 
     /// Write with origin capture; see [`Net::send_loc`]. Default delegates.
-    fn write_loc(&self, path: &str, value: u64, at: OriginSource) -> Result<Hash, FsError> {
+    fn write_loc(&self, path: &str, value: u64, at: OriginSource) -> Result<EntryHash, FsError> {
         let _ = at;
         self.write(path, value)
     }
 
     /// Flush all dirty page-cache entries to durable synced storage.
-    fn fsync(&self) -> Result<Hash, FsError>;
+    fn fsync(&self) -> Result<EntryHash, FsError>;
 
     /// Flush with origin capture; see [`Net::send_loc`]. Default delegates.
-    fn fsync_loc(&self, at: OriginSource) -> Result<Hash, FsError> {
+    fn fsync_loc(&self, at: OriginSource) -> Result<EntryHash, FsError> {
         let _ = at;
         self.fsync()
     }
@@ -125,12 +125,12 @@ pub trait Fs {
 /// entry id observable at this boundary to key an origin against.
 pub trait FsExt: Fs {
     #[track_caller]
-    fn write_tracked(&self, path: &str, value: u64) -> Result<Hash, FsError> {
+    fn write_tracked(&self, path: &str, value: u64) -> Result<EntryHash, FsError> {
         self.write_loc(path, value, Location::caller().into())
     }
 
     #[track_caller]
-    fn fsync_tracked(&self) -> Result<Hash, FsError> {
+    fn fsync_tracked(&self) -> Result<EntryHash, FsError> {
         self.fsync_loc(Location::caller().into())
     }
 
@@ -204,7 +204,7 @@ mod fs_error_tests {
 
     #[test]
     fn fs_error_into_journal_round_trips() {
-        let err = JournalError::MissingParent([1u8; 32]);
+        let err = JournalError::MissingParent(ledger_format::EntryHash([1u8; 32]));
         let fs_err = FsError(err.clone());
         assert_eq!(fs_err.into_journal(), err);
     }

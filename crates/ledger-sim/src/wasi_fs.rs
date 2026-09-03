@@ -40,7 +40,7 @@ impl SimFsHost {
     }
 
     /// Write `value` at `path`, journaling `FsWrite`.
-    pub fn write(&self, path: &str, value: u64) -> Result<ledger_format::Hash, JournalError> {
+    pub fn write(&self, path: &str, value: u64) -> Result<ledger_format::EntryHash, JournalError> {
         let mut journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         let mut fs = self.fs.lock().unwrap_or_else(|e| e.into_inner());
         match fs.write(&mut journal, self.actor, path, value) {
@@ -66,7 +66,7 @@ impl SimFsHost {
     }
 
     /// Flush dirty entries, journaling `FsFsync`.
-    pub fn fsync(&self) -> Result<ledger_format::Hash, JournalError> {
+    pub fn fsync(&self) -> Result<ledger_format::EntryHash, JournalError> {
         let mut journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         let mut fs = self.fs.lock().unwrap_or_else(|e| e.into_inner());
         match fs.fsync(&mut journal, self.actor) {

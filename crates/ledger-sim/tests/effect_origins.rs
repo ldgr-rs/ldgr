@@ -4,7 +4,10 @@
 use ledger_sim::{Effects, FsExt, Net, NetExt, OriginSource, SeedTree, SimBackend};
 
 fn fresh_backend() -> SimBackend {
-    SimBackend::for_actor(SeedTree::new([7; 32]), 1)
+    SimBackend::for_actor(
+        SeedTree::new(ledger_format::EntryHash([7; 32])),
+        ledger_format::ActorId(1),
+    )
 }
 
 fn message(to: usize) -> ledger_sim::Message {
@@ -12,8 +15,8 @@ fn message(to: usize) -> ledger_sim::Message {
         from: 1,
         to,
         content: 42u64.to_le_bytes().to_vec(),
-        message_id: ledger_format::MessageId::new(1, 0),
-        send_id: [0; 32],
+        message_id: ledger_format::MessageId::new(ledger_format::ActorId(1), 0),
+        send_id: ledger_format::EntryHash([0; 32]),
         deliver_at: 0,
     }
 }

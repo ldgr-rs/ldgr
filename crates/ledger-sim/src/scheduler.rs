@@ -443,8 +443,12 @@ impl Scheduler {
 
         for (idx, task_id) in ready.iter().enumerate() {
             let score = self.novelty.ucb1_score(*task_id, exploration);
-            if (score - best_score).abs() < 1e-9
-                || (score.is_infinite() && best_score.is_infinite())
+            if (score.is_infinite()
+                && best_score.is_infinite()
+                && score.is_sign_positive() == best_score.is_sign_positive())
+                || (!score.is_infinite()
+                    && !best_score.is_infinite()
+                    && (score - best_score).abs() < 1e-9)
             {
                 best_indices.push(idx);
             } else if score > best_score {
@@ -558,9 +562,9 @@ mod tests {
     #[test]
     fn novelty_rewards_are_keyed_by_task_id() {
         let mut model = NoveltyModel::new();
-        model.record_emission(3, EntryKind::Send, 3, None);
-        model.record_emission(3, EntryKind::Recv, 3, None);
-        model.record_emission(9, EntryKind::FsWrite, 9, None);
+        model.record_emission(ActorId(3), EntryKind::Send, 3, None);
+        model.record_emission(ActorId(3), EntryKind::Recv, 3, None);
+        model.record_emission(ActorId(9), EntryKind::FsWrite, 9, None);
         // Task 3 observed a novel (Send, Recv) transition, task 9 a novel one too.
         assert!(model.ucb1_score(3, 1.0) > 0.0);
         assert!(model.ucb1_score(9, 1.0) > 0.0);
@@ -577,14 +581,14 @@ mod tests {
                 exploration_constant: 0.0,
                 pct_mix: crate::config::Probability::ZERO,
             },
-            SeedTree::new([0; 32]),
+            SeedTree::new(ledger_format::EntryHash([0; 32])),
             Vec::new(),
         );
         // Task 4 earns a novel-transition reward; task 7 only repeats a seen one.
-        scheduler.on_entry_emitted(4, EntryKind::Send, 4, None);
-        scheduler.on_entry_emitted(4, EntryKind::Send, 4, None);
-        scheduler.on_entry_emitted(7, EntryKind::Send, 7, None);
-        scheduler.on_entry_emitted(7, EntryKind::Send, 7, None);
+        scheduler.on_entry_emitted(ActorId(4), EntryKind::Send, 4, None);
+        scheduler.on_entry_emitted(ActorId(4), EntryKind::Send, 4, None);
+        scheduler.on_entry_emitted(ActorId(7), EntryKind::Send, 7, None);
+        scheduler.on_entry_emitted(ActorId(7), EntryKind::Send, 7, None);
 
         // Task 4 sits at position 1, not position 4. Scoring must follow the
         // task id; a position-keyed scorer would pick untried position 0.
@@ -599,7 +603,7 @@ mod tests {
     #[test]
     fn bandit_same_seed_produces_same_decision_sequence() {
         let config = RunConfig::builder()
-            .seed([11; 32])
+            .seed(ledger_format::EntryHash([11; 32]))
             .policy(Policy::Bandit {
                 exploration_constant: 1.414,
                 pct_mix: crate::config::Probability::new(0.1).unwrap(),
@@ -619,13 +623,13 @@ mod tests {
     fn bandit_rewards_vc_branch_novelty() {
         let mut model = NoveltyModel::new();
         // Seed the (Send, Send) transition and the (3, 3) actor pair first.
-        model.record_emission(3, EntryKind::Send, 3, Some(100));
-        model.record_emission(3, EntryKind::Send, 3, Some(100));
+        model.record_emission(ActorId(3), EntryKind::Send, 3, Some(100));
+        model.record_emission(ActorId(3), EntryKind::Send, 3, Some(100));
         // A fresh vector-clock signature on the same (actor, kind) earns exactly
         // the VC-branch reward: the transition and pair are already seen.
-        let fresh_branch = model.record_emission(3, EntryKind::Send, 3, Some(200));
+        let fresh_branch = model.record_emission(ActorId(3), EntryKind::Send, 3, Some(200));
         assert_eq!(fresh_branch, 1.0, "a new VC branch rewards +1.0");
-        let repeated = model.record_emission(3, EntryKind::Send, 3, Some(200));
+        let repeated = model.record_emission(ActorId(3), EntryKind::Send, 3, Some(200));
         assert_eq!(repeated, 0.0, "a repeated VC branch earns nothing");
     }
 
@@ -633,14 +637,14 @@ mod tests {
     fn bandit_rewards_fault_adjacency() {
         let mut model = NoveltyModel::new();
         // Seed the (Send, Send) transition and (3, 3) actor pair.
-        model.record_emission(3, EntryKind::Send, 3, None);
-        model.record_emission(3, EntryKind::Send, 3, None);
+        model.record_emission(ActorId(3), EntryKind::Send, 3, None);
+        model.record_emission(ActorId(3), EntryKind::Send, 3, None);
         // A Fault-kind entry earns the transition reward plus the fault reward.
-        let fault = model.record_emission(3, EntryKind::Fault, 3, None);
+        let fault = model.record_emission(ActorId(3), EntryKind::Fault, 3, None);
         assert_eq!(fault, 2.0, "a fault entry earns transition + fault novelty");
         // The emission after a fault earns adjacency novelty on top of its own
         // new (Fault, Send) transition.
-        let adjacent = model.record_emission(3, EntryKind::Send, 3, None);
+        let adjacent = model.record_emission(ActorId(3), EntryKind::Send, 3, None);
         assert_eq!(
             adjacent, 2.0,
             "an emission adjacent to a fault earns adjacency novelty"
@@ -649,7 +653,7 @@ mod tests {
 
     #[test]
     fn bandit_pct_mix_zero_is_unchanged() {
-        let seed = SeedTree::new([13; 32]);
+        let seed = SeedTree::new(ledger_format::EntryHash([13; 32]));
         let mut mixed = Scheduler::new(
             Policy::Bandit {
                 exploration_constant: 1.414,
@@ -663,8 +667,8 @@ mod tests {
         let ready = vec![0, 1, 2, 3];
         for step in 0..16 {
             for task in &ready {
-                mixed.on_entry_emitted(*task as ActorId, EntryKind::Send, *task, None);
-                control.on_entry_emitted(*task as ActorId, EntryKind::Send, *task, None);
+                mixed.on_entry_emitted(ActorId(*task as u32), EntryKind::Send, *task, None);
+                control.on_entry_emitted(ActorId(*task as u32), EntryKind::Send, *task, None);
             }
             let expected = control.select_bandit(&ready, step, 1.414);
             assert_eq!(
@@ -681,7 +685,7 @@ mod tests {
     /// accidental change to the bandit stream offsets or tie-breaks is caught.
     #[test]
     fn bandit_pure_stream_golden_is_stable() {
-        let seed = SeedTree::new([7; 32]);
+        let seed = SeedTree::new(ledger_format::EntryHash([7; 32]));
         let mut sched = Scheduler::new(
             Policy::Bandit {
                 exploration_constant: 1.414,
@@ -694,7 +698,7 @@ mod tests {
         let mut decisions = Vec::new();
         for step in 0..20usize {
             for task in &ready {
-                sched.on_entry_emitted(*task as ActorId, EntryKind::Send, *task, None);
+                sched.on_entry_emitted(ActorId(*task as u32), EntryKind::Send, *task, None);
             }
             decisions.push(sched.choose(&ready, step));
         }
@@ -716,7 +720,7 @@ mod tests {
                 Policy::Pct {
                     priority_changes: budget,
                 },
-                SeedTree::new([7; 32]),
+                SeedTree::new(ledger_format::EntryHash([7; 32])),
                 Vec::new(),
             );
             (0..16).map(|step| scheduler.choose(&ready, step)).collect()

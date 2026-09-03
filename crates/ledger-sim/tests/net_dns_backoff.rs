@@ -69,7 +69,7 @@ fn backoff_jitter_is_deterministic_per_seed_and_varies_across_seeds() {
     let base = Duration::from_micros(100);
     let max = Duration::from_micros(100_000);
     let sequence = |seed: u8| -> Vec<Duration> {
-        let tree = SeedTree::new([seed; 32]);
+        let tree = SeedTree::new(ledger_format::EntryHash([seed; 32]));
         let mut rng = tree.rng("test/backoff");
         (0..8)
             .map(|retry| backoff_jittered(base, retry, max, &mut rng))
@@ -92,7 +92,7 @@ fn dns_resolve_send_recv_sim_is_deterministic() {
         let mut dns = DnsTable::new();
         dns.insert("peer", 1);
         let config = RunConfig::builder()
-            .seed([seed; 32])
+            .seed(ledger_format::EntryHash([seed; 32]))
             .max_steps(512)
             .dns(dns)
             .build();

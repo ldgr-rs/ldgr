@@ -10,7 +10,7 @@ use ledger_sim::{SeedTree, WasmBackend};
 #[test]
 fn wasm_fs_write_read_roundtrip() {
     let wasm = common::guest_wasm_bytes();
-    let seed = [9u8; 32];
+    let seed = ledger_format::EntryHash([9u8; 32]);
     let mut first = WasmBackend::from_wasm(SeedTree::new(seed), &wasm).expect("wasm backend");
     let out1 = first.run_export("run_fs").expect("run_fs");
     let text1 = String::from_utf8_lossy(&out1);
@@ -48,7 +48,7 @@ fn wasm_fs_write_read_roundtrip() {
 #[test]
 fn wasm_fs_crash_drops_unsynced() {
     let wasm = common::guest_wasm_bytes();
-    let seed = [11u8; 32];
+    let seed = ledger_format::EntryHash([11u8; 32]);
     let mut first = WasmBackend::from_wasm(SeedTree::new(seed), &wasm).expect("wasm backend");
     let out1 = first.run_export("run_fs_crash").expect("run_fs_crash");
     let text1 = String::from_utf8_lossy(&out1);
