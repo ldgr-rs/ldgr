@@ -1,9 +1,5 @@
 #![cfg(feature = "std")]
-//! Retention tier tests for the `PersistentJournal` and `SegmentStore`.
-//!
-//! Retention is archive-based and non-destructive. A store retained to cold
-//! reopens byte-identically to a hot store of the same content. Raising the
-//! class re-extracts archived segments back to loose files.
+//! Retention tier tests for `PersistentJournal` and `SegmentStore`.
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -18,7 +14,6 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Return the loose sealed segment files present in a directory, sorted.
 fn loose_segment_files(dir: &Path) -> Vec<String> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir).unwrap().flatten() {
@@ -32,10 +27,6 @@ fn loose_segment_files(dir: &Path) -> Vec<String> {
     names
 }
 
-/// Append a deterministic mixed stream across three sealed segments.
-///
-/// Segment 1 carries Outcome and Fault entries; segment 2 carries an Assert.
-/// The remaining frames are pure-effect Send entries.
 fn append_mixed_stream(journal: &mut PersistentJournal) {
     for seg in 0..3u64 {
         for i in 0..40 {
@@ -78,10 +69,6 @@ fn append_mixed_stream(journal: &mut PersistentJournal) {
     }
 }
 
-/// Append a stream where only segment 1 is fault-relevant.
-///
-/// Segment 0 is pure-effect Send. Segment 1 opens with an Outcome. Segment 2
-/// is pure-effect Recv and is the newest tail.
 fn append_warm_stream(journal: &mut PersistentJournal) {
     for i in 0..40 {
         journal

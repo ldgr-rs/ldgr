@@ -1,10 +1,6 @@
-//! Journal correctness monitor: coverage, parent fidelity, vector-clock
-//! recomputation, and replay determinism.
+//! Journal correctness monitor: coverage, parent fidelity, and replay checks.
 //!
-//! The monitor runs on every sim run and forked replay. It checks per-actor
-//! monotonic sequence, parent resolution, observed-value parent fidelity, and
-//! re-derives each entry's vector clock from its parents, so the journal is
-//! self-verifying without re-execution.
+//! Re-derives each vector clock from parents; no re-execution needed.
 
 use alloc::format;
 use alloc::vec;
@@ -59,10 +55,6 @@ pub enum MonitorIssue {
         position: usize,
     },
     /// A cross-boundary effect was not journaled exactly once.
-    ///
-    /// The journal must hold exactly as many entries per actor as the effect
-    /// boundary reported. A shortfall means an effect leaked past the
-    /// boundary; a surplus means entries were written outside it.
     CoverageMismatch {
         /// The actor whose coverage counts disagree.
         actor: ActorId,
@@ -90,9 +82,6 @@ pub struct JournalCorrectnessMonitor;
 
 impl JournalCorrectnessMonitor {
     /// Audit a journal DAG and return every defect found.
-    ///
-    /// No re-execution is needed; every check is derived from the journal
-    /// itself.
     pub fn audit(journal: &Journal) -> Vec<MonitorIssue> {
         let mut issues = Vec::new();
         let mut actor_seqs: HashMap<ActorId, u64> = HashMap::new();
@@ -126,8 +115,6 @@ impl JournalCorrectnessMonitor {
             }
             check_parent_kind(entry, journal, &mut issues);
 
-            // Vector-clock recomputation: max(parents) plus the actor's own
-            // increment.
             if parents_resolvable {
                 let expected_clock = clock.incremented(entry.data.actor);
                 if expected_clock != entry.vector_clock {
@@ -144,10 +131,7 @@ impl JournalCorrectnessMonitor {
         issues
     }
 
-    /// Audit a journal DAG for complete causal integrity.
-    ///
-    /// Returns the first defect as a [`JournalError`]; use [`Self::audit`]
-    /// to collect every defect.
+    /// Audit a journal DAG; return the first defect as [`JournalError`].
     pub fn verify(journal: &Journal) -> Result<VerificationReport, JournalError> {
         let issues = Self::audit(journal);
         if let Some(issue) = issues.first() {
@@ -164,10 +148,7 @@ impl JournalCorrectnessMonitor {
         })
     }
 
-    /// Verify that a forked replay's entry stream matches the original.
-    ///
-    /// Returns `Err` with a single [`MonitorIssue::ReplayDivergence`] at the
-    /// first differing index.
+    /// Verify a forked replay matches the original entry stream.
     pub fn verify_replay_fidelity(
         original: &Journal,
         fork: &Journal,
@@ -188,12 +169,7 @@ impl JournalCorrectnessMonitor {
         }
     }
 
-    /// Verify boundary coverage: every cross-boundary effect produces exactly
-    /// one journal entry.
-    ///
-    /// Compares each actor's reported boundary count against the entries
-    /// present in the journal and returns a [`MonitorIssue::CoverageMismatch`]
-    /// per disagreement.
+    /// Verify boundary coverage: one journal entry per cross-boundary effect.
     pub fn check_coverage(
         journal: &Journal,
         boundary_entries: &[(ActorId, u64)],
@@ -235,7 +211,6 @@ impl JournalCorrectnessMonitor {
     }
 }
 
-/// Check observed-value parent fidelity for `Recv`, `FsRead`, and `Wake`.
 fn check_parent_kind(entry: &crate::dag::Entry, journal: &Journal, issues: &mut Vec<MonitorIssue>) {
     let expected = match entry.data.kind {
         EntryKind::Recv => Some("Send"),
@@ -281,10 +256,7 @@ fn check_parent_kind(entry: &crate::dag::Entry, journal: &Journal, issues: &mut 
     }
 }
 
-/// Total order over issues: variant tag first, then each variant's fields.
-///
-/// Sorting with this comparator removes HashMap iteration-order dependence
-/// from emitted issue vectors.
+/// Total order over issues for deterministic output.
 fn cmp_issue(left: &MonitorIssue, right: &MonitorIssue) -> Ordering {
     fn tag(issue: &MonitorIssue) -> u8 {
         match issue {
@@ -376,13 +348,10 @@ fn cmp_issue(left: &MonitorIssue, right: &MonitorIssue) -> Ordering {
         })
 }
 
-/// Compare two vector clocks by their canonical (actor, value) pair sequences
-/// in ascending actor order.
 fn cmp_clock(left: &VectorClock, right: &VectorClock) -> Ordering {
     left.iter().cmp(right.iter())
 }
 
-/// Map a kind to a stable display name for issue reporting.
 fn kind_name(kind: EntryKind) -> &'static str {
     match kind {
         EntryKind::Spawn => "Spawn",
@@ -460,8 +429,6 @@ mod tests {
     use ledger_format::{EntryData, EntryHash, EntryPayload, SequenceNumber};
     use std::sync::Arc;
 
-    /// Builds a valid v2 typed payload for the kind in tests that only need
-    /// a well-formed entry, not domain semantics.
     fn scalar_payload(kind: EntryKind, value: u64) -> EntryPayload {
         use ledger_format::*;
         match kind {
@@ -823,14 +790,12 @@ mod tests {
             )
             .unwrap();
 
-        // Exact counts must pass.
         let exact = JournalCorrectnessMonitor::check_coverage(
             &journal,
             &[(ActorId(1), 2), (ActorId(2), 1)],
         );
         assert!(exact.is_empty(), "exact coverage must pass: {exact:?}");
 
-        // A reported shortfall (boundary says 1, journal holds 2) must flag actor 1.
         let shortfall = JournalCorrectnessMonitor::check_coverage(
             &journal,
             &[(ActorId(1), 1), (ActorId(2), 1)],
@@ -844,7 +809,6 @@ mod tests {
             }
         )));
 
-        // A reported surplus (boundary says 3, journal holds 1) must flag actor 2.
         let surplus = JournalCorrectnessMonitor::check_coverage(
             &journal,
             &[(ActorId(1), 2), (ActorId(2), 3)],
@@ -858,7 +822,6 @@ mod tests {
             }
         )));
 
-        // An unreported actor that nonetheless has entries is a leak.
         let missing = JournalCorrectnessMonitor::check_coverage(&journal, &[(ActorId(1), 2)]);
         assert!(missing.iter().any(|issue| matches!(
             issue,
@@ -886,7 +849,6 @@ mod tests {
                     .unwrap();
             }
         }
-        // Actor 6 is journaled but never reported by the boundary.
         journal
             .append(
                 EntryKind::Outcome,
@@ -896,8 +858,6 @@ mod tests {
             )
             .unwrap();
 
-        // Every reported count disagrees with the journal, so all six actors
-        // emit a CoverageMismatch and both HashMap collection paths run.
         let boundary: Vec<(ActorId, u64)> = (1..=5u32)
             .map(|actor| (ActorId(actor), u64::from(actor) + 5))
             .collect();
@@ -945,10 +905,6 @@ mod tests {
 
     #[test]
     fn audit_orders_mixed_issue_kinds() {
-        // The broken entry has a dangling parent; the recv entry references the
-        // broken entry as a Send-parent it can never satisfy. The order Vec
-        // lists the recv first, so unsorted iteration emits ParentKindMismatch
-        // before MissingParent. The sorted output must flip that order.
         let broken = Entry::new(
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,

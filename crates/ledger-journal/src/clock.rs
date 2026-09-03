@@ -1,8 +1,6 @@
 //! Vector clocks and causal happens-before relations.
 //!
-//! A vector clock summarizes the causal history of an entry: for every actor,
-//! the number of that actor's entries the entry depends on. Two clocks are
-//! ordered component-wise. Unrelated clocks are concurrent.
+//! Each clock maps every actor to the count of its entries in history.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -13,10 +11,7 @@ use rpds::RedBlackTreeMapSync;
 
 /// A compact vector-clock summary.
 ///
-/// Backed by a persistent red-black tree with structural sharing: an update
-/// copies only the O(log n) touched path, so `incremented` is cheap and
-/// forks cost O(1). The `_sync` Arc-backed variant keeps the clock `Send +
-/// Sync` inside `Arc<Entry>`. Semantics match a plain `BTreeMap`.
+/// Persistent tree with structural sharing: `incremented` copies O(log n).
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct VectorClock(RedBlackTreeMapSync<ActorId, u64>);
 
@@ -34,9 +29,6 @@ impl VectorClock {
     }
 
     /// Merge two clocks by component-wise maximum.
-    ///
-    /// Returns a new clock; neither input is mutated. A lockstep walk over
-    /// the two ascending iterators merges in O(#actors).
     pub fn merge(&self, other: &Self) -> Self {
         if self.0.is_empty() || self.0 == other.0 {
             return Self(other.0.clone());
@@ -95,9 +87,6 @@ impl VectorClock {
     }
 
     /// Increment the component for an actor.
-    ///
-    /// Returns a new clock; the receiver is not mutated. The insert copies
-    /// only the touched tree path, O(log #actors).
     pub fn incremented(&self, actor: ActorId) -> Self {
         let next = self.0.get(&actor).copied().unwrap_or(0).saturating_add(1);
         Self(self.0.insert(actor, next))
@@ -132,9 +121,6 @@ impl VectorClock {
     }
 
     /// Encode clock into a caller-provided buffer.
-    ///
-    /// Hot append paths reuse a scratch buffer to avoid one allocation per
-    /// entry.
     pub fn encode_into(&self, out: &mut Vec<u8>) {
         cbor::map(out, self.0.size());
         for (actor, value) in self.0.iter() {
@@ -163,9 +149,6 @@ impl VectorClock {
     }
 
     /// Return an owned clock sharing this clock's structure.
-    ///
-    /// The persistent tree shares its root, so this is O(1) regardless of the
-    /// actor count.
     pub fn compact(&self) -> Self {
         Self(self.0.clone())
     }

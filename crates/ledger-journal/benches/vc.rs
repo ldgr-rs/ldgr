@@ -1,9 +1,4 @@
 //! Vector clock benchmarks for the persistent representation.
-//!
-//! Groups:
-//! - `vc_incremented`: persistent insert on clocks of 10, 1000, and 10000 actors.
-//! - `vc_merge`: lockstep merge of two 1000-actor clocks.
-//! - `vc_fork`: O(1) structural clone through `compact`.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use ledger_format::ActorId;

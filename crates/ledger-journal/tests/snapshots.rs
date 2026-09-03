@@ -1,9 +1,5 @@
 #![cfg(feature = "std")]
 //! On-disk snapshot persistence tests.
-//!
-//! Snapshots fire every `interval` entries per actor. They are recorded in
-//! memory and appended to `snapshots.ldgr`. A reopen must restore the recorded
-//! snapshots and validate them against the replayed journal.
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -161,7 +157,6 @@ fn snapshot_referencing_missing_entry_fails_validation_on_open() {
         build(&mut journal, 20);
         journal.force_seal().unwrap();
     }
-    // Drop the only sealed segment so the referenced snapshot entries vanish.
     let seg = dir.join("segment-000000.seg");
     fs::remove_file(&seg).unwrap();
     let result = PersistentJournal::open(&dir);

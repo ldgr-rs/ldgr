@@ -4,11 +4,8 @@
 
 //! Content-addressed causal DAG journal, vector clocks, and segment store.
 //!
-//! The journal is immutable and content-addressed, with cheap forking and
-//! vector-clock happens-before summaries. A correctness monitor re-derives
-//! the clocks, so the journal is self-verifying without re-execution. An
-//! append-only on-disk segment store provides zstd-at-seal compression and
-//! WAL-shaped crash recovery.
+//! Immutable entries with cheap forking; monitor re-derives clocks.
+//! Segments provide zstd-at-seal compression and WAL recovery.
 
 extern crate alloc;
 
@@ -33,9 +30,7 @@ pub mod snapshot_store;
 
 pub use clock::VectorClock;
 pub use dag::{BatchEntry, Entry, EntryFrame, Journal, JournalError};
-pub use identity::{
-    CRASH_SEMANTICS_VERSION, ExecutionIdentity, JOURNAL_FORMAT_VERSION, ResourceLimits,
-};
+pub use identity::{CRASH_SEMANTICS_VERSION, ExecutionIdentity, ResourceLimits};
 pub use monitor::{JournalCorrectnessMonitor, MonitorIssue, VerificationReport};
 #[cfg(feature = "std")]
 pub use persistent::PersistentJournal;

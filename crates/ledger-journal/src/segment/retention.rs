@@ -1,8 +1,4 @@
 //! Retention policy and the segment manifest.
-//!
-//! [`super::SegmentStore::retain`] applies the configured
-//! [`RetentionClass`] by archiving or discarding loose segments and
-//! recording the outcome in the manifest.
 // ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design)
 
 use std::collections::BTreeMap;
@@ -25,15 +21,6 @@ use super::{
 
 impl SegmentStore {
     /// Enforce the current retention class over every sealed segment.
-    ///
-    /// Warm archives segments that are neither fault-relevant nor in the
-    /// newest `KEEP_TAIL`; cold archives everything. The archive is rebuilt
-    /// only when records must be removed; a pure append extends the chain.
-    ///
-    /// Archive input is sealed only: every archived id originates from a
-    /// `SegmentWriter<Sealed>` handle converted via `into_metadata` (see
-    /// `seal_writer`) or from verified `parse_segment_bytes` output. Open
-    /// writers never reach this path.
     pub fn retain(&mut self) -> Result<(), JournalError> {
         let existing = ArchiveStore::load(&self.dir)?;
         let mut archive_map: BTreeMap<u64, Vec<u8>> = existing.into_iter().collect();
@@ -95,8 +82,6 @@ impl SegmentStore {
                 bytes: Arc::new(bytes),
             })
             .collect();
-        // O(segments) membership via a HashSet; the prior linear `any` per
-        // pending record was O(segments^2).
         let mut archived_ids: hashbrown::HashSet<u64> = new_archived.iter().map(|a| a.id).collect();
         for (ordinal, bytes) in pending_append {
             if archived_ids.insert(ordinal) {
@@ -124,7 +109,6 @@ impl SegmentStore {
         Ok(())
     }
 
-    /// Return true when the warm tier keeps a segment loose.
     fn should_keep_loose(&self, segment: &SealedSegment, tail_start: u64) -> bool {
         match self.retention {
             RetentionClass::Hot => true,
@@ -133,10 +117,6 @@ impl SegmentStore {
         }
     }
 
-    /// Return the ordinal of the `KEEP_TAIL`-th newest segment.
-    ///
-    /// Segments at or above this ordinal form the newest tail; with fewer
-    /// than `KEEP_TAIL` segments the whole store is the tail.
     fn newest_tail_start(&self) -> u64 {
         let mut ids: Vec<u64> = self.sealed.iter().map(|segment| segment.id).collect();
         ids.sort_unstable();
@@ -147,17 +127,11 @@ impl SegmentStore {
     }
 
     /// Persist the manifest describing all sealed segments.
-    ///
-    /// The manifest records the retention class and the loose/archived and
-    /// fault-relevant split per segment. Archive contents are re-verified by
-    /// chain hash on load; these flags are a hint only.
     pub fn write_manifest(&self) -> Result<(), JournalError> {
         let path = self.dir.join(MANIFEST_FILE);
         let tmp_path = self.dir.join(format!("{MANIFEST_FILE}.tmp"));
         {
             let mut file = BufWriter::new(File::create(&tmp_path).map_err(segment_io)?);
-            // v2 outer frame prefix (LDGM, version 2); the record stream that
-            // follows is the container payload.
             let mut prefix = Vec::new();
             ledger_format::frame::encode_prefix(
                 &mut prefix,
@@ -170,8 +144,6 @@ impl SegmentStore {
                 .map_err(segment_io)?;
             file.write_all(&(self.sealed.len() as u64).to_be_bytes())
                 .map_err(segment_io)?;
-            // O(segments) archived-membership test; the prior per-segment
-            // linear scan was O(segments^2) on large stores.
             let archived_ids: hashbrown::HashSet<u64> =
                 self.archived.iter().map(|a| a.id).collect();
             for segment in &self.sealed {
@@ -204,7 +176,6 @@ impl SegmentStore {
         path: &Path,
     ) -> Result<(RetentionClass, Vec<ManifestEntry>), JournalError> {
         let mut file = File::open(path).map_err(segment_io)?;
-        // Validate the outer v2 prefix before trusting any record bytes.
         let mut prefix_bytes = [0u8; ledger_format::frame::FRAME_PREFIX_LEN];
         file.read_exact(&mut prefix_bytes).map_err(segment_io)?;
         ledger_format::frame::parse_prefix(
@@ -232,14 +203,11 @@ impl SegmentStore {
         let mut count = [0u8; 8];
         file.read_exact(&mut count).map_err(segment_io)?;
         let count = u64::from_be_bytes(count);
-        // No front-loaded allocation from a hostile count: the vector grows
-        // with records actually read, and read_exact stops at the file end.
         let mut entries = Vec::new();
         for _ in 0..count {
             let mut id = [0u8; 8];
             file.read_exact(&mut id).map_err(segment_io)?;
             let id = u64::from_be_bytes(id);
-            // Skip the 68 metadata bytes to reach the next record.
             file.seek(SeekFrom::Current(MANIFEST_RECORD_META_LEN as i64))
                 .map_err(segment_io)?;
             let flags = {
@@ -255,16 +223,12 @@ impl SegmentStore {
         Ok((retention, entries))
     }
 }
-/// One manifest record for a sealed segment.
 pub(crate) struct ManifestEntry {
     pub(crate) id: u64,
     pub(crate) fault_relevant: bool,
 }
 
-/// Write the full bytes of a sealed segment to its loose file atomically.
-///
-/// The temp file is synced before the rename, so a crash mid-write never
-/// leaves a partial loose segment under its final name.
+/// Write a sealed segment to its loose file atomically.
 pub(crate) fn write_loose_file(dir: &Path, id: u64, bytes: &[u8]) -> Result<(), JournalError> {
     let file_name = segment_file_name(id);
     let tmp_path = dir.join(format!("{file_name}.tmp"));

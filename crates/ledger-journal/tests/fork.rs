@@ -1,10 +1,5 @@
 #![cfg(feature = "std")]
 //! Content-addressed fork tests.
-//!
-//! A fork aliases the parent's sealed segments by hard link (same inode), keeps
-//! its own manifest and WAL, and diverges independently of the parent. A
-//! reopen of either directory must replay its own tail and reproduce its own
-//! root hash.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -45,7 +40,6 @@ fn entry_ids(journal: &PersistentJournal) -> Vec<EntryHash> {
     journal.entries().map(|entry| entry.id).collect()
 }
 
-/// Return `name -> inode` for every sealed segment file in a directory.
 fn segment_inodes(dir: &Path) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for entry in fs::read_dir(dir).unwrap() {
@@ -108,7 +102,6 @@ fn fork_diverges_independently() {
         parent.force_seal().unwrap();
         parent.write_manifest().unwrap();
         let mut fork = parent.fork(&fork_dir).unwrap();
-        // Divergence: each side appends after the fork point.
         build(&mut parent, 20);
         build(&mut fork, 30);
         (parent.root_hash(), fork.root_hash())
@@ -198,7 +191,6 @@ fn fork_covers_unsealed_parent_tail() {
     let all_parent_ids = {
         let mut parent = PersistentJournal::create(&parent_dir).unwrap();
         let ids = build(&mut parent, 80);
-        // No force_seal: every entry sits in the parent's open WAL.
         parent.write_manifest().unwrap();
         ids
     };
@@ -220,12 +212,7 @@ fn fork_covers_unsealed_parent_tail() {
     let _ = fs::remove_dir_all(&fork_dir);
 }
 
-/// The copy fallback must produce a fully correct fork when the fork directory
-/// lives on a different device than the parent (hard links fail there). The
-/// parent is created in the build tree; the fork goes to the temp dir. When
-/// the two are on different devices, the fallback is exercised and the fork's
-/// segments must be copies (different inodes); when they share a device the
-/// hard-link path is used instead.
+/// Copy fallback must produce a correct fork across devices.
 #[test]
 fn fork_copy_fallback_produces_correct_fork() {
     let parent_dir = std::env::current_dir().unwrap().join(format!(
@@ -271,8 +258,6 @@ fn fork_copy_fallback_produces_correct_fork() {
     let _ = fs::remove_dir_all(&fork_dir);
 }
 
-/// Forking a Cold-retention store must materialize the archived segments as
-/// loose files in the fork directory, and the fork must reopen correctly.
 #[test]
 fn fork_materializes_archived_segments() {
     let parent_dir = temp_dir("archived-parent");

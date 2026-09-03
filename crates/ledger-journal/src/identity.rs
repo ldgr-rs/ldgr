@@ -1,67 +1,30 @@
 //! Execution identity: the canonical run and build binding.
 //!
-//! An [`ExecutionIdentity`] binds every fact that must match for two runs to
-//! be comparable: the engine build (source revision, dirty state, version,
-//! toolchain, target triple, build profile, enabled features, and lockfile
-//! digest), the SUT and guest artifacts, the workload and its inputs, the
-//! backend and runtime profile, the canonical `RunConfig` digest and seed-tree
-//! root, the fault specification, the oracle and support-provider versions,
-//! the journal format and crash-semantics versions, and the deterministic
-//! resource limits.
-//!
-//! The canonical byte form is length-prefixed field encoding in declaration
-//! order. The digest is a BLAKE3 keyed hash over those bytes with a fixed
-//! domain key, so identity digests are domain-separated from every other hash
-//! in the system. An identity missing required build data is incomplete and
-//! has no digest: [`Self::digest`] returns `Ok(None)`, and a root comparison
-//! must fail before comparing roots when either side is incomplete.
-//!
-//! Trust boundary: every `String` field and `input_digests` crosses the
-//! host/journal boundary (compile-time build capture and runtime run context
-//! are both host-supplied). Encoding validates each field against
-//! `MAX_IDENTITY_FIELD_BYTES` and the input list against
-//! `MAX_IDENTITY_INPUT_DIGESTS` before any length conversion or allocation,
-//! and fails closed with a typed error. [`ExecutionIdentity::digest`]
-//! returns `Ok(None)` for incomplete identities and `Err` for oversize
-//! fields, so oversize identities surface errors rather than silently
-//! becoming incomparable.
+//! Binds every fact that must match for two runs to compare.
+//! Canonical form is length-prefixed fields in declaration order with
+//! 34-byte framed BLAKE3 multihashes. Digest is domain-separated.
+//! Incomplete identities have no digest. Host strings and inputs are
+//! bounded and fail closed.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::dag::JournalError;
-use ledger_format::EntryHash;
+use ledger_format::{EntryHash, FRAMED_HASH_LEN};
 
-/// Domain key for execution-identity digests. Exactly 32 bytes; changing the
-/// key changes every identity digest and is a breaking format change.
+/// Domain key for identity digests. Changing it breaks every digest.
 const IDENTITY_DOMAIN_KEY: [u8; 32] = *b"ldgr.execution-identity.v1\0\0\0\0\0\0";
 
-/// Journal format version bound by every identity. Bumped only by an approved
-/// format change.
-pub const JOURNAL_FORMAT_VERSION: u32 = 1;
-
-/// Crash-semantics version bound by every identity. Bumped only by an approved
-/// crash-semantics change.
+/// Crash-semantics version bound by every identity.
 pub const CRASH_SEMANTICS_VERSION: u32 = 1;
 
 /// Maximum bytes of one host-supplied identity string field.
-///
-/// Precedent is `MAX_CANONICAL_PATH_BYTES` (4096) in `ledger-format`: long
-/// enough for versions, toolchain ids, triples, profiles, feature lists,
-/// workload ids, backend names, runtime profiles, and revisions, tight enough
-/// to bound the canonical encoding before allocation.
 pub const MAX_IDENTITY_FIELD_BYTES: usize = 4096;
 
 /// Maximum digests in `input_digests`.
-///
-/// Precedent is `MAX_PARENTS_PER_ENTRY` (4096) in `ledger-format`: the same
-/// shape (a bounded list of 32-byte hashes) and the same bound discipline.
 pub const MAX_IDENTITY_INPUT_DIGESTS: usize = 4096;
 
 /// Deterministic resource limits bound by an execution identity.
-///
-/// The identity binds the limits so a run executed under different budgets is
-/// never compared as if it were the same run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResourceLimits {
     /// Maximum scheduler steps granted to the run.
@@ -69,17 +32,9 @@ pub struct ResourceLimits {
 }
 
 /// Canonical build and run binding for one execution.
-///
-/// Fields in the build segment come from compile-time capture (see
-/// `ledger_explorer::identity::EngineBuild`); fields in the run segment come
-/// from the configuration and context of the specific run. An identity is
-/// complete when every required build field is present; see
-/// [`Self::is_complete`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionIdentity {
-    // Build segment (compile-time derived).
-    /// ldgr source revision; `None` means build data was missing at compile
-    /// time, which makes the identity incomplete.
+    /// ldgr source revision; `None` makes the identity incomplete.
     pub engine_revision: Option<String>,
     /// Whether the ldgr source tree was dirty at build time.
     pub engine_dirty: bool,
@@ -134,11 +89,6 @@ pub struct ExecutionIdentity {
 
 impl ExecutionIdentity {
     /// Whether every required build field is present.
-    ///
-    /// An identity with missing build data (no source revision, no lockfile
-    /// digest, or an empty version, toolchain, target, or profile) is
-    /// incomplete: it cannot be compared against another identity, and
-    /// [`Self::digest`] returns `None`.
     pub fn is_complete(&self) -> bool {
         self.engine_revision.is_some()
             && self.lockfile_digest.is_some()
@@ -149,13 +99,6 @@ impl ExecutionIdentity {
     }
 
     /// Canonical length-prefixed field encoding in declaration order.
-    ///
-    /// `input_digests` is sorted before encoding so insertion order never
-    /// changes the bytes. The encoding is total over complete and incomplete
-    /// identities alike when every field fits its cap; oversize host-supplied
-    /// fields fail closed with [`JournalError::InvalidPayload`]. No length is
-    /// converted with `as`, and the output is pre-allocated from a
-    /// checked total bounded by the per-field caps.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, JournalError> {
         check_str_len("engine_version", &self.engine_version)?;
         check_str_len("toolchain", &self.toolchain)?;
@@ -202,11 +145,6 @@ impl ExecutionIdentity {
     }
 
     /// Upper bound of the canonical encoding from the per-field caps.
-    ///
-    /// Every variable field contributes its capped length plus its length
-    /// prefix; fixed fields contribute their exact widths. The caller
-    /// pre-allocates exactly this bound after the cap checks above, so a
-    /// hostile identity cannot force an unbounded reservation.
     fn encoded_len_bound(&self) -> usize {
         let str_fields = [
             self.engine_version.len(),
@@ -222,24 +160,18 @@ impl ExecutionIdentity {
             self.engine_revision.as_ref().map_or(0, |s| s.len()),
             self.sut_revision.as_ref().map_or(0, |s| s.len()),
         ];
-        // 8-byte length prefix per string, 1-byte presence per option,
-        // 1 byte per bool, 8 bytes per u64-shaped integer, 32 per hash.
-        let mut bound = 2 + 8 * 4 + 9 + 1 + 8 + 7 * 32 + 3 + 8 * 3;
+        let mut bound = 2 + 8 * 4 + 9 + 1 + 8 + 7 * FRAMED_HASH_LEN + 3 + 8 * 3;
         for len in str_fields {
             bound += 8 + len.min(MAX_IDENTITY_FIELD_BYTES);
         }
         for len in opt_str_fields {
             bound += 1 + 8 + len.min(MAX_IDENTITY_FIELD_BYTES);
         }
-        bound += 8 + self.input_digests.len().min(MAX_IDENTITY_INPUT_DIGESTS) * 32;
+        bound += 8 + self.input_digests.len().min(MAX_IDENTITY_INPUT_DIGESTS) * FRAMED_HASH_LEN;
         bound
     }
 
-    /// Domain-separated BLAKE3 digest of the canonical identity bytes.
-    ///
-    /// Returns `Ok(None)` for incomplete identities and `Err` when the
-    /// encoding exceeds the trust-boundary caps. Callers must treat both
-    /// as identity disagreement before any root comparison.
+    /// Domain-separated BLAKE3 digest of the canonical bytes.
     pub fn digest(&self) -> Result<Option<EntryHash>, JournalError> {
         if !self.is_complete() {
             return Ok(None);
@@ -248,6 +180,212 @@ impl ExecutionIdentity {
         Ok(Some(EntryHash(
             *blake3::keyed_hash(&IDENTITY_DOMAIN_KEY, &bytes).as_bytes(),
         )))
+    }
+
+    /// Decode an identity from [`Self::canonical_bytes`] output.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, JournalError> {
+        let mut cursor = IdentityDecoder::new(bytes);
+        let engine_revision = cursor.read_opt_str("engine_revision")?;
+        let engine_dirty = cursor.read_bool("engine_dirty")?;
+        let engine_version = cursor.read_str("engine_version")?;
+        let toolchain = cursor.read_str("toolchain")?;
+        let target_triple = cursor.read_str("target_triple")?;
+        let build_profile = cursor.read_str("build_profile")?;
+        let features = cursor.read_str("features")?;
+        let lockfile_digest = cursor.read_opt_hash("lockfile_digest")?;
+        let sut_revision = cursor.read_opt_str("sut_revision")?;
+        let sut_dirty = cursor.read_bool("sut_dirty")?;
+        let sut_artifact_digest = cursor.read_opt_hash("sut_artifact_digest")?;
+        let guest_digest = cursor.read_opt_hash("guest_digest")?;
+        let workload_id = cursor.read_str("workload_id")?;
+        let program_digest = cursor.read_hash("program_digest")?;
+        let input_digests = cursor.read_hashes()?;
+        let backend = cursor.read_str("backend")?;
+        let runtime_profile = cursor.read_str("runtime_profile")?;
+        let run_config_digest = cursor.read_hash("run_config_digest")?;
+        let seed_tree_root = cursor.read_hash("seed_tree_root")?;
+        let faultspec_digest = cursor.read_opt_hash("faultspec_digest")?;
+        let oracle_version = cursor.read_opt_u64("oracle_version")?;
+        let support_provider_version = cursor.read_opt_u64("support_provider_version")?;
+        let journal_format_version = cursor.read_u32("journal_format_version")?;
+        let crash_semantics_version = cursor.read_u32("crash_semantics_version")?;
+        let max_steps = cursor.read_u64("resource_limits.max_steps")?;
+        cursor.reject_trailing()?;
+        Ok(Self {
+            engine_revision,
+            engine_dirty,
+            engine_version,
+            toolchain,
+            target_triple,
+            build_profile,
+            features,
+            lockfile_digest,
+            sut_revision,
+            sut_dirty,
+            sut_artifact_digest,
+            guest_digest,
+            workload_id,
+            program_digest,
+            input_digests,
+            backend,
+            runtime_profile,
+            run_config_digest,
+            seed_tree_root,
+            faultspec_digest,
+            oracle_version,
+            support_provider_version,
+            journal_format_version,
+            crash_semantics_version,
+            resource_limits: ResourceLimits { max_steps },
+        })
+    }
+}
+
+/// Strict cursor over [`ExecutionIdentity::canonical_bytes`] output.
+struct IdentityDecoder<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> IdentityDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
+
+    fn take(&mut self, count: usize, field: &str) -> Result<&'a [u8], JournalError> {
+        let end = self.pos.checked_add(count).ok_or_else(|| {
+            JournalError::InvalidPayload(alloc::format!("identity field {field} is truncated"))
+        })?;
+        if end > self.bytes.len() {
+            return Err(JournalError::InvalidPayload(alloc::format!(
+                "identity field {field} is truncated"
+            )));
+        }
+        let slice = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn read_byte(&mut self, field: &str) -> Result<u8, JournalError> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    fn read_bool(&mut self, field: &str) -> Result<bool, JournalError> {
+        match self.read_byte(field)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(JournalError::InvalidPayload(alloc::format!(
+                "identity field {field} is not a bool"
+            ))),
+        }
+    }
+
+    fn read_presence(&mut self, field: &str) -> Result<bool, JournalError> {
+        match self.read_byte(field)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(JournalError::InvalidPayload(alloc::format!(
+                "identity field {field} has invalid presence flag"
+            ))),
+        }
+    }
+
+    fn read_u64(&mut self, field: &str) -> Result<u64, JournalError> {
+        let raw = self.take(8, field)?;
+        let mut wide = [0u8; 8];
+        wide.copy_from_slice(raw);
+        Ok(u64::from_le_bytes(wide))
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32, JournalError> {
+        let wide = self.read_u64(field)?;
+        u32::try_from(wide).map_err(|_| {
+            JournalError::InvalidPayload(alloc::format!("identity field {field} exceeds u32"))
+        })
+    }
+
+    fn read_len(&mut self, field: &str, cap: usize) -> Result<usize, JournalError> {
+        let wide = self.read_u64(field)?;
+        if wide > cap as u64 {
+            return Err(JournalError::InvalidPayload(alloc::format!(
+                "identity field {field} exceeds limit"
+            )));
+        }
+        usize::try_from(wide).map_err(|_| {
+            JournalError::InvalidPayload(alloc::format!(
+                "identity field {field} length exceeds usize"
+            ))
+        })
+    }
+
+    fn read_str(&mut self, field: &str) -> Result<String, JournalError> {
+        let len = self.read_len(field, MAX_IDENTITY_FIELD_BYTES)?;
+        let raw = self.take(len, field)?;
+        core::str::from_utf8(raw)
+            .map_err(|_| {
+                JournalError::InvalidPayload(alloc::format!(
+                    "identity field {field} is not valid UTF-8"
+                ))
+            })
+            .map(|s| s.to_string())
+    }
+
+    fn read_opt_str(&mut self, field: &str) -> Result<Option<String>, JournalError> {
+        if !self.read_presence(field)? {
+            return Ok(None);
+        }
+        Ok(Some(self.read_str(field)?))
+    }
+
+    fn read_opt_u64(&mut self, field: &str) -> Result<Option<u64>, JournalError> {
+        if !self.read_presence(field)? {
+            return Ok(None);
+        }
+        Ok(Some(self.read_u64(field)?))
+    }
+
+    fn read_hash(&mut self, field: &str) -> Result<EntryHash, JournalError> {
+        let raw = self.take(FRAMED_HASH_LEN, field)?;
+        EntryHash::from_framed_bytes(raw)
+            .map_err(|err| JournalError::InvalidPayload(err.to_string()))
+    }
+
+    fn read_opt_hash(&mut self, field: &str) -> Result<Option<EntryHash>, JournalError> {
+        if !self.read_presence(field)? {
+            return Ok(None);
+        }
+        Ok(Some(self.read_hash(field)?))
+    }
+
+    fn read_hashes(&mut self) -> Result<Vec<EntryHash>, JournalError> {
+        let count = self.read_len("input_digests", MAX_IDENTITY_INPUT_DIGESTS)?;
+        if count > self.remaining() / FRAMED_HASH_LEN {
+            return Err(JournalError::InvalidPayload(
+                "input_digests is truncated".to_string(),
+            ));
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let raw = self.take(FRAMED_HASH_LEN, "input_digests")?;
+            out.push(
+                EntryHash::from_framed_bytes(raw)
+                    .map_err(|err| JournalError::InvalidPayload(err.to_string()))?,
+            );
+        }
+        Ok(out)
+    }
+
+    fn reject_trailing(&self) -> Result<(), JournalError> {
+        if self.pos != self.bytes.len() {
+            return Err(JournalError::InvalidPayload(
+                "identity encoding has trailing bytes".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -316,7 +454,7 @@ fn encode_opt_str(value: &Option<String>, out: &mut Vec<u8>) -> Result<(), Journ
 }
 
 fn encode_hash(value: &EntryHash, out: &mut Vec<u8>) {
-    out.extend_from_slice(&value.0);
+    out.extend_from_slice(&value.to_framed_bytes());
 }
 
 fn encode_opt_hash(value: &Option<EntryHash>, out: &mut Vec<u8>) {
@@ -349,8 +487,8 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
     use alloc::vec;
+    use ledger_format::FORMAT_VERSION;
 
-    /// A complete identity with distinct values in every field.
     fn sample() -> ExecutionIdentity {
         ExecutionIdentity {
             engine_revision: Some("rev-abc123".to_string()),
@@ -375,7 +513,7 @@ mod tests {
             faultspec_digest: Some(EntryHash([0x99; 32])),
             oracle_version: Some(1),
             support_provider_version: Some(2),
-            journal_format_version: JOURNAL_FORMAT_VERSION,
+            journal_format_version: FORMAT_VERSION,
             crash_semantics_version: CRASH_SEMANTICS_VERSION,
             resource_limits: ResourceLimits { max_steps: 10_000 },
         }
@@ -557,7 +695,7 @@ mod tests {
             (
                 "journal_format_version",
                 ExecutionIdentity {
-                    journal_format_version: 2,
+                    journal_format_version: FORMAT_VERSION.wrapping_add(1),
                     ..base.clone()
                 },
             ),
@@ -701,5 +839,108 @@ mod tests {
         identity.input_digests = vec![EntryHash([0x55; 32]); MAX_IDENTITY_INPUT_DIGESTS];
         assert!(identity.canonical_bytes().is_ok());
         assert!(identity.digest().expect("at-cap").is_some());
+    }
+
+    #[test]
+    fn hashes_encode_as_framed_multihash() {
+        let bytes = sample().canonical_bytes().unwrap();
+        let framed = EntryHash([0x44; 32]).to_framed_bytes();
+        assert!(
+            bytes.windows(FRAMED_HASH_LEN).any(|w| w == framed),
+            "program digest must appear in framed form"
+        );
+    }
+
+    #[test]
+    fn framed_prefix_is_blake3_multihash() {
+        let framed = EntryHash([0xab; 32]).to_framed_bytes();
+        assert_eq!(framed.len(), FRAMED_HASH_LEN);
+        assert_eq!([framed[0], framed[1]], [0x1e, 0x20]);
+        assert_eq!(&framed[2..], &[0xab; 32]);
+    }
+
+    #[test]
+    fn round_trip_through_canonical_bytes() {
+        let identity = sample();
+        let bytes = identity.canonical_bytes().unwrap();
+        let decoded = ExecutionIdentity::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, identity);
+        assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+        assert_eq!(decoded.digest(), identity.digest());
+    }
+
+    #[test]
+    fn round_trip_with_empty_optionals() {
+        let identity = ExecutionIdentity {
+            engine_revision: Some("r".to_string()),
+            sut_revision: None,
+            sut_artifact_digest: None,
+            guest_digest: None,
+            lockfile_digest: Some(EntryHash([0x01; 32])),
+            faultspec_digest: None,
+            oracle_version: None,
+            support_provider_version: None,
+            input_digests: vec![],
+            ..sample()
+        };
+        let bytes = identity.canonical_bytes().unwrap();
+        let decoded = ExecutionIdentity::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn raw_32_byte_hash_is_rejected_on_decode() {
+        let mut bytes = sample().canonical_bytes().unwrap();
+        // Corrupt the first framed prefix so it no longer carries [0x1e, 0x20].
+        let framed = EntryHash([0x11; 32]).to_framed_bytes();
+        let pos = bytes
+            .windows(FRAMED_HASH_LEN)
+            .position(|w| w == framed)
+            .expect("lockfile digest must be framed");
+        bytes[pos] = 0x00;
+        assert!(
+            matches!(
+                ExecutionIdentity::from_canonical_bytes(&bytes),
+                Err(crate::dag::JournalError::InvalidPayload(_))
+            ),
+            "raw or corrupt hash prefix must fail closed"
+        );
+    }
+
+    #[test]
+    fn truncated_encoding_is_rejected() {
+        let bytes = sample().canonical_bytes().unwrap();
+        for cut in [1, 8, 34, bytes.len() - 1] {
+            assert!(
+                ExecutionIdentity::from_canonical_bytes(&bytes[..cut]).is_err(),
+                "truncation at {cut} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        let mut bytes = sample().canonical_bytes().unwrap();
+        bytes.push(0x00);
+        assert!(
+            matches!(
+                ExecutionIdentity::from_canonical_bytes(&bytes),
+                Err(crate::dag::JournalError::InvalidPayload(_))
+            ),
+            "trailing bytes must fail closed"
+        );
+    }
+
+    #[test]
+    fn invalid_bool_and_presence_are_rejected() {
+        let mut bytes = sample().canonical_bytes().unwrap();
+        // engine_revision presence flag is the first byte; 2 is invalid.
+        bytes[0] = 2;
+        assert!(ExecutionIdentity::from_canonical_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn sample_tracks_format_version() {
+        assert_eq!(sample().journal_format_version, FORMAT_VERSION);
     }
 }

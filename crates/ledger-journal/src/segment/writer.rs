@@ -1,9 +1,4 @@
 //! Open-segment writer: append, seal, and recovery-log plumbing.
-//!
-//! [`super::SegmentWriter`] accumulates frames and seals them into an
-//! immutable segment file with a sparse index. The [`super::SegmentStore`]
-//! writer methods keep the WAL byte-identical to the writer buffer and seal
-//! on size.
 // ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design)
 
 use std::format;
@@ -28,9 +23,6 @@ impl SegmentWriter<state::Open> {
     }
 
     /// Append one entry frame to the buffer.
-    ///
-    /// Returns the encoded frame bytes so the caller can duplicate them into a
-    /// recovery log without re-encoding.
     pub fn append(&mut self, entry: &Entry) -> Result<Vec<u8>, JournalError> {
         let frame = encode_entry_frame(entry)?;
         let offset = self.buffer.len() as u64;
@@ -41,10 +33,6 @@ impl SegmentWriter<state::Open> {
     }
 
     /// Append frames for all entries, encoding each exactly once.
-    ///
-    /// Frames assemble directly into the segment buffer from one reused
-    /// encode scratch, so a slice costs no per-frame allocations beyond
-    /// index growth. Byte layout is identical to per-entry [`Self::append`].
     pub fn append_slice(&mut self, entries: &[&Entry]) -> Result<(), JournalError> {
         if entries.is_empty() {
             return Ok(());
@@ -60,11 +48,7 @@ impl SegmentWriter<state::Open> {
         Ok(())
     }
 
-    /// Append pre-encoded frames produced by
-    /// [`crate::dag::Journal::append_batch_with_frames`].
-    ///
-    /// The canonical bytes leave the journal once and are copied straight
-    /// into the segment buffer; no CBOR pass runs here at all.
+    /// Append pre-encoded journal batch frames.
     pub fn append_frames(&mut self, frames: &[EntryFrame]) -> Result<(), JournalError> {
         if frames.is_empty() {
             return Ok(());
@@ -80,13 +64,6 @@ impl SegmentWriter<state::Open> {
     }
 
     /// Seal the buffer into an immutable segment file.
-    ///
-    /// Consumes the open writer and returns the sealed handle. The handle is
-    /// the only source of sealed metadata for the archive path; call
-    /// `into_metadata` to hand it to the store. The file is written
-    /// atomically (temp file plus rename) with a zstd-compressed frame block,
-    /// a sparse index sampling every SAMPLE_INTERVAL-th frame, and a BE
-    /// trailer.
     pub fn seal(
         self,
         dir: &Path,
@@ -130,9 +107,6 @@ impl SegmentWriter<state::Open> {
             }
             write_trailer(
                 &mut file,
-                // Sample count is bounded by the in-memory index: one sample
-                // pair per SAMPLE_INTERVAL entries, so u32 cannot truncate
-                // before the index itself exhausts memory.
                 samples.len() as u32,
                 SAMPLE_INTERVAL,
                 compressed.len() as u64,
@@ -166,7 +140,6 @@ impl SegmentWriter<state::Open> {
 }
 
 impl SegmentStore {
-    /// Append one entry. Seals the open segment when the buffer is full.
     pub fn append(&mut self, entry: &Entry) -> Result<(), JournalError> {
         self.ensure_wal()?;
         let frame = self.writer.append(entry)?;
@@ -180,11 +153,6 @@ impl SegmentStore {
     }
 
     /// Append frames for a slice of entries with one recovery-log write.
-    ///
-    /// Frames encode once into the writer and duplicate to the WAL as one
-    /// contiguous write_all, so the durable byte stream is identical to
-    /// per-entry appends while syscall and encoding counts drop per batch.
-    /// The seal check runs once after the whole slice.
     pub fn append_slice(&mut self, entries: &[&Entry]) -> Result<(), JournalError> {
         if entries.is_empty() {
             return Ok(());
@@ -200,9 +168,6 @@ impl SegmentStore {
     }
 
     /// Append pre-encoded journal batch frames with one recovery-log write.
-    ///
-    /// See [`Self::append_slice`]; this variant skips even the storage-side
-    /// canonical encode by consuming [`EntryFrame`] bytes.
     pub fn append_frames(&mut self, frames: &[EntryFrame]) -> Result<(), JournalError> {
         if frames.is_empty() {
             return Ok(());
@@ -217,13 +182,10 @@ impl SegmentStore {
         Ok(())
     }
 
-    /// Open the recovery log when the store has none yet.
     fn ensure_wal(&mut self) -> Result<(), JournalError> {
         if self.wal.is_none() {
             let path = self.dir.join(WAL_FILE);
             let mut file = File::create(&path).map_err(segment_io)?;
-            // v2 WAL opens with the outer frame prefix (LDGW, version 2,
-            // header_len 0, flags 0); frames follow the prefix.
             let mut prefix = Vec::new();
             ledger_format::frame::encode_prefix(&mut prefix, ledger_format::frame::MAGIC_WAL, 0);
             file.write_all(&prefix).map_err(segment_io)?;
@@ -232,7 +194,6 @@ impl SegmentStore {
         Ok(())
     }
 
-    /// Duplicate writer bytes from `start` into the recovery log.
     fn write_wal_range(&mut self, start: usize) -> Result<(), JournalError> {
         if let Some(wal) = self.wal.as_mut() {
             wal.write_all(&self.writer.buffer[start..])
@@ -242,10 +203,6 @@ impl SegmentStore {
     }
 
     /// Seal the open writer into a segment file and reset the WAL.
-    ///
-    /// Consumes the open writer through its sealed handle; the handle's
-    /// metadata is the only value pushed to the sealed list, so the archive
-    /// path below only ever sees sealed segments.
     pub fn seal_writer(&mut self) -> Result<(), JournalError> {
         if self.writer.is_empty() {
             return Ok(());
@@ -255,9 +212,6 @@ impl SegmentStore {
         self.next_segment_id += 1;
         self.sealed.push(sealed_handle.into_metadata());
         self.wal = None;
-        // Invariant: the WAL mirrors the open-writer contents. A stale WAL
-        // left after a seal would be re-ingested by a later `load`,
-        // duplicating entries already sealed into the segment.
         let wal_path = self.dir.join(WAL_FILE);
         match fs::remove_file(&wal_path) {
             Ok(()) => {}
@@ -270,12 +224,10 @@ impl SegmentStore {
         Ok(())
     }
 
-    /// Return the open writer entry count.
     pub fn buffered_count(&self) -> u64 {
         self.writer.entry_count()
     }
 }
-/// Encode `data || vector_clock` into `scratch`; return the data prefix len.
 fn encode_entry_payload(entry: &Entry, scratch: &mut Vec<u8>) -> Result<usize, JournalError> {
     scratch.clear();
     entry
@@ -288,10 +240,6 @@ fn encode_entry_payload(entry: &Entry, scratch: &mut Vec<u8>) -> Result<usize, J
 }
 
 /// Append one length-delimited frame for an already-encoded payload.
-///
-/// `payload` is the canonical `data || vector_clock` bytes, split at
-/// `data_len`. Field order and widths are identical to the framing of
-/// `encode_entry_frame`; a test pins the two byte-for-byte equal.
 fn write_frame(buffer: &mut Vec<u8>, id: &EntryHash, data_len: usize, payload: &[u8]) {
     let payload_len = 32 + 8 + payload.len();
     buffer.reserve(8 + payload_len);
@@ -301,7 +249,6 @@ fn write_frame(buffer: &mut Vec<u8>, id: &EntryHash, data_len: usize, payload: &
     buffer.extend_from_slice(payload);
 }
 
-/// Encode one entry as a length-delimited frame.
 fn encode_entry_frame(entry: &Entry) -> Result<Vec<u8>, JournalError> {
     let mut scratch = Vec::new();
     let data_len = encode_entry_payload(entry, &mut scratch)?;
@@ -317,8 +264,6 @@ fn write_header(
     root_hash: &EntryHash,
     sample_interval: u32,
 ) -> Result<(), JournalError> {
-    // v2 outer frame: 16-byte raw prefix (LDGS, version 2, header_len,
-    // flags) followed by the container-specific canonical CBOR header.
     let mut header = Vec::new();
     ledger_format::cbor::array(&mut header, 4);
     ledger_format::cbor::unsigned(&mut header, entry_count);

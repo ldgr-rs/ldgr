@@ -1,7 +1,4 @@
 //! Actor checkpoint and snapshot manager.
-//!
-//! Each snapshot carries a BLAKE3 hash of its opaque state payload, so
-//! on-disk corruption is detectable when the snapshot is loaded.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -66,9 +63,6 @@ impl Snapshot {
     }
 
     /// Encode the snapshot as deterministic canonical bytes.
-    ///
-    /// Field order is fixed and the vector clock encodes with ascending
-    /// actor keys, so equal snapshots encode byte-for-byte identically.
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         cbor::array(&mut out, 6);
@@ -81,10 +75,7 @@ impl Snapshot {
         out
     }
 
-    /// Decode a snapshot from canonical bytes.
-    ///
-    /// Rejects non-canonical encodings. The state hash is not verified here;
-    /// call [`Self::validate`] for that.
+    /// Decode from canonical bytes. Rejects non-canonical; skips hash check.
     #[cfg(any(feature = "std", test))]
     pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, JournalError> {
         let value = CborValue::from_canonical_bytes(bytes)
@@ -246,9 +237,6 @@ impl SnapshotManager {
     }
 
     /// Validate every recorded snapshot against a journal.
-    ///
-    /// Each snapshot must reproduce its state hash and reference an existing
-    /// journal entry.
     pub fn validate_all(&self, journal: &Journal) -> Result<(), JournalError> {
         for snapshots in self.snapshots.values() {
             for snapshot in snapshots {
@@ -263,10 +251,7 @@ impl SnapshotManager {
 
     /// Load and validate the latest snapshot for an actor.
     ///
-    /// Fails with [`JournalError::SnapshotHashMismatch`] when the recorded
-    /// state hash does not match the payload, or with
-    /// [`JournalError::MissingParent`] when the referenced journal entry no
-    /// longer exists.
+    /// Fails with `SnapshotHashMismatch` or `MissingParent`.
     pub fn load(
         &self,
         journal: &Journal,

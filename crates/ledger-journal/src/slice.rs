@@ -15,10 +15,6 @@ impl Journal {
                 return Err(JournalError::MissingParent(*target));
             }
         }
-        // Bounded HashSet closure: each id is inserted once, so the walk is
-        // O(entries + edges). Parents push unconditionally; duplicates are
-        // dropped by the insert at pop time, which avoids a second lookup
-        // per edge.
         let mut seen = HashSet::new();
         seen.reserve(targets.len());
         let mut stack: Vec<EntryHash> = targets.to_vec();
@@ -62,12 +58,7 @@ impl Journal {
             .collect()
     }
 
-    /// Return the causal slice of the targets, closed forward over its boundary.
-    ///
-    /// The backward closure keeps every parent of a member. The forward cone
-    /// adds the entries that consume the sliced boundary events, and the
-    /// result is re-closed backward so every parent is present and the slice
-    /// is replayable.
+    /// Return the causal slice of the targets, closed forward.
     pub fn causal_slice_forward(
         &self,
         targets: &[EntryHash],
@@ -77,7 +68,7 @@ impl Journal {
         self.causal_slice(&forward)
     }
 
-    /// Construct a subgraph Journal containing only the requested hashes (in topological order).
+    /// Construct a subgraph Journal with only the requested hashes.
     pub fn subgraph(&self, hashes: &[EntryHash]) -> Result<Self, JournalError> {
         let set: HashSet<EntryHash> = hashes.iter().copied().collect();
         let mut sub_entries = HashMap::new();

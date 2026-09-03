@@ -1,17 +1,12 @@
-//! Append-only segment storage with zstd-at-seal compression, a sparse
-//! hash-to-offset index, and WAL-shaped recovery.
+//! Append-only segment storage with zstd-at-seal compression and WAL recovery.
 //!
-//! This module is storage infrastructure, not a simulation runtime. It uses
-//! the ambient filesystem directly; simulation code must route I/O through
-//! `SimFs` instead.
+//! Storage uses the ambient filesystem; simulation code must use `SimFs`.
 //!
-//! Sealed segment file layout (see `writer::write_header` and
-//! `writer::write_trailer` for the writers and `recovery::parse_segment_bytes`
-//! for the reader; the constants below name the exact values):
+//! Sealed layout:
 //!
 //! ```text
 //! [outer prefix 16 bytes: magic "LDGS" 4 bytes]
-//! [format_version u32 LE = 2 4 bytes]
+//! [format_version u32 LE = FORMAT_VERSION 4 bytes]
 //! [header_len u32 LE 4 bytes][flags u32 LE = 0 4 bytes]
 //! [CBOR header header_len bytes: array(4) of
 //!  entry_count unsigned, uncompressed_len unsigned,
@@ -22,28 +17,8 @@
 //! [sample_interval u32 BE][compressed_len u64 BE]
 //! ```
 //!
-//! `data_offset` is `FRAME_PREFIX_LEN (16) + header_len`. The sparse index
-//! samples every `SAMPLE_INTERVAL (32)`-th frame; `offset` is the
-//! uncompressed-block offset and `prefix` is the little-endian u32 of the
-//! entry id bytes 0..4. `parse_segment_bytes` requires
-//! `data_offset + compressed_len + index_len * 12 + TRAILER_LEN (16)` to equal
-//! the file length exactly.
-//!
-//! Each frame is length-delimited: a u64 little-endian payload length
-//! followed by the entry id (32 bytes), a u64 little-endian data length, the
-//! canonical entry data bytes, and the vector-clock encoding. The id is
-//! stored in the frame and re-derived from the payload on read, so
-//! corruption is detectable.
-//!
-//! Open-segment frames are duplicated into a WAL file. A crash that leaves a
-//! partial tail is recovered by truncating the WAL to the last complete
-//! frame. A stale temp file from an interrupted seal is removed at load.
-//!
-//! The module root keeps the segment types, the shared frame codec, and the
-//! boot path. Concern-owned implementations live in the submodules:
-//! [`writer`] (append and seal), [`recovery`] (WAL and temp-file recovery),
-//! [`indexing`] (hash lookup and the sparse index), and [`retention`]
-//! (manifest and archival policy).
+//! Frames are length-delimited and hash-verified on read.
+//! Partial WAL tails truncate to the last complete frame.
 // ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design)
 
 use std::cell::RefCell;
@@ -67,26 +42,17 @@ mod writer;
 
 pub(crate) use retention::write_loose_file;
 
-/// Target size in bytes for a sealed segment.
+/// Target size for a sealed segment.
 pub const SEGMENT_TARGET_SIZE: usize = 64 * 1024 * 1024;
 
-/// Sparse-index sampling interval in frames.
 const SAMPLE_INTERVAL: u32 = 32;
 
-/// Number of bytes in the segment file trailer.
 const TRAILER_LEN: usize = 16;
 
-/// Bytes of metadata following the id field in a manifest record.
-///
-/// The fields after `id` are entry_count, uncompressed_len, compressed_len,
-/// sample_interval, and samples length: 8 + 8 + 8 + 4 + 8 = 36 bytes plus the
-/// 32-byte root hash.
 const MANIFEST_RECORD_META_LEN: usize = 68;
 
-/// Bytes of one sparse index entry (offset u64 BE, prefix u32 BE).
 const INDEX_ENTRY_LEN: usize = 12;
 
-/// Minimum payload size of a valid frame (id + data length + minimal data).
 const MIN_FRAME_PAYLOAD: usize = 40;
 
 const WAL_FILE: &str = "wal.bin";
@@ -108,11 +74,8 @@ pub struct SealedSegment {
     /// Sparse-index sampling interval in frames.
     pub sample_interval: u32,
     /// True when any frame carries a Fault, Outcome, or Assert kind.
-    ///
-    /// The warm retention tier keeps such segments loose.
     pub contains_fault_relevant: bool,
-    /// Byte offset where the compressed frame block begins (after the outer
-    /// frame prefix and the canonical CBOR header).
+    /// Byte offset where the compressed block begins.
     pub data_offset: u64,
     /// Sparse index entries, sorted by offset.
     samples: Vec<(u64, u32)>,
@@ -125,18 +88,15 @@ impl SealedSegment {
     }
 }
 
-/// Typestate markers governing segment storage lifecycles.
-/// Only [`SegmentWriter`] in [`Open`] accepts appends; [`Sealed`] is the
-/// immutable handle returned by seal and the only source of sealed metadata
-/// for the archive path.
+/// Typestate markers for segment storage lifecycles.
 pub mod state {
     use super::SealedSegment;
 
-    /// Typestate marker indicating that the segment writer is open and accepting frame appends.
+    /// Open writer accepting appends.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Open;
 
-    /// Typestate marker indicating that the segment is sealed and immutable.
+    /// Sealed immutable segment.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Sealed;
 
@@ -147,10 +107,6 @@ pub mod state {
     }
 
     /// Storage bound to a writer state.
-    ///
-    /// Open writers carry no sealed metadata; sealed writers carry exactly
-    /// the verified [`SealedSegment`] produced by seal. The associated type
-    /// keeps the sealed handle infallible without an `Option` plus unwrap.
     pub trait WriterState:
         private::SealedTrait + Clone + Copy + PartialEq + Eq + core::fmt::Debug
     {
@@ -168,77 +124,56 @@ pub mod state {
 }
 
 /// In-memory accumulation buffer for an open segment.
-///
-/// Typestate: append and seal exist only on `SegmentWriter<Open>`; read-only
-/// sealed accessors exist only on `SegmentWriter<Sealed>`. `seal` consumes
-/// the open writer and returns the sealed handle; the archive path consumes
-/// the handle via `into_metadata`, so an open buffer can never be archived.
 #[derive(Debug, Clone)]
 pub struct SegmentWriter<S: state::WriterState = state::Open> {
     buffer: Vec<u8>,
     index: Vec<(EntryHash, u64)>,
     fault_relevant: bool,
-    /// Reused canonical-encode buffer for slice appends.
-    ///
-    /// Cleared per entry; one allocation serves every framed entry of a
-    /// slice. Empty on sealed handles.
     encode_scratch: Vec<u8>,
     sealed: S::SealedStore,
     _state: core::marker::PhantomData<S>,
 }
 
 impl SegmentWriter<state::Open> {
-    /// Length of the open buffer in bytes.
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
 
-    /// True when the open buffer holds no frames.
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
-    /// Number of buffered frames.
     pub fn entry_count(&self) -> u64 {
         self.index.len() as u64
     }
 
-    /// True when the buffer reached the seal target.
     pub fn should_seal(&self) -> bool {
         self.buffer.len() >= SEGMENT_TARGET_SIZE
     }
 }
 
 impl SegmentWriter<state::Sealed> {
-    /// Borrow the sealed metadata produced by seal.
     pub fn metadata(&self) -> &SealedSegment {
         &self.sealed
     }
 
-    /// Consume the sealed handle into its metadata for the archive path.
-    ///
-    /// The store pushes the returned value into its sealed list; retention
-    /// archives only these values, never an open writer.
+    /// Consume the sealed handle into its metadata.
     pub fn into_metadata(self) -> SealedSegment {
         self.sealed
     }
 
-    /// Ordinal of the sealed segment.
     pub fn id(&self) -> u64 {
         self.sealed.id
     }
 
-    /// Number of entries in the sealed segment.
     pub fn entry_count(&self) -> u64 {
         self.sealed.entry_count
     }
 
-    /// True when the sealed segment carries fault-relevant kinds.
     pub fn contains_fault_relevant(&self) -> bool {
         self.sealed.contains_fault_relevant
     }
 
-    /// True when the sealed segment holds no entries (never for sealed output).
     pub fn is_empty(&self) -> bool {
         self.sealed.entry_count == 0
     }
@@ -257,30 +192,14 @@ impl Default for SegmentWriter<state::Open> {
     }
 }
 
-/// One sealed segment whose bytes live in the archive instead of a loose file.
-///
-/// The bytes are the full serialized segment file contents, kept in memory
-/// so lookups and re-extraction work without touching the archive.
+/// One sealed segment whose bytes live in the archive.
 #[derive(Debug, Clone)]
 pub struct ArchivedSegment {
-    /// Ordinal of the archived segment.
     pub(crate) id: u64,
-    /// Full serialized segment file bytes.
     pub(crate) bytes: Arc<Vec<u8>>,
 }
 
 /// Append-only on-disk segment store.
-///
-/// Frames accumulate in an in-memory writer and duplicate into a WAL file for
-/// crash recovery. A seal writes an immutable compressed, indexed segment
-/// file and removes the WAL. On `load`, a partial WAL tail is truncated to
-/// the last complete frame and the surviving frames recover into a fresh
-/// writer.
-///
-/// Sealed segments are retained by tier. Archived segments move their bytes
-/// into `archive.ldgr` and drop their loose file, but the bytes stay
-/// available in memory, so reads and re-extraction always work and the store
-/// is non-lossy.
 #[derive(Debug)]
 pub struct SegmentStore {
     dir: PathBuf,
@@ -305,27 +224,17 @@ impl SegmentStore {
     }
 
     /// Set the retention class and apply it immediately.
-    ///
-    /// Raising the class re-extracts archived segments back to loose files.
-    /// The store stays byte-identical under every class.
     pub fn set_retention(&mut self, class: RetentionClass) -> Result<(), JournalError> {
         self.retention = class;
         self.retain()
     }
 
     /// Open a store rooted at `dir`, creating it if necessary.
-    ///
-    /// Sealed segments already in `dir` are left untouched; a recoverable WAL
-    /// is loaded into the writer.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, JournalError> {
         Self::open_internal(dir.into(), true)
     }
 
     /// Open a store rooted at `dir` and load its persisted state.
-    ///
-    /// Stale temp files are removed, a trailing segment that does not match
-    /// its trailer is dropped, and a partial WAL tail is truncated to the
-    /// last complete frame.
     pub fn load(dir: impl Into<PathBuf>) -> Result<Self, JournalError> {
         Self::open_internal(dir.into(), false)
     }
@@ -367,11 +276,7 @@ fn segment_io(err: io::Error) -> JournalError {
     JournalError::SegmentCorrupt(err.to_string())
 }
 
-/// Read an 8-byte little-endian integer from `bytes[offset..offset + 8]`.
-///
-/// Callers bounds-check the window first; the slice is exactly 8 bytes by
-/// construction, so the conversion is a plain copy (debug-asserted), with no
-/// unreachable defensive arm.
+/// Read u64 LE at offset; caller bounds-checks the window.
 fn read_u64_le_at(bytes: &[u8], offset: usize) -> u64 {
     debug_assert!(offset + 8 <= bytes.len(), "window must be bounds-checked");
     let mut array = [0u8; 8];
@@ -379,9 +284,7 @@ fn read_u64_le_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(array)
 }
 
-/// Read a `u32` big-endian from `bytes[offset..offset + 4]`.
-///
-/// Window validity is the caller's responsibility (see `read_u64_le_at`).
+/// Read u32 BE at offset; caller bounds-checks the window.
 fn read_u32_be_at(bytes: &[u8], offset: usize) -> u32 {
     debug_assert!(offset + 4 <= bytes.len(), "window must be bounds-checked");
     let mut array = [0u8; 4];
@@ -389,9 +292,7 @@ fn read_u32_be_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(array)
 }
 
-/// Read a `u64` big-endian from `bytes[offset..offset + 8]`.
-///
-/// Window validity is the caller's responsibility (see `read_u64_le_at`).
+/// Read u64 BE at offset; caller bounds-checks the window.
 fn read_u64_be_at(bytes: &[u8], offset: usize) -> u64 {
     debug_assert!(offset + 8 <= bytes.len(), "window must be bounds-checked");
     let mut array = [0u8; 8];
@@ -399,11 +300,7 @@ fn read_u64_be_at(bytes: &[u8], offset: usize) -> u64 {
     u64::from_be_bytes(array)
 }
 
-/// Return the payload slice for the frame starting at `offset`.
-///
-/// The u64 length prefix is hostile input: every span computation is
-/// checked, so a prefix near `u64::MAX` yields [`JournalError::SegmentCorrupt`]
-/// instead of a wrapping-index panic.
+/// Return the payload slice for the frame at `offset`. Checked for hostile lengths.
 fn frame_payload_at(block: &[u8], offset: u64) -> Result<&[u8], JournalError> {
     let prefix_end = offset
         .checked_add(8)
@@ -413,7 +310,6 @@ fn frame_payload_at(block: &[u8], offset: u64) -> Result<&[u8], JournalError> {
             "frame offset out of bounds".to_string(),
         ));
     }
-    // Safe: prefix_end <= block.len(), so the usize conversion is lossless.
     let prefix_end = prefix_end as usize;
     let len = read_u64_le_at(block, offset as usize);
     let frame_end = (prefix_end as u64)
@@ -424,15 +320,10 @@ fn frame_payload_at(block: &[u8], offset: u64) -> Result<&[u8], JournalError> {
             "frame length exceeds block".to_string(),
         ));
     }
-    // Safe: frame_end <= block.len(), so the usize conversion is lossless.
     Ok(&block[prefix_end..frame_end as usize])
 }
 
-/// Walk to the frame at `offset`, validating the length prefix.
-///
-/// The u64 length prefix is hostile input: every span computation is
-/// checked, so a prefix near `u64::MAX` yields
-/// [`JournalError::SegmentCorrupt`] instead of a wrapping-index panic.
+/// Walk to the frame at `offset`. Checked for hostile lengths.
 fn next_frame(block: &[u8], offset: usize) -> Result<Option<(usize, &[u8])>, JournalError> {
     if offset >= block.len() {
         return Ok(None);
@@ -459,7 +350,6 @@ fn next_frame(block: &[u8], offset: usize) -> Result<Option<(usize, &[u8])>, Jou
             "frame extends past block end".to_string(),
         ));
     }
-    // Safe: frame_end <= block.len(), so the usize conversion is lossless.
     let frame_end = frame_end as usize;
     Ok(Some((frame_end, &block[prefix_end..frame_end])))
 }
@@ -475,8 +365,6 @@ fn decode_frame_payload(payload: &[u8]) -> Result<Arc<Entry>, JournalError> {
     raw.copy_from_slice(&payload[0..32]);
     let id = EntryHash(raw);
     let data_len = read_u64_le_at(payload, 32);
-    // Checked span math: a hostile data length yields SegmentCorrupt, never
-    // a wrapping-index panic.
     let data_end = 40u64.checked_add(data_len).ok_or_else(|| {
         JournalError::SegmentCorrupt("frame data length exceeds payload".to_string())
     })?;
@@ -485,7 +373,6 @@ fn decode_frame_payload(payload: &[u8]) -> Result<Arc<Entry>, JournalError> {
             "frame data length exceeds payload".to_string(),
         ));
     }
-    // Safe: data_end <= payload.len(), so the usize conversion is lossless.
     let data_end = data_end as usize;
     let data_bytes = &payload[40..data_end];
     let vc_bytes = &payload[data_end..];
@@ -547,9 +434,7 @@ fn decode_vector_clock(bytes: &[u8]) -> Result<VectorClock, JournalError> {
 }
 
 fn decode_entry_data(bytes: &[u8]) -> Result<EntryData, JournalError> {
-    // v2 decoding is owned by ledger-format: the typed decoder validates the
-    // outer format version, kind tag, bounds, and payload shape before any
-    // content allocation. The journal only maps the error class.
+    // Owned by ledger-format; journal maps the error class.
     EntryData::from_canonical_bytes(bytes)
         .map_err(|err| JournalError::SegmentCorrupt(err.to_string()))
 }
@@ -559,7 +444,6 @@ mod tests {
     use super::recovery::{last_complete_frame_end, parse_segment_bytes};
     use super::*;
 
-    /// Number of bytes in the segment file header.
     const HEADER_LEN: usize = 56;
     use crate::clock::VectorClock;
     use crate::dag::{BatchEntry, Journal};
@@ -650,8 +534,6 @@ mod tests {
                     payload: EntryPayload::RngDraw(ledger_format::RngDrawPayload {
                         stream: StreamId(0),
                         draw_index: 0,
-                        // Just under the 17 MiB entry cap; five entries cross
-                        // the 64 MiB seal target.
                         content: vec![0xab; 16 * 1024 * 1024 - 1024],
                     }),
                 },
@@ -672,10 +554,6 @@ mod tests {
 
     #[test]
     fn hostile_trailer_lengths_are_rejected_not_wrapped() {
-        // index_len = u32::MAX: the sparse index product overflows usize on
-        // 32-bit builds (the checked_mul path) and cannot match the real
-        // file length anywhere. Both cases must read as an incomplete
-        // segment, never a panic and never a wrong-sized slice.
         let mut bytes = vec![0u8; HEADER_LEN + TRAILER_LEN];
         let trailer = &mut bytes[HEADER_LEN..];
         trailer[0..4].copy_from_slice(&(u32::MAX).to_be_bytes());
@@ -683,8 +561,6 @@ mod tests {
         trailer[8..16].copy_from_slice(&0u64.to_be_bytes());
         assert!(parse_segment_bytes(&bytes, 1).unwrap().is_none());
 
-        // compressed_len = u64::MAX: the expected-length addition overflows
-        // u64 and must read as an incomplete segment.
         let mut bytes = vec![0u8; HEADER_LEN + TRAILER_LEN];
         let trailer = &mut bytes[HEADER_LEN..];
         trailer[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
@@ -700,7 +576,6 @@ mod tests {
             for entry in &entries {
                 store.append(entry).unwrap();
             }
-            // Simulate a crash mid-write: a partial frame appended to the WAL.
             let wal_path = dir.join(WAL_FILE);
             let mut file = fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
             file.write_all(&0u64.to_le_bytes()).unwrap();
@@ -733,15 +608,11 @@ mod tests {
             for entry in &entries {
                 store.append(entry).unwrap();
             }
-            // Crash mid-write: a partial frame appended to the WAL.
             let wal_path = dir.join(WAL_FILE);
             let mut file = fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
             file.write_all(&0u64.to_le_bytes()).unwrap();
             file.write_all(&[0xde, 0xad, 0xbe, 0xef]).unwrap();
         }
-        // Recovery truncates the partial tail; the writer keeps the recovered
-        // frames. A subsequent append must extend the recovered WAL, never
-        // truncate it, so the tail survives the next reopen.
         {
             let mut store = SegmentStore::load(&dir).unwrap();
             for entry in &more {
@@ -765,8 +636,6 @@ mod tests {
             let _ = SegmentStore::new(&dir).unwrap();
         }
         let mut store = SegmentStore::load(&dir).unwrap();
-        // An empty writer leaves no WAL file; appending after load must
-        // create a fresh WAL without any recovered-frame bookkeeping.
         let entry = Entry::new(
             EntryData {
                 format_version: ledger_format::FORMAT_VERSION,
@@ -802,7 +671,6 @@ mod tests {
             store.seal_writer().unwrap();
             store.write_manifest().unwrap();
         }
-        // Corrupt the trailer of the sealed segment file.
         let seg_path = dir.join(segment_file_name(0));
         let len = fs::metadata(&seg_path).unwrap().len();
         let mut file = fs::OpenOptions::new().write(true).open(&seg_path).unwrap();
@@ -954,7 +822,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Build a varied stream whose kinds include the fault-relevant set.
     fn build_varied_entries(count: usize) -> Vec<Entry> {
         let mut journal = Journal::new();
         let mut out = Vec::with_capacity(count);
@@ -1005,17 +872,14 @@ mod tests {
         let entries = build_varied_entries(40);
         let refs: Vec<&Entry> = entries.iter().collect();
 
-        // Per-entry reference encoding.
         let mut per_entry = SegmentWriter::new();
         for entry in &refs {
             per_entry.append(entry).unwrap();
         }
 
-        // One-shot slice encoding through the reused scratch.
         let mut sliced = SegmentWriter::new();
         sliced.append_slice(&refs).unwrap();
 
-        // Pre-encoded journal frames: zero CBOR passes in the writer.
         let mut source = Journal::new();
         let batch = entries
             .iter()
@@ -1029,7 +893,6 @@ mod tests {
             .collect();
         let mut frames = Vec::new();
         source.append_batch_with_frames(batch, &mut frames).unwrap();
-        // The journal must reproduce exactly these ids in append order.
         let frame_ids: Vec<EntryHash> = frames.iter().map(|frame| frame.id).collect();
         let journal_ids: Vec<EntryHash> = entries.iter().map(|entry| entry.id).collect();
         assert_eq!(frame_ids, journal_ids);
@@ -1074,15 +937,12 @@ mod tests {
         let dir = temp_dir("slice-wal");
         {
             let mut store = SegmentStore::new(&dir).unwrap();
-            // Mixed slices and single appends share one WAL; every byte
-            // range duplicates into it contiguously.
             store.append_slice(&refs[..50]).unwrap();
             for entry in &entries[50..80] {
                 store.append(entry).unwrap();
             }
             store.append_slice(&refs[80..]).unwrap();
         }
-        // Simulate a crash mid-write with a partial trailing frame.
         let wal_path = dir.join(WAL_FILE);
         let mut file = fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
         file.write_all(&7u64.to_le_bytes()).unwrap();
@@ -1116,7 +976,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Hostile length prefixes must produce typed errors, never panics.
     #[test]
     fn frame_walks_reject_hostile_length_prefixes() {
         for prefix in [
@@ -1127,14 +986,12 @@ mod tests {
             1024, // fits u64 but exceeds the buffer
             65536,
         ] {
-            // next_frame: the strict walk rejects the prefix.
             let mut block = vec![0u8; 16];
             block[..8].copy_from_slice(&prefix.to_le_bytes());
             assert!(
                 matches!(next_frame(&block, 0), Err(JournalError::SegmentCorrupt(_))),
                 "prefix {prefix} must be rejected by next_frame, not panic"
             );
-            // frame_payload_at: same rejection with a raw offset.
             assert!(
                 matches!(
                     frame_payload_at(&block, 0),
@@ -1142,10 +999,6 @@ mod tests {
                 ),
                 "prefix {prefix} must be rejected by frame_payload_at, not panic"
             );
-            // last_complete_frame_end: a prefix that cannot fit ends the run
-            // like any truncated tail; never a panic and never a wrap. The
-            // WAL walk starts after the outer 16-byte prefix, so the hostile
-            // length occupies the first frame slot.
             let mut wal = Vec::new();
             ledger_format::frame::encode_prefix(&mut wal, ledger_format::frame::MAGIC_WAL, 0);
             wal.extend_from_slice(&prefix.to_le_bytes());
@@ -1158,7 +1011,6 @@ mod tests {
         }
     }
 
-    /// A hostile data length inside a frame payload yields SegmentCorrupt.
     #[test]
     fn decode_frame_payload_rejects_hostile_data_length() {
         for data_len in [u64::MAX, u64::MAX - 39, 1u64 << 40, 1024] {
@@ -1174,7 +1026,6 @@ mod tests {
         }
     }
 
-    /// Valid frames walk exactly as before the checked-arithmetic fix.
     #[test]
     fn frame_walks_valid_path_is_unchanged() {
         let mut block = Vec::new();
@@ -1201,8 +1052,6 @@ mod tests {
         assert_eq!(last_complete_frame_end(&wal).unwrap(), wal.len() as u64);
     }
 
-    /// A hostile prefix after valid frames ends the run at the last complete
-    /// frame, exactly like a truncated tail.
     #[test]
     fn last_complete_run_stops_at_hostile_prefix() {
         let mut wal = Vec::new();
@@ -1246,8 +1095,6 @@ mod tests {
 
     #[test]
     fn crash_window_sealed_and_wal_duplicate_is_deduplicated() {
-        // Simulate the window where seal made the segment durable but the
-        // WAL was not yet removed: both contain identical frames.
         let entries = build_entries(8, ActorId(1), 0);
         let dir = temp_dir("crash-window-dedup");
         {
@@ -1258,8 +1105,6 @@ mod tests {
             let wal_path = dir.join(WAL_FILE);
             let pre_seal_wal = fs::read(&wal_path).unwrap();
             store.seal_writer().unwrap();
-            // Crash between durable rename and WAL removal: restore the
-            // pre-seal WAL so both the sealed segment and its frames exist.
             fs::write(&wal_path, &pre_seal_wal).unwrap();
         }
         let store = SegmentStore::load(&dir).unwrap();
@@ -1289,7 +1134,6 @@ mod tests {
         store.seal_writer().unwrap();
         let seg_path = dir.join(segment_file_name(0));
         let mut bytes = fs::read(&seg_path).unwrap();
-        // Bump outer version field (LE u32 at bytes 4..8) to 99.
         bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
         let err = parse_segment_bytes(&bytes, 0).unwrap_err();
         assert!(
@@ -1326,8 +1170,6 @@ mod tests {
         assert_eq!(open.entry_count(), 64);
         assert!(!open.is_empty());
         let sealed = open.seal(&dir, 7).unwrap();
-        // Sealed handle exposes read-only metadata; append does not exist
-        // on this type (compile-time enforcement).
         assert_eq!(sealed.id(), 7);
         assert_eq!(sealed.entry_count(), 64);
         assert!(!sealed.is_empty());
@@ -1340,9 +1182,6 @@ mod tests {
 
     #[test]
     fn sealed_file_matches_documented_layout() {
-        // Pins the documented sealed layout: 16-byte outer prefix (LDGS,
-        // version 2 LE, header_len LE, flags 0), CBOR header, compressed
-        // block, BE sparse index, and 16-byte BE trailer.
         let entries = build_entries(40, ActorId(1), 0);
         let dir = temp_dir("layout-pin");
         let mut store = SegmentStore::new(&dir).unwrap();
@@ -1352,7 +1191,10 @@ mod tests {
         store.seal_writer().unwrap();
         let bytes = fs::read(dir.join(segment_file_name(0))).unwrap();
         assert_eq!(&bytes[0..4], b"LDGS");
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            ledger_format::FORMAT_VERSION
+        );
         let header_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 0);
         let segment = &store.segments()[0];

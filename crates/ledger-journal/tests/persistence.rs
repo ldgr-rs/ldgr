@@ -1,9 +1,5 @@
 #![cfg(feature = "std")]
-//! End-to-end persistence tests for the `PersistentJournal` facade.
-//!
-//! These tests exercise the real file path: a journal appends through the
-//! facade into a segment store, then a fresh `PersistentJournal` is opened from
-//! the same directory and must reproduce an identical DAG.
+//! End-to-end persistence tests for `PersistentJournal`.
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -20,11 +16,6 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Append `count` varied entries across several actors.
-///
-/// Each entry observes its own actor's previous entry and one other actor's
-/// previous entry, so the DAG is deeply cross-linked. Kinds, payloads, and
-/// timer/RNG-style variety are rotated per entry.
 fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<EntryHash> {
     const ACTORS: usize = 4;
     let mut last: Vec<Option<EntryHash>> = vec![None; ACTORS];
@@ -40,7 +31,6 @@ fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<EntryHash>
             _ => EntryKind::Assert,
         };
         let value = i as u64;
-        // v2 payloads are kind-specific; the payload derives from the kind.
         let payload = match kind {
             EntryKind::Outcome => EntryPayload::Outcome(ledger_format::OutcomePayload {
                 schema: EntryHash([0x00; 32]),
@@ -90,7 +80,6 @@ fn build_stream(journal: &mut PersistentJournal, count: usize) -> Vec<EntryHash>
     ids
 }
 
-/// Snapshot of the append-order entry stream used for equality checks.
 #[derive(Debug)]
 struct EntryStream {
     ids: Vec<EntryHash>,
@@ -195,7 +184,6 @@ fn wal_truncation_recovers_last_complete_frame_through_facade() {
         let root = journal.root_hash();
         let stream = EntryStream::capture(&journal);
         drop(journal);
-        // Simulate a crash mid-write: a partial frame appended to the WAL.
         {
             let wal_path = dir.join(WAL_FILE);
             let mut file = fs::OpenOptions::new().append(true).open(&wal_path).unwrap();
@@ -224,8 +212,6 @@ fn corrupt_sealed_tail_is_dropped_and_buffered_tail_reconstructs() {
         build_stream(&mut journal, 100);
         journal.force_seal().unwrap();
         journal.write_manifest().unwrap();
-        // Append a buffered tail from fresh actors so the tail does not
-        // reference the sealed segment that will be dropped.
         for i in 0..50 {
             journal
                 .append(
@@ -254,7 +240,6 @@ fn corrupt_sealed_tail_is_dropped_and_buffered_tail_reconstructs() {
                 .unwrap();
         }
         let tail_root = reference.root_hash();
-        // Corrupt the trailer of the sealed segment.
         let seg_path = dir.join("segment-000000.seg");
         let len = fs::metadata(&seg_path).unwrap().len();
         let mut file = fs::OpenOptions::new().write(true).open(&seg_path).unwrap();

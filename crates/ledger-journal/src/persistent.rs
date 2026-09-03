@@ -1,14 +1,8 @@
 //! Durable facade over an in-memory [`Journal`] and a [`SegmentStore`].
 // ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design, same as segment.rs)
 //!
-//! The in-memory journal is the authority for reads and for the DAG; the
-//! segment store is the durable copy. Every append is written to both, so
-//! ordering is identical in memory and on disk, and `open` rebuilds the DAG
-//! by replaying persisted entries in append order.
-//!
-//! On append the journal validates and stages the entry, then the store
-//! persists it. A store I/O failure returns an error and rolls back the
-//! in-memory journal so in-memory and on-disk states stay consistent.
+//! Memory journal is the read authority; store is the durable copy.
+//! Appends write both; store failure rolls back memory.
 
 use std::format;
 use std::fs;
@@ -25,10 +19,6 @@ use crate::snapshot_store::SnapshotStore;
 use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload};
 
 /// A journal that is both in-memory and durably persisted.
-///
-/// Reads and DAG operations delegate to the in-memory journal. The store
-/// holds the durable copy, and periodic per-actor snapshots append to an
-/// on-disk snapshot store.
 #[derive(Debug)]
 pub struct PersistentJournal {
     journal: Journal,
@@ -44,8 +34,6 @@ impl PersistentJournal {
     }
 
     /// Create a fresh store and an empty journal with a snapshot interval.
-    ///
-    /// See [`SnapshotManager::should_snapshot`].
     pub fn create_with_interval(
         dir: impl Into<PathBuf>,
         interval: u64,
@@ -62,19 +50,11 @@ impl PersistentJournal {
     }
 
     /// Open an existing store and reconstruct the journal from its entries.
-    ///
-    /// Snapshots are validated, then entries are replayed in append order
-    /// through [`Journal::append`]. The replayed entry must reproduce the
-    /// persisted id and vector clock; a mismatch means the store is
-    /// inconsistent and the open fails instead of silently diverging.
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, JournalError> {
         Self::open_with_interval(dir, DEFAULT_SNAPSHOT_INTERVAL)
     }
 
     /// Open an existing store with a snapshot interval for future recording.
-    ///
-    /// The interval does not affect the loaded snapshots; it only governs which
-    /// appends record new snapshots after the open.
     pub fn open_with_interval(
         dir: impl Into<PathBuf>,
         interval: u64,
@@ -121,13 +101,6 @@ impl PersistentJournal {
     }
 
     /// Fork this journal into a fresh directory, sharing sealed segments.
-    ///
-    /// Sealed segment files are hard-linked into `fork_dir`, so the fork
-    /// aliases the parent's content by inode; the fallback is a byte copy
-    /// (correct, not deduplicated). The fork gets its own manifest, WAL, and
-    /// snapshot store. The parent's open-writer tail is re-framed into the
-    /// fork's WAL so the fork's on-disk prefix covers every pre-fork entry.
-    /// Snapshots are not inherited.
     pub fn fork(&self, fork_dir: impl Into<PathBuf>) -> Result<Self, JournalError> {
         let fork_dir: PathBuf = fork_dir.into();
         let journal = self.journal.fork();
@@ -138,8 +111,6 @@ impl PersistentJournal {
             let name = segment.file_name();
             let dst = fork_dir.join(&name);
             if let Some(bytes) = self.store.archived_bytes(segment.id) {
-                // An archived segment has no loose file in the parent; write
-                // its verified bytes atomically (temp + rename).
                 crate::segment::write_loose_file(&fork_dir, segment.id, bytes.as_slice())?;
             } else {
                 let src = parent_dir.join(&name);
@@ -149,8 +120,6 @@ impl PersistentJournal {
             }
         }
 
-        // Reopen the shared segments in the fork directory, then re-frame the
-        // parent's open-writer tail so every pre-fork entry is durable here.
         let mut store = SegmentStore::load(&fork_dir)?;
         let sealed_count: u64 = self
             .store
@@ -173,14 +142,6 @@ impl PersistentJournal {
     }
 
     /// Append an entry to the journal and the store, returning its id.
-    ///
-    /// A journal validation failure leaves both sides unchanged. A store
-    /// failure is returned and the in-memory journal is rolled back so both
-    /// sides stay consistent.
-    ///
-    /// A snapshot is recorded at interval boundaries. The journal entry is
-    /// durable before its snapshot, so a snapshot never references an entry
-    /// absent from the store.
     pub fn append(
         &mut self,
         kind: EntryKind,
@@ -219,15 +180,7 @@ impl PersistentJournal {
         Ok(id)
     }
 
-    /// Append a group of entries to the journal and the store, returning ids.
-    ///
-    /// Byte-identical to looping [`Self::append`]; see
-    /// [`Journal::append_batch`] for the equality contract. The store side
-    /// consumes the journal's canonical bytes through the frame path, so an
-    /// entry encodes once for hashing and storage together.
-    ///
-    /// Failure semantics match [`Self::append`]: a journal validation or store
-    /// error leaves both sides consistent.
+    /// Append entries to the journal and the store, returning ids.
     pub fn append_batch(&mut self, batch: Vec<BatchEntry>) -> Result<Vec<EntryHash>, JournalError> {
         let snapshot_state = self.journal.clone();
         let mut frames = Vec::with_capacity(batch.len());
@@ -287,10 +240,7 @@ impl PersistentJournal {
         self.journal.entries()
     }
 
-    /// Seal the open writer into an immutable segment and reset the WAL.
-    ///
-    /// The store also seals automatically when the buffer reaches the target
-    /// segment size.
+    /// Seal the open writer into an immutable segment.
     pub fn force_seal(&mut self) -> Result<(), JournalError> {
         self.store.seal_writer()
     }
@@ -300,10 +250,7 @@ impl PersistentJournal {
         self.store.retention()
     }
 
-    /// Set the retention class and apply it to the store immediately.
-    ///
-    /// Retention is non-destructive; a store reopens byte-identically under
-    /// every class.
+    /// Set the retention class and apply it immediately.
     pub fn set_retention(&mut self, class: RetentionClass) -> Result<(), JournalError> {
         self.store.set_retention(class)
     }
@@ -333,9 +280,7 @@ impl PersistentJournal {
         &self.journal
     }
 
-    /// Audit the in-memory journal for structural and causal integrity.
-    ///
-    /// Delegates to [`JournalCorrectnessMonitor::verify`].
+    /// Audit the in-memory journal.
     pub fn verify(&self) -> Result<VerificationReport, JournalError> {
         JournalCorrectnessMonitor::verify(&self.journal)
     }
@@ -444,20 +389,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// One step of the round-trip stream.
     struct Step {
         kind: EntryKind,
         actor: ActorId,
         payload: EntryPayload,
-        /// Observe the id produced `back` steps earlier (0 = none).
         observed_backs: Vec<usize>,
-        /// Chain to the immediately preceding step of the same group.
         chain: bool,
     }
 
-    /// Five-step groups shaped like the executor's quiescent groups: a
-    /// chained TimerFire/Wake pair for actor 1, then Send and Recv for
-    /// actor 2 where the Recv observes its Send.
     fn stream(groups: usize) -> Vec<Step> {
         let mut steps = Vec::with_capacity(groups * 5);
         for round in 0..groups {
@@ -546,11 +485,9 @@ mod tests {
         let dir = temp_dir("batch-round-trip");
         let steps = stream(6);
 
-        // Sequential in-memory reference over the identical op stream.
         let mut reference = Journal::new();
         let sequential_ids = apply_sequential(&mut reference, &steps);
 
-        // Batched run through the durable facade, one group per batch call.
         let mut persisted_ids = Vec::new();
         {
             let mut journal = PersistentJournal::create(&dir).unwrap();

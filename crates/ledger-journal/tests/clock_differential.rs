@@ -1,11 +1,4 @@
-//! Differential property test for the persistent vector clock.
-//!
-//! The production `VectorClock` is backed by an immutable rpds red-black tree.
-//! This test replays the same random program of `incremented` and `merge`
-//! operations against a reference implementation built on `std`'s `BTreeMap`
-//! with the original (pre-rpds) semantics. The two must produce byte-identical
-//! canonical encodings and identical `get` / `happens-before` results for every
-//! generated clock.
+//! Differential test for the persistent vector clock against `BTreeMap`.
 
 use std::collections::BTreeMap;
 
@@ -15,7 +8,6 @@ use proptest::prelude::*;
 
 const ACTOR_UNIVERSE: u32 = 8;
 
-/// Old-semantics reference implementation on a `BTreeMap`.
 fn increment_ref(clock: &BTreeMap<ActorId, u64>, actor: ActorId) -> BTreeMap<ActorId, u64> {
     let mut next = clock.clone();
     let value = next.entry(actor).or_default();
@@ -56,8 +48,6 @@ fn happens_before_or_equal_ref(
 }
 
 proptest! {
-    /// Arbitrary program of `incremented` and `merge` operations over a small
-    /// actor universe. Both implementations consume the identical program.
     #[test]
     fn differential_against_btreemap(
         ops in prop::collection::vec((0u8..2u8, 0u8..200u8), 1..64usize),

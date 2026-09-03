@@ -1,9 +1,4 @@
 //! Entry lookup and the sparse hash index.
-//!
-//! Lookup consults the open writer first, then sealed segments. Sealed
-//! blocks decompress on demand; [`super::SegmentStore::get_from_sealed`]
-//! locates a frame with the sparse index and the root frame codec, with a
-//! full window scan as backstop.
 // ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design)
 
 use std::format;
@@ -21,11 +16,6 @@ use super::{
 
 impl SegmentStore {
     /// Return all persisted entries in append order.
-    ///
-    /// Sealed segments are walked oldest to newest, then the open writer
-    /// buffer. Every frame is hash-verified during decode; a corrupt frame
-    /// aborts the walk. Used by the persistent-journal facade to rebuild the
-    /// in-memory DAG.
     pub(crate) fn entries_in_append_order(&self) -> Result<Vec<Arc<Entry>>, JournalError> {
         let mut out = Vec::new();
         for segment in &self.sealed {
@@ -97,10 +87,6 @@ impl SegmentStore {
         Ok(block)
     }
 
-    /// Return the full serialized bytes of a sealed segment.
-    ///
-    /// Archived segments read from the in-memory archive index; the rest read
-    /// from their loose file.
     fn segment_bytes(&self, id: u64) -> Result<Arc<Vec<u8>>, JournalError> {
         if let Some(archived) = self.archived.iter().find(|archived| archived.id == id) {
             return Ok(Arc::clone(&archived.bytes));
@@ -109,7 +95,6 @@ impl SegmentStore {
         Ok(Arc::new(fs::read(&path).map_err(segment_io)?))
     }
 
-    /// Return the archived bytes of a segment, when it is archived.
     pub(crate) fn archived_bytes(&self, id: u64) -> Option<Arc<Vec<u8>>> {
         self.archived
             .iter()
@@ -118,10 +103,6 @@ impl SegmentStore {
     }
 
     /// Return the entry stored under `hash`, if any.
-    ///
-    /// The open writer is consulted first. Sealed segments decompress on
-    /// demand; a sparse-index scan locates the frame and a full scan
-    /// backstops it.
     pub fn get(&self, hash: &EntryHash) -> Result<Option<Arc<Entry>>, JournalError> {
         if let Some((_, offset)) = self.writer.index.iter().rev().find(|(id, _)| id == hash) {
             let payload = frame_payload_at(&self.writer.buffer, *offset)?;
@@ -135,7 +116,6 @@ impl SegmentStore {
         Ok(None)
     }
 }
-/// Locate the frame holding `hash` inside an uncompressed block.
 fn locate_in_block(
     block: &[u8],
     samples: &[(u64, u32)],

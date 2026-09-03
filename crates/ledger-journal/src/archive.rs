@@ -1,13 +1,8 @@
 //! Content-addressed archive of sealed segments.
 //!
-//! The archive is the always-recoverable durable base of a journal store. A
-//! cold store keeps only the manifest and this file. A warm store keeps the
-//! newest and fault-relevant segments loose and moves the rest here. Raising
-//! the retention class re-extracts archived segments back to loose files, so
-//! nothing is ever lost.
+//! Durable base of a journal store; re-extracting restores loose files.
 //!
-//! File layout (see `ARCHIVE_MAGIC`, `ARCHIVE_FORMAT_VERSION`, `HEADER_LEN`,
-//! and `RECORD_PREFIX_LEN` for the exact constants):
+//! File layout:
 //!
 //! ```text
 //! [magic "LDAR" 4 bytes][version u32 BE = 1 4 bytes]
@@ -17,17 +12,9 @@
 //! [record: ...]
 //! ```
 //!
-//! Total header is `HEADER_LEN (48)` bytes; each record prefix is
-//! `RECORD_PREFIX_LEN (16)` bytes. The chain hash covers
-//! `chain || ordinal LE || len LE || record bytes` per record from
-//! `initial_chain` (BLAKE3 of empty).
-//!
-//! The chain hash is a running BLAKE3 hash over the whole record stream.
-//! Each append advances the chain and rewrites the header. The header
-//! rewrite is the commit point. On load the whole stream is re-hashed and
-//! compared against the recorded chain, so a torn write, truncation, or byte
-//! flip is detected. Each record holds the full serialized bytes of one
-//! sealed `segment-NNNNNN.seg` file, including its own header and trailer.
+//! Header is 48 bytes; record prefix is 16 bytes. Chain covers
+//! `chain || ordinal LE || len LE || record bytes` from empty BLAKE3.
+//! Header rewrite is the commit point; load re-hashes the stream.
 // ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design)
 
 use std::format;
@@ -39,20 +26,14 @@ use std::vec::Vec;
 
 use crate::dag::JournalError;
 use ledger_format::EntryHash;
+use ledger_format::frame::MAGIC_JOURNAL_ARCHIVE;
 
-/// Name of the archive file inside a journal directory.
+/// Archive file name inside a journal directory.
 pub const ARCHIVE_FILE: &str = "archive.ldgr";
-/// Four-byte magic identifying an archive file.
-const ARCHIVE_MAGIC: &[u8; 4] = b"LDAR";
-/// Archive format version.
 const ARCHIVE_FORMAT_VERSION: u32 = 1;
-/// Byte offset of the chain hash within the header.
 const CHAIN_OFFSET: usize = 16;
-/// Total header length: magic, version, record count, chain hash.
 const HEADER_LEN: usize = 4 + 4 + 8 + 32;
-/// Byte offset of the record count within the header.
 const RECORD_COUNT_OFFSET: usize = 8;
-/// Bytes of one record prefix: ordinal and length.
 const RECORD_PREFIX_LEN: usize = 16;
 
 /// Append-only content-addressed archive store.
@@ -65,9 +46,6 @@ pub struct ArchiveStore {
 
 impl ArchiveStore {
     /// Open the archive rooted at `dir`, creating the file if needed.
-    ///
-    /// An existing stream is continued from the recorded chain hash and
-    /// record count.
     pub fn new(dir: &Path) -> Result<Self, JournalError> {
         fs::create_dir_all(dir).map_err(archive_io)?;
         let path = dir.join(ARCHIVE_FILE);
@@ -94,9 +72,6 @@ impl ArchiveStore {
     }
 
     /// Append one sealed segment to the archive.
-    ///
-    /// The chain hash in the header is rewritten to the new running hash;
-    /// that rewrite is the commit point.
     pub fn append(
         &mut self,
         segment_ordinal: u64,
@@ -133,11 +108,7 @@ impl ArchiveStore {
         Ok(())
     }
 
-    /// Load and hash-verify every archived segment.
-    ///
-    /// Returns an empty vector when the archive file does not exist. A chain
-    /// mismatch, truncation, or structural defect returns
-    /// [`JournalError::ArchiveHashMismatch`].
+    /// Load and hash-verify every archived segment. Empty when missing.
     pub fn load(dir: &Path) -> Result<Vec<(u64, Vec<u8>)>, JournalError> {
         let path = dir.join(ARCHIVE_FILE);
         if !path.is_file() {
@@ -147,7 +118,7 @@ impl ArchiveStore {
         if bytes.len() < HEADER_LEN {
             return Err(JournalError::ArchiveHashMismatch);
         }
-        if &bytes[0..4] != ARCHIVE_MAGIC {
+        if &bytes[0..4] != MAGIC_JOURNAL_ARCHIVE {
             return Err(JournalError::ArchiveHashMismatch);
         }
         let version = u32::from_be_bytes(bytes[4..8].try_into().map_or([0; 4], |b| b));
@@ -197,9 +168,6 @@ impl ArchiveStore {
     }
 
     /// Rewrite the archive from scratch with exactly `records`.
-    ///
-    /// Used when a retention change re-extracts segments. The file is written
-    /// atomically (temp file plus rename).
     pub(crate) fn write_all(dir: &Path, records: &[(u64, Vec<u8>)]) -> Result<(), JournalError> {
         let path = dir.join(ARCHIVE_FILE);
         let tmp_path = dir.join(format!("{ARCHIVE_FILE}.tmp"));
@@ -229,7 +197,6 @@ impl ArchiveStore {
     }
 }
 
-/// The chain hash of an empty record stream.
 fn initial_chain() -> EntryHash {
     EntryHash(*blake3::hash(b"").as_bytes())
 }
@@ -239,7 +206,7 @@ fn write_header(
     record_count: u64,
     chain: &EntryHash,
 ) -> Result<(), JournalError> {
-    file.write_all(ARCHIVE_MAGIC).map_err(archive_io)?;
+    file.write_all(MAGIC_JOURNAL_ARCHIVE).map_err(archive_io)?;
     file.write_all(&ARCHIVE_FORMAT_VERSION.to_be_bytes())
         .map_err(archive_io)?;
     file.write_all(&record_count.to_be_bytes())
@@ -251,7 +218,7 @@ fn write_header(
 fn read_header(file: &mut File) -> Result<(EntryHash, u64), JournalError> {
     let mut header = [0u8; HEADER_LEN];
     file.read_exact(&mut header).map_err(archive_io)?;
-    if &header[0..4] != ARCHIVE_MAGIC {
+    if &header[0..4] != MAGIC_JOURNAL_ARCHIVE {
         return Err(JournalError::ArchiveHashMismatch);
     }
     let version = u32::from_be_bytes(header[4..8].try_into().map_or([0; 4], |b| b));

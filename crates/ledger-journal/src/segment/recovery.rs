@@ -1,10 +1,4 @@
 //! Boot and crash recovery: WAL truncation and temp-file cleanup.
-//!
-//! [`super::SegmentStore::recover_wal`] truncates a partial WAL tail to the
-//! last complete frame; [`super::SegmentStore::recover_temp_files`] removes
-//! stale seal temp files. Segment loading
-//! ([`super::SegmentStore::load_sealed_segments`]) re-verifies sealed
-//! segments and archive chains.
 // ledger-lint:allow:fs:: (storage infrastructure uses the ambient filesystem by design)
 
 use std::collections::BTreeMap;
@@ -42,10 +36,6 @@ impl SegmentStore {
                 || name.ends_with("manifest.bin.tmp")
                 || name == "archive.ldgr.tmp"
             {
-                // Best-effort cleanup of a crash-left temp file. `NotFound`
-                // (another process removed it) is tolerated; any other error
-                // is deliberately ignored: next load re-scans and the stale
-                // temp is then either still present (cleaned again) or gone.
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -59,17 +49,12 @@ impl SegmentStore {
             (RetentionClass::Hot, Vec::new())
         };
 
-        // Archive contents are the source of truth for which segments are
-        // archived; the manifest flags are a hint only.
         let archive_records = ArchiveStore::load(&self.dir)?;
         let mut archived_bytes: BTreeMap<u64, Arc<Vec<u8>>> = BTreeMap::new();
         for (ordinal, bytes) in archive_records {
             archived_bytes.insert(ordinal, Arc::new(bytes));
         }
 
-        // Prefer manifest ids; fall back to the sorted union of loose-file
-        // ids and archive ordinals. The union uses a HashSet so discovery
-        // stays O(segments) instead of O(segments^2) via Vec::contains.
         let ids: Vec<u64> = if !manifest_entries.is_empty() {
             manifest_entries.iter().map(|entry| entry.id).collect()
         } else {
@@ -86,8 +71,6 @@ impl SegmentStore {
         self.next_segment_id = ids.last().copied().map_or(0, |id| id + 1);
 
         let count = ids.len();
-        // O(segments) fault-flag lookup; the prior per-id linear find was
-        // O(segments^2) on stores with many sealed segments.
         let fault_flags: hashbrown::HashMap<u64, bool> = manifest_entries
             .iter()
             .map(|entry| (entry.id, entry.fault_relevant))
@@ -102,7 +85,6 @@ impl SegmentStore {
             } {
                 Some(segment) => segment,
                 None if i + 1 == count && !is_archived => {
-                    // The last segment is a partial tail; truncate it.
                     continue;
                 }
                 None => {
@@ -116,7 +98,6 @@ impl SegmentStore {
         }
         self.sealed = loaded;
 
-        // O(segments) sealed-membership test via a HashSet.
         let sealed_ids: HashSet<u64> = self.sealed.iter().map(|segment| segment.id).collect();
         for (ordinal, bytes) in archived_bytes {
             if sealed_ids.contains(&ordinal) {
@@ -125,10 +106,6 @@ impl SegmentStore {
         }
         self.archived.sort_by_key(|archived| archived.id);
 
-        // Persisted retention: the manifest class when known. When the
-        // manifest is absent or legacy but an archive exists, infer the class
-        // from how much of the store is archived. HashSet keeps the check
-        // O(segments).
         if !self.archived.is_empty() && retention == RetentionClass::Hot {
             let archived_ids: HashSet<u64> = self.archived.iter().map(|a| a.id).collect();
             let all_archived = self
@@ -183,8 +160,6 @@ impl SegmentStore {
                 .map_err(segment_io)?;
         }
 
-        // Validate the outer v2 prefix before walking frames; frames start
-        // after the 16-byte prefix.
         let prefix = ledger_format::frame::parse_prefix(&bytes, ledger_format::frame::MAGIC_WAL)
             .map_err(|err| JournalError::SegmentCorrupt(format!("WAL prefix invalid: {err:?}")))?;
         if prefix.header_len != 0 {
@@ -194,10 +169,6 @@ impl SegmentStore {
         }
         let wal_prefix = ledger_format::frame::FRAME_PREFIX_LEN;
 
-        // Sealed ids are content hashes, so membership is definitive.
-        // Collect them before replaying the WAL so a crash window that
-        // left both a sealed segment and its WAL prefix does not double
-        // replay.
         let sealed_ids: HashSet<EntryHash> = self
             .entries_in_append_order()?
             .into_iter()
@@ -210,7 +181,6 @@ impl SegmentStore {
             let (next, payload) = next_frame(&bytes, offset)?
                 .ok_or_else(|| JournalError::SegmentCorrupt("WAL frame walk failed".to_string()))?;
             let entry = decode_frame_payload(payload)?;
-            // Skip frames whose content already lives in a sealed segment.
             if !sealed_ids.contains(&entry.id) {
                 recovered.push(entry);
             }
@@ -219,9 +189,6 @@ impl SegmentStore {
         for entry in &recovered {
             self.writer.append(entry)?;
         }
-        // Invariant: the WAL mirrors the open-writer contents. An append-mode
-        // handle lets the next append extend the recovered WAL instead of
-        // truncating it.
         if self.writer.entry_count() > 0 {
             let file = fs::OpenOptions::new()
                 .create(true)
@@ -233,14 +200,8 @@ impl SegmentStore {
         Ok(())
     }
 }
-/// Return the byte length of the longest run of complete frames in the WAL.
-///
-/// A length prefix that cannot fit the buffer (including a wrap-around
-/// prefix near `u64::MAX`) ends the run like any truncated tail; the walk
-/// never panics on hostile input.
+/// Return the byte length of complete frames in the WAL.
 pub(crate) fn last_complete_frame_end(bytes: &[u8]) -> Result<u64, JournalError> {
-    // Frames start after the 16-byte outer prefix. A WAL with no complete
-    // frame truncates to the prefix itself.
     let prefix = ledger_format::frame::FRAME_PREFIX_LEN;
     if bytes.len() < prefix {
         return Ok(0);
@@ -252,7 +213,6 @@ pub(crate) fn last_complete_frame_end(bytes: &[u8]) -> Result<u64, JournalError>
         if len < MIN_FRAME_PAYLOAD as u64 {
             break;
         }
-        // Checked span math: a wrapping prefix is an incomplete frame.
         let Some(end) = (offset as u64)
             .checked_add(8)
             .and_then(|end| end.checked_add(len))
@@ -262,7 +222,6 @@ pub(crate) fn last_complete_frame_end(bytes: &[u8]) -> Result<u64, JournalError>
         if end > bytes.len() as u64 {
             break;
         }
-        // Safe: end <= bytes.len(), so the usize conversion is lossless.
         let end = end as usize;
         last_complete = end as u64;
         offset = end;
@@ -271,9 +230,6 @@ pub(crate) fn last_complete_frame_end(bytes: &[u8]) -> Result<u64, JournalError>
 }
 
 /// Read segment metadata and sparse index from a loose file.
-///
-/// Returns `Ok(None)` when the file is a partial tail that does not match its
-/// trailer.
 fn read_segment_meta(dir: &Path, id: u64) -> Result<Option<SealedSegment>, JournalError> {
     let path = dir.join(segment_file_name(id));
     if !path.is_file() {
@@ -283,11 +239,7 @@ fn read_segment_meta(dir: &Path, id: u64) -> Result<Option<SealedSegment>, Journ
     parse_segment_bytes(&bytes, id)
 }
 
-/// Parse segment metadata and sparse index from full serialized bytes.
-///
-/// The bytes must match the on-disk segment layout exactly; archived segment
-/// bytes are the same as a loose file. Returns `Ok(None)` when the bytes do
-/// not form a complete segment.
+/// Parse segment metadata and sparse index from serialized bytes.
 pub(crate) fn parse_segment_bytes(
     bytes: &[u8],
     id: u64,
@@ -302,8 +254,6 @@ pub(crate) fn parse_segment_bytes(
     let _sample_interval = read_u32_be_at(trailer, 4);
     let compressed_len = read_u64_be_at(trailer, 8);
 
-    // Validate the outer frame prefix first: any version other than 2 fails
-    // closed before any header field is trusted.
     let prefix =
         match ledger_format::frame::parse_prefix(bytes, ledger_format::frame::MAGIC_SEGMENT) {
             Ok(prefix) => prefix,
@@ -352,11 +302,6 @@ pub(crate) fn parse_segment_bytes(
         _ => return Ok(None),
     };
 
-    // Belt-and-braces length arithmetic: `index_len * INDEX_ENTRY_LEN` could
-    // overflow usize on a 32-bit build for a hostile trailer, so the product
-    // is checked before it is compared against the real file length. Every
-    // overflow path is a shape mismatch and reads as an incomplete segment,
-    // matching the other `Ok(None)` returns below.
     let index_bytes = match index_len.checked_mul(INDEX_ENTRY_LEN) {
         Some(product) => product as u64,
         None => return Ok(None),
@@ -380,11 +325,6 @@ pub(crate) fn parse_segment_bytes(
         samples.push((offset, prefix));
     }
 
-    // Format review section 12: the complete decompressed segment is
-    // verified before it becomes readable. Every frame is decoded (which
-    // re-verifies each entry hash), then the entry count, the segment root,
-    // and every sparse-index sample are recomputed from the decoded frames.
-    // A sampled tail check would accept a corrupted middle.
     let compressed = &bytes[data_offset as usize..index_start];
     let block = zstd::decode_all(compressed).map_err(segment_io)?;
     if block.len() as u64 != uncompressed_len {

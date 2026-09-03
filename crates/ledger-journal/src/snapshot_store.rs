@@ -1,12 +1,7 @@
 //! On-disk snapshot persistence.
 //!
-//! Snapshots append to a single `snapshots.ldgr` file. The file starts with a
-//! header holding a format version and a running BLAKE3 chain hash over the
-//! whole record stream, so the file is content-addressed. Each append extends
-//! the record stream and rewrites the chain hash in the header. The header
-//! rewrite is the commit point. On load the entire record stream is re-hashed
-//! and compared against the recorded chain, so a torn write or truncation is
-//! detected.
+//! Single `snapshots.ldgr` file with version and running chain hash.
+//! Header rewrite is the commit point; load re-hashes the stream.
 //!
 //! File layout:
 //!
@@ -27,11 +22,10 @@ use std::vec::Vec;
 use crate::dag::JournalError;
 use crate::snapshot::Snapshot;
 use ledger_format::EntryHash;
+use ledger_format::frame::MAGIC_SNAPSHOT_STORE;
 
 /// Name of the snapshot store file inside a journal directory.
 const SNAPSHOT_FILE: &str = "snapshots.ldgr";
-/// Four-byte magic identifying a snapshot store file.
-const SNAPSHOT_MAGIC: &[u8; 4] = b"LDSN";
 /// Snapshot store format version.
 const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 /// Byte offset of the chain hash within the header.
@@ -40,9 +34,6 @@ const CHAIN_OFFSET: usize = 8;
 const HEADER_LEN: usize = 4 + 4 + 32;
 
 /// Append-only on-disk snapshot store.
-///
-/// The chain hash is kept in memory and rewritten to the header on every
-/// append.
 #[derive(Debug)]
 pub struct SnapshotStore {
     file: File,
@@ -51,8 +42,6 @@ pub struct SnapshotStore {
 
 impl SnapshotStore {
     /// Open the store rooted at `dir`, creating the file if needed.
-    ///
-    /// An existing stream is continued from the recorded chain hash.
     pub fn new(dir: &Path) -> Result<Self, JournalError> {
         fs::create_dir_all(dir).map_err(snapshot_io)?;
         let path = dir.join(SNAPSHOT_FILE);
@@ -75,10 +64,6 @@ impl SnapshotStore {
     }
 
     /// Append one snapshot to the record stream.
-    ///
-    /// The chain hash in the header is rewritten after the record; that
-    /// rewrite is the commit point. A crash before it leaves the file
-    /// detectable as corrupt on the next load.
     pub fn append(&mut self, snapshot: &Snapshot) -> Result<(), JournalError> {
         let record = snapshot.to_canonical_bytes();
         let mut hasher = blake3::Hasher::new();
@@ -100,12 +85,7 @@ impl SnapshotStore {
         Ok(())
     }
 
-    /// Load and hash-verify every persisted snapshot.
-    ///
-    /// Returns an empty vector when the store file does not exist. A chain
-    /// mismatch or a partial record tail returns [`JournalError::SnapshotHashMismatch`];
-    /// a structurally invalid header or record returns
-    /// [`JournalError::SnapshotStoreError`].
+    /// Load and hash-verify every persisted snapshot. Empty when missing.
     pub fn load(dir: &Path) -> Result<Vec<Snapshot>, JournalError> {
         let path = dir.join(SNAPSHOT_FILE);
         if !path.is_file() {
@@ -117,7 +97,7 @@ impl SnapshotStore {
                 "snapshot file is too short".into(),
             ));
         }
-        if &bytes[0..4] != SNAPSHOT_MAGIC {
+        if &bytes[0..4] != MAGIC_SNAPSHOT_STORE {
             return Err(JournalError::SnapshotStoreError(
                 "snapshot file magic mismatch".into(),
             ));
@@ -160,13 +140,12 @@ impl SnapshotStore {
     }
 }
 
-/// The chain hash of an empty record stream.
 fn initial_chain() -> EntryHash {
     EntryHash(*blake3::hash(b"").as_bytes())
 }
 
 fn write_header(file: &mut impl Write, chain: &EntryHash) -> Result<(), JournalError> {
-    file.write_all(SNAPSHOT_MAGIC).map_err(snapshot_io)?;
+    file.write_all(MAGIC_SNAPSHOT_STORE).map_err(snapshot_io)?;
     file.write_all(&SNAPSHOT_FORMAT_VERSION.to_be_bytes())
         .map_err(snapshot_io)?;
     file.write_all(&chain.0).map_err(snapshot_io)?;
@@ -176,7 +155,7 @@ fn write_header(file: &mut impl Write, chain: &EntryHash) -> Result<(), JournalE
 fn read_header_chain(file: &mut File) -> Result<EntryHash, JournalError> {
     let mut header = [0u8; HEADER_LEN];
     file.read_exact(&mut header).map_err(snapshot_io)?;
-    if &header[0..4] != SNAPSHOT_MAGIC {
+    if &header[0..4] != MAGIC_SNAPSHOT_STORE {
         return Err(JournalError::SnapshotStoreError(
             "snapshot file magic mismatch".into(),
         ));
