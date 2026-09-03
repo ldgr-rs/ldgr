@@ -1,33 +1,27 @@
 //! Canonical path identity for filesystem effects.
 //!
-//! Paths are opaque byte sequences, not Unicode strings. Canonicalization
-//! occurs before SimFs lookup, hashing, journaling, fault selection, or
-//! handle creation. `/` is the separator; empty components and `.` are
-//! removed; `..` removes one component and is rejected when it escapes the
-//! virtual root; NUL is rejected; other bytes are preserved without case
-//! folding or Unicode normalization.
+//! Opaque bytes, not Unicode. `/` separates; empty components and `.`
+//! vanish; `..` pops one component and fails past the virtual root;
+//! NUL fails; other bytes pass through unchanged.
 
 use alloc::vec::Vec;
 
 use crate::limits::MAX_CANONICAL_PATH_BYTES;
 
-/// Length of a canonical path digest: 32-byte BLAKE3.
+/// Length of a canonical path digest (32-byte BLAKE3).
 pub const PATH_HASH_LEN: usize = 32;
 
-/// Domain prefix separating path hashes from entry, content, and
-/// execution-identity hashes.
+/// Domain prefix separating path hashes from entry and content hashes.
 pub const PATH_DOMAIN: &[u8] = b"ldgr.fs.path.v2\0";
 
-/// Canonical path identity failures.
+/// Canonical path failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
-    /// The path escaped the virtual root via a leading `..`.
     RootEscape,
-    /// The path contains a NUL byte.
     NulByte,
-    /// The canonicalized path exceeds [`MAX_CANONICAL_PATH_BYTES`].
+    /// Canonical bytes exceed [`MAX_CANONICAL_PATH_BYTES`].
     TooLong,
-    /// The decoded `PathRef` hash does not match the canonical bytes.
+    /// `PathRef` hash does not match the canonical bytes.
     HashMismatch,
 }
 
@@ -44,12 +38,9 @@ impl core::fmt::Display for PathError {
 
 impl core::error::Error for PathError {}
 
-/// Canonicalizes a raw path byte sequence.
+/// Canonicalizes raw path bytes to an absolute virtual path.
 ///
-/// The separator is `/`. Empty components and `.` are removed; `..` removes
-/// one component and is rejected when it escapes the virtual root. The
-/// result is an absolute virtual path (starts with `/`). The length limit
-/// applies after canonicalization.
+/// The length limit applies after canonicalization.
 pub fn canonicalize(raw: &[u8]) -> Result<Vec<u8>, PathError> {
     if raw.contains(&0) {
         return Err(PathError::NulByte);
@@ -82,24 +73,20 @@ pub fn canonicalize(raw: &[u8]) -> Result<Vec<u8>, PathError> {
     Ok(canonical)
 }
 
-/// A canonicalized path reference: content-address of the canonical bytes.
+/// Canonicalized path: content address of the canonical bytes.
 ///
 /// The decoder recomputes and verifies the hash before trusting the path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathRef {
-    /// BLAKE3 content address of the canonical path.
     pub path_hash: [u8; PATH_HASH_LEN],
-    /// Canonical absolute virtual path bytes.
     pub canonical_path: Vec<u8>,
 }
 
 impl PathRef {
     /// Computes the domain-separated content address of `canonical_path`.
     ///
-    /// `canonical_path` must already be canonical (see [`canonicalize`]).
-    /// The caller supplies the hash to keep `ledger-format` free of the
-    /// BLAKE3 dependency; callers compute it using domain-separated BLAKE3
-    /// hashing.
+    /// `canonical_path` must already be canonical. The caller supplies
+    /// the hash to keep `ledger-format` free of the BLAKE3 dependency.
     pub fn new(path_hash: [u8; PATH_HASH_LEN], canonical_path: Vec<u8>) -> Self {
         Self {
             path_hash,
@@ -107,13 +94,12 @@ impl PathRef {
         }
     }
 
-    /// Returns the canonical path bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.canonical_path
     }
 }
 
-/// Encodes a `PathRef` as its canonical CBOR array `[hash, bytes]`.
+/// Encodes a `PathRef` as canonical CBOR `[hash, bytes]`.
 pub fn encode_path_ref(out: &mut Vec<u8>, path_ref: &PathRef) {
     crate::cbor::array(out, 2);
     crate::cbor::bytes(out, &path_ref.path_hash);

@@ -1,19 +1,15 @@
-//! Hard format limits enforced before content allocation.
-//!
-//! Every decoder enforces these bounds before reserving vectors, cloning
-//! content, or converting lengths to platform sizes. The limits are the
-//! format-level contract from the v2 format review; run-level budgets live
-//! in `ExecutionIdentity` and may be lower.
+//! Hard format limits, enforced before content allocation.
 
-/// Outer format version. Every durable container carries this value and a
-/// decoder rejects anything else.
-pub const FORMAT_VERSION: u32 = 2;
+/// Outer format version; decoders reject anything else.
+///
+/// v3 frames every `EntryHash` as a 34-byte BLAKE3 multihash
+/// (`[0x1e, 0x20]` prefix plus digest); v2 bytes fail.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Crash-semantics version bound by the manifest and `ExecutionIdentity`.
 pub const CRASH_SEMANTICS_VERSION: u32 = 1;
 
-/// Maximum bytes in a container header (the 16-byte raw prefix plus the
-/// canonical CBOR header that follows it).
+/// Maximum bytes in a container header (16-byte prefix plus CBOR header).
 pub const MAX_HEADER_BYTES: usize = 1024 * 1024;
 
 /// Maximum bytes of one canonical entry.

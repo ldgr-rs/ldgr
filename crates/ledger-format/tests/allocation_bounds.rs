@@ -1,16 +1,8 @@
-//! Allocation instrumentation: bounds execute before content allocation.
+//! Allocation gate: hostile declared lengths fail before content allocation.
 //!
-//! The section-14 matrix row requires proof that hostile declared lengths
-//! fail before any content-sized allocation. A counting global allocator
-//! measures the live-allocation delta around a hostile decode: a declared
-//! array length larger than the remaining input must be rejected with
-//! `LengthOverflow` while allocating at most a few bytes of harness noise,
-//! never the declared content.
-//!
-//! The delta assertion is intentionally generous (4 KiB) because tests in
-//! this binary share a process; a hostile 2^32-byte allocation would blow
-//! the bound by nine orders of magnitude, so the check is decisive without
-//! being flaky.
+//! A counting allocator measures the delta around a hostile decode; a
+//! length beyond remaining input must fail with `LengthOverflow` with only
+//! harness noise (4 KiB bound), never the declared content.
 
 use ledger_format::cbor::{CborError, CborValue};
 use ledger_format::frame::{FrameError, MAGIC_SEGMENT, parse_prefix};
@@ -21,9 +13,7 @@ struct CountingAllocator;
 
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 
-// Test harness only: counts every allocation the process makes. The unsafe
-// impl is the standard counting-allocator pattern and never runs in the
-// no_std library surface under test.
+// Test harness only: standard counting allocator; never runs in no_std.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATED.fetch_add(layout.size(), Ordering::SeqCst);
@@ -41,7 +31,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
-/// The maximum live-allocation delta a bound-rejected decode may produce.
+/// Maximum allocation delta a bound-rejected decode may produce.
 const MAX_HARNESS_DELTA: usize = 4 * 1024;
 
 fn allocated_delta_around(call: impl FnOnce()) -> usize {
@@ -52,9 +42,8 @@ fn allocated_delta_around(call: impl FnOnce()) -> usize {
 
 #[test]
 fn oversized_array_length_fails_before_content_allocation() {
-    // A canonical CBOR array header declaring 2^32 items with only four
-    // bytes of remaining input. The decoder must reject with LengthOverflow
-    // before `Vec::with_capacity(2^32)` can run.
+    // Array declares 2^32 items with 4 bytes remaining; must fail before
+    // `Vec::with_capacity(2^32)`.
     let hostile = [0x9A, 0x01, 0x00, 0x00, 0x00];
     let delta = allocated_delta_around(|| {
         let result = CborValue::from_canonical_bytes(&hostile);
@@ -68,8 +57,7 @@ fn oversized_array_length_fails_before_content_allocation() {
 
 #[test]
 fn oversized_text_length_fails_before_content_allocation() {
-    // A canonical CBOR text header declaring 2^32 bytes with three bytes of
-    // remaining input.
+    // Text declares 2^32 bytes with 3 bytes remaining.
     let hostile = [0x7A, 0x01, 0x00, 0x00, 0x00, b'a', b'b', b'c'];
     let delta = allocated_delta_around(|| {
         let result = CborValue::from_canonical_bytes(&hostile);
@@ -83,8 +71,7 @@ fn oversized_text_length_fails_before_content_allocation() {
 
 #[test]
 fn oversized_frame_header_fails_before_any_header_copy() {
-    // An outer frame prefix declaring a header length beyond the 1 MiB cap.
-    // parse_prefix validates the cap before any header allocation.
+    // Frame declares beyond the 1 MiB cap; the cap checks before allocation.
     let mut hostile = Vec::new();
     hostile.extend_from_slice(MAGIC_SEGMENT);
     hostile.extend_from_slice(&ledger_format::limits::FORMAT_VERSION.to_le_bytes());
@@ -102,9 +89,8 @@ fn oversized_frame_header_fails_before_any_header_copy() {
 
 #[test]
 fn encoder_rejects_an_entry_the_decoder_would_reject() {
-    // The 17 MiB entry cap is enforced on decode; the encoder must reject
-    // the same shape, or a journal could seal and hash-verify an entry that
-    // then fails on every read.
+    // The encoder must reject what the decoder rejects, or a journal could
+    // seal an entry that then fails on every read.
     use ledger_format::{ActorId, EntryData, EntryKind, EntryPayload, RngDrawPayload};
     use ledger_format::{SequenceNumber, StreamId};
     let oversized = EntryData {

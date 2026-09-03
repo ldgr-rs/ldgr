@@ -1,24 +1,9 @@
 //! Manifest schemas and format version identifiers.
 //!
-//! Version 2 manifest layout (canonical CBOR array of exactly 8 items):
-//!
-//! ```text
-//! Manifest = [
-//!   format_version,
-//!   crash_semantics_version,
-//!   execution_identity_digest,
-//!   root_seed,
-//!   policy,
-//!   journal_root,
-//!   entry_count,
-//!   actor_heads
-//! ]
-//! ```
-//!
-//! The execution-identity digest moved from the version-1 extensions slot
-//! into a first-class array element; the extensions map is gone. The outer
-//! 16-byte frame prefix (see [`crate::frame`]) precedes the manifest bytes
-//! on disk.
+//! Version 3 layout: canonical CBOR array of exactly 8 items
+//! `[version, crash_version, identity, seed, policy, root, count, heads]`.
+//! Every hash is a 34-byte framed BLAKE3 multihash; raw hashes fail. The
+//! outer 16-byte frame prefix (see [`crate::frame`]) precedes the bytes.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -28,12 +13,10 @@ use crate::cbor::{self, CborError, CborValue};
 use crate::entry::{ActorId, EntryHash};
 use crate::limits::{CRASH_SEMANTICS_VERSION, FORMAT_VERSION};
 
-/// Current manifest format version. Version 2 is the only supported version.
+/// Current manifest format version; v3 is the only supported version.
 pub const MANIFEST_FORMAT_VERSION: u32 = FORMAT_VERSION;
 
-/// A manifest format version identifier.
-///
-/// A reader rejects any version other than [`ManifestVersion::CURRENT`].
+/// A manifest format version; readers reject anything but `CURRENT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManifestVersion(pub u32);
 
@@ -49,19 +32,15 @@ impl ManifestVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunManifest {
     pub format_version: u32,
-    /// Crash-semantics version bound by the manifest and `ExecutionIdentity`.
+    /// Bound by the manifest and `ExecutionIdentity`.
     pub crash_semantics_version: u32,
-    /// Execution-identity digest of the run that produced this manifest.
-    ///
-    /// `None` means the run did not bind an identity; a root comparison
-    /// involving this manifest must treat the identity as incomplete.
+    /// Identity digest; `None` means unbound and root comparison must
+    /// treat the identity as incomplete.
     pub execution_identity: Option<EntryHash>,
     pub root_seed: EntryHash,
-    /// Scheduling policy name or parameters.
     pub policy_tag: String,
     /// Root hash of the resulting journal DAG.
     pub journal_root: EntryHash,
-    /// Total entries executed in this trial.
     pub entry_count: u64,
     /// Actor sequence heads at end of run.
     pub actor_heads: BTreeMap<ActorId, EntryHash>,
@@ -74,12 +53,12 @@ impl RunManifest {
         cbor::unsigned(&mut out, self.format_version as u64);
         cbor::unsigned(&mut out, self.crash_semantics_version as u64);
         match &self.execution_identity {
-            Some(digest) => cbor::bytes(&mut out, &digest.0),
+            Some(digest) => cbor::encode::hash(&mut out, digest),
             None => cbor::null(&mut out),
         }
-        cbor::bytes(&mut out, &self.root_seed.0);
+        cbor::encode::hash(&mut out, &self.root_seed);
         cbor::text(&mut out, &self.policy_tag);
-        cbor::bytes(&mut out, &self.journal_root.0);
+        cbor::encode::hash(&mut out, &self.journal_root);
         cbor::unsigned(&mut out, self.entry_count);
 
         let heads: Vec<(CborValue, CborValue)> = self
@@ -88,7 +67,7 @@ impl RunManifest {
             .map(|(actor, hash)| {
                 (
                     CborValue::Unsigned(actor.0 as u64),
-                    CborValue::Bytes(hash.0.to_vec()),
+                    CborValue::Bytes(hash.to_framed_bytes().to_vec()),
                 )
             })
             .collect();
@@ -98,8 +77,8 @@ impl RunManifest {
 
     /// Deserializes a manifest from canonical CBOR bytes.
     ///
-    /// Version 2 is an array of exactly 8 canonical items in the order above.
-    /// Any other version is rejected.
+    /// Exactly 8 items in layout order; other versions fail. Every hash
+    /// must be a 34-byte framed multihash; raw hashes fail.
     pub fn from_canonical_bytes(input: &[u8]) -> Result<Self, CborError> {
         let value = CborValue::from_canonical_bytes(input)?;
         let CborValue::Array(items) = value else {
@@ -139,23 +118,24 @@ impl RunManifest {
 
         let execution_identity = match &items[2] {
             CborValue::Null => None,
-            CborValue::Bytes(b) => Some(EntryHash(<[u8; 32]>::try_from(b.as_slice()).map_err(
-                |_| {
-                    CborError::MalformedManifest("execution_identity digest must be a 32-byte hash")
-                },
-            )?)),
+            CborValue::Bytes(b) => {
+                Some(EntryHash::from_framed_bytes(b.as_slice()).map_err(|_| {
+                    CborError::MalformedManifest(
+                        "execution_identity digest must be a 34-byte framed hash",
+                    )
+                })?)
+            }
             _ => {
                 return Err(CborError::MalformedManifest(
-                    "execution_identity must be null or a 32-byte hash",
+                    "execution_identity must be null or a 34-byte framed hash",
                 ));
             }
         };
 
         let root_seed = match &items[3] {
-            CborValue::Bytes(b) => EntryHash(
-                <[u8; 32]>::try_from(b.as_slice())
-                    .map_err(|_| CborError::MalformedManifest("root_seed must be 32 bytes"))?,
-            ),
+            CborValue::Bytes(b) => EntryHash::from_framed_bytes(b.as_slice()).map_err(|_| {
+                CborError::MalformedManifest("root_seed must be a 34-byte framed hash")
+            })?,
             _ => {
                 return Err(CborError::MalformedManifest(
                     "root_seed must be a byte string",
@@ -167,10 +147,9 @@ impl RunManifest {
             _ => return Err(CborError::MalformedManifest("policy must be a text string")),
         };
         let journal_root = match &items[5] {
-            CborValue::Bytes(b) => EntryHash(
-                <[u8; 32]>::try_from(b.as_slice())
-                    .map_err(|_| CborError::MalformedManifest("journal_root must be 32 bytes"))?,
-            ),
+            CborValue::Bytes(b) => EntryHash::from_framed_bytes(b.as_slice()).map_err(|_| {
+                CborError::MalformedManifest("journal_root must be a 34-byte framed hash")
+            })?,
             _ => {
                 return Err(CborError::MalformedManifest(
                     "journal_root must be a byte string",
@@ -200,9 +179,11 @@ impl RunManifest {
                     };
                     let hash = match val {
                         CborValue::Bytes(b) => {
-                            EntryHash(<[u8; 32]>::try_from(b.as_slice()).map_err(|_| {
-                                CborError::MalformedManifest("actor hash must be 32 bytes")
-                            })?)
+                            EntryHash::from_framed_bytes(b.as_slice()).map_err(|_| {
+                                CborError::MalformedManifest(
+                                    "actor hash must be a 34-byte framed hash",
+                                )
+                            })?
                         }
                         _ => {
                             return Err(CborError::MalformedManifest(
@@ -280,11 +261,11 @@ mod tests {
     #[test]
     fn wrong_version_is_rejected() {
         let mut manifest = sample_manifest();
-        manifest.format_version = 1;
+        manifest.format_version = 2;
         let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
         assert!(matches!(
             RunManifest::from_canonical_bytes(&bytes),
-            Err(CborError::UnsupportedVersion(1))
+            Err(CborError::UnsupportedVersion(2))
         ));
     }
 
@@ -301,16 +282,60 @@ mod tests {
 
     #[test]
     fn wrong_identity_shape_is_rejected() {
-        // Craft a manifest whose identity element is a 16-byte byte string;
-        // the typed field cannot express that, so build the raw array.
+        // Identity holds a 16-byte string; valid hashes use the framed form.
+        let root_framed = EntryHash([0x01; 32]).to_framed_bytes();
+        let journal_framed = EntryHash([0x02; 32]).to_framed_bytes();
         let mut bytes = Vec::new();
         cbor::array(&mut bytes, 8);
         cbor::unsigned(&mut bytes, MANIFEST_FORMAT_VERSION as u64);
         cbor::unsigned(&mut bytes, CRASH_SEMANTICS_VERSION as u64);
         cbor::bytes(&mut bytes, &[0xaa; 16]);
+        cbor::bytes(&mut bytes, &root_framed);
+        cbor::text(&mut bytes, "random");
+        cbor::bytes(&mut bytes, &journal_framed);
+        cbor::unsigned(&mut bytes, 7);
+        CborValue::Map(Vec::new())
+            .try_encode(&mut bytes)
+            .expect("actor heads encode");
+        assert!(matches!(
+            RunManifest::from_canonical_bytes(&bytes),
+            Err(CborError::MalformedManifest(_))
+        ));
+    }
+
+    #[test]
+    fn raw_32_byte_hashes_are_rejected() {
+        // v3 requires the framed form; raw 32-byte hashes fail.
+        let mut bytes = Vec::new();
+        cbor::array(&mut bytes, 8);
+        cbor::unsigned(&mut bytes, MANIFEST_FORMAT_VERSION as u64);
+        cbor::unsigned(&mut bytes, CRASH_SEMANTICS_VERSION as u64);
+        cbor::null(&mut bytes);
         cbor::bytes(&mut bytes, &[0x01; 32]);
         cbor::text(&mut bytes, "random");
         cbor::bytes(&mut bytes, &[0x02; 32]);
+        cbor::unsigned(&mut bytes, 7);
+        CborValue::Map(Vec::new())
+            .try_encode(&mut bytes)
+            .expect("actor heads encode");
+        assert!(matches!(
+            RunManifest::from_canonical_bytes(&bytes),
+            Err(CborError::MalformedManifest(_))
+        ));
+    }
+
+    #[test]
+    fn wrong_framing_prefix_is_rejected() {
+        let mut bad = EntryHash([0x01; 32]).to_framed_bytes();
+        bad[0] = 0x1f;
+        let mut bytes = Vec::new();
+        cbor::array(&mut bytes, 8);
+        cbor::unsigned(&mut bytes, MANIFEST_FORMAT_VERSION as u64);
+        cbor::unsigned(&mut bytes, CRASH_SEMANTICS_VERSION as u64);
+        cbor::null(&mut bytes);
+        cbor::bytes(&mut bytes, &bad);
+        cbor::text(&mut bytes, "random");
+        cbor::bytes(&mut bytes, &EntryHash([0x02; 32]).to_framed_bytes());
         cbor::unsigned(&mut bytes, 7);
         CborValue::Map(Vec::new())
             .try_encode(&mut bytes)

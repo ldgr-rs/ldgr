@@ -1,20 +1,13 @@
-//! Repository scan: no old payload shapes or alternate format paths remain.
+//! Scan: no old payload shapes or alternate format paths remain.
 //!
-//! Section 13 of the format-v2 review requires that "a repository search
-//! must find no direct semantic matching on generic payload shapes after the
-//! integration", and section 14 requires a repository scan confirming removal
-//! of old shapes and alternate format paths.
-//!
-//! The tokens below name the removed scalar payload shapes, the legacy crash
-//! operator, and prior-format decoder paths. Any resurrection of these names
-//! in tracked Rust sources breaks this test, so the migration cannot silently
-//! regress.
+//! The banned tokens name removed scalar shapes, the legacy crash operator,
+//! and prior-format decoder paths. Any resurrection in tracked Rust sources
+//! fails this test.
 
 use std::fs;
 use std::path::Path;
 
-/// Banned tokens: old scalar/generic payload shapes, the legacy crash
-/// operator, and prior-format decoder paths.
+/// Banned tokens: old payload shapes, legacy crash operator, prior decoders.
 const BANNED: &[&str] = &[
     "Payload::Value",
     "Payload::Number",
@@ -28,8 +21,7 @@ const BANNED: &[&str] = &[
 ];
 
 fn repo_root() -> &'static Path {
-    // This test lives at crates/ledger-format/tests/repo_hygiene.rs, so the
-    // manifest directory is two levels below the workspace root.
+    // Crate manifest is two levels below the workspace root.
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -64,7 +56,7 @@ fn no_old_payload_shapes_or_alternate_format_paths() {
     );
     let mut hits: Vec<(String, usize, &str)> = Vec::new();
     for source in sources {
-        // The BANNED list lives in this file; do not scan the scan itself.
+        // The BANNED list lives here; do not scan the scan itself.
         if source.ends_with("tests/repo_hygiene.rs") {
             continue;
         }

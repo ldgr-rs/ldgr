@@ -7,7 +7,7 @@ use super::encode::{f16_bits_to_f64, f32_bits_to_f16};
 use super::{CborError, CborValue, TAG_ALLOWLIST, TolerantReader, compare_canonical_keys};
 
 impl CborValue {
-    /// Parses one canonical CBOR value from bytes, enforcing all canonical constraints.
+    /// Parses one canonical CBOR value, enforcing all canonical constraints.
     pub fn from_canonical_bytes(input: &[u8]) -> Result<Self, CborError> {
         let mut cursor = 0;
         let val = decode_value(input, &mut cursor, 0)?;
@@ -85,10 +85,10 @@ pub(crate) fn decode_header(input: &[u8], cursor: &mut usize) -> Result<(u8, u64
     Ok((major, value))
 }
 
-/// Decodes one canonical CBOR value from `input`, advancing `cursor`.
+/// Decodes one value, advancing `cursor`.
 ///
-/// `depth` tracks the current nesting level. The decoder rejects input deeper
-/// than [`super::MAX_DEPTH`] so hostile data can never exhaust the stack.
+/// `depth` bounds nesting; input deeper than [`super::MAX_DEPTH`] fails
+/// so hostile data cannot exhaust the stack.
 fn decode_value(input: &[u8], cursor: &mut usize, depth: usize) -> Result<CborValue, CborError> {
     if depth > super::MAX_DEPTH {
         return Err(CborError::DepthLimitExceeded);
@@ -116,7 +116,7 @@ fn decode_value(input: &[u8], cursor: &mut usize, depth: usize) -> Result<CborVa
                 let v = input[*cursor];
                 *cursor += 1;
                 if v < 24 {
-                    // A simple value below 24 must use the one-byte form.
+                    // Values below 24 must use the one-byte form.
                     Err(CborError::NonCanonicalIntegerEncoding)
                 } else {
                     Err(CborError::UnsupportedType(initial))
@@ -202,7 +202,7 @@ fn decode_value(input: &[u8], cursor: &mut usize, depth: usize) -> Result<CborVa
     }
 }
 
-/// Decodes a half-precision float (major type 7, additional value 25).
+/// Decodes half precision (major type 7, additional 25).
 fn decode_f16(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> {
     if *cursor + 2 > input.len() {
         return Err(CborError::UnexpectedEof);
@@ -216,11 +216,11 @@ fn decode_f16(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> 
     if value.is_sign_negative() && value == 0.0 {
         return Err(CborError::NonCanonicalFloat);
     }
-    // Half precision has no narrower float width, so a half is always minimal.
+    // Half is the narrowest width, so it is always minimal.
     Ok(CborValue::Float(value))
 }
 
-/// Decodes a single-precision float (major type 7, additional value 26).
+/// Decodes single precision (major type 7, additional 26).
 fn decode_f32(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> {
     if *cursor + 4 > input.len() {
         return Err(CborError::UnexpectedEof);
@@ -235,7 +235,7 @@ fn decode_f32(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> 
     if value.is_sign_negative() && value == 0.0 {
         return Err(CborError::NonCanonicalFloat);
     }
-    // A single that is exactly representable in half is non-canonical.
+    // Reject singles that fit in half as non-canonical.
     let half_bits = f32_bits_to_f16(value.to_bits());
     if f16_bits_to_f64(half_bits) == value as f64 {
         return Err(CborError::NonCanonicalFloat);
@@ -243,7 +243,7 @@ fn decode_f32(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> 
     Ok(CborValue::Float(value as f64))
 }
 
-/// Decodes a double-precision float (major type 7, additional value 27).
+/// Decodes double precision (major type 7, additional 27).
 fn decode_f64(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> {
     if *cursor + 8 > input.len() {
         return Err(CborError::UnexpectedEof);
@@ -258,27 +258,20 @@ fn decode_f64(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> 
     if value.is_sign_negative() && value == 0.0 {
         return Err(CborError::NonCanonicalFloat);
     }
-    // A double that is exactly representable as a single is non-canonical.
+    // Reject doubles that fit in single as non-canonical.
     if value as f32 as f64 == value {
         return Err(CborError::NonCanonicalFloat);
     }
     Ok(CborValue::Float(value))
 }
 
-/// Parses one CBOR value from `bytes` with a default [`TolerantReader`].
-///
-/// The tolerant reader accepts supersets of the canonical form and never
-/// panics on any byte input. See [`TolerantReader::parse`] for the contract.
+/// Parses one value with a default [`TolerantReader`].
 pub fn parse_tolerant(bytes: &[u8]) -> Result<CborValue, CborError> {
     TolerantReader::new().parse(bytes)
 }
 
 impl TolerantReader {
-    /// Parses one CBOR value from `bytes`.
-    ///
-    /// Returns [`CborError::TrailingBytes`] when extra bytes follow the
-    /// complete value. The reader never panics; malformed, hostile, and
-    /// truncated input returns an error.
+    /// Parses one value; extra trailing bytes fail. Never panics.
     pub fn parse(&self, bytes: &[u8]) -> Result<CborValue, CborError> {
         let mut cursor = 0;
         let Some(value) = self.decode_item(bytes, &mut cursor, 0, false)? else {
@@ -290,13 +283,10 @@ impl TolerantReader {
         Ok(value)
     }
 
-    /// Decodes one CBOR item, advancing `cursor`.
+    /// Decodes one item, advancing `cursor`.
     ///
-    /// `break_allowed` is true only directly inside an indefinite-length
-    /// container. A break stop code at such a position is consumed and yields
-    /// `Ok(None)`. Every other item yields `Ok(Some(...))`. `depth` tracks the
-    /// nesting level; input deeper than `max_depth` is rejected so hostile
-    /// data can never exhaust the stack.
+    /// `break_allowed` holds only inside an indefinite container, where a
+    /// break yields `Ok(None)`. `depth` bounds nesting against hostile input.
     fn decode_item(
         &self,
         input: &[u8],
@@ -315,7 +305,6 @@ impl TolerantReader {
         let additional = initial & 0x1f;
 
         if major == 7 && additional == 31 {
-            // Break stop code: terminates an enclosing indefinite container.
             if break_allowed {
                 *cursor += 1;
                 return Ok(None);
@@ -332,8 +321,7 @@ impl TolerantReader {
                 25 => decode_f16_tolerant(input, cursor).map(Some),
                 26 => decode_f32_tolerant(input, cursor).map(Some),
                 27 => decode_f64_tolerant(input, cursor).map(Some),
-                // Simple values 0..23, one-byte simple values, and reserved
-                // additional values have no representation in CborValue.
+                // No `CborValue` form exists for other simple values.
                 _ => Err(CborError::UnsupportedType(initial)),
             };
         }
@@ -462,7 +450,7 @@ impl TolerantReader {
         Ok(CborValue::Array(items))
     }
 
-    /// Duplicate keys are kept, matching the tolerant policy of the reader.
+    /// Duplicate keys are kept, per the tolerant policy.
     fn decode_indefinite_map(
         &self,
         input: &[u8],
@@ -480,10 +468,7 @@ impl TolerantReader {
     }
 }
 
-/// Reads a CBOR header without canonical width checks.
-///
-/// Non-shortest integer widths are accepted. `additional == 31` is reported to
-/// the caller as an indefinite-length marker.
+/// Reads a header without canonical width checks; non-shortest widths pass.
 fn read_tolerant_header(input: &[u8], cursor: &mut usize) -> Result<(u8, u8, u64), CborError> {
     if *cursor >= input.len() {
         return Err(CborError::UnexpectedEof);
@@ -500,8 +485,7 @@ fn read_tolerant_header(input: &[u8], cursor: &mut usize) -> Result<(u8, u8, u64
         27 => u64::from_be_bytes(take_bytes::<8>(input, cursor)?),
         28..=30 => return Err(CborError::UnsupportedType(initial)),
         31 => 0,
-        // The 5-bit mask bounds additional to 0..=31, so this arm is
-        // unreachable; it keeps the match exhaustive.
+        // The 5-bit mask bounds additional to 0..=31; unreachable.
         _ => return Err(CborError::UnsupportedType(initial)),
     };
     Ok((major, additional, value))
@@ -527,10 +511,7 @@ fn take_bytes<const N: usize>(input: &[u8], cursor: &mut usize) -> Result<[u8; N
     Ok(out)
 }
 
-/// Returns a slice of `declared` bytes starting at `cursor`.
-///
-/// The declared length is bounded against the remaining input, so a hostile
-/// declared length yields an error instead of an out-of-bounds read.
+/// Returns `declared` bytes at `cursor`; hostile lengths fail before use.
 fn take_bytes_span<'a>(
     input: &'a [u8],
     cursor: &mut usize,
@@ -547,11 +528,8 @@ fn take_bytes_span<'a>(
     Ok(span)
 }
 
-/// Bounds a declared item count against the remaining input.
-///
-/// `min_bytes_per_item` is the minimum bytes one item occupies (1 for array
-/// items, 2 for map entries). The returned count never exceeds the available
-/// bytes, so a hostile count cannot force a huge allocation.
+/// Bounds a declared item count against remaining input so it cannot force
+/// a huge allocation (`min_bytes_per_item`: 1 per array item, 2 per map).
 fn bounded_item_count(
     input: &[u8],
     cursor: &mut usize,
@@ -566,26 +544,19 @@ fn bounded_item_count(
     Ok(declared as usize)
 }
 
-/// Decodes a half-precision float without canonical checks.
-///
-/// `-0.0` and `NaN` are accepted. Half precision is never wider than needed,
-/// so no minimal-width check applies.
+/// Decodes half precision tolerantly; `-0.0` and `NaN` pass.
 fn decode_f16_tolerant(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> {
     let bits = u16::from_be_bytes(take_bytes::<2>(input, cursor)?);
     Ok(CborValue::Float(f16_bits_to_f64(bits)))
 }
 
-/// Decodes a single-precision float without canonical checks.
-///
-/// `-0.0`, `NaN`, and non-minimal widths are accepted.
+/// Decodes single precision tolerantly; `-0.0`, `NaN`, wide forms pass.
 fn decode_f32_tolerant(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> {
     let bits = u32::from_be_bytes(take_bytes::<4>(input, cursor)?);
     Ok(CborValue::Float(f32::from_bits(bits) as f64))
 }
 
-/// Decodes a double-precision float without canonical checks.
-///
-/// `-0.0`, `NaN`, and non-minimal widths are accepted.
+/// Decodes double precision tolerantly; `-0.0`, `NaN`, wide forms pass.
 fn decode_f64_tolerant(input: &[u8], cursor: &mut usize) -> Result<CborValue, CborError> {
     let bits = u64::from_be_bytes(take_bytes::<8>(input, cursor)?);
     Ok(CborValue::Float(f64::from_bits(bits)))

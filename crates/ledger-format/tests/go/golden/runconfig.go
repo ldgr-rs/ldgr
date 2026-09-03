@@ -1,6 +1,6 @@
 package main
 
-// RunConfig v1 canonical encoding, implemented independently from the Rust
+// RunConfig v2 canonical encoding, implemented independently from the Rust
 // codec in crates/ledger-sim/src/config_canonical.rs.
 //
 // The fixture corpus crates/ledger-format/tests/fixtures/run-config describes
@@ -8,10 +8,10 @@ package main
 // file maps that description onto canonical CBOR with the same field rules as
 // the Rust encoder:
 //
-//   document := [1, { fields }]
+//   document := [2, { fields }]
 //
 //   dns           := [ [text name, unsigned actor], ... ]  sorted by name
-//   seed          := bytes(32)
+//   seed          := multihash-framed bytes ([0x1e, 0x20] + 32B digest)
 //   links         := [ [unsigned from, unsigned to,
 //                       [unsigned base_delay, unsigned jitter,
 //                        float loss_probability, unsigned reorder_window]], ... ]
@@ -21,13 +21,13 @@ package main
 //   monitor       := bool
 //   max_steps     := unsigned
 //   fs_journaling := null | unsigned (0=writeback, 1=ordered, 2=data)
-//   dropped_events:= [bytes(32), ...]
-//   fault_schedule:= [ [unsigned tag, ...payload], ... ]
+//   dropped_events:= [framed-hash, ...]
+//   fault_schedule:= [ [unsigned tag, ...payload], ... ] (hash payloads framed)
 //
 // Policy tags: 0 random, 1 pct (priority_changes), 2 bandit (two floats),
 // 3 replay, 4 dpor. Fault tags: 0 drop (id), 1 delay (send, ticks),
 // 2 partition (src, dst), 3 crash (id), 4 corrupt (write, xor_mask),
-// 5 crash_state (write, state).
+// 5 crash_state (write, state), 6 duplicate (send).
 //
 // Floats are minimal-width canonical CBOR floats; NaN, +-infinity, and -0.0
 // are rejected on encode, exactly like the Rust module.
@@ -41,14 +41,14 @@ import (
 	"strconv"
 )
 
-// runConfigFixture is one entry of the v1 fixture corpus.
+// runConfigFixture is one entry of the v2 fixture corpus.
 type runConfigFixture struct {
 	Name   string          `json:"name"`
 	Config json.RawMessage `json:"config"`
 	Hex    string          `json:"hex"`
 }
 
-// runConfigDoc is the top-level v1 fixture document.
+// runConfigDoc is the top-level v2 fixture document.
 type runConfigDoc struct {
 	SchemaVersion int                `json:"schema_version"`
 	FormatVersion int                `json:"format_version"`
@@ -154,7 +154,8 @@ func parseDecimalFloat(field, text string) (float64, error) {
 	return value, nil
 }
 
-// hashBytes returns the fixture value for a 32-byte hash hex string.
+// hashBytes returns the fixture value for a 32-byte hash hex string,
+// framed as multihash BLAKE3 ([0x1e, 0x20] + digest) like the Rust codec.
 func hashBytes(field, text string) (Value, error) {
 	raw, err := decodeHex(text)
 	if err != nil {
@@ -163,7 +164,10 @@ func hashBytes(field, text string) (Value, error) {
 	if len(raw) != 32 {
 		return Value{}, fmt.Errorf("%s: hash has %d bytes, want 32", field, len(raw))
 	}
-	return Bytes(raw), nil
+	framed := make([]byte, 0, 34)
+	framed = append(framed, 0x1e, 0x20)
+	framed = append(framed, raw...)
+	return Bytes(framed), nil
 }
 
 // policyValue maps the description onto the policy sub-encoding.
@@ -230,6 +234,12 @@ func faultValue(fault faultDesc) (Value, error) {
 			return Value{}, err
 		}
 		return Array(Uint(5), write, Uint(fault.State)), nil
+	case "duplicate":
+		send, err := hashBytes("duplicate.send", fault.Send)
+		if err != nil {
+			return Value{}, err
+		}
+		return Array(Uint(6), send), nil
 	default:
 		return Value{}, fmt.Errorf("unknown fault tag %q", fault.Tag)
 	}
@@ -256,7 +266,7 @@ func fsJournalingValue(raw json.RawMessage) (Value, error) {
 	}
 }
 
-// encodeRunConfig maps one fixture description onto canonical v1 bytes.
+// encodeRunConfig maps one fixture description onto canonical v2 bytes.
 func encodeRunConfig(desc *runConfigDesc) ([]byte, error) {
 	seed, err := hashBytes("seed", desc.Seed)
 	if err != nil {
@@ -345,7 +355,7 @@ func encodeRunConfig(desc *runConfigDesc) ([]byte, error) {
 	}
 
 	document := Array(
-		Uint(1),
+		Uint(2),
 		Map(
 			Entry{Key: Text("dns"), Value: Array(dnsValues...)},
 			Entry{Key: Text("seed"), Value: seed},
@@ -365,7 +375,7 @@ func encodeRunConfig(desc *runConfigDesc) ([]byte, error) {
 	return Encode(document)
 }
 
-// loadRunConfigFixtures reads the shared v1 fixture corpus.
+// loadRunConfigFixtures reads the shared v2 fixture corpus.
 func loadRunConfigFixtures(path string) ([]runConfigFixture, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -378,7 +388,7 @@ func loadRunConfigFixtures(path string) ([]runConfigFixture, error) {
 	if doc.SchemaVersion != 1 {
 		return nil, fmt.Errorf("%s: unsupported schema version %d", path, doc.SchemaVersion)
 	}
-	if doc.FormatVersion != 1 {
+	if doc.FormatVersion != 2 {
 		return nil, fmt.Errorf("%s: unsupported run-config format version %d", path, doc.FormatVersion)
 	}
 	return doc.Shapes, nil

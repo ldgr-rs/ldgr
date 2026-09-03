@@ -32,11 +32,7 @@ fn hex_digit_value(byte: u8) -> u32 {
     }
 }
 
-/// A minimal JSON value model for the fixture expectation files.
-///
-/// The companion `.json` files declare the semantic value a fixture must
-/// decode to. The crate has no JSON dependency, so the test parses the small
-/// grammar it emits itself.
+/// Minimal JSON model for fixture expectations (avoids a JSON dependency).
 #[derive(Debug)]
 enum Json {
     Str(String),
@@ -387,11 +383,9 @@ fn golden_fixture_semantic_expectations() {
 #[test]
 fn rejects_non_canonical_forms() {
     let cases: Vec<(Vec<u8>, CborError)> = vec![
-        // Indefinite-length encodings are forbidden in canonical CBOR.
         (vec![0x9f], CborError::IndefiniteLengthForbidden),
         (vec![0xbf], CborError::IndefiniteLengthForbidden),
         (vec![0xff], CborError::IndefiniteLengthForbidden),
-        // Integers not in shortest form.
         (
             vec![0x39, 0x00, 0xff],
             CborError::NonCanonicalIntegerEncoding,
@@ -400,27 +394,21 @@ fn rejects_non_canonical_forms() {
             vec![0x1a, 0x00, 0x00, 0x00, 0x18],
             CborError::NonCanonicalIntegerEncoding,
         ),
-        // Duplicate map key.
         (
             vec![0xa2, 0x00, 0x01, 0x00, 0x02],
             CborError::DuplicateMapKey,
         ),
-        // Map keys not sorted canonically.
         (
             vec![0xa2, 0x01, 0x01, 0x00, 0x02],
             CborError::UnsortedMapKeys,
         ),
-        // NaN and -0.0 as half precision.
         (vec![0xf9, 0x7e, 0x00], CborError::NonCanonicalFloat),
         (vec![0xf9, 0x80, 0x00], CborError::NonCanonicalFloat),
-        // 1.5 encoded as double fits single precision: non-canonical width.
         (
             vec![0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
             CborError::NonCanonicalFloat,
         ),
-        // Disallowed semantic tag.
         (vec![0xc0, 0x00], CborError::UnknownTag(0)),
-        // Invalid UTF-8 inside a text string.
         (vec![0x61, 0xff], CborError::InvalidUtf8),
     ];
 
@@ -430,28 +418,25 @@ fn rejects_non_canonical_forms() {
     }
 }
 
-/// Curated hostile byte strings the canonical decoder must reject.
+/// Curated hostile inputs the canonical decoder must reject.
 fn curated_hostile_inputs() -> Vec<Vec<u8>> {
     let huge = [0xffu8; 8];
     let mut hostile: Vec<Vec<u8>> = Vec::new();
     hostile.push(Vec::new());
-    // Indefinite-length forms and the break simple value.
     hostile.push(vec![0x9f]);
     hostile.push(vec![0xbf]);
     hostile.push(vec![0xff]);
     hostile.push(vec![0x5f]);
     hostile.push(vec![0x7f]);
-    // Truncated headers.
     hostile.push(vec![0x18]);
     hostile.push(vec![0x19, 0x01]);
     hostile.push(vec![0x1a, 0x00, 0x00]);
     hostile.push(vec![0x1b, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    // Non-shortest integers.
     hostile.push(vec![0x18, 0x00]);
     hostile.push(vec![0x39, 0x00, 0xff]);
     hostile.push(vec![0x1a, 0x00, 0x00, 0x00, 0x18]);
     hostile.push(vec![0x1b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18]);
-    // Huge declared lengths and counts (2^64 - 1) must not over-allocate.
+    // Huge declared lengths (2^64 - 1) must not over-allocate.
     hostile.push({
         let mut v = vec![0x9b];
         v.extend_from_slice(&huge);
@@ -472,20 +457,16 @@ fn curated_hostile_inputs() -> Vec<Vec<u8>> {
         v.extend_from_slice(&huge);
         v
     });
-    // Arrays and maps declaring more items than the input provides.
     hostile.push(vec![0x82, 0x01]);
     hostile.push(vec![0xa1, 0x01]);
     hostile.push(vec![0x43, 0xff]);
-    // Nested huge count inside a valid outer array.
     hostile.push({
         let mut v = vec![0x82, 0x9b];
         v.extend_from_slice(&huge);
         v.push(0x00);
         v
     });
-    // Invalid UTF-8.
     hostile.push(vec![0x61, 0xff]);
-    // Floats: NaN, -0.0, non-minimal width, truncated payloads.
     hostile.push(vec![0xf9, 0x7e, 0x00]);
     hostile.push(vec![0xf9, 0x80, 0x00]);
     hostile.push(vec![0xf9, 0x3c]);
@@ -494,21 +475,16 @@ fn curated_hostile_inputs() -> Vec<Vec<u8>> {
     hostile.push(vec![0xfa, 0x3f, 0x80, 0x00, 0x00]);
     hostile.push(vec![0xfa, 0x7f, 0x80, 0x00, 0x00]);
     hostile.push(vec![0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-    // Disallowed tags.
     hostile.push(vec![0xc0, 0x00]);
-    // Map key ordering violations.
     hostile.push(vec![0xa2, 0x01, 0x01, 0x00, 0x02]);
     hostile.push(vec![0xa2, 0x00, 0x01, 0x00, 0x02]);
-    // Nesting far beyond the depth limit.
     hostile.push({
         let mut deep = vec![0x81; 300];
         deep.push(0x00);
         deep
     });
-    // Unsupported simple values.
     hostile.push(vec![0x7c, 0x01]);
     hostile.push(vec![0xf8, 0x1f]);
-    // Trailing bytes after a complete value.
     hostile.push(vec![0x00, 0x00]);
     hostile.push(vec![0xf6, 0x40]);
     hostile.push(vec![0x18, 0x18, 0x00]);
@@ -531,9 +507,7 @@ fn hostile_input_never_panics() {
         );
     }
 
-    // Mutations of a valid entry encoding: the reader must never panic,
-    // whether it accepts or rejects a mutation. Every truncation is a proper
-    // prefix of the full entry and is always rejected.
+    // Mutations of a valid entry must never panic; every truncation fails.
     let entry_bytes = sample_entry_bytes();
     let mut checks = 0usize;
     for end in 0..entry_bytes.len() {
@@ -637,14 +611,14 @@ fn tolerant_reader_never_panics_on_hostile_and_mutated_input() {
         checks += 1;
     }
 
-    // A valid canonical entry parses tolerantly to the same semantic value.
+    // A valid entry parses tolerantly to the same value.
     let entry_bytes = sample_entry_bytes();
     assert_eq!(
         reader.parse(&entry_bytes),
         CborValue::from_canonical_bytes(&entry_bytes),
         "tolerant reader must agree with the canonical decoder on valid input"
     );
-    // Every truncation of the entry is a proper prefix and must never panic.
+    // Every truncation and single-byte mutation must never panic.
     for end in 0..entry_bytes.len() {
         let _ = reader.parse(&entry_bytes[..end]);
         checks += 1;
@@ -659,7 +633,7 @@ fn tolerant_reader_never_panics_on_hostile_and_mutated_input() {
         }
     }
 
-    // The manifest surface must never panic the tolerant reader either.
+    // The manifest surface must never panic either.
     let manifest_bytes = sample_manifest_bytes();
     for end in 0..manifest_bytes.len() {
         let _ = reader.parse(&manifest_bytes[..end]);
@@ -750,8 +724,7 @@ fn entry_round_trip_stability() {
     }
 }
 
-/// Returns a v2 typed payload valid for every kind, so round-trip stability
-/// covers the full tag space.
+/// A v3 typed payload valid for every kind, covering the full tag space.
 fn default_payload(kind: EntryKind) -> ledger_format::EntryPayload {
     use ledger_format::*;
     match kind {
@@ -882,15 +855,23 @@ fn manifest_version_migration() {
         ]),
     };
     assert!(ManifestVersion::CURRENT.is_supported());
-    assert!(ManifestVersion(2).is_supported());
+    assert!(ManifestVersion(3).is_supported());
+    assert!(!ManifestVersion(2).is_supported());
     assert!(!ManifestVersion(1).is_supported());
 
     let bytes = manifest.to_canonical_bytes().expect("manifest encodes");
     assert_eq!(bytes[0], 0x88, "manifest is an array of 8");
-    let decoded = RunManifest::from_canonical_bytes(&bytes).expect("v2 manifest decodes");
+    let decoded = RunManifest::from_canonical_bytes(&bytes).expect("v3 manifest decodes");
     assert_eq!(decoded, manifest);
 
-    // A v1 manifest is rejected as unsupported.
+    // v2 and earlier manifests fail as unsupported.
+    let mut version_2 = bytes.clone();
+    version_2[1] = 0x02;
+    assert_eq!(
+        RunManifest::from_canonical_bytes(&version_2),
+        Err(CborError::UnsupportedVersion(2))
+    );
+
     let mut version_1 = bytes.clone();
     version_1[1] = 0x01;
     assert_eq!(
@@ -898,7 +879,6 @@ fn manifest_version_migration() {
         Err(CborError::UnsupportedVersion(1))
     );
 
-    // A v0 manifest is also rejected as unsupported.
     let mut version_0 = bytes.clone();
     version_0[1] = 0x00;
     assert_eq!(

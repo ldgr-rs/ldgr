@@ -1,13 +1,7 @@
-//! Bounded canonical CBOR value used by Outcome, Assert, InputStep, and
-//! StepEnd payloads.
+//! Bounded canonical CBOR value for Outcome, Assert, InputStep, and StepEnd.
 //!
-//! `CanonicalValue` is canonical RFC 8949 Core Deterministic CBOR with
-//! nesting at most [`MAX_CANONICAL_VALUE_DEPTH`], at most
-//! [`MAX_CANONICAL_VALUE_ITEMS`] collection items in total, text or byte
-//! strings at most [`MAX_CANONICAL_VALUE_STRING_BYTES`], sorted unique map
-//! keys, and no floating-point NaN or negative zero. Each domain that uses
-//! a payload carrying a `CanonicalValue` defines and binds its schema digest
-//! in `ExecutionIdentity`.
+//! Canonical RFC 8949 Core Deterministic CBOR: bounded depth, item count,
+//! and string size, sorted unique map keys, no NaN or negative zero.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -20,34 +14,25 @@ use crate::limits::{
 /// Bounded canonical CBOR value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CanonicalValue {
-    /// Unsigned integer.
     Unsigned(u64),
-    /// Negative integer (-1 - n).
     Negative(u64),
-    /// Byte string.
     Bytes(Vec<u8>),
-    /// UTF-8 text string.
     Text(String),
-    /// Array of values.
     Array(Vec<CanonicalValue>),
-    /// Map of canonical-key-sorted entries.
+    /// Map entries in canonical-key order.
     Map(Vec<(CanonicalValue, CanonicalValue)>),
-    /// Boolean.
     Bool(bool),
-    /// Null.
     Null,
-    /// IEEE 754 float, never NaN or -0.0.
+    /// Never NaN or -0.0.
     Float(f64),
 }
 
 impl Eq for CanonicalValue {}
 
-/// Canonical-value validation failures beyond the CBOR codec errors.
+/// Canonical-value validation failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueError {
-    /// The value exceeds a canonical-value bound.
     BoundsExceeded(&'static str),
-    /// The underlying CBOR is not canonical.
     Cbor(CborError),
 }
 
@@ -78,8 +63,7 @@ impl core::error::Error for ValueError {
 impl CanonicalValue {
     /// Encodes the value as canonical CBOR into `out`.
     ///
-    /// Fails when a bound is exceeded; on error the buffer may contain
-    /// partial bytes and the caller must discard the tail.
+    /// On error the buffer may hold partial bytes; discard the tail.
     pub fn try_encode(&self, out: &mut Vec<u8>) -> Result<(), ValueError> {
         let mut budget = Budget::default();
         self.encode_into(out, &mut budget)
@@ -116,9 +100,8 @@ impl CanonicalValue {
             }
             Self::Map(entries) => {
                 budget.collection(entries.len())?;
-                // Canonical key ordering requires the encoded key bytes; the
-                // values are encoded after the sorted keys so item accounting
-                // stays on the shared budget.
+                // Sort by encoded key bytes; values encode after sorting
+                // so item accounting stays on the shared budget.
                 let mut encoded_keys: Vec<(Vec<u8>, &CanonicalValue)> =
                     Vec::with_capacity(entries.len());
                 for (key, value) in entries {
@@ -170,8 +153,7 @@ impl CanonicalValue {
 
     /// Decodes a canonical value from canonical CBOR bytes.
     ///
-    /// Rejects non-canonical encodings, values exceeding the bounds, and
-    /// trailing bytes.
+    /// Rejects non-canonical encodings, out-of-bounds values, trailing bytes.
     pub fn from_canonical_bytes(input: &[u8]) -> Result<Self, ValueError> {
         let value = CborValue::from_canonical_bytes(input)?;
         let mut budget = Budget::default();
@@ -226,7 +208,6 @@ impl CanonicalValue {
     }
 }
 
-/// Tracks canonical-value bounds during encode and decode.
 #[derive(Debug, Default)]
 pub(crate) struct Budget {
     depth: usize,
@@ -266,7 +247,6 @@ impl Budget {
     }
 }
 
-/// Appends a major-type item with the canonical minimal-width argument.
 fn major(out: &mut Vec<u8>, kind: u8, value: u64) {
     let head = kind << 5;
     if value <= 23 {

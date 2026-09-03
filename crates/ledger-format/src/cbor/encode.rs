@@ -1,32 +1,29 @@
 use alloc::vec::Vec;
 
 use super::{CborError, CborValue, TAG_ALLOWLIST, compare_canonical_keys};
+use crate::entry::EntryHash;
 
 impl CborValue {
     /// Returns the canonical serialized bytes of this value.
     ///
-    /// Returns a [`CborError`] when encountering disallowed values (such as `-0.0`, `NaN`, or
-    /// disallowed tags).
+    /// Fails on disallowed values (`-0.0`, `NaN`, disallowed tags).
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
         let mut out = Vec::new();
         self.try_encode(&mut out)?;
         Ok(out)
     }
 
-    /// Explicit alias for [`Self::to_canonical_bytes`].
     pub fn try_to_canonical_bytes(&self) -> Result<Vec<u8>, CborError> {
         self.to_canonical_bytes()
     }
 
-    /// Encodes this value into the output byte buffer.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), CborError> {
         self.try_encode(out)
     }
 
-    /// Encodes this value into the output byte buffer, reporting the error.
+    /// Encodes into `out`.
     ///
-    /// On error the buffer may contain partial bytes; the caller must discard
-    /// the tail.
+    /// On error the buffer may hold partial bytes; discard the tail.
     pub fn try_encode(&self, out: &mut Vec<u8>) -> Result<(), CborError> {
         match self {
             Self::Unsigned(val) => {
@@ -123,6 +120,12 @@ pub fn bytes(out: &mut Vec<u8>, value: &[u8]) {
     out.extend_from_slice(value);
 }
 
+/// Appends an `EntryHash` as its 34-byte framed multihash; raw content
+/// byte strings never frame.
+pub(crate) fn hash(out: &mut Vec<u8>, h: &EntryHash) {
+    bytes(out, &h.to_framed_bytes());
+}
+
 #[inline]
 pub fn text(out: &mut Vec<u8>, value: &str) {
     major(out, 3, value.len() as u64);
@@ -158,14 +161,10 @@ pub fn null(out: &mut Vec<u8>) {
     out.push(0xf6);
 }
 
-/// Appends a canonical CBOR float using the minimal width that round-trips.
+/// Appends a float in minimal width that round-trips.
 ///
-/// The caller must reject `-0.0` and `NaN` before calling.
-///
-/// Width selection: half precision when the value round-trips exactly, else
-/// single precision when the value round-trips through `f32`, else double
-/// precision. An integer-valued float is never coerced to an integer encoding;
-/// the specification only notes this as a policy, not a rule.
+/// Rejects `-0.0` and `NaN` before calling. Prefers half, then single,
+/// then double; integer-valued floats stay floats.
 pub fn encode_minimal_float(out: &mut Vec<u8>, value: f64) {
     if let Some(half_bits) = value_round_trips_as_f16(value) {
         out.push(0xf9);
@@ -181,8 +180,7 @@ pub fn encode_minimal_float(out: &mut Vec<u8>, value: f64) {
 
 #[inline]
 fn major(out: &mut Vec<u8>, kind: u8, value: u64) {
-    // Every narrowing cast below is guarded by the preceding bounds check,
-    // so the value always fits the encoded width.
+    // Narrowing casts are guarded by the bounds checks, so each fits.
     let head = kind << 5;
     if value <= 23 {
         out.push(head | value as u8);
@@ -201,13 +199,10 @@ fn major(out: &mut Vec<u8>, kind: u8, value: u64) {
     }
 }
 
-/// Returns the half-precision bits for `value`, if it round-trips exactly
-/// through half precision.
+/// Returns half-precision bits when `value` round-trips exactly.
 ///
-/// The value must round-trip through `f32` first; a value not representable in
-/// single precision can never be representable in half precision. The final
-/// check compares the half value against the original `f64`, not against the
-/// intermediate `f32`.
+/// Must round-trip through `f32` first; compare the half value against
+/// the original `f64`, not the intermediate `f32`.
 fn value_round_trips_as_f16(value: f64) -> Option<u16> {
     let single = value as f32;
     if single as f64 != value {
@@ -221,16 +216,14 @@ fn value_round_trips_as_f16(value: f64) -> Option<u16> {
     }
 }
 
-/// Converts IEEE 754 single-precision bits to half-precision bits using
-/// round-to-nearest-even on the discarded mantissa bits.
+/// Converts single-precision bits to half bits (round-to-nearest-even).
 pub(crate) fn f32_bits_to_f16(bits: u32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
     let mant = bits & 0x7f_ffff;
 
     if exp == 0xff {
-        // Infinity or NaN: preserve the class in half precision. Callers
-        // reject NaN upstream, so this path only carries a NaN class bit.
+        // Preserve Infinity/NaN class; callers reject NaN upstream.
         return sign | 0x7c00 | u16::from(mant != 0);
     }
 
@@ -248,7 +241,7 @@ pub(crate) fn f32_bits_to_f16(bits: u32) -> u16 {
         if round_bit == 1 && (sticky != 0 || m16 & 1 == 1) {
             m16 += 1;
             if m16 == 0x400 {
-                // Mantissa overflow: carry into the exponent field.
+                // Mantissa overflow carries into the exponent field.
                 return sign | ((exp16 + 1) as u16) << 10;
             }
         }
@@ -258,7 +251,7 @@ pub(crate) fn f32_bits_to_f16(bits: u32) -> u16 {
     // Subnormal or zero in half precision. exp16 <= 0.
     let shift = (14 - exp16) as u32;
     if shift >= 25 {
-        // Magnitude rounds to zero; the round bit is never set at this shift.
+        // Magnitude rounds to zero.
         return sign;
     }
     let full = mant | 0x80_0000;
@@ -271,8 +264,7 @@ pub(crate) fn f32_bits_to_f16(bits: u32) -> u16 {
     sign | (m16 as u16)
 }
 
-/// Converts half-precision bits to an exact `f64`. Every half value is
-/// exactly representable as a double, so the arithmetic below is exact.
+/// Converts half-precision bits to an exact `f64`.
 pub(crate) fn f16_bits_to_f64(bits: u16) -> f64 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((bits >> 10) & 0x1f) as i32;
@@ -289,9 +281,7 @@ pub(crate) fn f16_bits_to_f64(bits: u16) -> f64 {
 
 /// Returns `2^k` exactly, for `-24 <= k <= 15`.
 ///
-/// `f64::powi` is not available in `core`. Powers of two are exactly
-/// representable, and division by a power of two is exact, so the result has
-/// the same bits as `powi`.
+/// `core` lacks `powi`; powers of two are exact, so this matches its bits.
 fn two_to_power(k: i32) -> f64 {
     if k >= 0 {
         (1u32 << k) as f64

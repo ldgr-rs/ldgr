@@ -11,9 +11,8 @@ const MAX_DEPTH: usize = 128;
 
 /// Allowlist of CBOR semantic tags accepted by the canonical decoder.
 ///
-/// Tags carry type semantics only, never structural meaning. The journal
-/// self-emits no tags, so the allowlist is empty. Extend it only when the
-/// specification adds a tag with defined semantics.
+/// Empty by policy: the journal self-emits no tags. Extend only when the
+/// spec adds a tag with defined semantics.
 pub const TAG_ALLOWLIST: &[u64] = &[];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,20 +29,19 @@ pub enum CborError {
     InvalidUtf8,
     /// CBOR semantic tag is not on the documented allowlist.
     UnknownTag(u64),
-    /// Declared array, map, byte, or text length exceeds the remaining input.
+    /// Declared array, map, byte, or text length exceeds remaining input.
     LengthOverflow,
-    /// One canonical entry exceeds [`crate::limits::MAX_ENTRY_BYTES`].
+    /// One entry exceeds [`crate::limits::MAX_ENTRY_BYTES`].
     EntryTooLarge(usize),
     DepthLimitExceeded,
     UnsupportedType(u8),
     TrailingBytes,
     UnsupportedVersion(u32),
-    /// Manifest structure does not match the version 1 layout.
+    /// Structure does not match the versioned layout.
     MalformedManifest(&'static str),
 }
 
 impl CborError {
-    /// Converts into a canonical-value error, preserving the source.
     pub fn into_value(self) -> crate::value::ValueError {
         crate::value::ValueError::Cbor(self)
     }
@@ -85,32 +83,22 @@ impl core::error::Error for CborError {}
 
 /// An in-memory CBOR data item.
 ///
-/// `Float` equality compares IEEE bit patterns. The canonical encoder and
-/// decoder never store `NaN` or `-0.0`; the tolerant reader may store either.
-/// Bit-pattern equality is a true equivalence relation for every value,
-/// including `NaN` and `-0.0`.
+/// `Float` equality compares IEEE bit patterns, a true equivalence relation
+/// even for `NaN` and `-0.0`. Canonical paths never store either; the
+/// tolerant reader may.
 #[derive(Debug, Clone)]
 pub enum CborValue {
-    /// Major type 0: Unsigned integer.
     Unsigned(u64),
-    /// Major type 1: Negative integer (-1 - n).
     Negative(u64),
-    /// Major type 2: Byte string.
     Bytes(Vec<u8>),
-    /// Major type 3: UTF-8 text string.
     Text(String),
-    /// Major type 4: Array of values.
     Array(Vec<CborValue>),
-    /// Major type 5: Map of key-value pairs (maintained in canonical key order).
+    /// Maintained in canonical key order.
     Map(Vec<(CborValue, CborValue)>),
-    /// Major type 6: Tagged value.
     Tag(u64, Box<CborValue>),
-    /// Major type 7: Boolean.
     Bool(bool),
-    /// Major type 7: Null.
     Null,
-    /// Major type 7: IEEE 754 floating point. The canonical path never stores
-    /// `NaN` or `-0.0`; the tolerant reader may store either from input.
+    /// Never `NaN` or `-0.0` on the canonical path.
     Float(f64),
 }
 
@@ -134,16 +122,11 @@ impl PartialEq for CborValue {
 
 impl Eq for CborValue {}
 
-/// Zero-trust CBOR reader for a superset of canonical RFC 8949 Core
-/// Deterministic CBOR.
+/// Zero-trust reader for a superset of canonical CBOR.
 ///
-/// The canonical decoder [`CborValue::from_canonical_bytes`] rejects every
-/// non-canonical form. This reader is a separate path for untrusted input. It
-/// accepts indefinite-length arrays and maps, non-shortest integer widths,
-/// duplicate map keys, non-minimal float widths, `-0.0`, `NaN`, and unknown
-/// semantic tags. It never panics on any byte input. A nesting depth limit and
-/// bounded declared lengths make hostile input return an error instead of
-/// exhausting the stack or the heap.
+/// Accepts indefinite lengths, non-shortest widths, duplicate keys,
+/// non-minimal floats, `-0.0`, `NaN`, and unknown tags. Never panics;
+/// depth and length bounds turn hostile input into errors.
 #[derive(Debug, Clone, Copy)]
 pub struct TolerantReader {
     max_depth: usize,
@@ -156,11 +139,10 @@ impl TolerantReader {
         }
     }
 
-    /// Constructs a tolerant reader with a custom nesting depth limit.
+    /// Constructs a reader with a custom depth limit.
     ///
-    /// Keep the depth modest. The depth bound is the only guard against stack
-    /// exhaustion from hostile nesting. A huge limit lets deeply nested input
-    /// recurse to the input length. Prefer a small value near [`MAX_DEPTH`].
+    /// Keep the depth modest: it is the only guard against stack
+    /// exhaustion from hostile nesting.
     pub const fn with_max_depth(max_depth: usize) -> Self {
         Self { max_depth }
     }
@@ -172,10 +154,8 @@ impl Default for TolerantReader {
     }
 }
 
-/// Compares two serialized canonical CBOR keys according to RFC 8949,
-/// section 4.2.3:
-/// 1. Shorter byte length precedes longer byte length.
-/// 2. Identical byte length uses bytewise lexicographical comparison.
+/// Compares canonical CBOR keys (RFC 8949 sec 4.2.3): shorter first,
+/// then bytewise lexicographic.
 #[inline]
 pub fn compare_canonical_keys(a: &[u8], b: &[u8]) -> Ordering {
     if a.len() != b.len() {

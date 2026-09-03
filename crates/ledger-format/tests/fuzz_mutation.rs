@@ -1,32 +1,25 @@
-//! Deterministic mutation harness for the zero-trust parser boundary.
+//! Deterministic mutation harness for the parser boundary.
 //!
-//! Extends the curated hostile-input tests in `conformance.rs` to mutated and
-//! random bytes. Every reader must either decode the input or return an
-//! error, never panic. Fixed seeds make the harness byte-identical on every
-//! run, so it is a load-bearing gate in regular CI. The libFuzzer targets in
-//! `crates/ledger-format/fuzz/` extend the same property with coverage-guided
-//! search.
+//! Mutated and random bytes must decode or error, never panic. Fixed seeds
+//! keep runs byte-identical; libFuzzer targets extend the same property.
 
 use std::collections::BTreeMap;
 
 use ledger_format::cbor::{self, CborValue};
 use ledger_format::{EntryData, EntryKind, RunManifest};
 
-/// Mutation rounds per seed. Bounded so the harness finishes fast in CI.
+/// Mutation rounds per seed; bounded for fast CI.
 const ROUNDS_PER_SEED: usize = 1500;
 
 /// Fixed seeds keep every run byte-identical.
 const SEEDS: [u64; 4] = [0xba5e_1d00, 0x5eed_cafe, 0xc0f_feee, 0xdead_beef];
 
-/// Bytes that exercise decode-path corners when planted anywhere.
+/// Bytes exercising decode-path corners when planted anywhere.
 const CORNER_BYTES: [u8; 12] = [
     0x00, 0x18, 0x1b, 0x5f, 0x7f, 0x9f, 0xbf, 0xc0, 0xf9, 0xfb, 0xff, 0xf6,
 ];
 
-/// Deterministic splitmix64 PRNG.
-///
-/// The harness must be byte-identical across runs, so the PRNG is seeded
-/// from a constant and never touches ambient entropy.
+/// Deterministic splitmix64 PRNG (seeded; never ambient entropy).
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -47,10 +40,8 @@ impl SplitMix64 {
     }
 }
 
-/// Seed corpus of valid inputs the harness mutates.
-///
-/// The entries cover unit, structured, and fault kinds plus the full manifest
-/// wire form, so mutations hit every CBOR structure the engine writes.
+/// Seed corpus of valid inputs; covers unit, structured, and fault kinds
+/// plus the manifest wire form.
 fn seed_corpus() -> Vec<Vec<u8>> {
     let entries: Vec<(EntryKind, ledger_format::EntryPayload)> = [
         (
@@ -216,14 +207,13 @@ fn mutate(rng: &mut SplitMix64, base: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Builds a random byte buffer of bounded length, exercising arbitrary input.
+/// Builds a bounded random buffer, exercising arbitrary input.
 fn random_buffer(rng: &mut SplitMix64) -> Vec<u8> {
     let len = rng.next_usize(65);
     (0..len).map(|_| rng.next_u8()).collect()
 }
 
-/// Reports a reader panic with the exact input so it can become a regression
-/// test. Never returns.
+/// Reports a reader panic with the input for a regression test. Never returns.
 fn panic_payload(payload: Box<dyn std::any::Any + Send>, reader: &str, bytes: &[u8]) -> ! {
     let detail = if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -235,10 +225,8 @@ fn panic_payload(payload: Box<dyn std::any::Any + Send>, reader: &str, bytes: &[
     panic!("{reader} panicked on input {:02x?}: {detail}", bytes);
 }
 
-/// Runs every zero-trust reader over `bytes` and asserts none panics.
-///
-/// The tolerant reader is a superset: any input the canonical decoder
-/// accepts, the tolerant reader must also accept to the same value.
+/// Runs every reader over `bytes`; none may panic. Tolerant input the
+/// canonical decoder accepts must parse to the same value.
 fn run_readers(bytes: &[u8]) {
     let canonical = match std::panic::catch_unwind(|| CborValue::from_canonical_bytes(bytes)) {
         Ok(result) => result,

@@ -1,10 +1,7 @@
 //! Borrowed canonical CBOR item reader for bounded entry decoding.
 //!
-//! [`ItemReader`] walks canonical CBOR items with a cursor, borrowing byte
-//! strings and text from the input instead of cloning them. The entry
-//! decoder uses it so declared lengths are checked against the remaining
-//! input *before* any content allocation, satisfying the pre-allocation
-//! validation order in the format review.
+//! Borrows byte and text strings so declared lengths check against remaining
+//! input before any content allocation.
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -16,19 +13,16 @@ use super::{CborError, compare_canonical_keys};
 /// One borrowed canonical CBOR item.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item<'a> {
-    /// Major type 0: unsigned integer.
     Unsigned(u64),
-    /// Major type 1: negative integer (-1 - n).
     Negative(u64),
-    /// Major type 2: byte string, borrowed from the input.
+    /// Borrowed from the input.
     Bytes(&'a [u8]),
-    /// Major type 3: text string, borrowed from the input.
+    /// Borrowed from the input.
     Text(&'a str),
-    /// Major type 4: array header with the declared element count.
+    /// Array header with the declared element count.
     Array(usize),
-    /// Major type 5: map header with the declared entry count.
+    /// Map header with the declared entry count.
     Map(usize),
-    /// Major type 7 simple values: false, true, null, and floats.
     Bool(bool),
     Null,
     Float(f64),
@@ -43,7 +37,6 @@ pub struct ItemReader<'a> {
 }
 
 impl<'a> ItemReader<'a> {
-    /// Creates a reader over `input` at offset 0.
     pub fn new(input: &'a [u8]) -> Self {
         Self {
             input,
@@ -52,17 +45,14 @@ impl<'a> ItemReader<'a> {
         }
     }
 
-    /// Returns the current cursor position.
     pub fn position(&self) -> usize {
         self.cursor
     }
 
-    /// Returns the remaining input bytes.
     pub fn remaining(&self) -> usize {
         self.input.len() - self.cursor
     }
 
-    /// Returns true when the input is fully consumed.
     pub fn at_end(&self) -> bool {
         self.cursor == self.input.len()
     }
@@ -144,11 +134,10 @@ impl<'a> ItemReader<'a> {
         if declared > self.remaining() as u64 {
             return Err(CborError::LengthOverflow);
         }
-        // Safe: declared <= remaining <= usize::MAX, so the cast is lossless.
+        // declared <= remaining <= usize::MAX, so the cast is lossless.
         Ok(declared as usize)
     }
 
-    /// Reads an unsigned integer item.
     pub fn read_unsigned(&mut self) -> Result<u64, CborError> {
         match self.read_item()? {
             Item::Unsigned(v) => Ok(v),
@@ -156,7 +145,6 @@ impl<'a> ItemReader<'a> {
         }
     }
 
-    /// Reads a byte string item, borrowing it from the input.
     pub fn read_bytes(&mut self) -> Result<&'a [u8], CborError> {
         match self.read_item()? {
             Item::Bytes(b) => Ok(b),
@@ -164,7 +152,6 @@ impl<'a> ItemReader<'a> {
         }
     }
 
-    /// Reads a text string item, borrowing it from the input.
     pub fn read_text(&mut self) -> Result<&'a str, CborError> {
         match self.read_item()? {
             Item::Text(t) => Ok(t),
@@ -172,7 +159,6 @@ impl<'a> ItemReader<'a> {
         }
     }
 
-    /// Reads a bool item.
     pub fn read_bool(&mut self) -> Result<bool, CborError> {
         match self.read_item()? {
             Item::Bool(b) => Ok(b),
@@ -180,7 +166,6 @@ impl<'a> ItemReader<'a> {
         }
     }
 
-    /// Reads an array header and returns the declared element count.
     pub fn read_array(&mut self) -> Result<usize, CborError> {
         match self.read_item()? {
             Item::Array(n) => Ok(n),
@@ -188,7 +173,6 @@ impl<'a> ItemReader<'a> {
         }
     }
 
-    /// Reads a null item.
     pub fn read_null(&mut self) -> Result<(), CborError> {
         match self.read_item()? {
             Item::Null => Ok(()),
@@ -196,9 +180,7 @@ impl<'a> ItemReader<'a> {
         }
     }
 
-    /// Reads one canonical value (used by Outcome, Assert, InputStep, and
-    /// StepEnd payloads), enforcing the canonical-value bounds while
-    /// decoding.
+    /// Reads one canonical value with canonical-value bounds enforced.
     pub fn read_canonical_value(
         &mut self,
     ) -> Result<crate::value::CanonicalValue, crate::value::ValueError> {

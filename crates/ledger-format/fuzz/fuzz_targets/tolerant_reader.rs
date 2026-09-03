@@ -1,9 +1,5 @@
-//! Fuzz the tolerant (superset-accepting) CBOR reader.
-//!
-//! The tolerant reader accepts indefinite-length forms, non-shortest widths,
-//! duplicate keys, `NaN`, and `-0.0`. Its contract is the same as the
-//! canonical decoder: any byte input returns a value or an error, never a
-//! panic. A panic here is a libFuzzer crash and fails the run.
+//! Fuzz the tolerant reader: any input returns a value or an error,
+//! never a panic. A panic is a libFuzzer crash.
 
 #![no_main]
 

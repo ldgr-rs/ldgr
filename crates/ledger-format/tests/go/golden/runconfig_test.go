@@ -4,7 +4,7 @@ package main
 //
 // The Rust encoder in crates/ledger-sim/src/config_canonical.rs and this Go
 // encoder must produce byte-identical output for every fixture in
-// crates/ledger-format/tests/fixtures/run-config/run_config_v1.json. The
+// crates/ledger-format/tests/fixtures/run-config/run_config_v2.json. The
 // blake3 hash column of the fixture file is verified by the Rust test in
 // crates/ledger-sim/tests/canonical_config.rs; Go verifies the wire bytes.
 
@@ -26,7 +26,7 @@ func runConfigFixtureDir() string {
 }
 
 func TestRunConfigConformance(t *testing.T) {
-	fixtures, err := loadRunConfigFixtures(filepath.Join(runConfigFixtureDir(), "run_config_v1.json"))
+	fixtures, err := loadRunConfigFixtures(filepath.Join(runConfigFixtureDir(), "run_config_v2.json"))
 	if err != nil {
 		t.Fatalf("load fixtures: %v", err)
 	}

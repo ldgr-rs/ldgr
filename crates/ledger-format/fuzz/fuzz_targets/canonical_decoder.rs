@@ -1,9 +1,5 @@
-//! Fuzz the canonical CBOR decoder and the manifest reader.
-//!
-//! The zero-trust contract: any byte input must either decode or return an
-//! error. A panic in the decoder is a libFuzzer crash and fails the run,
-//! which is the desired signal. These are the only two calls made; there is
-//! no setup that can panic first.
+//! Fuzz the canonical decoder and manifest reader: any input decodes or
+//! errors, never panics. A panic is a libFuzzer crash.
 
 #![no_main]
 

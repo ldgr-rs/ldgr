@@ -22,9 +22,10 @@ pub use cbor::{CborError, CborValue, TolerantReader, compare_canonical_keys, par
 pub use entry::{
     ActorId, AssertPayload, BlockPayload, CapGrantPayload, CapInvokePayload, CapRequestPayload,
     CapRevokePayload, CrashOperation, EntryData, EntryHash, EntryKind, EntryPayload, EpochPayload,
-    FaultPayload, FaultSpec, FsReadPayload, FsSyncPayload, FsWritePayload, InputStepPayload,
-    MessageId, ObservedRead, OutcomePayload, RecvFrame, RngDrawPayload, SendFrame, SequenceNumber,
-    SnapshotPayload, StepBeginPayload, StepEndPayload, StreamId, WakePayload,
+    FRAMED_HASH_LEN, FaultPayload, FaultSpec, FsReadPayload, FsSyncPayload, FsWritePayload,
+    InputStepPayload, MULTIHASH_BLAKE3_CODE, MULTIHASH_BLAKE3_LEN, MessageId, ObservedRead,
+    OutcomePayload, RecvFrame, RngDrawPayload, SendFrame, SequenceNumber, SnapshotPayload,
+    StepBeginPayload, StepEndPayload, StreamId, WakePayload,
 };
 pub use frame::{FRAME_PREFIX_LEN, FrameError, FramePrefix};
 pub use hex::{HexError, hash_from_hex, hash_to_hex};

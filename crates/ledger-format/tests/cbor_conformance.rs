@@ -91,7 +91,6 @@ fn entry(
 
 #[test]
 fn spawn_payload_round_trips() {
-    // Spawn encodes as [child_actor]: array(1) with the actor.
     let data = entry(
         EntryKind::Spawn,
         ledger_format::ActorId(0),
@@ -100,10 +99,8 @@ fn spawn_payload_round_trips() {
         },
     );
     let bytes = data.try_canonical_bytes().unwrap();
-    // 7-element EntryData array: version, tag 0, actor 0, parents, clock,
-    // sequence, payload array(1) child_actor 5.
     assert_eq!(bytes[0], 0x87);
-    assert_eq!(bytes[1], 0x02); // format_version = 2
+    assert_eq!(bytes[1], 0x03); // format_version = 3
     assert_eq!(bytes[2], 0x00); // kind tag 0
     let decoded = EntryData::from_canonical_bytes(&bytes).unwrap();
     assert_eq!(decoded, data);
@@ -111,18 +108,15 @@ fn spawn_payload_round_trips() {
 
 #[test]
 fn floats_encode_minimal_width() {
-    // 1.0 is exactly representable in half precision: 0x3c00.
     assert_eq!(
         CborValue::Float(1.0).try_to_canonical_bytes().unwrap(),
         vec![0xf9, 0x3c, 0x00]
     );
-    // 1.5 is also exactly representable in half precision: 0x3e00, so the
-    // minimal width is half, not single.
     assert_eq!(
         CborValue::Float(1.5).try_to_canonical_bytes().unwrap(),
         vec![0xf9, 0x3e, 0x00]
     );
-    // 1 + 2^-13 is not half-representable but round-trips through f32: single.
+    // 1 + 2^-13 needs single precision.
     let single_val = 1.0 + 2.0_f64.powi(-13);
     assert_eq!(
         CborValue::Float(single_val)
@@ -130,7 +124,7 @@ fn floats_encode_minimal_width() {
             .unwrap(),
         vec![0xfa, 0x3f, 0x80, 0x04, 0x00]
     );
-    // A large value not representable in f32: double.
+    // A large value needs double precision.
     let big_bytes = CborValue::Float(1e100).try_to_canonical_bytes().unwrap();
     assert_eq!(big_bytes[0], 0xfb);
     assert_eq!(big_bytes.len(), 9);
@@ -146,7 +140,6 @@ fn floats_encode_minimal_width() {
 
 #[test]
 fn floats_reject_non_canonical() {
-    // 1.5 encoded as double fits f32: non-canonical.
     let double_1_5 = [0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     assert_eq!(
         CborValue::from_canonical_bytes(&double_1_5),
@@ -179,7 +172,7 @@ fn floats_reject_non_canonical() {
         Err(CborError::NonCanonicalFloat)
     );
 
-    // Minimal-width floats still decode: half 1.0 and single 1 + 2^-13.
+    // Minimal-width floats still decode.
     let half_1_0 = CborValue::from_canonical_bytes(&[0xf9, 0x3c, 0x00]).unwrap();
     assert_eq!(half_1_0, CborValue::Float(1.0));
     let single_val = CborValue::from_canonical_bytes(&[0xfa, 0x3f, 0x80, 0x04, 0x00]).unwrap();
@@ -188,9 +181,8 @@ fn floats_reject_non_canonical() {
 
 #[test]
 fn all_f16_bit_patterns_either_roundtrip_or_reject() {
-    // Every f16 bit pattern must either decode to a canonical float that
-    // re-encodes to the same bytes, or be rejected as -0.0 / NaN. This guards
-    // the manual half-precision conversion against regressions.
+    // Every f16 pattern decodes and re-encodes identically, or fails as
+    // -0.0 / NaN. Guards the manual half-precision conversion.
     for bits in 0u16..=u16::MAX {
         let bytes = [0xf9, (bits >> 8) as u8, bits as u8];
         match CborValue::from_canonical_bytes(&bytes) {
@@ -206,12 +198,10 @@ fn all_f16_bit_patterns_either_roundtrip_or_reject() {
 
 #[test]
 fn unknown_tag_rejected() {
-    // Tag 0 is not on the allowlist (empty by policy).
     assert_eq!(
         CborValue::from_canonical_bytes(&[0xc0, 0x00]),
         Err(CborError::UnknownTag(0))
     );
-    // The encoder refuses to emit disallowed tags too.
     let tagged = CborValue::Tag(0, Box::new(CborValue::Unsigned(1)));
     assert_eq!(
         tagged.try_to_canonical_bytes(),
@@ -229,7 +219,6 @@ fn duplicate_map_key_rejected_on_encode() {
         val.try_to_canonical_bytes(),
         Err(CborError::DuplicateMapKey)
     );
-    // Distinct values whose canonical key bytes collide are also rejected.
     let val = CborValue::Map(vec![
         (CborValue::Unsigned(24), CborValue::Unsigned(1)),
         (CborValue::Unsigned(24), CborValue::Unsigned(2)),
@@ -242,10 +231,9 @@ fn duplicate_map_key_rejected_on_encode() {
 
 #[test]
 fn hostile_input_never_panics() {
-    // Huge array / map / byte / text counts (2^64 - 1) must not over-allocate.
-    // Deep nesting exceeds the depth limit. Indefinite-length forms, truncated
-    // headers and payloads, short counts, and non-shortest integers complete
-    // the hostile set.
+    // Huge counts (2^64 - 1) must not over-allocate; deep nesting must
+    // hit the depth limit; indefinite forms, truncations, and
+    // non-shortest integers must fail.
     let hostile: Vec<Vec<u8>> = vec![
         vec![0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
         vec![0xbb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
@@ -291,8 +279,6 @@ fn hostile_input_never_panics() {
 fn tolerant_reader_accepts_superset_forms() {
     let reader = cbor::TolerantReader::new();
 
-    // Indefinite-length array: accepted by the tolerant reader, rejected by
-    // the canonical decoder.
     let indefinite_array = vec![0x9f, 0x01, 0x02, 0xff];
     assert_eq!(
         CborValue::from_canonical_bytes(&indefinite_array),
@@ -306,7 +292,6 @@ fn tolerant_reader_accepts_superset_forms() {
         ]))
     );
 
-    // Indefinite-length map.
     let indefinite_map = vec![0xbf, 0x01, 0x02, 0xff];
     assert_eq!(
         CborValue::from_canonical_bytes(&indefinite_map),
@@ -320,7 +305,6 @@ fn tolerant_reader_accepts_superset_forms() {
         )]))
     );
 
-    // Indefinite-length byte string, single chunk.
     let indefinite_bytes = vec![0x5f, 0x41, 0x61, 0xff];
     assert_eq!(
         CborValue::from_canonical_bytes(&indefinite_bytes),
@@ -331,7 +315,6 @@ fn tolerant_reader_accepts_superset_forms() {
         Ok(CborValue::Bytes(vec![0x61]))
     );
 
-    // Indefinite-length byte string, multiple chunks concatenated in order.
     let indefinite_bytes_multi = vec![0x5f, 0x41, 0x61, 0x42, 0x62, 0x63, 0xff];
     assert_eq!(
         CborValue::from_canonical_bytes(&indefinite_bytes_multi),
@@ -342,7 +325,6 @@ fn tolerant_reader_accepts_superset_forms() {
         Ok(CborValue::Bytes(vec![0x61, 0x62, 0x63]))
     );
 
-    // Indefinite-length byte string with a nested indefinite chunk.
     let indefinite_bytes_nested = vec![0x5f, 0x5f, 0x41, 0x61, 0xff, 0xff];
     assert_eq!(
         CborValue::from_canonical_bytes(&indefinite_bytes_nested),
@@ -353,7 +335,6 @@ fn tolerant_reader_accepts_superset_forms() {
         Ok(CborValue::Bytes(vec![0x61]))
     );
 
-    // Indefinite-length text string, multiple chunks concatenated in order.
     let indefinite_text = vec![0x7f, 0x61, 0x61, 0x61, 0x62, 0xff];
     assert_eq!(
         CborValue::from_canonical_bytes(&indefinite_text),
@@ -364,14 +345,12 @@ fn tolerant_reader_accepts_superset_forms() {
         Ok(CborValue::Text("ab".into()))
     );
 
-    // Non-shortest integer: 24 encoded in the two-byte form.
     let non_shortest = vec![0x19, 0x00, 0x18];
     assert_eq!(
         CborValue::from_canonical_bytes(&non_shortest),
         Err(CborError::NonCanonicalIntegerEncoding)
     );
     assert_eq!(reader.parse(&non_shortest), Ok(CborValue::Unsigned(24)));
-    // Non-shortest integer: 23 encoded in the one-byte-extra form.
     let non_shortest_23 = vec![0x18, 0x17];
     assert_eq!(
         CborValue::from_canonical_bytes(&non_shortest_23),
@@ -379,7 +358,6 @@ fn tolerant_reader_accepts_superset_forms() {
     );
     assert_eq!(reader.parse(&non_shortest_23), Ok(CborValue::Unsigned(23)));
 
-    // Duplicate map keys are kept in order.
     let duplicate_keys = vec![0xa2, 0x00, 0x01, 0x00, 0x02];
     assert_eq!(
         CborValue::from_canonical_bytes(&duplicate_keys),
@@ -393,7 +371,6 @@ fn tolerant_reader_accepts_superset_forms() {
         ]))
     );
 
-    // Non-minimal float width: 1.5 encoded as a double.
     let non_minimal_float = [0xfb, 0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     assert_eq!(
         CborValue::from_canonical_bytes(&non_minimal_float),
@@ -401,7 +378,6 @@ fn tolerant_reader_accepts_superset_forms() {
     );
     assert_eq!(reader.parse(&non_minimal_float), Ok(CborValue::Float(1.5)));
 
-    // Non-minimal float width: 1.0 encoded as a single that fits half.
     let non_minimal_single = [0xfa, 0x3f, 0x80, 0x00, 0x00];
     assert_eq!(
         CborValue::from_canonical_bytes(&non_minimal_single),
@@ -409,7 +385,6 @@ fn tolerant_reader_accepts_superset_forms() {
     );
     assert_eq!(reader.parse(&non_minimal_single), Ok(CborValue::Float(1.0)));
 
-    // Unknown semantic tag: the tolerant reader stores it.
     let unknown_tag = vec![0xc0, 0x00];
     assert_eq!(
         CborValue::from_canonical_bytes(&unknown_tag),
@@ -420,7 +395,6 @@ fn tolerant_reader_accepts_superset_forms() {
         Ok(CborValue::Tag(0, Box::new(CborValue::Unsigned(0))))
     );
 
-    // -0.0 and NaN as double.
     let neg_zero_double = [0xfb, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     assert_eq!(
         CborValue::from_canonical_bytes(&neg_zero_double),
@@ -434,7 +408,6 @@ fn tolerant_reader_accepts_superset_forms() {
     );
     assert_eq!(reader.parse(&nan_double), Ok(CborValue::Float(f64::NAN)));
 
-    // -0.0 and NaN as half.
     let neg_zero_half = [0xf9, 0x80, 0x00];
     assert_eq!(
         CborValue::from_canonical_bytes(&neg_zero_half),
@@ -451,7 +424,6 @@ fn tolerant_reader_accepts_superset_forms() {
         other => panic!("half NaN must parse to a NaN float, got {other:?}"),
     }
 
-    // A non-shortest length header for a container is also accepted.
     let non_shortest_array_len = vec![0x98, 0x00];
     assert_eq!(
         CborValue::from_canonical_bytes(&non_shortest_array_len),
@@ -462,7 +434,7 @@ fn tolerant_reader_accepts_superset_forms() {
         Ok(CborValue::Array(Vec::new()))
     );
 
-    // The free-function entry point matches the reader.
+    // The free function matches the reader.
     assert_eq!(
         cbor::parse_tolerant(&non_shortest_array_len),
         Ok(CborValue::Array(Vec::new()))
@@ -471,8 +443,7 @@ fn tolerant_reader_accepts_superset_forms() {
 
 #[test]
 fn tolerant_reader_enforces_depth_limit() {
-    // Deeply nested input is rejected with DepthLimitExceeded, never a stack
-    // overflow. The default limit matches the canonical decoder.
+    // Deep nesting fails; the default limit matches the canonical decoder.
     let mut deep = vec![0x81; 300];
     deep.push(0x00);
     assert_eq!(
@@ -484,7 +455,7 @@ fn tolerant_reader_enforces_depth_limit() {
         Err(CborError::DepthLimitExceeded)
     );
 
-    // A custom shallow limit rejects 5-level nesting.
+    // A shallow limit rejects 5 levels but accepts 4.
     let five_deep = vec![0x81, 0x81, 0x81, 0x81, 0x81, 0x00];
     let shallow = cbor::TolerantReader::with_max_depth(4);
     assert_eq!(
@@ -502,8 +473,7 @@ fn tolerant_reader_enforces_depth_limit() {
 
 #[test]
 fn entry_kind_structured_encoding_stable() {
-    // v2 golden bytes: EntryData = [format_version, kind_tag, actor,
-    // parents, vector_clock, sequence, typed_payload].
+    // v3 golden bytes; hashes are framed (0x58 0x22 header, 0x1e 0x20 prefix).
     let rng = entry(
         EntryKind::RngDraw,
         ledger_format::ActorId(0),
@@ -516,7 +486,7 @@ fn entry_kind_structured_encoding_stable() {
     assert_eq!(
         rng.try_canonical_bytes().unwrap(),
         vec![
-            0x87, 0x02, 0x0b, 0x00, 0x80, 0x80, 0x00, 0x83, 0x07, 0x00, 0x40
+            0x87, 0x03, 0x0b, 0x00, 0x80, 0x80, 0x00, 0x83, 0x07, 0x00, 0x40
         ]
     );
 
@@ -532,7 +502,7 @@ fn entry_kind_structured_encoding_stable() {
     assert_eq!(
         step.try_canonical_bytes().unwrap(),
         vec![
-            0x87, 0x02, 0x10, 0x00, 0x80, 0x80, 0x00, 0x83, 0x02, 0x03, 0x00
+            0x87, 0x03, 0x10, 0x00, 0x80, 0x80, 0x00, 0x83, 0x02, 0x03, 0x00
         ]
     );
 
@@ -548,7 +518,7 @@ fn entry_kind_structured_encoding_stable() {
     assert_eq!(
         partition.try_canonical_bytes().unwrap(),
         vec![
-            0x87, 0x02, 0x15, 0x00, 0x80, 0x80, 0x00, 0x84, 0x04, 0x01, 0x02, 0xf5
+            0x87, 0x03, 0x15, 0x00, 0x80, 0x80, 0x00, 0x84, 0x04, 0x01, 0x02, 0xf5
         ]
     );
 
@@ -563,10 +533,10 @@ fn entry_kind_structured_encoding_stable() {
     assert_eq!(
         outcome.try_canonical_bytes().unwrap(),
         vec![
-            0x87, 0x02, 0x0c, 0x00, 0x80, 0x80, 0x00, 0x82, 0x58, 0x20, 0xaa, 0xaa, 0xaa, 0xaa,
+            0x87, 0x03, 0x0c, 0x00, 0x80, 0x80, 0x00, 0x82, 0x58, 0x22, 0x1e, 0x20, 0xaa, 0xaa,
             0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
             0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
-            0x18, 0x2a
+            0xaa, 0xaa, 0x18, 0x2a
         ]
     );
 
@@ -605,8 +575,14 @@ fn manifest_round_trip_and_version_reject() {
     let decoded = RunManifest::from_canonical_bytes(&bytes).unwrap();
     assert_eq!(decoded, manifest);
 
-    // A manifest declaring version 1 must be rejected.
+    // Prior versions fail.
     let mut bad = bytes.clone();
+    bad[1] = 0x02;
+    assert_eq!(
+        RunManifest::from_canonical_bytes(&bad),
+        Err(CborError::UnsupportedVersion(2))
+    );
+
     bad[1] = 0x01;
     assert_eq!(
         RunManifest::from_canonical_bytes(&bad),

@@ -1,21 +1,18 @@
 //! Outer frame prefix for every independently readable durable container.
 //!
-//! Version 2 layout:
+//! Version 3 layout:
 //!
 //! ```text
 //! offset  size  field
 //! 0       4     magic bytes, selected from the table below
-//! 4       4     format_version, u32 little-endian, value 2
+//! 4       4     format_version, u32 little-endian, value 3
 //! 8       4     header_len, u32 little-endian
 //! 12      4     flags, u32 little-endian, value 0
 //! ```
 //!
-//! The prefix is followed by exactly `header_len` bytes of canonical CBOR.
-//! A decoder validates the outer version before decoding entries or
-//! allocating payload content. Any value other than [`FORMAT_VERSION`]
-//! returns [`FrameError::UnsupportedVersion`]. Unknown flag bits, incorrect
-//! magic, a non-canonical header, an oversized header, or trailing data
-//! outside the container grammar fails.
+//! Followed by exactly `header_len` canonical CBOR bytes. Anything other
+//! than [`FORMAT_VERSION`], unknown flag bits, wrong magic, a non-canonical
+//! or oversized header, or trailing data outside the grammar fails.
 
 use alloc::vec::Vec;
 
@@ -43,42 +40,32 @@ pub const MAGIC_ENVELOPE: &[u8; 4] = b"LDGE";
 /// Solver-state artifact magic.
 pub const MAGIC_SOLVER_STATE: &[u8; 4] = b"LDGV";
 
-/// Journal archive-file magic.
+/// Journal archive-file magic: registry entry for `archive.ldgr`.
 ///
-/// This is the single registry entry for the archive file magic used by the
-/// journal archive store (`archive.ldgr`). Its bytes are identical to the
-/// former journal-side `ARCHIVE_MAGIC`. It differs from [`MAGIC_ARCHIVE`],
-/// which is a frame-prefix container magic, and the two values must not be
-/// confused: this one starts the big-endian archive file, the other starts a
-/// little-endian frame prefix.
+/// Big-endian file magic; do not confuse with the little-endian
+/// frame-prefix container [`MAGIC_ARCHIVE`].
 pub const MAGIC_JOURNAL_ARCHIVE: &[u8; 4] = b"LDAR";
 
 /// Journal archive-file format version.
 pub const JOURNAL_ARCHIVE_VERSION: u32 = 1;
 
-/// Snapshot-store file magic.
+/// Snapshot-store file magic: registry entry for `snapshots.ldgr`.
 ///
-/// This is the single registry entry for the snapshot-store file magic used
-/// by the journal snapshot store (`snapshots.ldgr`). Its bytes are identical
-/// to the former journal-side `SNAPSHOT_MAGIC`. It differs from
-/// [`MAGIC_SNAPSHOT`], which is a frame-prefix container magic.
+/// File magic; do not confuse with the frame-prefix [`MAGIC_SNAPSHOT`].
 pub const MAGIC_SNAPSHOT_STORE: &[u8; 4] = b"LDSN";
 
 /// Snapshot-store file format version.
 pub const SNAPSHOT_STORE_VERSION: u32 = 1;
 
-/// Outer frame validation failures.
+/// Outer frame failures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrameError {
-    /// The container magic does not match the expected magic.
     WrongMagic,
-    /// The outer format version is not [`FORMAT_VERSION`].
+    /// Outer version is not [`FORMAT_VERSION`].
     UnsupportedVersion(u32),
-    /// A reserved flag bit is set.
     ReservedFlags(u32),
-    /// The declared header length exceeds [`MAX_HEADER_BYTES`].
+    /// Declared header length exceeds [`MAX_HEADER_BYTES`].
     HeaderTooLarge(u32),
-    /// The input ends before the declared header completes.
     TruncatedFrame,
 }
 
@@ -99,11 +86,10 @@ impl core::error::Error for FrameError {}
 /// A validated outer frame prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FramePrefix {
-    /// The container magic that was validated.
     pub magic: [u8; 4],
-    /// Outer format version; always [`FORMAT_VERSION`] after validation.
+    /// Always [`FORMAT_VERSION`] after validation.
     pub format_version: u32,
-    /// Length of the canonical CBOR header that follows the prefix.
+    /// Canonical CBOR header length following the prefix.
     pub header_len: u32,
 }
 
@@ -115,12 +101,10 @@ pub fn encode_prefix(out: &mut Vec<u8>, magic: &[u8; 4], header_len: u32) {
     out.extend_from_slice(&0u32.to_le_bytes());
 }
 
-/// Validates the raw prefix at the start of `bytes` against `expected_magic`.
+/// Validates the raw prefix against `expected_magic`.
 ///
-/// Returns the validated prefix and the offset where the canonical CBOR
-/// header begins. The caller must still verify that the header itself is
-/// exactly `header_len` canonical CBOR bytes and that no trailing data
-/// violates the container grammar.
+/// Returns the prefix and the header offset. The caller must still verify
+/// the header is exactly `header_len` canonical CBOR bytes.
 pub fn parse_prefix(bytes: &[u8], expected_magic: &[u8; 4]) -> Result<FramePrefix, FrameError> {
     if bytes.len() < FRAME_PREFIX_LEN {
         return Err(FrameError::TruncatedFrame);
@@ -188,12 +172,12 @@ mod tests {
     fn wrong_version_is_rejected() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(MAGIC_SEGMENT);
-        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
         bytes.extend_from_slice(&24u32.to_le_bytes());
         bytes.extend_from_slice(&0u32.to_le_bytes());
         assert_eq!(
             parse_prefix(&bytes, MAGIC_SEGMENT),
-            Err(FrameError::UnsupportedVersion(1))
+            Err(FrameError::UnsupportedVersion(2))
         );
     }
 

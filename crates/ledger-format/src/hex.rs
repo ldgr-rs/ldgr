@@ -1,8 +1,5 @@
-//! Hex encoding for 32-byte content hashes.
-//!
-//! One canonical encoder/decoder so every crate prints and parses hashes
-//! identically: 64 lowercase hex chars on the wire, case-insensitive on
-//! decode.
+//! Hex codec for 32-byte content hashes: 64 lowercase chars on encode,
+//! case-insensitive on decode, raw digest only (never the framed multihash).
 
 use alloc::string::String;
 use core::fmt;
@@ -12,9 +9,7 @@ use crate::entry::EntryHash;
 /// Errors from [`hash_from_hex`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HexError {
-    /// Input was not exactly 64 chars; carries the actual length.
     InvalidLength(usize),
-    /// A non-hex character at the given char index.
     InvalidChar { index: usize, char: char },
 }
 
@@ -54,7 +49,7 @@ fn hex_val(byte: u8) -> Option<u8> {
 /// Decode 64 hex chars (either case) into a hash.
 ///
 /// # Errors
-/// Returns [`HexError`] when the input is not exactly 64 hex characters.
+/// Returns [`HexError`] when the input is not 64 hex characters.
 pub fn hash_from_hex(s: &str) -> Result<EntryHash, HexError> {
     if s.len() != 64 {
         return Err(HexError::InvalidLength(s.len()));
