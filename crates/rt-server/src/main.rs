@@ -1,11 +1,6 @@
 // ledger-lint:allow (host binary; rt-server parses process CLI arguments)
 //! `rt-server`: the AGPL engine effect server binary.
-//!
-//! Usage: `rt-server --socket PATH --seed HEX`
-//!
-//! The binary binds a private Unix socket and serves the deterministic effect
-//! protocol. The seed is the run's seed-tree root (32 hex bytes), which also
-//! derives the session identity bound by the handshake.
+//! Usage: `rt-server --socket PATH --seed HEX`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -55,8 +50,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Decode 64 hex characters into a 32-byte seed. Returns `None` on any
-/// malformed input so the server fails closed with the zero seed.
+/// Decode 64 hex chars into a 32-byte seed (`None` fails closed to zero seed).
 fn decode_hex(hex: &str) -> Option<ledger_format::EntryHash> {
     ledger_format::hash_from_hex(hex).ok()
 }

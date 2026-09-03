@@ -73,9 +73,6 @@ pub struct ScaffoldReport {
 }
 
 /// Scaffolds a project template into `dir`.
-///
-/// Refuses to overwrite an existing `repro.ldgr` unless `force` is true.
-/// Other existing files are skipped and reported when `force` is false.
 pub fn scaffold(dir: &Path, force: bool) -> Result<ScaffoldReport, ScaffoldError> {
     fs::create_dir_all(dir).map_err(|error| ScaffoldError::CreateDir {
         path: dir.to_path_buf(),
@@ -306,10 +303,6 @@ merging changes.
 "#;
 
 /// Generates an ldgr-rt based SUT scaffold.
-///
-/// Creates a minimal crate that runs the same async code under tokio
-/// (`cargo run`) and under the deterministic executor
-/// (`cargo run --features sim`).
 pub fn write_sut_scaffold(dir: &Path, force: bool) -> Result<(), ScaffoldError> {
     fs::create_dir_all(dir).map_err(|error| ScaffoldError::CreateDir {
         path: dir.to_path_buf(),

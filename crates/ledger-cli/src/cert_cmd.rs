@@ -32,8 +32,7 @@ pub enum CertVerifyError {
     Json(#[from] serde_json::Error),
 }
 
-/// Maps a statement service failure onto the command error, keeping the
-/// decode-versus-validation distinction the CLI surfaces.
+/// Maps a statement service failure onto the command error.
 fn to_verify_error(error: ServiceError) -> CertVerifyError {
     match error {
         ServiceError::Cert(err) => match &err {
@@ -48,18 +47,7 @@ fn to_verify_error(error: ServiceError) -> CertVerifyError {
 }
 
 /// Verifies a campaign certificate JSON file.
-///
-/// Reads `path` through a bounded reader, validates the statement, and
-/// optionally binds it to a journal.
-///
-/// # Errors
-/// Returns [`CertVerifyError`] when the file cannot be read, parsed, validated,
-/// or bound to the supplied journal.
-/// Verifies a campaign certificate JSON file.
-///
-/// Reads `path` through a bounded reader and runs the named operation.
-/// `Journal` and `InclusionMinimal` require an explicit journal directory;
-/// `Statement` ignores it.
+/// `Journal` and `InclusionMinimal` require a journal directory.
 ///
 /// # Errors
 /// Returns [`CertVerifyError`] when the file cannot be read, parsed, validated,

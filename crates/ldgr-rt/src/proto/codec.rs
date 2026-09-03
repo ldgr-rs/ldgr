@@ -1,15 +1,7 @@
 //! Frame layout and stream codec.
-//!
-//! A frame is:
-//!
-//! ```text
-//! magic[4] | version u16 LE | reserved u16 LE | body_len u32 LE | seq u64 LE | body
-//! ```
-//!
-//! `reserved` must be zero; a decoder rejects any other value. `body_len` is
-//! capped at [`crate::MAX_FRAME_BYTES`] before the body is touched. The
-//! sequence number is validated by the caller (see [`msg::Message`] users):
-//! the codec only carries it so every layer sees the same authoritative value.
+//! `magic[4] | version u16 LE | reserved u16 LE | body_len u32 LE | seq u64 LE | body`.
+//! `reserved` must be zero; `body_len` capped before the body is read;
+//! sequence validated by the caller.
 
 use super::{MAGIC, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 

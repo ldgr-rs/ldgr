@@ -1,11 +1,5 @@
 // ledger-lint:allow (host application; coverage export reads files on disk)
-//! `ledger coverage` export command.
-//!
-//! Input is NDJSON of `{root_hex, run_index, finding}` lines produced by
-//! campaigns. Each line is a JSON object with those three fields. The header
-//! may include comment lines starting with `#` which are ignored.
-//! The command builds a [`CoverageReport`] via [`CoverageBuilder`] and
-//! exports to lcov, SARIF, or JaCoCo.
+//! `ledger coverage` export command (NDJSON `{root_hex, run_index, finding}`).
 
 use std::path::Path;
 
@@ -71,11 +65,8 @@ impl std::error::Error for CoverageCmdError {
 
 /// Run the coverage export for `input` NDJSON and return the rendered output.
 ///
-/// `format` is one of `lcov`, `sarif`, or `jacoco` (case insensitive).
-///
 /// # Errors
-/// Returns [`CoverageCmdError`] when the input cannot be read, parsed, or
-/// exported.
+/// Returns [`CoverageCmdError`] on read, parse, or export failures.
 pub fn run(input: &Path, format: &str) -> Result<String, CoverageCmdError> {
     let raw = std::fs::read_to_string(input).map_err(CoverageCmdError::Io)?;
     let mut builder = CoverageBuilder::new();

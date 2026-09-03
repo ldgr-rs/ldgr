@@ -1,40 +1,17 @@
 //! Workspace automation: `cargo xtask licenses`, `cargo xtask doctor`.
-//!
-//! `licenses` enforces the crate-level licensing split in CI:
-//!
-//! - `ledger-sim`, `ledger-explorer`: AGPL-3.0-or-later (the engine).
-//! - `ledger-format`, `ledger-journal`, `wasm-guest`: MIT OR Apache-2.0.
-//! - everything else: Apache-2.0.
-//!
-//! It also enforces the license-boundary architecture:
-//!
-//! - Non-AGPL crates must not transitively depend on an AGPL crate, except
-//!   the declared composition roots (`ledger-cli`, `ledger-worker`) where
-//!   the permissive surface meets the engine at a process boundary.
-//! - Codec crates (`ledger-adapters`) depend only on contract layers
-//!   (`ledger-format`, `ledger-journal`), never reference journal storage
-//!   internals (segments, persistence, snapshot stores, archives), and
-//!   stay free of runtime/role dependencies such as `tokio`.
-//!
-//! `doctor` checks the onboarding environment: pinned toolchain, committed
-//! lockfile, wasm target, and workflow files.
-//!
-//! Exits 0 when every check passes, 1 otherwise.
+//! `licenses` enforces the crate license split and the license-boundary
+//! architecture; `doctor` checks the onboarding environment.
 
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Crates allowed to import AGPL engine code: they are process boundaries
-/// (binaries/services), not embeddable libraries.
+/// Composition roots allowed to import AGPL engine code.
 const COMPOSITION_ROOTS: [&str; 3] = ["ledger-cli", "ledger-worker", "rt-server"];
 
-/// Codec crates expose the ingest/embedding edge. Their whole value is
-/// external embedding under a permissive license, so their engine surface
-/// is pinned to contract layers and storage internals stay out.
+/// Codec crates pinned to contract layers.
 const CODEC_CRATES: [&str; 1] = ["ledger-adapters"];
 
-/// Journal modules that are persistence machinery, not contract. Codec
-/// crates must not touch them; composition roots may.
+/// Journal persistence internals codec crates must not touch.
 const JOURNAL_INTERNALS: [&str; 4] = [
     "ledger_journal::segment::",
     "ledger_journal::persistent",
@@ -42,8 +19,7 @@ const JOURNAL_INTERNALS: [&str; 4] = [
     "ledger_journal::archive::",
 ];
 
-/// Dependencies that mark a codec crate as growing role behavior (runtimes,
-/// queues). Roles live in the worker and control-plane repos.
+/// Role dependencies codec crates must not grow.
 const ROLE_DEPENDENCIES: [&str; 1] = ["tokio"];
 
 fn expected_license(crate_name: &str) -> &'static str {

@@ -348,9 +348,10 @@ fn deterministic_root_across_orderings_chain() {
 fn already_sorted_stays_identical() {
     // Already sorted input must produce the pinned journal root below: the
     // topo order for a sorted chain is the identity order, so journal bytes
-    // are pinned against silent uniform drift.
+    // are pinned against silent uniform drift. v3 reframed every hashed
+    // entry field as multihash, moving this root honestly.
     const PINNED_ROOT_HEX: &str =
-        "f64bcc43e7f6edc77d49c5474b830e31449f78d4c486333b692b958fa925f7da";
+        "5f97527ab28f5c16b61d6829cec636d5887e4477d86507d0bd19f9c89bdada34";
     let s1 = make_span("t", "s1", None, "op1");
     let s2 = make_span("t", "s2", Some("s1"), "op2");
     let s3 = make_span("t", "s3", Some("s2"), "op3");

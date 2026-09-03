@@ -1,10 +1,6 @@
 // ledger-lint:allow:getrandom:: - host daemon / non-sim passthrough, like TokioBackend
-//! Deterministic RNG facade.
-//!
-//! Why: ambient entropy (`rand::thread_rng`, `getrandom`) is forbidden inside
-//! simulation. Under `sim` this module serves ChaCha20 streams derived from the
-//! seed tree. Outside `sim` it serves OS entropy via `getrandom` wrapped as a
-//! ChaCha RNG so the call site stays identical.
+//! Deterministic RNG facade: ChaCha20 seed-tree streams under `sim`, OS
+//! entropy otherwise so the call site stays identical.
 
 use rand_core::Rng as _;
 use thiserror::Error;
@@ -50,16 +46,11 @@ pub struct DetRng {
 }
 
 impl DetRng {
-    /// Stream label this handle was derived from.
     pub fn stream(&self) -> StreamId {
         self.stream
     }
 
     /// Return the next `u64` from this stream.
-    ///
-    /// In `sim-link` this draw is journaled when called via a `Handle`.
-    /// Under `sim` (IPC) the local RNG is not journaled; the remote run is
-    /// deterministic server-side.
     pub fn next_u64(&mut self) -> u64 {
         #[cfg(feature = "sim-link")]
         {

@@ -1,15 +1,5 @@
 // ledger-lint:allow (host application; fault scenarios load DSL files from disk)
 //! `ledger faults` command: compile and apply failure-spec scenarios.
-//!
-//! `compile` parses and compiles a DSL file via `ledger-faultspec` and lists
-//! each fault with its kind, target, and cost. The cost is a deterministic
-//! magnitude estimate derived from the block parameters (percent for drops,
-//! ticks for delays and clock skew, byte span for corruption, 1 otherwise);
-//! exact per-event costs need a live journal and stay the LDFI solver's job.
-//!
-//! `apply` bridges the compiled scenario onto a seeded [`RunConfig`] through
-//! the explorer's `faultspec_bridge`, runs the reference mini-KV workload,
-//! and prints the journal root plus the applied-fault count.
 
 use std::path::Path;
 
@@ -53,12 +43,13 @@ fn kind_name(kind: EntryKind) -> &'static str {
     }
 }
 
-/// Human-readable target label for one compiled block.
+/// Target label for one compiled block.
 fn target_label(fault: &CompiledFault) -> String {
     match fault {
         CompiledFault::Drop { src, dst, .. }
         | CompiledFault::Partition { src, dst }
-        | CompiledFault::Delay { src, dst, .. } => format!("{src}->{dst}"),
+        | CompiledFault::Delay { src, dst, .. }
+        | CompiledFault::Duplicate { src, dst } => format!("{src}->{dst}"),
         CompiledFault::Crash { actor, .. } | CompiledFault::ClockSkew { actor, .. } => {
             actor.clone()
         }
@@ -78,6 +69,7 @@ fn fault_cost(fault: &CompiledFault) -> u64 {
         CompiledFault::Delay { ticks, .. } => *ticks,
         CompiledFault::Partition { .. }
         | CompiledFault::Crash { .. }
+        | CompiledFault::Duplicate { .. }
         | CompiledFault::TornWrite { .. } => 1,
     }
 }
@@ -98,9 +90,6 @@ struct FaultRow {
 }
 
 /// Zips entry kinds with schedule injections into listing rows.
-///
-/// The compiler emits one fault entry and one injection per block, so the
-/// zip never truncates; it only guards against future shape drift.
 fn fault_rows(compiled: &CompiledScenario) -> Vec<FaultRow> {
     compiled
         .faults
@@ -118,11 +107,8 @@ fn fault_rows(compiled: &CompiledScenario) -> Vec<FaultRow> {
 
 /// Compiles the scenario at `path` and renders the fault listing.
 ///
-/// Returns human-readable text, or a JSON object when `json` is set.
-///
 /// # Errors
-/// Returns [`FaultsError`] when the file cannot be read or the DSL fails to
-/// parse or compile, including [`ScenarioError::StormDetected`] rejections.
+/// Returns [`FaultsError`] on read, parse, or compile failures.
 pub fn compile_scenario(path: &Path, json: bool) -> Result<String, FaultsError> {
     let compiled = load_compiled(path)?;
     let rows = fault_rows(&compiled);
@@ -171,15 +157,10 @@ fn parse_seed_hex(seed_hex: &str) -> Result<EntryHash, FaultsError> {
     Ok(EntryHash(seed))
 }
 
-/// Compiles the scenario, applies it to a seeded run config, runs the
-/// selected workload, and renders the result.
-///
-/// When `json` is true, output is `{"journal_root_hex":"...","applied_faults":N}`.
-/// Otherwise a human-readable summary is returned.
+/// Compiles the scenario, applies it to a seeded run, and renders the result.
 ///
 /// # Errors
-/// Returns [`FaultsError`] on read, parse, compile (including storm
-/// detection), seed-hex, workload, or simulation failures.
+/// Returns [`FaultsError`] on read, parse, compile, seed, workload, or run failures.
 pub fn apply_scenario(
     path: &Path,
     seed_hex: &str,

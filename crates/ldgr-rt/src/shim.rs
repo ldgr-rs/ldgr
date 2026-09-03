@@ -1,12 +1,5 @@
-//! Framed effect-protocol client for the SUT side of the D1 boundary.
-//!
-//! This is the explicit shim an external SUT (for example the canary binary)
-//! links against. It connects to the AGPL `rt-server`, performs the identity
-//! handshake, then exchanges one deterministic effect request at a time.
-//!
-//! Computation between effects (the SUT's business logic) is outside the
-//! deterministic boundary; only the effects cross this shim, so the engine
-//! journals a pure function of the effect stream and the seed.
+//! Framed effect-protocol client for the SUT side: connects to `rt-server`,
+//! handshakes identity, then exchanges one deterministic effect at a time.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -52,12 +45,7 @@ pub struct EngineSession {
 }
 
 impl EngineSession {
-    /// Connect to the engine at `socket` and complete the identity handshake.
-    ///
-    /// `identity` must equal the digest the server was launched with; any
-    /// mismatch fails closed before the first effect. `actor` binds this
-    /// connection's effect routing; it is echoed back in `Welcome` and must
-    /// match, otherwise the session fails closed.
+    /// Connect and complete the identity handshake (mismatch fails closed).
     pub fn connect(socket: &Path, identity: EntryHash, actor: ActorId) -> Result<Self, ShimError> {
         if actor.0 > crate::proto::MAX_ACTOR {
             return Err(ShimError::InvalidActor {
@@ -89,7 +77,6 @@ impl EngineSession {
         }
     }
 
-    /// The stable actor id assigned by the server.
     pub fn actor(&self) -> ActorId {
         self.actor
     }

@@ -1,17 +1,16 @@
-//! Message bodies carried inside frames.
-//!
-//! The client (`ldgr-rt` shim) sends [`Hello`] first (frame sequence 0),
-//! then one [`EffectRequest`] per effect (sequence 1, 2, ...), then a
-//! [`Goodbye`] carrying the run result. The server replies [`Welcome`] or
-//! [`Reject`] to the hello, then one [`EffectResponse`] per request with the
-//! same sequence number.
-//!
-//! All lengths are checked before any allocation. Paths are UTF-8 and capped
-//! at [`crate::MAX_PATH_BYTES`]; payloads at [`crate::MAX_PAYLOAD_BYTES`].
+//! Message bodies carried inside frames: `Hello`(0), effects(1..), `Goodbye`;
+//! server replies `Welcome`/`Reject` then one response per request.
+//! All lengths checked before allocation.
 
 use super::codec::DecodeError;
 use super::{MAX_ACTOR, MAX_PATH_BYTES, MAX_PAYLOAD_BYTES, MAX_RANDOM_COUNT};
 use ledger_format::{ActorId, EntryHash};
+
+/// Wire prefix for a framed `EntryHash` (34 bytes on the wire).
+pub const FRAMED_HASH_PREFIX: [u8; 2] = [0x1e, 0x20];
+
+/// Wire length of one framed `EntryHash`.
+pub const FRAMED_HASH_LEN: usize = 34;
 
 /// A complete application message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +39,8 @@ pub enum Message {
 /// for this connection as that actor; it must not default to zero.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
-    /// Complete `ExecutionIdentity` digest (BLAKE3, 32 bytes).
+    /// Complete `ExecutionIdentity` digest, framed on the wire as 34 bytes
+    /// (`FRAMED_HASH_PREFIX` plus the 32-byte BLAKE3 digest).
     pub identity: EntryHash,
     /// Logical actor this connection sends and receives as.
     pub actor: ActorId,
@@ -88,7 +88,8 @@ pub struct EffectResponse {
 /// Final session message carrying the journal root (server to client).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Goodbye {
-    /// Journal root hash (BLAKE3, 32 bytes).
+    /// Journal root hash, framed on the wire as 34 bytes
+    /// (`FRAMED_HASH_PREFIX` plus the 32-byte BLAKE3 digest).
     pub root: EntryHash,
     /// Number of entries the run journaled.
     pub entries: u64,
@@ -181,7 +182,7 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
     match message {
         Message::Hello(hello) => {
             out.push(T_HELLO);
-            out.extend_from_slice(&hello.identity.0);
+            encode_framed_hash(&hello.identity, &mut out);
             out.extend_from_slice(&hello.actor.0.to_le_bytes());
         }
         Message::Welcome(welcome) => {
@@ -205,7 +206,7 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
         Message::Finish => out.push(T_FINISH),
         Message::Goodbye(goodbye) => {
             out.push(T_GOODBYE);
-            out.extend_from_slice(&goodbye.root.0);
+            encode_framed_hash(&goodbye.root, &mut out);
             out.extend_from_slice(&goodbye.entries.to_le_bytes());
         }
     }
@@ -291,13 +292,22 @@ fn encode_path(path: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(path.as_bytes());
 }
 
+/// Append one framed hash (`FRAMED_HASH_PREFIX || digest`, 34 bytes).
+///
+/// Uses the canonical `EntryHash::to_framed_bytes` wire form: internal
+/// values stay raw 32-byte digests, hex stays 64 chars, only this binary
+/// encoding frames.
+fn encode_framed_hash(hash: &EntryHash, out: &mut Vec<u8>) {
+    out.extend_from_slice(&hash.to_framed_bytes());
+}
+
 /// Decode a message body.
 pub fn decode_message(body: &[u8]) -> Result<Message, DecodeError> {
     let mut r = Reader::new(body);
     let tag = r.u8()?;
     match tag {
         T_HELLO => {
-            let identity = r.hash32()?;
+            let identity = r.hash_framed()?;
             let actor_raw = r.u32()?;
             if actor_raw > MAX_ACTOR {
                 return Err(DecodeError::BadActor(actor_raw));
@@ -332,7 +342,7 @@ pub fn decode_message(body: &[u8]) -> Result<Message, DecodeError> {
             Ok(Message::Finish)
         }
         T_GOODBYE => {
-            let root = r.hash32()?;
+            let root = r.hash_framed()?;
             let entries = r.u64()?;
             r.finish()?;
             Ok(Message::Goodbye(Goodbye { root, entries }))
@@ -471,11 +481,9 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(out))
     }
 
-    fn hash32(&mut self) -> Result<EntryHash, DecodeError> {
-        let bytes = self.take(32)?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(bytes);
-        Ok(EntryHash(out))
+    fn hash_framed(&mut self) -> Result<EntryHash, DecodeError> {
+        let bytes = self.take(FRAMED_HASH_LEN)?;
+        EntryHash::from_framed_bytes(bytes).map_err(|_| DecodeError::BadHash)
     }
 
     fn bounded_bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
@@ -626,13 +634,64 @@ mod tests {
             Err(DecodeError::BadActor(crate::proto::MAX_ACTOR + 1)),
             "an actor over the cap must fail closed"
         );
-        // A truncated hello (identity without actor) fails closed.
+        // A truncated hello (framed identity without actor) fails closed.
         let mut short = vec![T_HELLO];
+        short.extend_from_slice(&FRAMED_HASH_PREFIX);
         short.extend_from_slice(&[0xAA; 32]);
         assert_eq!(
             decode_message(&short),
             Err(DecodeError::UnexpectedEof),
             "old hellos without actor must not decode"
+        );
+    }
+
+    #[test]
+    fn framed_hashes_encode_34_bytes_with_prefix() {
+        let hello = Message::Hello(Hello {
+            identity: EntryHash([0xAA; 32]),
+            actor: ActorId(3),
+        });
+        let body = encode_message(&hello);
+        assert_eq!(body.len(), 1 + FRAMED_HASH_LEN + 4);
+        assert_eq!(&body[1..3], &FRAMED_HASH_PREFIX);
+        assert_eq!(&body[3..35], &[0xAA; 32]);
+
+        let goodbye = Message::Goodbye(Goodbye {
+            root: EntryHash([0xBB; 32]),
+            entries: 12,
+        });
+        let body = encode_message(&goodbye);
+        assert_eq!(body.len(), 1 + FRAMED_HASH_LEN + 8);
+        assert_eq!(&body[1..3], &FRAMED_HASH_PREFIX);
+        assert_eq!(&body[3..35], &[0xBB; 32]);
+    }
+
+    #[test]
+    fn framed_hash_with_bad_prefix_fails_closed() {
+        let mut body = vec![T_HELLO];
+        body.extend_from_slice(&[0x00, 0x00]);
+        body.extend_from_slice(&[0xAA; 32]);
+        body.extend_from_slice(&3u32.to_le_bytes());
+        assert_eq!(decode_message(&body), Err(DecodeError::BadHash));
+
+        let mut body = vec![T_GOODBYE];
+        body.extend_from_slice(&[0x00, 0x00]);
+        body.extend_from_slice(&[0xBB; 32]);
+        body.extend_from_slice(&12u64.to_le_bytes());
+        assert_eq!(decode_message(&body), Err(DecodeError::BadHash));
+    }
+
+    #[test]
+    fn raw_32_byte_hash_no_longer_decodes() {
+        // Pre-framing wire carried a raw 32-byte digest. That form must not
+        // decode now: the framed reader needs 34 bytes, so a raw body is
+        // truncated, and a raw digest followed by an actor reads the wrong
+        // prefix and fails with BadHash.
+        let mut raw_truncated = vec![T_HELLO];
+        raw_truncated.extend_from_slice(&[0xAA; 32]);
+        assert_eq!(
+            decode_message(&raw_truncated),
+            Err(DecodeError::UnexpectedEof)
         );
     }
 }

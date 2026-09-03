@@ -24,7 +24,6 @@ use clap_verbosity_flag::{Verbosity, VerbosityFilter};
 use ledger_format::{ActorId, EntryHash, EntryKind, EntryPayload, SendFrame};
 use ledger_sim::{Instruction, Policy, Probability, RunResult};
 
-/// Default pct_mix 0.1 without unwrap or expect; 0.1 is known valid.
 pub(crate) fn default_pct_mix() -> Probability {
     match Probability::new(0.1) {
         Ok(prob) => prob,
@@ -36,9 +35,6 @@ pub(crate) fn default_pct_mix() -> Probability {
 pub use clap_complete::Shell;
 
 /// Emits shell completions for the ledger command.
-///
-/// This helper lives in the library so integration tests can exercise the
-/// generator without spawning the binary.
 pub fn generate_completions(shell: clap_complete::Shell, out: &mut dyn io::Write) {
     let mut command = Cli::command();
     clap_complete::generate(shell, &mut command, "ledger", out);
@@ -118,7 +114,6 @@ pub fn seed_from_u64(value: u64) -> EntryHash {
     EntryHash(seed)
 }
 
-/// Returns true when the requested verbosity shows detail beyond the default.
 pub fn is_verbose(filter: VerbosityFilter) -> bool {
     matches!(
         filter,

@@ -1,10 +1,5 @@
 // ledger-lint:allow:SystemTime::now() - host daemon / non-sim passthrough, like TokioBackend
-//! Deterministic clock facade.
-//!
-//! Why a wrapper: direct `Instant::now` or `SystemTime::now` would break
-//! determinism under `sim`. This module routes to virtual time when compiled
-//! with `sim` and to the ambient clock otherwise, so the same SUT source stays
-//! deterministic in sim and live in production.
+//! Deterministic clock facade: virtual time under `sim`, ambient clock otherwise.
 
 use core::time::Duration;
 
@@ -27,10 +22,6 @@ pub enum ClockError {
 }
 
 /// Deterministic clock handle.
-///
-/// In `sim-link` mode the handle captures virtual time at creation. In
-/// non-sim and `sim` IPC mode it is a zero-cost marker that reads system time
-/// on demand. IPC runs are deterministic server-side via `rt-server`.
 #[derive(Debug, Clone, Copy)]
 pub struct SimClock {
     #[cfg(feature = "sim-link")]
@@ -41,10 +32,6 @@ pub struct SimClock {
 
 impl SimClock {
     /// Snapshot the current time.
-    ///
-    /// In `sim-link` mode this value comes from `VirtualTime` via the executor.
-    /// Outside `sim-link` it comes from `SystemTime`. IPC mode is ambient
-    /// locally and deterministic server-side.
     pub fn now(&self) -> Duration {
         #[cfg(feature = "sim-link")]
         {
@@ -58,7 +45,7 @@ impl SimClock {
         }
     }
 
-    /// Raw tick value (microseconds) for sim-mode expiry math.
+    /// Raw tick value (microseconds).
     pub fn ticks(&self) -> u64 {
         #[cfg(feature = "sim-link")]
         {

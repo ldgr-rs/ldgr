@@ -1,21 +1,6 @@
 //! Runtime profile handshake between worker and control plane.
-//!
-//! A [`RuntimeProfile`] captures the engine build and host shape a worker
-//! runs under: `engine_sha`, `toolchain`, compile-time `features`,
-//! `sut_hashes` (system-under-test digests, provided at registration),
-//! `cpu_topology`, and `env_sanitation` (names of stripped variable
-//! patterns). The blake3 [`RuntimeProfile::fingerprint`] over the canonical
-//! field encoding is the handshake identity:
-//!
-//! - Wire: the session hello carries the hex fingerprint in
-//!   `RuntimeProfile.fingerprint_hex`; the control plane validates it.
-//! - Certificates: emission sites append `+<hex8>` to the builder id when
-//!   `LEDGER_PROFILE_FINGERPRINT` is set (see
-//!   `examples/nightly_swarm_campaign.rs`), binding certificates to the
-//!   runtime that produced them.
-//!
-//! The fingerprint is deterministic: list fields are sorted before hashing,
-//! so equal profiles fingerprint equally regardless of registration order.
+//! [`RuntimeProfile`] captures engine build and host shape; the blake3
+//! fingerprint is the handshake identity (lists sorted before hashing).
 
 use ledger_format::EntryHash;
 use serde::{Deserialize, Serialize};
@@ -48,9 +33,6 @@ pub struct RuntimeProfile {
 
 impl RuntimeProfile {
     /// Detect the profile of the running worker.
-    ///
-    /// Compile-time fields come from the `LDGR_*` build environment with
-    /// documented fallbacks; `cpu_topology` is read from the host.
     pub fn detect() -> Self {
         Self {
             engine_sha: option_env!("LDGR_ENGINE_SHA")
@@ -67,10 +49,6 @@ impl RuntimeProfile {
     }
 
     /// Deterministic blake3 fingerprint over the canonical field encoding.
-    ///
-    /// Fields are encoded length-prefixed in declaration order; `sut_hashes`
-    /// and `env_sanitation` are sorted first so registration order does not
-    /// change the fingerprint.
     pub fn fingerprint(&self) -> EntryHash {
         EntryHash(*blake3::hash(&self.canonical_bytes()).as_bytes())
     }
@@ -111,10 +89,6 @@ fn encode_sorted_strings(list: &[String], out: &mut Vec<u8>) {
 }
 
 /// Comma-separated sorted list of enabled crate features.
-///
-/// Every crate feature must appear here: the list feeds the runtime-profile
-/// fingerprint, so an unlisted feature would make different builds claim
-/// the same identity.
 fn feature_list() -> String {
     let mut features: Vec<&'static str> = Vec::new();
     if cfg!(feature = "control-plane") {
@@ -130,7 +104,7 @@ fn feature_list() -> String {
     features.join(",")
 }
 
-/// Host CPU shape; parallelism count when available, else "unknown".
+/// Host CPU shape.
 fn cpu_topology() -> String {
     match std::thread::available_parallelism() {
         Ok(cpus) => format!("cpus={cpus}"),

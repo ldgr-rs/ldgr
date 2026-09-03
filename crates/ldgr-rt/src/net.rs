@@ -1,14 +1,5 @@
-//! Message-based network facade.
-//!
-//! Why: raw `std::net` is forbidden inside simulation. This module exposes a
-//! minimal `Conn` channel between two logical actors. Under `sim` it forwards
-//! to `SimNet` (partition-aware, timed delivery). Outside `sim` it is an
-//! in-process rendezvous channel with no network effects.
-//!
-//! The `Conn` stores [`ActorId`] explicitly so a [`Handle`] bound to one actor
-//! can send as that actor (`Handle::with_actor`). The shared in-process net
-//! keeps the same partition and queue semantics as `SimNet` but without virtual
-//! time - a thin drop-in facade.
+//! Message-based network facade: `Conn` channel between two actors.
+//! Under `sim` forwards to `SimNet`; outside `sim` an in-process channel.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -40,7 +31,6 @@ struct Message {
 }
 
 impl Conn {
-    /// Create a connection from `from` to `to` over the given shared network.
     pub fn new(from: ActorId, to: ActorId, shared: SharedNetwork) -> Self {
         Self { from, to, shared }
     }
@@ -54,7 +44,7 @@ impl Conn {
         }
     }
 
-    /// Send a payload. Returns `false` when the link is partitioned.
+    /// Send a payload (`false` when partitioned).
     pub fn send(&self, payload: u64) -> bool {
         let mut net = match self.shared.inner().lock() {
             Ok(g) => g,
@@ -73,7 +63,7 @@ impl Conn {
         true
     }
 
-    /// Non-blocking receive for `to` matching this connection's destination.
+    /// Non-blocking receive.
     pub fn recv(&self) -> Option<u64> {
         let mut net = match self.shared.inner().lock() {
             Ok(g) => g,
@@ -86,7 +76,6 @@ impl Conn {
         net.queue.remove(pos).map(|m| m.payload)
     }
 
-    /// Whether a message is ready for this connection's destination.
     pub fn has_ready(&self) -> bool {
         let net = match self.shared.inner().lock() {
             Ok(g) => g,
@@ -97,7 +86,7 @@ impl Conn {
             .any(|m| m.from == self.from && m.to == self.to)
     }
 
-    /// Partition this directed link. Further sends return `false`.
+    /// Partition this directed link.
     pub fn partition(&self) {
         // Recover from a poisoned lock (impossible in the single-threaded
         // sim) so the partition is never silently dropped.
@@ -109,7 +98,6 @@ impl Conn {
         net.partitions.insert((self.from, self.to));
     }
 
-    /// Whether this link is currently partitioned.
     pub fn is_partitioned(&self) -> bool {
         self.shared
             .inner()
@@ -128,10 +116,6 @@ impl Conn {
 }
 
 /// Shared in-process network backing non-sim `Conn`s.
-///
-/// The handle is opaque: the internal mutex never leaves this module, so link
-/// state can only change through [`Conn`] methods or the crate-internal net.
-/// Create one with [`shared_network`] and share it by cloning.
 #[derive(Debug, Clone, Default)]
 pub struct SharedNetwork {
     inner: Arc<Mutex<SharedNet>>,
@@ -139,29 +123,25 @@ pub struct SharedNetwork {
 }
 
 impl SharedNetwork {
-    /// Crate-internal access to the guarded net state.
     pub(crate) fn inner(&self) -> &Arc<Mutex<SharedNet>> {
         &self.inner
     }
 
-    /// Crate-internal access to the notification primitive.
     pub(crate) fn notify(&self) -> &Arc<tokio::sync::Notify> {
         &self.notify
     }
 }
 
 impl SharedNet {
-    /// Remove the oldest queued message addressed to `actor` from any sender.
-    ///
-    /// Why destination-based: receivers must not depend on knowing or
-    /// scanning sender ids, so receives work across the full actor id space.
+    /// Remove the oldest message addressed to `actor` (destination-based
+    /// so receives span the full actor id space).
     pub(crate) fn recv_for(&mut self, actor: ActorId) -> Option<u64> {
         let pos = self.queue.iter().position(|m| m.to == actor)?;
         self.queue.remove(pos).map(|m| m.payload)
     }
 }
 
-/// Create a shared network with one shared queue (non-sim path).
+/// Create a shared network (non-sim path).
 pub fn shared_network() -> SharedNetwork {
     SharedNetwork::default()
 }

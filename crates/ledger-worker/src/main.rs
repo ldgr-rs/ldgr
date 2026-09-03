@@ -53,9 +53,7 @@ struct LedgerWorker {
     artifact_base_url: Option<String>,
 }
 
-/// Typed failure of queue-file loading. Open and read failures keep the
-/// [`std::io::Error`] source; per-line failures keep the line number and
-/// their own typed sources via [`QueueFileError`].
+/// Typed failure of queue-file loading.
 #[derive(Debug, thiserror::Error)]
 enum QueueLoadError {
     /// The queue file could not be opened.
@@ -69,14 +67,12 @@ enum QueueLoadError {
     /// A line could not be read from the open file.
     #[error("queue file read: {0}")]
     Read(#[from] std::io::Error),
-    /// A decoded line violated the queue-file projection contract. This
-    /// branch carries the 1-based line number through [`QueueFileError`].
+    /// A decoded line violated the queue-file contract.
     #[error(transparent)]
     Parse(#[from] QueueFileError),
 }
 
-/// Load NDJSON task specs into the queue. Malformed lines are reported and
-/// skipped so one bad row cannot silence the whole file.
+/// Load NDJSON task specs into the queue (bad rows skipped).
 fn load_queue_file(path: &PathBuf, queue: &mut InMemoryQueue) -> Result<usize, QueueLoadError> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).map_err(|source| QueueLoadError::Open {

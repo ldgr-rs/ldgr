@@ -1,19 +1,9 @@
 #![deny(unsafe_code)]
 
 //! Failure-spec DSL, compiler, and canonical scenario library.
-//!
-//! This crate is a pure spec seam (Apache-2.0) that parses a human-readable
-//! failure DSL and compiles it into neutral fault types. The porting seam to
-//! the simulation engine goes through `ledger-format` types only: each
-//! scenario compiles to ordered `(EntryKind, FaultSpec)` entries plus a
-//! string-targeted `FaultInjection` schedule, both accessible from
-//! [`CompiledScenario`]. The `ledger-explorer` crate (AGPL) owns the bridge
-//! `faultspec_bridge` that converts this neutral output into hash-targeted
-//! engine faults and wires it into `RunConfig.fault_schedule()` via
-//! deterministic BLAKE3 hashing. Same DSL yields same engine faults without a
-//! live journal. The two fault types stay explicitly named at that seam: this
-//! crate's string-targeted `FaultInjection` and the engine's hash-targeted
-//! `ledger_sim::SimFault`. No AGPL type is imported by this crate.
+//! Pure spec seam (Apache-2.0): DSL compiles to neutral fault types over
+//! `ledger-format` only. The `ledger-explorer` bridge converts them to
+//! engine faults. No AGPL import.
 
 mod compiler;
 mod library;

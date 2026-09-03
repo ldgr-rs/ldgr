@@ -90,9 +90,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 "#;
 
 /// Scaffold a consensus-family template into `dir`.
-///
-/// `template` is `consensus` | `kv` | `2pc`. Creates `Cargo.toml` and
-/// `src/main.rs`. Refuses to overwrite existing files unless `force` is true.
 pub fn scaffold_consensus(
     dir: &Path,
     template: &str,

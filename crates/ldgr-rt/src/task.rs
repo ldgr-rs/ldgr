@@ -1,10 +1,4 @@
-//! Cooperative task spawning facade.
-//!
-//! Why a wrapper: `std::thread::spawn` and ambient `tokio::spawn` break the
-//! single-threaded deterministic scheduling invariant. Under `sim-link` this
-//! module backs `Handle::spawn`, which forwards to `Boundary::spawn_task`.
-//! Outside `sim-link` `Handle::spawn` forwards to `tokio` (including `sim`
-//! IPC mode, where the remote run is deterministic server-side).
+//! Cooperative task spawning facade (single-threaded deterministic schedule).
 
 use ledger_format::EntryHash;
 
@@ -12,12 +6,8 @@ use ledger_format::EntryHash;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TaskId(pub u64);
 
-/// Content-addressed task identifier.
-///
-/// Hashes `name` and `input_hash` with BLAKE3 to produce a stable `TaskId` so
-/// tasks can be deduped across runs (CAM idea). The same `(name, input)`
-/// always yields the same id on every platform; different inputs yield
-/// uncorrelated ids. The sentinel `0` is never returned.
+/// Content-addressed task identifier: BLAKE3(`name`, `input_hash`).
+/// Same input yields same id; sentinel `0` is never returned.
 pub fn task_id_for(name: &str, input_hash: EntryHash) -> TaskId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(name.as_bytes());

@@ -51,6 +51,22 @@ fn compile_json_array_parses() {
 }
 
 #[test]
+fn compile_duplicate_lists_send_target_cost_one() {
+    let path = write_dsl("dup", "scenario demo\nduplicate a->b\n");
+    let out = compile_scenario(&path, false).unwrap();
+    assert!(out.contains("scenario 'demo': 1 fault(s)"), "got: {out}");
+    assert!(
+        out.contains("[0] kind=send target=a->b cost=1"),
+        "got: {out}"
+    );
+    let json_out = compile_scenario(&path, true).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+    assert_eq!(value["faults"][0]["kind"], "send");
+    assert_eq!(value["faults"][0]["target"], "a->b");
+    assert_eq!(value["faults"][0]["cost"], 1);
+}
+
+#[test]
 fn compile_rejects_storm_with_nonzero_error() {
     let storm = "scenario s\n\
                  partition a->b\npartition a->c\npartition a->d\n\

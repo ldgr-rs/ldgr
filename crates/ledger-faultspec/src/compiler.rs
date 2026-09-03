@@ -7,12 +7,8 @@ use ledger_format::{ActorId, EntryKind, FaultSpec};
 use crate::parser::{Block, Scenario, ScenarioError};
 
 /// A scheduled fault injection derived from a scenario block.
-///
-/// String-targeted (spec-shaped). This is the neutral representation owned by
-/// the Apache-licensed spec crate. The `ledger-explorer` bridge (AGPL) converts
-/// it into hash-targeted engine faults via deterministic BLAKE3 hashing at the
-/// porting seam. Keeping the spec string-targeted preserves readability and
-/// avoids coupling the DSL to entry IDs.
+/// String-targeted neutral form; the explorer bridge converts it to
+/// hash-targeted engine faults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaultInjection {
     Drop {
@@ -46,6 +42,10 @@ pub enum FaultInjection {
         dst: String,
         ticks: u64,
     },
+    Duplicate {
+        src: String,
+        dst: String,
+    },
 }
 
 /// Compiled scenario with validated faults and schedule.
@@ -57,9 +57,6 @@ pub struct CompiledScenario {
 }
 
 /// Compile a scenario, validating and producing ordered fault entries.
-///
-/// Validation includes percent bounds, range ordering, duplicate-target
-/// detection, and storm heuristics (>5 total faults or >3 faults on same actor).
 pub fn compile(scenario: &Scenario) -> Result<CompiledScenario, ScenarioError> {
     // Storm heuristic: too many total faults.
     if scenario.blocks.len() > 5 {
@@ -124,14 +121,11 @@ fn actors_for_block(block: &Block) -> Vec<String> {
         Block::Partition { src, dst } => vec![src.clone(), dst.clone()],
         Block::ClockSkew { actor, .. } => vec![actor.clone()],
         Block::BoundedLatency { src, dst, .. } => vec![src.clone(), dst.clone()],
+        Block::Duplicate { src, dst } => vec![src.clone(), dst.clone()],
     }
 }
 
 /// Actor names a block addresses as simulated actors.
-///
-/// `Corrupt` segments and `TornWrite` flags name storage objects, not
-/// actors, so they stay out of the actor registry (they still count toward
-/// the per-actor storm heuristic via [`actors_for_block`]).
 fn actor_names_for_block(block: &Block) -> Vec<String> {
     match block {
         Block::Drop { src, dst, .. } => vec![src.clone(), dst.clone()],
@@ -141,15 +135,11 @@ fn actor_names_for_block(block: &Block) -> Vec<String> {
         Block::Partition { src, dst } => vec![src.clone(), dst.clone()],
         Block::ClockSkew { actor, .. } => vec![actor.clone()],
         Block::BoundedLatency { src, dst, .. } => vec![src.clone(), dst.clone()],
+        Block::Duplicate { src, dst } => vec![src.clone(), dst.clone()],
     }
 }
 
-/// Historic deterministic id for opaque actor names.
-///
-/// Restored wrapping multiply (`h % 10000 + 1`, never 0) so ad-hoc
-/// topologies keep byte-stable mappings across refactors. Collisions
-/// between distinct names are detected at registration, not silently
-/// merged.
+/// Historic deterministic id for opaque actor names (wrapping hash, never 0).
 pub fn opaque_actor_id(name: &str) -> ActorId {
     let mut h: u32 = 0;
     for b in name.bytes() {
@@ -163,11 +153,6 @@ pub fn opaque_actor_id(name: &str) -> ActorId {
 }
 
 /// Build the scenario-scoped registry for `compile`.
-///
-/// Starts from [`ActorRegistry::with_known`] and auto-registers every
-/// opaque name the scenario mentions at its [`opaque_actor_id`]. Numeric
-/// suffixes need no registration. Distinct names that map to one id fail
-/// with [`ScenarioError::ActorCollision`].
 pub fn scenario_registry(
     names: impl IntoIterator<Item = String>,
 ) -> Result<ActorRegistry, ScenarioError> {
@@ -331,18 +316,38 @@ fn compile_block(
             };
             Ok((faults, inj))
         }
+        Block::Duplicate { src, dst } => {
+            let src_id = registry.resolve(src)?;
+            let dst_id = registry.resolve(dst)?;
+            if src_id == dst_id && src != dst {
+                return Err(ScenarioError::ActorCollision {
+                    first: src.clone(),
+                    second: dst.clone(),
+                    id: src_id,
+                });
+            }
+            let faults = vec![(EntryKind::Send, FaultSpec::Duplicate)];
+            let inj = FaultInjection::Duplicate {
+                src: src.clone(),
+                dst: dst.clone(),
+            };
+            Ok((faults, inj))
+        }
     }
 }
 
-/// Record Partition actor ids and reject cross-block id reuse across
-/// distinct names.
+/// Record Partition and Duplicate actor ids and reject cross-block id
+/// reuse across distinct names.
 fn check_partition_collision(
     injection: &FaultInjection,
     registry: &ActorRegistry,
     owners: &mut HashMap<ActorId, String>,
 ) -> Result<(), ScenarioError> {
-    let FaultInjection::Partition { src, dst } = injection else {
-        return Ok(());
+    let (src, dst) = match injection {
+        FaultInjection::Partition { src, dst } | FaultInjection::Duplicate { src, dst } => {
+            (src, dst)
+        }
+        _ => return Ok(()),
     };
     for name in [src, dst] {
         // Names resolve through the scenario registry built at compile;
@@ -372,25 +377,14 @@ fn target_key(block: &Block) -> String {
         Block::Partition { src, dst } => format!("partition:{src}->{dst}"),
         Block::ClockSkew { actor, .. } => format!("clock:{actor}"),
         Block::BoundedLatency { src, dst, .. } => format!("latency:{src}->{dst}"),
+        Block::Duplicate { src, dst } => format!("duplicate:{src}->{dst}"),
     }
 }
 
-/// Maximum actor id accepted by the registry.
-///
-/// Matches the IPC wire cap so compiled partitions stay routable; larger
-/// numeric suffixes are rejected with [`ScenarioError::InvalidActorId`].
-/// Zero is the default first actor and stays valid.
+/// Maximum actor id accepted by the registry (matches IPC wire cap).
 pub const MAX_REGISTRY_ACTOR_ID: u32 = 1 << 20;
 
 /// Deterministic actor registry for opaque names.
-///
-/// Numeric suffixes (`replica-2`, `node:3`, `replica-0`) resolve directly
-/// without registration. Opaque names resolve through the scenario-scoped
-/// registry built by [`scenario_registry`], which auto-registers every
-/// name the scenario mentions at its [`opaque_actor_id`]; direct
-/// [`ActorRegistry::resolve`] on an unregistered opaque name fails with
-/// [`ScenarioError::UnknownActor`]. Registration rejects id reuse across
-/// distinct names with [`ScenarioError::ActorCollision`].
 #[derive(Debug, Clone, Default)]
 pub struct ActorRegistry {
     by_name: std::collections::BTreeMap<String, ActorId>,
@@ -398,14 +392,11 @@ pub struct ActorRegistry {
 }
 
 impl ActorRegistry {
-    /// Empty registry with no opaque names.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Registry preloaded with the canonical opaque names at their historic
-    /// ids (`leader` -> 3002, `replica` -> 4633) so existing canonical
-    /// scenarios keep identical mappings.
+    /// Registry preloaded with canonical names (`leader`, `replica`).
     pub fn with_known() -> Self {
         let mut registry = Self::new();
         // Historic wrapping-hash values, preserved so canonical fixtures do
@@ -416,10 +407,6 @@ impl ActorRegistry {
     }
 
     /// Register `name` at `id`.
-    ///
-    /// Rejects empty or overlong names and over-cap ids, and id reuse
-    /// across distinct names. Zero is a valid actor (the default first
-    /// actor; sim and the IPC wire both accept it).
     pub fn register(&mut self, name: &str, id: ActorId) -> Result<(), ScenarioError> {
         if name.is_empty() || name.len() > crate::parser::MAX_NAME_LEN {
             return Err(ScenarioError::InvalidSyntax(format!(
@@ -456,13 +443,7 @@ impl ActorRegistry {
         Ok(())
     }
 
-    /// Resolve `name` to an actor id.
-    ///
-    /// A trailing numeric suffix after `-` or `:` resolves directly
-    /// (`replica-2` -> 2, `node:3` -> 3, `replica-0` -> 0) within
-    /// `0..=MAX`. Opaque names resolve through registration (see
-    /// [`scenario_registry` for scenario-scoped auto-registration);
-    /// unknown opaque names fail with [`ScenarioError::UnknownActor`].
+    /// Resolve `name` to an actor id (numeric suffix direct, else registry).
     pub fn resolve(&self, name: &str) -> Result<ActorId, ScenarioError> {
         if name.is_empty() || name.len() > crate::parser::MAX_NAME_LEN {
             return Err(ScenarioError::InvalidSyntax(format!(
@@ -494,14 +475,6 @@ fn check_numeric_id(name: &str, id: u32) -> Result<ActorId, ScenarioError> {
 }
 
 /// Deterministic actor-id parse shared with the explorer bridge.
-///
-/// Numeric suffixes resolve directly; opaque names resolve through the
-/// canonical registry (`leader`, `replica` plus numeric forms). Unknown
-/// opaque names fail with [`ScenarioError::UnknownActor`]; use
-/// [`scenario_registry`] to resolve every name a scenario mentions
-/// (auto-registers opaque names at [`opaque_actor_id`] with collision
-/// detection). The bridge in `ledger-explorer` must propagate the
-/// `Result`.
 pub fn actor_id(name: &str) -> Result<ActorId, ScenarioError> {
     ActorRegistry::with_known().resolve(name)
 }
@@ -603,6 +576,7 @@ mod tests {
             "partition replica-1->replica-2",
             "clock-skew n1 by 100ms",
             "delay a->b by 50ms",
+            "duplicate a->b",
         ];
         for c in cases {
             let s = parse_scenario(c).unwrap();
@@ -777,6 +751,7 @@ mod tests {
             "partition replica-1->replica-2",
             "clock-skew n1 by 100ms",
             "delay a->b by 50ms",
+            "duplicate a->b",
         ];
         for dsl in cases {
             let scenario = parse_scenario(dsl).unwrap();
@@ -792,5 +767,45 @@ mod tests {
                 let _: &FaultInjection = injection;
             }
         }
+    }
+
+    #[test]
+    fn compile_duplicate_happy() {
+        let s = parse_scenario("duplicate leader->replica").unwrap();
+        let c = compile(&s).unwrap();
+        assert_eq!(c.faults, vec![(EntryKind::Send, FaultSpec::Duplicate)]);
+        match &c.schedule[0] {
+            FaultInjection::Duplicate { src, dst } => {
+                assert_eq!(src, "leader");
+                assert_eq!(dst, "replica");
+            }
+            _ => panic!("expected duplicate"),
+        }
+    }
+
+    #[test]
+    fn compile_duplicate_repeated_target() {
+        let s = parse_scenario("scenario dup\nduplicate a->b\nduplicate a->b").unwrap();
+        assert!(matches!(
+            compile(&s),
+            Err(ScenarioError::DuplicateTarget(_))
+        ));
+    }
+
+    #[test]
+    fn compile_duplicate_numeric_alias_collision() {
+        let s = parse_scenario("scenario c\nduplicate replica-1->node:1").unwrap();
+        assert!(matches!(
+            compile(&s),
+            Err(ScenarioError::ActorCollision { .. })
+        ));
+        let s = parse_scenario(
+            "scenario c\nduplicate replica-1->replica-2\nduplicate node:1->replica-3",
+        )
+        .unwrap();
+        assert!(matches!(
+            compile(&s),
+            Err(ScenarioError::ActorCollision { .. })
+        ));
     }
 }

@@ -4,15 +4,9 @@ use std::num::ParseIntError;
 use thiserror::Error;
 
 /// Maximum bytes for an actor, segment, or flag name.
-///
-/// Bounds unbounded allocation from untrusted DSL input; longer names are
-/// rejected with [`ScenarioError::InvalidSyntax`].
 pub const MAX_NAME_LEN: usize = 64;
 
 /// A block in a failure scenario.
-///
-/// Actor, segment, and flag names are bounded to [`MAX_NAME_LEN`] bytes;
-/// longer names are rejected at parse time with a typed error.
 #[rustfmt::skip]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
@@ -23,6 +17,7 @@ pub enum Block {
     Partition { src: String, dst: String },
     ClockSkew { actor: String, skew_ticks: i64 },
     BoundedLatency { src: String, dst: String, delay_ticks: u64 },
+    Duplicate { src: String, dst: String },
 }
 
 /// A parsed scenario with a name and ordered blocks.
@@ -46,15 +41,12 @@ pub enum ScenarioError {
     DuplicateTarget(String),
     #[error("invalid duration {0}")]
     InvalidDuration(String),
-    /// A numeric field failed to parse; the offending token is carried so
-    /// the source parse error stays inspectable.
     #[error("invalid number '{token}': {source}")]
     InvalidNumber {
         token: String,
         #[source]
         source: ParseIntError,
     },
-    /// A hex field failed to parse; the offending token is carried.
     #[error("invalid hex '{token}': {source}")]
     InvalidHex {
         token: String,
@@ -63,18 +55,14 @@ pub enum ScenarioError {
     },
     #[error("storm detected: {0}")]
     StormDetected(String),
-    /// An opaque actor name is not in the deterministic registry and carries
-    /// no numeric suffix. Register the name or use `name-N` / `name:N` form.
     #[error("unknown actor {name:?}: not registered and no numeric suffix")]
     UnknownActor { name: String },
-    /// Two distinct actor names resolve to the same id.
     #[error("actor collision: {first:?} and {second:?} both map to id {id:?}")]
     ActorCollision {
         first: String,
         second: String,
         id: ledger_format::ActorId,
     },
-    /// A numeric actor suffix is outside the accepted id range.
     #[error("invalid actor id {id:?} for {name:?}: must be 1..={max}")]
     InvalidActorId {
         name: String,
@@ -128,6 +116,8 @@ fn parse_block(line: &str) -> Result<Block, ScenarioError> {
         parse_torn_write(line)
     } else if l.starts_with("partition ") {
         parse_partition(line)
+    } else if l.starts_with("duplicate ") {
+        parse_duplicate(line)
     } else if l.starts_with("clock-skew ") {
         parse_clock_skew(line)
     } else if l.starts_with("delay ") || l.starts_with("bounded-latency ") {
@@ -233,6 +223,11 @@ fn parse_partition(line: &str) -> Result<Block, ScenarioError> {
     Ok(Block::Partition { src: s, dst: d })
 }
 
+fn parse_duplicate(line: &str) -> Result<Block, ScenarioError> {
+    let (s, d) = extract_link(line["duplicate".len()..].trim())?;
+    Ok(Block::Duplicate { src: s, dst: d })
+}
+
 fn parse_clock_skew(line: &str) -> Result<Block, ScenarioError> {
     let rest = line["clock-skew".len()..].trim();
     let (actor, dur_s) = if let Some(pos) = rest.to_ascii_lowercase().find(" by ") {
@@ -327,12 +322,7 @@ fn extract_link(line: &str) -> Result<(String, String), ScenarioError> {
     Err(ScenarioError::InvalidSyntax(line.to_string()))
 }
 
-/// Find the duration token that follows `kw` in `line`, if any.
-///
-/// The keyword absent (or dangling with no following token) is `Ok(None)`:
-/// the caller defaults to zero, which is legitimate for an indefinite fault.
-/// A present token that fails to parse is a typed parse error, never a
-/// silent zero.
+/// Find the duration token after `kw`, if any. Absent is `Ok(None)`.
 fn extract_duration_after(line: &str, kw: &str) -> Result<Option<u64>, ScenarioError> {
     let Some(pos) = line.to_ascii_lowercase().find(&format!(" {kw} ")) else {
         return Ok(None);
@@ -383,10 +373,7 @@ fn parse_hex_u64(s: &str) -> Result<u64, ScenarioError> {
     })
 }
 
-/// Reject names over [`MAX_NAME_LEN`] bytes with a typed syntax error.
-///
-/// Bounds allocation from untrusted DSL input before names reach the actor
-/// registry or the compiled schedule.
+/// Reject names over [`MAX_NAME_LEN`] bytes.
 fn check_name_len(name: &str) -> Result<(), ScenarioError> {
     if name.len() > MAX_NAME_LEN {
         return Err(ScenarioError::InvalidSyntax(format!(
@@ -452,6 +439,35 @@ mod tests {
             Block::TornWrite { flag } => assert_eq!(flag, "O_APPEND"),
             _ => panic!("wrong"),
         }
+    }
+    #[test]
+    fn parse_partition_example() {
+        let s = parse_scenario("partition leader->replica").unwrap();
+        match &s.blocks[0] {
+            Block::Partition { src, dst } => {
+                assert_eq!(src, "leader");
+                assert_eq!(dst, "replica");
+            }
+            _ => panic!("wrong"),
+        }
+    }
+    #[test]
+    fn parse_duplicate_example() {
+        let s = parse_scenario("duplicate leader->replica").unwrap();
+        match &s.blocks[0] {
+            Block::Duplicate { src, dst } => {
+                assert_eq!(src, "leader");
+                assert_eq!(dst, "replica");
+            }
+            _ => panic!("wrong"),
+        }
+    }
+    #[test]
+    fn parse_duplicate_missing_link_is_rejected() {
+        assert!(matches!(
+            parse_scenario("duplicate leader"),
+            Err(ScenarioError::InvalidSyntax(_))
+        ));
     }
     #[test]
     fn parse_errors() {

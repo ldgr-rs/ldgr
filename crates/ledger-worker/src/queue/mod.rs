@@ -1,10 +1,4 @@
 //! Task queue backends and their shared contracts.
-//!
-//! The module root keeps the task model ([`Task`], [`TaskStatus`]) and the
-//! [`TaskQueue`] trait. [`wire`] owns the queue-file serde projections and
-//! [`memory`] owns the lease-accounting in-memory backend used by
-//! standalone mode. The root re-exports every public item so the historical
-//! `queue` API surface is unchanged.
 
 use ledger_format::EntryHash;
 use ledger_sim::RunConfig;
@@ -19,9 +13,6 @@ pub use wire::{FlatQueueFileLine, QueueFileError, QueueFileLine, TaskSpecError, 
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 
 /// Lifecycle state of a [`Task`].
-///
-/// `Queued` and `Leased` are transient; `Failed`, `Cancelled`, and `Done`
-/// are terminal. Terminal tasks never re-enter the queue.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -56,11 +47,6 @@ pub struct Task {
     /// Optional deterministic hash of run_config, computed at queue push.
     pub run_config_hash: Option<EntryHash>,
     /// Execution-identity digest pinned by the task author.
-    ///
-    /// When present, the worker recomputes its own identity for the task
-    /// and rejects the task before execution when the digests differ or its
-    /// own identity is incomplete. `None` leaves the worker to record its
-    /// own assembled identity in the result.
     pub execution_identity: Option<EntryHash>,
     /// Execution attempts charged against this task.
     pub attempts: u32,
@@ -71,8 +57,7 @@ pub struct Task {
 }
 
 impl Task {
-    /// Create a new task in the [`TaskStatus::Queued`] state with
-    /// [`DEFAULT_MAX_ATTEMPTS`].
+    /// Create a new task with [`DEFAULT_MAX_ATTEMPTS`].
     pub fn new(id: impl Into<String>, run_config: RunConfig, workload: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -110,17 +95,9 @@ pub trait TaskQueue {
     }
 
     /// Acknowledge completion and release the lease.
-    ///
-    /// Default no-op keeps trait object compatible for stubs. Real queues
-    /// (external control plane) delete or complete the job; [`InMemoryQueue`] moves
-    /// the task to the terminal done list.
     fn ack(&mut self, _task_id: &str) {}
 
-    /// Charge one failed execution attempt against a leased task.
-    ///
-    /// Default no-op returns `None` so stub queues keep old behavior.
-    /// Lease-accounting queues requeue while attempts remain and retire the
-    /// task once [`Task::max_attempts`] is exhausted.
+    /// Charge one failed attempt against a leased task.
     fn report_failure(&mut self, _task_id: &str) -> Option<AttemptOutcome> {
         None
     }

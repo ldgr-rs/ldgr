@@ -6,18 +6,8 @@ use std::path::PathBuf;
 use ldgr_rt::EngineProcess;
 use ledger_format::{ActorId, EntryHash};
 
-/// Probe the engine binary with production precedence
-/// (`LEDGER_ENGINE_BIN` only, explicit otherwise), then the sibling binary
-/// from the same cargo build (`current_exe` ancestors:
-/// `target/<profile>/deps/<test>` -> `target/<profile>/ledger`).
-/// No CWD or PATH fallback: an unpinned binary must not satisfy gates.
-/// The sibling build artifact is pinned by construction (same sources,
-/// same profile) and keeps the default workspace suite green without env.
-///
-/// An explicitly configured `LEDGER_ENGINE_BIN` that does not exist is a
-/// setup error, not a skip: it panics loudly instead of vacuously passing.
-/// No binary anywhere is `None` so the required gate fails closed with its
-/// setup message.
+/// Probe the engine binary: `LEDGER_ENGINE_BIN`, else the sibling `ledger`
+/// build artifact. No CWD/PATH fallback. Missing explicit binary panics.
 fn probe_engine_path() -> Option<PathBuf> {
     match std::env::var("LEDGER_ENGINE_BIN") {
         Ok(env) if !env.trim().is_empty() => {
@@ -42,9 +32,7 @@ fn probe_engine_path() -> Option<PathBuf> {
     sibling.exists().then_some(sibling)
 }
 
-/// The full roundtrip determinism body shared by the required and the
-/// optional local test. Spawns the engine, runs the kv workload twice per
-/// seed and actor, and asserts root stability.
+/// Shared roundtrip determinism body (kv workload, root stability).
 async fn run_determinism_checks(engine: PathBuf) {
     eprintln!("using engine {}", engine.display());
     let mut proc = EngineProcess::spawn(Some(engine))

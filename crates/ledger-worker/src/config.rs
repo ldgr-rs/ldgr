@@ -1,11 +1,6 @@
 // ledger-lint:allow - host daemon startup reads ambient config by design
 
-//! Configuration for a [`crate::Worker`] instance.
-//!
-//! The worker is a pure client: it owns no control-plane socket. In
-//! standalone mode it drains a local queue file; with a control-plane
-//! endpoint it dials the external control plane and receives assignments
-//! over one outbound session.
+//! Configuration for a [`crate::Worker`] instance (pure client, no socket).
 
 use std::time::Duration;
 
@@ -16,9 +11,7 @@ pub struct WorkerConfig {
     pub lease_timeout: Duration,
     /// Maximum number of tasks the worker may execute concurrently.
     pub max_concurrent: usize,
-    /// Eight-hex runtime-profile fingerprint bound into every published
-    /// certificate. Detected once at startup so all certs from one process
-    /// carry the same profile identity.
+    /// Eight-hex runtime-profile fingerprint for published certificates.
     pub profile_hex8: String,
 }
 
@@ -33,8 +26,7 @@ impl Default for WorkerConfig {
 }
 
 impl WorkerConfig {
-    /// Create a config with the given lease timeout and default remaining
-    /// fields.
+    /// Create a config with the given lease timeout.
     pub fn new(lease_timeout: Duration) -> Self {
         Self {
             lease_timeout,

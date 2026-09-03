@@ -1,9 +1,5 @@
 // ledger-lint:allow - host daemon / non-sim passthrough, like TokioBackend
-//! Lease-accounting in-memory queue backend.
-//!
-//! [`InMemoryQueue`] answers every lease-deadline question from the injected
-//! [`Clock`], so expiry behavior is deterministic in tests without sleeping
-//! on the wall clock.
+//! Lease-accounting in-memory queue backend (injected clock for tests).
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -11,9 +7,6 @@ use std::time::{Duration, Instant};
 use super::{AttemptOutcome, Task, TaskQueue, TaskStatus};
 
 /// Clock used for lease deadlines.
-///
-/// Production uses wall time; tests inject a manual clock so lease expiry
-/// is exercised deterministically without sleeping.
 type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
 
 /// In-memory queue with lease semantics for tests and standalone mode.
@@ -42,9 +35,6 @@ impl InMemoryQueue {
     }
 
     /// Create an empty queue over an injected clock (tests only).
-    ///
-    /// The clock answers every lease-deadline question, so tests advance it
-    /// manually and never sleep on the wall clock.
     #[cfg(test)]
     pub(crate) fn with_clock(lease_timeout: Duration, now: Clock) -> Self {
         Self {
@@ -59,9 +49,6 @@ impl InMemoryQueue {
     }
 
     /// Push a task into the queue, plumbing the deterministic hash.
-    ///
-    /// The task is (re)entered in the [`TaskStatus::Queued`] state; attempts
-    /// already charged are preserved so re-pushed tasks keep their budget.
     pub fn push(&mut self, mut task: Task) {
         // Compute the deterministic boundary hash so same RunConfigHash ->
         // same root holds across queue and worker layers. The hash is dropped
@@ -81,10 +68,7 @@ impl InMemoryQueue {
         }
     }
 
-    /// Charge one failed execution attempt against a taken task.
-    ///
-    /// Used by the `UploadResult` path where `take_by_id` already removed
-    /// the task; the budget accounting mirrors `report_failure`.
+    /// Charge one failed attempt against a taken task (mirrors `report_failure`).
     pub fn record_taken_task_failure(&mut self, mut task: Task) -> AttemptOutcome {
         task.attempts += 1;
         if task.attempts >= task.max_attempts {
@@ -104,11 +88,7 @@ impl InMemoryQueue {
         }
     }
 
-    /// Charge one failed execution attempt against a leased task.
-    ///
-    /// Requeues the task while attempts remain in its budget and retires it
-    /// to the failed list once `attempts >= max_attempts`. Returns `None`
-    /// when no live lease exists for `task_id`.
+    /// Charge one failed attempt against a leased task.
     pub fn report_failure(&mut self, task_id: &str) -> Option<AttemptOutcome> {
         let (task, _) = self.leased.remove(task_id)?;
         Some(self.retire_or_requeue(task))
@@ -135,8 +115,6 @@ impl InMemoryQueue {
     }
 
     /// Extend the active lease deadline of a leased task by `extra`.
-    ///
-    /// Returns false when the task is not currently leased.
     pub fn extend_lease(&mut self, task_id: &str, extra: Duration) -> bool {
         match self.leased.get_mut(task_id) {
             Some((_, deadline)) => {
@@ -147,10 +125,7 @@ impl InMemoryQueue {
         }
     }
 
-    /// Cancel a queued or leased task.
-    ///
-    /// Cancellation is terminal: the task moves to the cancelled list and
-    /// never requeues. Returns false when no queued or leased task matches.
+    /// Cancel a queued or leased task (terminal; never requeues).
     pub fn cancel(&mut self, task_id: &str) -> bool {
         if let Some(pos) = self.queue.iter().position(|t| t.id == task_id)
             && let Some(mut task) = self.queue.remove(pos)
@@ -207,11 +182,7 @@ impl InMemoryQueue {
         self.done.clone()
     }
 
-    /// Remove and return a task by id, searching both queued and leased slots.
-    ///
-    /// Used by the standalone drain loop to take a task by id. Terminal
-    /// tasks (failed, cancelled, done) are never returned.
-    /// tasks (failed, cancelled, done) are never returned.
+    /// Remove and return a task by id (queued and leased slots only).
     pub fn take_by_id(&mut self, task_id: &str) -> Option<Task> {
         if let Some(pos) = self.queue.iter().position(|t| t.id == task_id) {
             return self.queue.remove(pos);

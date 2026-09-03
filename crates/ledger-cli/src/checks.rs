@@ -26,8 +26,6 @@ impl DoctorReport {
     }
 
     /// Renders the report as one line per check.
-    ///
-    /// Each line is `[ok] <check>: <detail>` or `[FAIL] <check>: <detail>`.
     pub fn render(&self) -> Vec<String> {
         self.outcomes
             .iter()
@@ -302,9 +300,6 @@ struct PackageInfo {
 }
 
 /// Extracts the `[package]` section of a manifest.
-///
-/// A manifest that lacks `[package]` yields a section with no fields. The scan
-/// is line-based and accepts `license` and `license.workspace` forms.
 fn package_section(text: &str) -> PackageInfo {
     let mut info = PackageInfo {
         name: None,
@@ -338,9 +333,6 @@ fn package_section(text: &str) -> PackageInfo {
 }
 
 /// Returns the `[workspace.members]` list of a root manifest.
-///
-/// Accepts both the `[workspace.members]` table form and the `members = [...]`
-/// key inside the `[workspace]` table, single-line or multi-line.
 fn workspace_members(root_manifest: &str) -> Vec<String> {
     let mut members = Vec::new();
     let mut section: Option<&str> = None;
@@ -416,9 +408,6 @@ fn toml_value(text: &str, key: &str) -> Option<String> {
 }
 
 /// Locates the repository root by walking up for `rust-toolchain.toml`.
-///
-/// Stops after six levels so a stray install directory cannot be walked
-/// indefinitely.
 pub fn find_repo_root(start: &Path) -> PathBuf {
     let mut current = Some(start);
     for _ in 0..6 {

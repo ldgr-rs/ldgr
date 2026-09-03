@@ -1,15 +1,6 @@
-//! Generated `ledger.control.v2` wire bindings.
-//!
-//! The contract lives in
-//! `crates/ledger-format/proto/ledger/control/v2/control.proto`. With the
-//! `grpc` feature, this module holds the tonic/prost mirror of every message
-//! and the service stubs. The build script regenerates
-//! `gen/ledger.control.v2.rs` on every `grpc` build where `protoc` succeeds;
-//! the checked-in copy keeps offline builds working because `include!`
-//! resolves against this source tree, not `OUT_DIR`.
-//!
-//! This module is the single wire codec for the control plane. prost skips
-//! unknown fields, so older readers tolerate newer writers within v2.
+//! Generated `ledger.control.v2` wire bindings (contract in
+//! `crates/ledger-format/proto/ledger/control/v2/control.proto`).
+//! Checked-in copy keeps offline builds working; prost skips unknown fields.
 
 #[cfg(feature = "grpc")]
 include!("gen/ledger.control.v2.rs");
@@ -59,7 +50,7 @@ mod tests {
         WorkerHello {
             worker_id: "worker-7".to_string(),
             version: "0.1.0".to_string(),
-            execution_identity: [0xabu8; 32].to_vec(),
+            execution_identity: framed([0xabu8; 32]),
             profile: Some(sample_profile()),
         }
     }
@@ -82,7 +73,7 @@ mod tests {
             run_config_bytes: vec![1, 2, 3],
             workload: "kv".to_string(),
             run_config_hash_hex: "ab".repeat(32),
-            execution_identity: [0xcdu8; 32].to_vec(),
+            execution_identity: framed([0xcdu8; 32]),
         }
     }
 
@@ -93,8 +84,16 @@ mod tests {
             steps: 4096,
             ok: true,
             error: String::new(),
-            execution_identity: [0xabu8; 32].to_vec(),
+            execution_identity: framed([0xabu8; 32]),
         }
+    }
+
+    /// Framed wire form for one test digest: prefix plus 32-byte digest.
+    fn framed(digest: [u8; 32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(34);
+        out.extend_from_slice(&[0x1e, 0x20]);
+        out.extend_from_slice(&digest);
+        out
     }
 
     // Round-trips prove encode/decode agreement for every message the
@@ -131,7 +130,7 @@ mod tests {
         let bytes = msg.encode_to_vec();
         let back = TaskDispatch::decode(bytes.as_slice()).unwrap();
         assert_eq!(back, msg);
-        assert_eq!(back.execution_identity, [0xcdu8; 32].to_vec());
+        assert_eq!(back.execution_identity, framed([0xcdu8; 32]));
     }
 
     #[test]
@@ -141,7 +140,7 @@ mod tests {
         let back = ResultUpload::decode(bytes.as_slice()).unwrap();
         assert_eq!(back, msg);
         assert_eq!(back.steps, 4096);
-        assert_eq!(back.execution_identity, [0xabu8; 32].to_vec());
+        assert_eq!(back.execution_identity, framed([0xabu8; 32]));
     }
 
     #[test]

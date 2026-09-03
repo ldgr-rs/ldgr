@@ -1,35 +1,9 @@
 #![deny(unsafe_code)]
 
 //! Durable execution step logging built on the Ledger causal journal.
-//!
-//! EXPERIMENTAL: the API is usable for evaluation but has no production
-//! consumers yet. The step-begin/end entries, recovery rules, and plan
-//! semantics are fixed by the eight unit tests in this crate; treat any
-//! wider compatibility promise as pending.
-//!
-//! One active workflow per actor id; use distinct actors for concurrent
-//! workflows.
-//!
-//! [`WorkflowPlan`] fixes the ordered step names. [`WorkflowExecution`]
-//! journals a begin entry per step and pairs it with an end entry carrying
-//! the effect result; [`WorkflowExecution::resume`] replays the journal and
-//! skips, reruns, or executes each planned step based on the recorded
-//! evidence.
-//!
-//! # Durable step logging and retry contract
-//!
-//! Each step journals a `StepBegin` before the external effect runs and a
-//! `StepEnd` after it completes. If a step's external effect does not
-//! complete (crash between begin and end leaves an unpaired begin), the next
-//! `resume` reruns that effect. This gives at-least-once execution for
-//! incomplete external effects: a begin without a paired end is evidence
-//! that the effect may not have committed, so it is retried. Completed steps
-//! (paired begin and end) are skipped. Callers must make external effects
-//! idempotent or safe to retry.
-//!
-//! The typed `StepBeginPayload` carries the step id, the step name bytes, and
-//! an optional idempotency key as separate fields; the executor journals it
-//! as the canonical `EntryPayload::StepBegin` payload.
+//! One active workflow per actor id. See [`WorkflowExecution::resume`] for
+//! the at-least-once retry contract (unpaired begin reruns; paired begin+end
+//! skips; callers make effects idempotent).
 
 pub mod workflow;
 pub use workflow::{FlowError, ResumeStatus, StepOutcome, WorkflowExecution, WorkflowPlan};

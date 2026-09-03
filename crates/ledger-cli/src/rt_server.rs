@@ -1,18 +1,7 @@
 // ledger-lint:allow (host application; rt-server binds Unix socket and uses std::fs, unlike simulation code)
 //! Hidden `ledger rt-server` for the `ldgr-rt` IPC transport.
-//!
-//! The server binds a Unix socket and serves line-delimited JSON:
-//! request `{op:"run", workload:"kv", seed_hex, max_steps, attempts}`
-//! response `{roots:[hex...], findings, steps}` or `{error:...}`.
-//! Parsing is strict at this trust boundary: `op` must be exactly `"run"`,
-//! the workload name is required (no default), and counters are capped with
-//! lossless conversions.
-//!
-//! Reuses the existing `DefaultMiniKv` workload and `Simulation` machinery so
-//! the journal roots are byte-identical to `ledger sim` campaigns. Caller
-//! programs do not cross this boundary: `ldgr-rt::run(closure)` reports
-//! `ProgramNotTransportable`, and named requests dispatch to the workloads
-//! registered here (`kv`).
+//! Unix socket, line-delimited JSON (`run` op only, strict bounds).
+//! Roots are byte-identical to `ledger sim`; caller programs never cross.
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,11 +16,7 @@ use ledger_sim::{RunConfig, RuntimeError, Simulation};
 
 use crate::DefaultMiniKv;
 
-/// Errors from one rt-server workload run.
-///
-/// Formatted into the wire `{"error": ...}` reply at the connection
-/// boundary; the typed value keeps the simulation error inspectable until
-/// then.
+/// Errors from one rt-server workload run (formatted into the wire reply).
 #[derive(Debug)]
 enum RunError {
     /// The simulation run failed.

@@ -52,25 +52,11 @@ pub fn dsl_for(id: ScenarioId) -> &'static str {
 }
 
 /// Canonical library of at least 8 scenarios.
-///
-/// Each entry is parsed from its DSL string and is a corpus fixture with a
-/// known outcome. Compilation is validated to have no voided storms.
-/// Derived from [`canonical_library_with_ids`]; ids are dropped because
-/// the scenario name is the id's canonical string.
-///
-/// # Errors
-///
-/// Returns `ScenarioError` if any canonical DSL fails to parse. This is
-/// fallible and never panics in production; callers propagate the error.
 pub fn canonical_library() -> Result<Vec<Scenario>, ScenarioError> {
     canonical_library_with_ids().map(|lib| lib.into_iter().map(|(_, scenario)| scenario).collect())
 }
 
 /// Return canonical library with ids paired.
-///
-/// # Errors
-///
-/// Returns `ScenarioError` if any canonical DSL fails to parse.
 pub fn canonical_library_with_ids() -> Result<Vec<(ScenarioId, Scenario)>, ScenarioError> {
     let ids = [
         ScenarioId::Partition,

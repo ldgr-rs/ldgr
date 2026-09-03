@@ -1,17 +1,8 @@
 #![deny(unsafe_code)]
 
-//! OTel ingest adapters for the ledger journal.
-//!
-//! Pure translation layer: external traces and invocations become
-//! content-addressed journal entries. No solver or scheduling logic
-//! lives here; only deterministic mapping and fidelity tracking.
-//!
-//! Fidelity is structural: ingests produce an `IngestedJournal` that
-//! carries `Fidelity` explicitly. Callers must check
-//! `is_certifiable()` before producing certificates (LDFI layer-A
-//! rule). Lineage-only journals also carry an `Epoch` marker entry
-//! so downstream consumers that only see the raw `Journal` can still
-//! detect non-certifiable lineage.
+//! OTel ingest adapters: external traces become content-addressed entries.
+//! Fidelity is structural (`IngestedJournal`); check `is_certifiable()`
+//! before producing certificates.
 
 pub mod envelope;
 pub mod otel;
@@ -96,11 +87,7 @@ pub enum AdapterError {
 }
 
 /// Content-addressed ingest result that carries fidelity structurally.
-///
-/// Callers must check `is_certifiable()` before producing certificates.
-/// A `LineageOnly` journal is never certifiable, even if its hash is
-/// deterministic. The envelope is retained for lineage and hash
-/// verification.
+/// Check `is_certifiable()` before producing certificates.
 #[derive(Debug, Clone)]
 pub struct IngestedJournal {
     /// The content-addressed journal.
@@ -129,10 +116,7 @@ impl IngestedJournal {
     }
 
     /// Whether this journal may be used to produce certificates.
-    ///
     /// Only `BitExact` journals are certifiable.
-    /// Lineage-only traces are deterministic but not bit-exact and must
-    /// not produce certificates.
     pub fn is_certifiable(&self) -> bool {
         self.fidelity == Fidelity::BitExact
     }
@@ -152,12 +136,7 @@ impl IngestedJournal {
     }
 }
 
-/// Append a fidelity marker to the journal when `LineageOnly`.
-///
-/// The marker is an `Epoch` entry with `Text("lineage-only")` on actor 0
-/// with no parents. It is deterministic and does not affect vector
-/// clocks beyond a single increment. `BitExact` leaves the journal
-/// unchanged.
+/// Append a fidelity marker when `LineageOnly`.
 pub(crate) fn mark_fidelity(journal: &mut Journal, fidelity: Fidelity) -> Result<(), AdapterError> {
     if fidelity == Fidelity::LineageOnly {
         journal

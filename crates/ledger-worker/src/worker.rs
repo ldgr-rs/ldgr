@@ -12,12 +12,6 @@ use crate::config::WorkerConfig;
 use crate::queue::{InMemoryQueue, Task, TaskQueue};
 
 /// One failure class routed through the worker's single failure funnel.
-///
-/// Every task-ending failure - transport, join, execution, upload,
-/// unknown workload, or cancellation - funnels into the same transition:
-/// charge one attempt and requeue or retire the task
-/// ([`route_failure`]). Keeping the classes explicit makes the funnel's
-/// coverage testable without message-text matching.
 #[derive(Debug)]
 pub enum TaskFailure {
     /// The session transport broke while the task was in flight.
@@ -35,7 +29,6 @@ pub enum TaskFailure {
 }
 
 impl TaskFailure {
-    /// Human-readable cause for logs and the attempt record.
     pub fn message(&self) -> String {
         match self {
             Self::Transport(reason) => format!("transport: {reason}"),
@@ -59,11 +52,7 @@ pub struct WorkerResult {
     pub steps: usize,
     /// Findings count from the pre-run explorer campaign.
     pub campaign_findings: usize,
-    /// Execution-identity digest assembled by the worker for this task.
-    ///
-    /// `None` when the worker build data is incomplete (no source revision
-    /// captured at compile time); such results must be treated as
-    /// identity-incomplete by the control plane.
+    /// Execution-identity digest for this task (`None` when build data incomplete).
     pub execution_identity: Option<EntryHash>,
 }
 
@@ -160,17 +149,7 @@ impl Worker {
     }
 
     /// Pull one task and run it to completion.
-    ///
-    /// Returns `Ok(None)` when the queue is empty. On success the journal
-    /// root is returned and the lease is acked, marking the task done. On
-    /// failure the attempt is charged against [`Task::max_attempts`]: the
-    /// queue requeues while attempts remain and retires the task once the
-    /// budget is exhausted. Deterministic boundary: the queued
-    /// `run_config_hash` (if present) must match the recomputed canonical
-    /// hash, enforcing same RunConfigHash -> same root.
-    ///
-    /// Certificate publication through the artifact sink is best-effort:
-    /// sink errors are logged and never fail the task.
+    /// Returns `Ok(None)` when empty. Certificate publication is best-effort.
     pub fn run_one(&mut self) -> Result<Option<WorkerResult>, WorkerError> {
         let task = match self.queue.pull() {
             Some(task) => task,
@@ -198,12 +177,7 @@ impl Worker {
 }
 
 /// Charge a failed task through the queue's attempt accounting.
-///
-/// This is the worker's single failure funnel: every task-ending failure
-/// class ([`TaskFailure`]) converges here, maps onto the queue's routing
-/// decision, and surfaces as [`WorkerError::TaskFailed`] when the queue
-/// tracks leases. Queues that do not track leases (stub default) return
-/// the original error unchanged so callers keep the typed cause.
+/// Single failure funnel for every [`TaskFailure`] class.
 pub fn route_failure(
     queue: &mut dyn TaskQueue,
     task_id: &str,
@@ -237,18 +211,7 @@ pub fn route_failure(
     }
 }
 
-/// Publish a task certificate through `sink`, best-effort.
-///
-/// Renders the minimal task certificate (journal root as subject; the full
-/// [`ledger_explorer::certs::CampaignCertificate`] derives from a
-/// [`ledger_explorer::CampaignReport`], which the worker does not
-/// produce), computes its BLAKE3 checksum, and
-/// uploads it as `certificate.json`. When set, `builder_id` lands in
-/// `predicate.runDetails.builder.id` and `profile_fingerprint_hex8` in
-/// `predicate.extensions.runtimeProfile`, binding the certificate to the
-/// runtime that produced it. Every failure mode is logged and swallowed on
-/// purpose: artifact publication must never fail a completed, deterministic
-/// task.
+/// Publish a task certificate through `sink`, best-effort (never fails the task).
 pub fn publish_result_certificate(
     sink: &dyn ArtifactSink,
     result: &WorkerResult,
@@ -289,14 +252,6 @@ pub fn publish_result_certificate(
 }
 
 /// Execute a pulled task while periodically extending its lease.
-///
-/// Runs [`execute_task`] on the blocking pool and extends the lease by
-/// `lease` every `heartbeat` period until execution finishes, so tasks that
-/// outlive the original lease deadline are not reclaimed mid-run. The first
-/// tick fires immediately; that extension of a fresh lease is harmless.
-///
-/// On success the lease is acked (task done). On failure the attempt is
-/// charged through the queue's accounting and a typed error is returned.
 ///
 /// # Errors
 /// Returns [`WorkerError`] when execution fails or the blocking pool panics.
@@ -361,13 +316,7 @@ impl Workload for SmallWorkload {
 }
 
 /// Execute a single task through the deterministic simulation.
-///
-/// Shared helper used by [`Worker::run_one`], [`execute_with_heartbeat`], and
-/// the session client ([`crate::transport::run_assigned_task`]) so the wire
-/// boundary and the in-process dispatcher run identical logic. Validates the
-/// queued `run_config_hash`, exercises the explorer campaign, and runs the
-/// simulation to produce the journal root.
-///
+/// Shared by [`Worker::run_one`], [`execute_with_heartbeat`], and the session client.
 pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerError> {
     // Always recompute and compare. A task without a stored hash (its config
     // failed canonical encoding at push time) is rejected here, so no task
@@ -417,11 +366,7 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
 }
 
 /// Assemble the worker's execution-identity digest for one task.
-///
-/// The build segment comes from the worker binary's compile-time capture; the
-/// run segment comes from the task's run config and workload selector. Returns
-/// `None` when the worker build data is incomplete, `Err` when the identity
-/// exceeds its encoding caps.
+/// Returns `None` when build data is incomplete.
 fn task_identity(
     task: &crate::queue::Task,
     run_config_digest: EntryHash,
@@ -765,10 +710,7 @@ mod tests {
     }
 }
 
-/// Every failure arm funnels into the same transition: one attempt is
-/// charged and the task requeues or retires. This pins the plan's
-/// single-funnel contract across transport, join, execution, upload,
-/// unknown-workload, and cancellation failures.
+/// Every failure arm funnels into one transition (attempt charged, requeue/retire).
 #[test]
 fn every_failure_arm_funnels_through_one_transition() {
     struct CountingQueue {
@@ -813,8 +755,7 @@ fn every_failure_arm_funnels_through_one_transition() {
     }
 }
 
-/// Unknown workloads fail closed: `workload_for` rejects the name
-/// instead of running a substitute program.
+/// Unknown workloads fail closed instead of running a substitute.
 #[test]
 fn unknown_workload_fails_closed() {
     let err = workload_for("no-such-workload").expect_err("must reject");

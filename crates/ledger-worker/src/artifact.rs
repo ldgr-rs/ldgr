@@ -1,13 +1,6 @@
 //! Artifact publication client for the control plane.
-//!
-//! After a task finishes, the worker publishes a certificate artifact
-//! (`certificate.json`) through an [`ArtifactSink`]. Publication is
-//! best-effort: a sink error is logged and never fails the task. [`NoopSink`]
-//! is the default and only logs; [`HttpSink`] is
-//! compiled behind the `control-plane` feature and talks GetUploadURL /
-//! ConfirmUpload against the R2-backed control plane. The feature pulls the
-//! optional `reqwest` dependency and needs network access at build time, so
-//! offline builds stay on the default (noop) path.
+//! Best-effort: sink errors never fail the task. [`NoopSink`] is default;
+//! [`HttpSink`] (feature `control-plane`) talks GetUploadURL/ConfirmUpload.
 
 use std::fmt;
 
@@ -52,21 +45,17 @@ pub enum ArtifactError {
 }
 
 /// Destination for task artifacts (certificates, journals).
-///
-/// The operations mirror the session upload handshake: GetUploadURL, byte
-/// transfer, ConfirmUpload.
 pub trait ArtifactSink: Send + Sync {
     /// Request a presigned upload URL for `task_id`/`name`.
     ///
     /// # Errors
-    /// Returns [`ArtifactError`] when the control plane rejects the request.
+    /// Returns [`ArtifactError`] when rejected.
     fn get_upload_url(&self, task_id: &str, name: &str) -> Result<String, ArtifactError>;
 
-    /// Tell the control plane the artifact bytes are stored under
-    /// `checksum_hex`.
+    /// Tell the control plane the bytes under `checksum_hex` are stored.
     ///
     /// # Errors
-    /// Returns [`ArtifactError`] when confirmation is rejected.
+    /// Returns [`ArtifactError`] when rejected.
     fn confirm(&self, task_id: &str, name: &str, checksum_hex: &str) -> Result<(), ArtifactError>;
 
     /// Transfer `bytes` and confirm them. Returns the stored URL.
@@ -83,8 +72,6 @@ pub trait ArtifactSink: Send + Sync {
 }
 
 /// Default no-op destination: logs and reports a synthetic URL.
-///
-/// Keeps standalone runs fully local; nothing leaves the process.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopSink;
 
@@ -114,13 +101,6 @@ impl ArtifactSink for NoopSink {
 }
 
 /// Real HTTP destination behind the `control-plane` feature.
-///
-/// Expects a control plane exposing:
-/// - `GET {base}/tasks/{task_id}/artifacts/{name}/upload-url` returning
-///   `{"url": "...", "method": "PUT"}`,
-/// - the returned presigned URL accepting the raw bytes,
-/// - `POST {base}/tasks/{task_id}/artifacts/{name}/confirm` accepting a
-///   `ConfirmUpload`-shaped JSON body.
 #[cfg(feature = "control-plane")]
 pub struct HttpSink {
     base_url: String,
@@ -237,16 +217,7 @@ pub fn checksum_hex(bytes: &[u8]) -> String {
 pub const WORKER_BUILDER_ID: &str = "ledger-worker";
 
 /// Render the minimal task certificate as JSON bytes.
-///
-/// Full [`ledger_explorer::certs::CampaignCertificate`] statements need the
-/// complete campaign report; the minimal certificate attests the journal
-/// root as subject and carries the campaign findings count in the predicate.
-///
-/// When `builder_id` is set the statement gains
-/// `predicate.runDetails.builder.id`; when `profile_fingerprint_hex8` is set
-/// it gains `predicate.extensions.runtimeProfile`, binding the certificate
-/// to the runtime profile that produced the run. Both fields are omitted
-/// otherwise.
+/// Optional `builder_id`/`profile_fingerprint_hex8` bind runtime identity.
 ///
 /// # Errors
 /// Returns the serialization error when JSON rendering fails.

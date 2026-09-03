@@ -1,15 +1,6 @@
 //! Durable execution step-logging workflow engine.
-//!
-//! Each step journals a `StepBegin` before the external effect and a
-//! `StepEnd` after it completes. If an effect does not complete (crash
-//! between begin and end leaves an unpaired begin), the next `resume`
-//! reruns that effect. This is an at-least-once retry contract for
-//! incomplete external effects: an unpaired begin is evidence the effect
-//! may not have committed, so it is retried until a paired end appears.
-//! Completed steps (paired begin and end) are skipped. Callers must make
-//! external effects idempotent or safe to retry.
-//!
-//! A typed `StepBeginPayload` v2 is deferred to stage E2; the v1 text-name payload is the current contract. This documents the approved G1 contract and its E2 evolution, not a pending plan marker.
+//! Each step journals `StepBegin` before the effect and `StepEnd` after;
+//! unpaired begin reruns, paired begin+end skips (at-least-once).
 
 use std::collections::{HashMap, HashSet};
 
@@ -54,9 +45,6 @@ pub struct StepOutcome {
 }
 
 /// Ordered step names a durable workflow intends to run.
-///
-/// The plan is the resumption intent: `resume` consults it against journal
-/// evidence to decide skip, rerun, or execute per step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowPlan {
     steps: Vec<String>,
@@ -198,28 +186,12 @@ impl WorkflowExecution {
         }
     }
 
-    /// Resume a planned workflow with Temporal-style at-most-once skip.
-    ///
-    /// For every planned step, journal evidence decides the action:
-    ///
-    /// - The step's begin has a paired end: skip execution and report the
-    ///   recorded result ([`ResumeStatus::Skipped`]).
-    /// - Only an unpaired begin exists (crash between begin and end):
-    ///   re-execute and pair the new end against that existing begin
-    ///   ([`ResumeStatus::Rerun`]).
-    /// - No entries exist: execute once and append a fresh begin-end pair
-    ///   ([`ResumeStatus::Executed`]).
-    ///
-    /// The begin entry lands before the effect runs, so a crash during the
-    /// effect leaves an unpaired begin that classifies the step as
-    /// [`ResumeStatus::Rerun`] on the next resume. Re-running a completed
-    /// plan is idempotent: every outcome is [`ResumeStatus::Skipped`] with
-    /// identical results.
+    /// Resume a planned workflow: paired begin+end skips, unpaired begin
+    /// reruns, no evidence executes. Re-running a completed plan is idempotent.
     ///
     /// # Errors
-    /// Returns [`FlowError::NoPlan`] when no plan is attached via
-    /// [`Self::set_plan`], [`FlowError::Journal`] when an append fails, and
-    /// propagates errors from `exec` (the journal keeps the unpaired begin).
+    /// Returns [`FlowError::NoPlan`] without a plan, [`FlowError::Journal`]
+    /// on append failure; propagates `exec` errors (begin stays unpaired).
     pub fn resume(
         &mut self,
         journal: &mut Journal,
@@ -270,12 +242,11 @@ impl WorkflowExecution {
         Ok(outcomes)
     }
 
-    /// Asynchronous variant of [`Self::resume`] accepting an async step executor.
+    /// Asynchronous variant of [`Self::resume`].
     ///
     /// # Errors
-    /// Returns [`FlowError::NoPlan`] when no plan is attached via
-    /// [`Self::set_plan`], [`FlowError::Journal`] when an append fails, and
-    /// propagates errors from `exec`.
+    /// Returns [`FlowError::NoPlan`] without a plan, [`FlowError::Journal`]
+    /// on append failure; propagates `exec` errors.
     pub async fn resume_async<F, Fut>(
         &mut self,
         journal: &mut Journal,
@@ -358,9 +329,7 @@ fn classify(name: &str, evidence: &StepEvidence) -> StepPrior {
 }
 
 /// Collect latest-begin and paired-end evidence for one actor.
-///
-/// A later unpaired begin supersedes an earlier completed pair: the crash
-/// happened while the step was mid-flight again, so the step must re-run.
+/// A later unpaired begin supersedes an earlier completed pair.
 fn scan_step_evidence(journal: &Journal, actor: ActorId) -> StepEvidence {
     let mut evidence = StepEvidence {
         begins: HashMap::new(),

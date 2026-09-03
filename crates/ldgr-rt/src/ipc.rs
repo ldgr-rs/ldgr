@@ -1,20 +1,9 @@
 // ledger-lint:allow (host daemon; IPC transport uses ambient time, env, fs by design)
 //! IPC transport to the AGPL engine.
-//!
-//! Why: `ldgr-rt` is Apache-2.0 and must not link the AGPL engine
-//! (`ledger-sim`, `ledger-explorer`) in SUT crates. With `sim` the facade
-//! delegates the whole deterministic run to the `ledger rt-server` process over
-//! a Unix socket. `sim-link` keeps the old direct link for workspace tests.
-//!
-//! The protocol is line-delimited JSON over a Unix socket:
-//! request `{op:"run", workload:"kv", seed_hex, max_steps, attempts}`
-//! response `{roots:[hex...], findings, steps}` or `{error:...}`.
-//!
-//! Tradeoff note: programs do not cross this boundary. `runtime::run()` with
-//! a caller closure under `sim` returns `ProgramNotTransportable` instead of
-//! running anything else; `run_named` asks the engine to run one of its own
-//! registered workloads (`kv`) and the facade returns the server-computed
-//! journal root deterministically.
+//! `sim` delegates the deterministic run to `ledger rt-server` over a Unix
+//! socket. Line-delimited JSON: request `{op:"run", workload, seed_hex,
+//! max_steps, attempts}`, response `{roots, findings, steps}` or `{error}`.
+//! Caller programs never cross this boundary.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -30,34 +19,24 @@ use ledger_format::{ActorId, EntryHash};
 pub const ENGINE_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Candidate private directories tried before giving up on socket setup.
-/// A pid+nanos name collision is possible when two processes start inside
-/// one nanosecond tick; the retry makes that a non-event.
 const SOCKET_DIR_ATTEMPTS: u64 = 3;
 
-/// Maximum engine stderr bytes kept for diagnostics after startup succeeds.
-/// Capture stops at the cap by contract so a chatty server cannot grow memory.
+/// Maximum engine stderr bytes kept for diagnostics.
 const STDERR_CAPTURE_CAP: usize = 8 * 1024;
 
-/// Upper bound for a server-reported step count. Step budgets stay far below
-/// this; larger values mean a broken or hostile server.
+/// Upper bound for a server-reported step count.
 const MAX_SERVER_STEPS: u64 = 1 << 40;
 
 /// Upper bound for a server-reported finding count.
 const MAX_SERVER_FINDINGS: u64 = 1 << 24;
 
 /// Maximum bytes for a workload name.
-///
-/// Bounds untrusted workload strings before they reach the engine request.
 pub const MAX_WORKLOAD_NAME_BYTES: usize = 128;
 
 /// Maximum remote attempts per call.
-///
-/// Bounds server-reported root vectors before allocation.
 pub const MAX_IPC_ATTEMPTS: usize = 1024;
 
 /// Maximum actor id accepted on the IPC control path.
-///
-/// Matches the framed wire cap so control and effect paths stay routable.
 pub const MAX_IPC_ACTOR: u32 = 1 << 20;
 
 /// Errors from the engine process transport.
@@ -79,7 +58,7 @@ pub enum IpcError {
     /// The server violated the line protocol (empty or incomplete reply).
     #[error("protocol violation: {0}")]
     Protocol(&'static str),
-    /// A root hex field did not decode into a 32-byte hash.
+    /// A root hex field did not decode into a 32-byte digest.
     #[error("invalid root hex: {0}")]
     RootHex(#[from] ledger_format::HexError),
     /// The private socket directory could not be set up as required.
@@ -109,7 +88,6 @@ pub struct RunOutcome {
 }
 
 impl RunOutcome {
-    /// Convenience: first root if any.
     pub fn journal_root(&self) -> Option<EntryHash> {
         self.roots.first().copied()
     }
@@ -127,12 +105,7 @@ pub struct EngineProcess {
 }
 
 impl EngineProcess {
-    /// Resolve the engine binary path.
-    ///
-    /// Precedence: explicit arg, then `LEDGER_ENGINE_BIN`. No workspace or
-    /// PATH fallback: an implicit binary is not pinned to this build, so a
-    /// missing configuration fails closed with a typed error instead of
-    /// silently running an unverified engine.
+    /// Resolve the engine binary path: explicit arg, then `LEDGER_ENGINE_BIN`.
     fn resolve_engine_path(explicit: Option<PathBuf>) -> Result<PathBuf, IpcError> {
         if let Some(path) = explicit {
             return Ok(path);
@@ -150,23 +123,14 @@ impl EngineProcess {
         }
     }
 
-    /// Spawn the engine `rt-server` on a fresh socket inside a private
-    /// directory (mode 0700) under the system temp root.
-    ///
-    /// Async: the readiness probe connects over the socket so the returned
-    /// process is guaranteed to be inside its accept loop. The engine path
-    /// must be explicit or configured via `LEDGER_ENGINE_BIN`; otherwise
-    /// this fails closed with [`IpcError::EngineNotConfigured`].
+    /// Spawn the engine `rt-server` on a fresh socket in a private dir (0700).
     pub async fn spawn(engine_path: Option<PathBuf>) -> Result<Self, IpcError> {
         let engine = Self::resolve_engine_path(engine_path)?;
         let (dir, socket_path) = prepare_socket_dir()?;
         Self::spawn_in(engine, socket_path, Some(dir)).await
     }
 
-    /// Spawn with an explicit socket path (useful for deterministic tests).
-    ///
-    /// The caller owns placement and permissions of `socket_path`; no private
-    /// directory is created or removed around it.
+    /// Spawn with an explicit socket path (tests). Caller owns placement.
     pub async fn spawn_with_socket(
         engine_path: Option<PathBuf>,
         socket_path: PathBuf,
@@ -277,9 +241,6 @@ impl EngineProcess {
     }
 
     /// Last captured engine stderr bytes (bounded, best-effort).
-    ///
-    /// Populated by the background drain thread once startup succeeded; empty
-    /// until the engine writes something or exits.
     pub fn stderr_tail(&self) -> String {
         let slot = match self.stderr_tail.lock() {
             Ok(slot) => slot,
@@ -288,8 +249,7 @@ impl EngineProcess {
         String::from_utf8_lossy(&slot).into_owned()
     }
 
-    /// Append the stderr tail to server-reported failures; the tail is often
-    /// the only hint why the engine rejected a request.
+    /// Append the stderr tail to server-reported failures.
     fn attach_tail(&self, mut error: IpcError) -> IpcError {
         let tail = self.stderr_tail();
         if tail.is_empty() {
@@ -314,9 +274,6 @@ impl EngineProcess {
     }
 
     /// Run a named workload remotely with explicit `max_steps`.
-    ///
-    /// `actor` threads the caller's logical identity into the engine request
-    /// so multi-actor runs stay routed; the server journals per actor.
     pub fn run_workload_with_steps(
         &mut self,
         workload: &str,
@@ -345,11 +302,6 @@ impl EngineProcess {
     }
 
     /// Perform one request/response exchange over the socket.
-    ///
-    /// Blocking note: synchronous Unix-stream IO with retry sleeps runs here.
-    /// Callers must invoke it on the single-task current-thread driver that
-    /// owns the engine session; blocking inside a multi-task reactor stalls
-    /// every task sharing it.
     fn request(&mut self, value: serde_json::Value) -> Result<serde_json::Value, IpcError> {
         let mut line = serde_json::to_string(&value)?;
         line.push('\n');
@@ -411,11 +363,7 @@ impl Drop for EngineProcess {
     }
 }
 
-/// Create a fresh private directory for the engine socket and derive the
-/// socket path inside it.
-///
-/// Name collisions are retried a bounded number of times (see
-/// [`SOCKET_DIR_ATTEMPTS`]); everything else surfaces immediately.
+/// Create a fresh private directory for the engine socket.
 fn prepare_socket_dir() -> Result<(PathBuf, PathBuf), IpcError> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -454,11 +402,8 @@ where
     })
 }
 
-/// Exclusively create `dir` with mode 0700 and prove it is owned by this
-/// process.
-///
-/// The raw [`std::io::Error`] is returned so callers can distinguish a name
-/// collision ([`std::io::ErrorKind::AlreadyExists`]) from real setup damage.
+/// Exclusively create `dir` with mode 0700 and prove ownership.
+/// Returns raw IO error so callers distinguish collision from setup failure.
 fn create_private_dir_checked(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
@@ -488,10 +433,7 @@ fn create_private_dir_checked(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Drain engine stderr on a dedicated OS thread so the reactor never blocks.
-///
-/// Capture stops after [`STDERR_CAPTURE_CAP`] bytes by contract; diagnostics
-/// beyond the cap are dropped.
+/// Drain engine stderr on a dedicated OS thread (bounded by cap).
 fn spawn_stderr_drain(stderr: std::process::ChildStderr, tail: Arc<Mutex<Vec<u8>>>) {
     use std::io::Read as _;
 
@@ -509,10 +451,6 @@ fn spawn_stderr_drain(stderr: std::process::ChildStderr, tail: Arc<Mutex<Vec<u8>
 }
 
 /// Validate one outbound workload request before it reaches the socket.
-///
-/// Bounds workload names, step budgets, attempt counts, and actor ids so a
-/// broken caller fails closed locally instead of asking the server to
-/// allocate unbounded work.
 fn validate_workload_request(
     workload: &str,
     max_steps: usize,
@@ -544,9 +482,6 @@ fn validate_workload_request(
 }
 
 /// Parse one successful `{roots, findings, steps}` reply.
-///
-/// Counters cross a trust boundary, so they must exist, fit their caps, and
-/// convert losslessly; nothing is clamped or defaulted here.
 fn parse_run_response(value: &serde_json::Value) -> Result<RunOutcome, IpcError> {
     let mut roots: Vec<EntryHash> = Vec::new();
     if let Some(array) = value.get("roots").and_then(|v| v.as_array()) {

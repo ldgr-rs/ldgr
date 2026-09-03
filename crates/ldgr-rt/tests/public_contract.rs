@@ -1,8 +1,4 @@
-//! Public-contract proof: this file must compile and pass identically under
-//! default, `sim`, and `sim-link` builds. Every public item is constructed or
-//! exercised here with one bound set, so a signature or variant that drifts
-//! between feature combinations breaks all three builds at once. The dead
-//! code below is intentional: it is type-checked per build but never run.
+//! Public-contract proof: compiles/passes under default, `sim`, `sim-link`.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -15,8 +11,7 @@ use ldgr_rt::{
     RuntimeError, SimClock, StreamId, TaskId, TaskMain, VERSION, shared_network,
 };
 
-/// Exhaustive match: fails to compile if any variant goes missing under a
-/// feature combination.
+/// Exhaustive match over [`RuntimeError`] variants.
 fn name_runtime_error(error: &RuntimeError) -> &'static str {
     match error {
         RuntimeError::StepLimit { .. } => "step_limit",
@@ -31,7 +26,6 @@ fn name_runtime_error(error: &RuntimeError) -> &'static str {
     }
 }
 
-/// `journal_root` and `steps` are public fields under every feature set.
 fn construct_run_result() -> RunResult {
     RunResult {
         outcome: ldgr_rt::RunCompletion::Completed,
@@ -40,7 +34,6 @@ fn construct_run_result() -> RunResult {
     }
 }
 
-/// Fault wrappers are nameable and constructible without optional deps.
 fn construct_faults() -> (JournalFault, IpcFault) {
     (
         JournalFault::from_message("journal fault"),
@@ -55,7 +48,6 @@ const _: Option<TaskMain> = None;
 #[allow(dead_code)]
 type AssertNonSend = Pin<Box<dyn Future<Output = ()>>>;
 
-/// Every `Handle` method callable with one bound set under every feature set.
 #[allow(dead_code)]
 fn exercise_handle(handle: &mut Handle) -> TaskId {
     let _: ActorId = handle.actor();
@@ -76,15 +68,13 @@ fn exercise_handle(handle: &mut Handle) -> TaskId {
     id
 }
 
-/// Registration and named dispatch keep one signature everywhere.
 #[allow(dead_code)]
 fn exercise_registration(build: fn() -> TaskMain) -> Result<RunResult, RuntimeError> {
     ldgr_rt::register_workload("contract-workload", build);
     ldgr_rt::run_named(RunConfig::default(), "contract-workload")
 }
 
-/// Named dispatch on direct-executor backends must execute the CALLER's
-/// registered program end-to-end, not some stand-in workload.
+/// Named dispatch executes the caller's registered program (direct backends).
 #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
 #[test]
 fn registered_named_run_executes_the_caller_program() {
@@ -115,14 +105,12 @@ fn registered_named_run_executes_the_caller_program() {
     );
 }
 
-/// Async surface: sleep and net_recv share one signature everywhere.
 #[allow(dead_code)]
 async fn exercise_handle_async(handle: &Handle) {
     handle.sleep(Duration::from_millis(1)).await;
     let _: u64 = handle.net_recv().await;
 }
 
-/// `run` accepts one bound set everywhere: plain futures, no Send bound.
 #[allow(dead_code)]
 fn exercise_run_signature(config: RunConfig) -> Result<RunResult, RuntimeError> {
     ldgr_rt::run(config.clone(), |handle| async move {
@@ -167,10 +155,6 @@ fn public_types_construct_identically_under_every_combo() {
     let _id = TaskId(1);
 }
 
-/// Mirror of the engine-path precedence so tests decide IPC testability
-/// exactly like production: an explicit path or a set `LEDGER_ENGINE_BIN`
-/// pointing at an existing binary. No workspace or PATH fallback: an
-/// unpinned binary must not satisfy gates.
 // ledger-lint:allow - host-side test probes ambient env by design
 #[cfg(all(feature = "sim", not(feature = "sim-link")))]
 fn resolve_engine_for_test() -> Option<std::path::PathBuf> {
@@ -190,9 +174,6 @@ fn resolve_engine_for_test() -> Option<std::path::PathBuf> {
     None
 }
 
-/// `run` installs the thread-local handle for the duration of the program,
-/// and refuses caller programs loudly under IPC-only builds instead of
-/// polling them against some other workload.
 #[test]
 fn handle_current_is_installed_inside_run() {
     #[cfg(all(feature = "sim", not(feature = "sim-link")))]
@@ -223,9 +204,6 @@ fn handle_current_is_installed_inside_run() {
     }
 }
 
-/// Under `sim` (IPC) `run_named` reaches the engine's registered server
-/// workloads over the socket and yields a deterministic journal root.
-/// Skipped without an engine binary, resolved with production precedence.
 #[cfg(all(feature = "sim", not(feature = "sim-link")))]
 #[test]
 fn named_run_reaches_server_workload_under_ipc() {

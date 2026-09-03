@@ -1,7 +1,4 @@
 //! Queue-file wire conversion: serde projections and NDJSON parsing.
-//!
-//! [`QueueFileLine`], [`FlatQueueFileLine`], and [`WorkerTaskSpec`] are the
-//! stable on-disk task shapes.
 
 use ledger_sim::RunConfig;
 use serde::{Deserialize, Serialize};
@@ -9,15 +6,8 @@ use thiserror::Error as ThisError;
 
 use super::Task;
 
-/// Minimal serde projection of a simulation run config for queue files.
-///
-/// `ledger_sim::RunConfig` does not implement serde, so NDJSON queue files
-/// carry this projection. [`WorkerTaskSpec::to_run_config`] maps it back:
-/// `seed_hex` fills `RunConfig::seed`, `max_steps` fills
-/// `RunConfig::max_steps`, and `"random"` maps to `Policy::Random`. Every
-/// other field keeps its `RunConfig::default()` value, so the canonical
-/// hash of the mapped config equals the hash of the equivalent in-process
-/// config.
+/// Minimal serde projection of a run config for queue files
+/// (`seed_hex`/`max_steps`/`"random"` policy; rest is `RunConfig::default()`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerTaskSpec {
     /// 64-char lowercase hex root seed.

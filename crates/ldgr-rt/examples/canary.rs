@@ -1,13 +1,6 @@
 // ledger-lint:allow (host SUT binary; rt-canary parses process CLI arguments)
-//! `rt-canary`: a real external SUT driving the ldgr-rt effect shim.
-//!
-//! The canary runs a fixed business logic against the deterministic engine:
-//! read the clock, draw random words, write a value to SimFs, read it back,
-//! fsync, sleep, send a message to itself, and receive it. Every effect is
-//! journaled by the engine; the canary prints the final journal root and
-//! entry count to stdout.
-//!
-//! Usage: `rt-canary --socket PATH --identity HEX [--actor ID]`
+//! `rt-canary`: external SUT driving the ldgr-rt effect shim.
+//! Usage: `rt-canary --socket PATH --identity HEX [--actor ID]`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -75,14 +68,12 @@ fn main() -> ExitCode {
 fn run_canary(socket: &Path, identity: EntryHash, actor: ActorId) -> Result<Goodbye, ShimError> {
     let mut session = EngineSession::connect(socket, identity, actor)?;
 
-    // Clock: read the virtual clock.
     let clock = session.effect(Effect::Clock)?;
     let _ticks = match clock {
         EffectResult::Clock { ticks } => ticks,
         other => panic!("clock effect returned {other:?}"),
     };
 
-    // Random: two words from stream 3.
     let random = session.effect(Effect::Random {
         stream: 3,
         count: 2,
@@ -92,7 +83,6 @@ fn run_canary(socket: &Path, identity: EntryHash, actor: ActorId) -> Result<Good
         other => panic!("random effect returned {other:?}"),
     }
 
-    // Filesystem: write, read, sync.
     session.effect(Effect::FsWrite {
         path: "/kv/k".into(),
         offset: 0,
@@ -117,7 +107,6 @@ fn run_canary(socket: &Path, identity: EntryHash, actor: ActorId) -> Result<Good
         path: "/kv/k".into(),
     })?;
 
-    // Sleep and network.
     session.effect(Effect::Sleep { ticks: 10 })?;
     session.effect(Effect::Send {
         to: session.actor(),

@@ -1,26 +1,11 @@
 // ledger-lint:allow:thread::spawn - test-only probe; verifies thread-local registry isolation
-//! Runtime facade entrypoint.
-//!
-//! Why: the SUT should not name `ledger-sim` types. `Handle` is the single
-//! porting seam. The same async body runs under `Simulation` in sim and under
-//! `tokio` otherwise.
-//!
-//! Public contract: every item here has one name, one signature, and one
-//! bound set under every feature combination (none, `sim`, `sim-link`).
-//! Feature-specific behavior lives in private backends behind `run_main`.
-//!
-//! In production `sim` is IPC-only: `run()` delegates to the `ledger
-//! rt-server` process over a Unix socket so the SUT crate stays Apache-2.0.
-//! The `sim-link` feature keeps the old direct `ledger-sim` link for
-//! workspace tests and examples. It is not for SUT crates published outside
-//! the workspace.
-//!
-//! Program transport: caller programs run in this process on the direct
-//! backends (none, `sim-link`). Programs do not cross the IPC boundary, so
-//! under `sim`-only `run(closure)` returns [`RuntimeError::ProgramNotTransportable`]
-//! instead of running anything else, and named execution goes through
-//! [`register_workload`] (direct backends) or `run_named` (server workloads
-//! such as `"kv"`). See the README for the per-feature truth table.
+//! Runtime facade entrypoint: `Handle` is the single porting seam.
+//! Same async body runs under `Simulation` (sim) or `tokio`.
+//! One name, signature, and bound set per item under every feature combo.
+//! `sim` is IPC-only (`ledger rt-server` over Unix socket); `sim-link`
+//! keeps the direct link for workspace tests only.
+//! Caller programs never cross IPC: `sim`-only `run(closure)` returns
+//! [`RuntimeError::ProgramNotTransportable`]; use `run_named`.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -65,11 +50,7 @@ fn clear_current() {
 pub struct RunConfig {
     /// Root seed for deterministic runs. Ignored outside `sim`.
     pub seed: EntryHash,
-    /// Maximum executor steps before `StepLimit`.
-    ///
-    /// Enforced by the simulation backends (`sim`, `sim-link`) only; the
-    /// direct tokio backend runs programs to completion without a step
-    /// budget.
+    /// Maximum executor steps before `StepLimit` (sim backends only).
     pub max_steps: usize,
 }
 
@@ -83,7 +64,6 @@ impl Default for RunConfig {
 }
 
 impl RunConfig {
-    /// Return a builder initialized from [`RunConfig::default`].
     pub fn builder() -> RunConfigBuilder {
         RunConfigBuilder::default()
     }
@@ -93,16 +73,12 @@ impl RunConfig {
         self.seed
     }
 
-    /// Maximum executor steps before `StepLimit`.
     pub fn max_steps(&self) -> usize {
         self.max_steps
     }
 }
 
-/// Builder for [`RunConfig`] with stable, additive setters.
-///
-/// Defaults mirror [`RunConfig::default`]. Call [`RunConfigBuilder::build`]
-/// to finish.
+/// Builder for [`RunConfig`]; defaults mirror [`RunConfig::default`].
 #[derive(Debug, Clone)]
 pub struct RunConfigBuilder {
     seed: EntryHash,
@@ -119,24 +95,20 @@ impl Default for RunConfigBuilder {
 }
 
 impl RunConfigBuilder {
-    /// Create a new builder from defaults.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the root seed.
     pub fn seed(mut self, seed: EntryHash) -> Self {
         self.seed = seed;
         self
     }
 
-    /// Set the instruction budget.
     pub fn max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
         self
     }
 
-    /// Build the [`RunConfig`].
     pub fn build(self) -> RunConfig {
         RunConfig {
             seed: self.seed,
@@ -156,9 +128,6 @@ impl From<RunConfigBuilder> for RunConfig {
 // ---------------------------------------------------------------------------
 
 /// Whether a run reached completion, and why it stopped when it did not.
-///
-/// Facade-local carrier: liveness detail requires the simulation backend;
-/// other builds report [`RunCompletion::Completed`] for their runs.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunCompletion {
@@ -195,11 +164,8 @@ pub struct RunResult {
 }
 
 /// Journal invariant failure raised by a simulation backend.
-///
-/// Why a facade-local carrier: `RuntimeError` must expose one variant set
-/// under every feature combination, but the typed `ledger-journal` error
-/// links only under `sim-link`. There the typed cause stays reachable via
-/// [`core::error::Error::source`]; other builds carry the message only.
+/// Facade-local carrier: typed cause links only under `sim-link` (via
+/// `source`); other builds carry the message only.
 #[derive(Debug)]
 pub struct JournalFault {
     message: Box<str>,
@@ -207,7 +173,6 @@ pub struct JournalFault {
 }
 
 impl JournalFault {
-    /// Build from a description when the typed cause is unavailable.
     pub fn from_message(message: impl Into<Box<str>>) -> Self {
         Self {
             message: message.into(),
@@ -224,7 +189,6 @@ impl JournalFault {
         }
     }
 
-    /// Description carried by this fault.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -244,10 +208,7 @@ impl core::error::Error for JournalFault {
 }
 
 /// Engine-process transport failure (spawn, connect, wire, timeout).
-///
-/// Same rationale as [`JournalFault`]: the typed [`crate::ipc::IpcError`]
-/// cause links only with `sim` or `sim-link` and is preserved as `source`
-/// there; other builds carry messages only.
+/// Same facade-local rationale as [`JournalFault`].
 #[derive(Debug)]
 pub struct IpcFault {
     message: Box<str>,
@@ -255,7 +216,6 @@ pub struct IpcFault {
 }
 
 impl IpcFault {
-    /// Build from a description when the typed cause is unavailable.
     pub fn from_message(message: impl Into<Box<str>>) -> Self {
         Self {
             message: message.into(),
@@ -263,7 +223,6 @@ impl IpcFault {
         }
     }
 
-    /// Description carried by this fault.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -290,7 +249,6 @@ pub struct BeltFault {
 }
 
 impl BeltFault {
-    /// Build from a description when the typed cause is unavailable.
     pub fn from_message(message: impl Into<Box<str>>) -> Self {
         Self {
             message: message.into(),
@@ -307,7 +265,6 @@ impl BeltFault {
         }
     }
 
-    /// Description carried by this fault.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -326,9 +283,8 @@ impl core::error::Error for BeltFault {
     }
 }
 
-/// Local mirror of the engine strict-replay violation. It keeps the engine
-/// type out of this crate's public API outside the `sim-link` feature, so
-/// the dependency stays optional and the license graph unchanged.
+/// Local mirror of the engine strict-replay violation. Keeps the engine
+/// type out of this crate's public API outside `sim-link`.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StrictReplayViolation {
     /// Decision value is outside the ready set.
@@ -422,15 +378,7 @@ impl From<crate::ipc::IpcError> for RuntimeError {
 // ---------------------------------------------------------------------------
 
 /// Capability handle handed to the SUT main future.
-///
-/// The handle is the only way to touch time, RNG, net, and task spawning so
-/// the surface cannot drift between the sim and non-sim paths.
-///
-/// The `actor` field pins the logical actor identity for multi-actor non-sim
-/// routing. In `sim-link` mode the `Boundary` actor is authoritative for
-/// journaling; `actor` mirrors the task id for convenience and `with_actor`
-/// rebinds the non-sim queue only. Use `Handle::conn(from, to)` for arbitrary
-/// pairs when full fan-out is needed.
+/// Only way to touch time, RNG, net, and task spawning.
 pub struct Handle {
     #[cfg(feature = "sim-link")]
     boundary: Option<ledger_sim::Boundary>,
@@ -455,24 +403,15 @@ impl Clone for Handle {
 }
 
 impl Handle {
-    /// Logical actor id this handle sends as.
     pub fn actor(&self) -> ActorId {
         self.actor
     }
 
-    /// Root seed for the deterministic stream of this handle's draws.
     pub fn seed(&self) -> EntryHash {
         self.seed
     }
 
-    /// Return a handle bound to `actor`.
-    ///
-    /// The new handle shares the same seed and shared network but sends and
-    /// receives as `actor`. This enables multi-actor non-sim tests without
-    /// reaching for the full `SimNet` outside simulation. In `sim-link` mode the
-    /// journaling path still uses the `Boundary` task id; `with_actor` only
-    /// affects the non-sim in-process net. For true multi-actor journaling,
-    /// spawn separate tasks under `sim-link` instead.
+    /// Return a handle bound to `actor` (shares seed and net).
     pub fn with_actor(&self, actor: ActorId) -> Self {
         Self {
             #[cfg(feature = "sim-link")]
@@ -484,21 +423,14 @@ impl Handle {
     }
 
     /// Try to fetch the thread-local handle set by `run`.
-    ///
-    /// Returns `None` when called outside a `run` context (for example in host
-    /// setup code).
+    /// Returns `None` outside a `run` context.
     pub fn current() -> Option<Self> {
         CURRENT.with(|c| c.borrow().clone())
     }
 
     /// Return a deterministic clock snapshot.
-    ///
-    /// Under `sim-link` with a live boundary this reads virtual time. Without
-    /// a boundary there is no deterministic source, so this fails with
-    /// [`ClockError::NoContext`] instead of returning epoch zero. Under `sim`
-    /// IPC the local clock is unavailable ([`ClockError::IpcLocal`]); issue a
-    /// server-side effect. Default builds read ambient time as host
-    /// passthrough.
+    /// Fails with [`ClockError::NoContext`] without a boundary (`sim-link`),
+    /// [`ClockError::IpcLocal`] under `sim` IPC; default builds read ambient time.
     pub fn clock(&self) -> Result<crate::time::SimClock, ClockError> {
         #[cfg(feature = "sim-link")]
         {
@@ -517,13 +449,7 @@ impl Handle {
         }
     }
 
-    /// Sleep for `duration`.
-    ///
-    /// Deterministic under `sim-link` with a live boundary (journaled
-    /// `TimerSet` plus virtual time advance). Without a boundary the
-    /// sim-link path is unreachable in normal runs and falls back to
-    /// `tokio::time::sleep`. Under `sim` (IPC) this sleeps locally; the
-    /// remote execution stays deterministic server-side via `rt-server`.
+    /// Sleep for `duration` (journaled under `sim-link`).
     pub async fn sleep(&self, duration: Duration) {
         #[cfg(feature = "sim-link")]
         {
@@ -536,13 +462,8 @@ impl Handle {
     }
 
     /// Return a deterministic RNG for `stream`.
-    ///
-    /// Each draw advances the stream and is journaled when a live
-    /// `sim-link` boundary is present. Without a boundary this fails with
-    /// [`RngError::NoContext`]. Under `sim` IPC local draws are unavailable
-    /// ([`RngError::IpcLocal`]); issue a server-side effect. Default builds
-    /// seed from host entropy and fail closed with
-    /// [`RngError::EntropyUnavailable`] instead of a wall-time fallback.
+    /// Fails with [`RngError::NoContext`] without a boundary, [`RngError::IpcLocal`]
+    /// under `sim` IPC; default builds seed from host entropy.
     pub fn rng(&mut self, stream: StreamId) -> Result<DetRng, RngError> {
         #[cfg(feature = "sim-link")]
         {
@@ -563,22 +484,12 @@ impl Handle {
     }
 
     /// Convenience: next u64 from `stream`.
-    ///
-    /// Each call advances the stream, so successive calls yield successive
-    /// values. This delegates to [`Handle::rng`] and journals the draw
-    /// under `sim-link`.
     pub fn rng_next_u64(&mut self, stream: StreamId) -> Result<u64, RngError> {
         self.rng(stream).map(|mut rng| rng.next_u64())
     }
 
-    /// Send a payload from `self.actor` to `to` via the facade net.
-    ///
-    /// Under `sim-link` this delegates to `Boundary::send` when a boundary is
-    /// present. Outside `sim-link` it uses the shared in-process net bound to
-    /// `self.actor`. Use `with_actor` to fan out as different actors without
-    /// rebuilding the handle from scratch. Returns `false` when the link is
-    /// partitioned or `to` exceeds the actor id range, mirroring an
-    /// undeliverable link rather than truncating the id.
+    /// Send a payload from `self.actor` to `to`. Returns `false` when
+    /// partitioned or `to` exceeds the actor id range.
     #[track_caller]
     pub fn net_send(&self, to: usize, payload: u64) -> bool {
         let Ok(to_id) = u32::try_from(to) else {
@@ -593,10 +504,7 @@ impl Handle {
         Conn::new(self.actor, ActorId(to_id), self.shared_net.clone()).send(payload)
     }
 
-    /// Receive a payload addressed to `self.actor` from any sender via the facade net.
-    ///
-    /// Outside `sim-link` this polls the shared in-process net for messages whose
-    /// destination equals `self.actor`. In `sim-link` it delegates to the boundary.
+    /// Receive a payload addressed to `self.actor`.
     pub async fn net_recv(&self) -> u64 {
         #[cfg(feature = "sim-link")]
         {
@@ -622,18 +530,8 @@ impl Handle {
     }
 
     /// Spawn a child task running `f(child_handle)`.
-    ///
-    /// One bound set under every feature combination: the erased future is
-    /// non-`Send` on purpose, because every executor behind this facade polls
-    /// tasks on one thread. Under `sim-link` with a live boundary the task
-    /// joins the deterministic schedule. Otherwise it runs through
-    /// `spawn_local` on the `LocalSet` installed by [`run`]; spawning outside
-    /// `run` panics, mirroring bare `tokio::spawn` misuse.
-    ///
-    /// Interim limitation under `sim` (IPC): a locally spawned task would sit
-    /// outside the journaled remote run, so meaningful spawns reach the engine
-    /// only once programs cross the process boundary; see the README tradeoff
-    /// note.
+    /// Non-`Send` by design: every executor polls on one thread.
+    /// Under `sim` IPC spawns stay local and outside the journaled run.
     pub fn spawn<F>(&self, f: F) -> crate::task::TaskId
     where
         F: FnOnce(Handle) -> Pin<Box<dyn Future<Output = ()>>> + 'static,
@@ -675,7 +573,7 @@ impl Handle {
         }
     }
 
-    /// Convenience: build a `Conn` from `from` to `to` sharing this handle's net.
+    /// Convenience: build a `Conn` from `from` to `to` on this handle's net.
     pub fn conn(&self, from: ActorId, to: ActorId) -> Conn {
         Conn::new(from, to, self.shared_net.clone())
     }
@@ -686,19 +584,10 @@ impl Handle {
 // ---------------------------------------------------------------------------
 
 /// Caller program accepted by `run`, identical under every feature set.
-///
-/// The future is erased and deliberately non-`Send`: all executors behind the
-/// facade poll tasks on one thread, so requiring `Send` would make SUT
-/// sources non-portable across feature sets.
+/// Erased non-`Send` future: all executors poll on one thread.
 pub type TaskMain = Box<dyn FnOnce(Handle) -> Pin<Box<dyn Future<Output = ()>>> + 'static>;
 
-/// What a backend executes.
-///
-/// Why an enum: keeping "caller program" and "registered workload name"
-/// distinct types makes it impossible to conflate them or to discard a
-/// program silently while claiming to run a workload. Each backend resolves
-/// only the arm it can honestly execute and rejects the other with a typed
-/// error.
+/// What a backend executes: caller program or registered workload name.
 enum Main {
     /// A caller program captured at the public seam.
     Closure(TaskMain),
@@ -707,8 +596,7 @@ enum Main {
 }
 
 impl Main {
-    /// Resolve to a caller program on direct-executor backends: closures
-    /// pass through; names look up the [`register_workload`] registry.
+    /// Resolve to a caller program on direct-executor backends.
     #[cfg(any(feature = "sim-link", not(any(feature = "sim", feature = "sim-link"))))]
     fn into_program(self) -> Result<TaskMain, RuntimeError> {
         match self {
@@ -717,9 +605,7 @@ impl Main {
         }
     }
 
-    /// Resolve to a server workload name on the IPC backend. Caller programs
-    /// cannot cross the process boundary, so they are consumed and refused
-    /// loudly instead of being substituted with some other program.
+    /// Resolve to a server workload name on the IPC backend.
     #[cfg(all(feature = "sim", not(feature = "sim-link")))]
     fn into_workload(self) -> Result<&'static str, RuntimeError> {
         match self {
@@ -733,8 +619,7 @@ impl Main {
     }
 }
 
-/// Factory producing a fresh program per run; programs are consume-once by
-/// contract, so the registry stores factories rather than programs.
+/// Factory producing a fresh program per run (programs are consume-once).
 type WorkloadFactory = fn() -> TaskMain;
 
 thread_local! {
@@ -746,15 +631,8 @@ thread_local! {
         RefCell::new(std::collections::BTreeMap::new());
 }
 
-/// Register a named caller program for the direct-executor backends
-/// (default build and `sim-link`).
-///
-/// `build` is a factory so each run gets a fresh [`TaskMain`]; programs are
-/// consume-once by contract. Re-registering a name replaces its factory.
-/// Thread-local scope: the registration is visible to `run_named` on the
-/// same thread only, matching where programs execute. Under `sim` (IPC) the
-/// engine resolves its own server-side workloads; client registrations have
-/// no effect there.
+/// Register a named caller program for the direct-executor backends.
+/// Thread-local: visible to `run_named` on the same thread only.
 pub fn register_workload(name: &'static str, build: fn() -> TaskMain) {
     WORKLOADS.with(|workloads| {
         workloads.borrow_mut().insert(name, build);
@@ -772,29 +650,13 @@ fn resolve_workload(name: &'static str) -> Result<TaskMain, RuntimeError> {
 }
 
 /// Run a registered workload by name.
-///
-/// Direct-executor backends resolve `name` against [`register_workload`]
-/// and execute the resulting caller program; an unknown name returns
-/// [`RuntimeError::UnknownWorkload`]. Under `sim` (IPC) the name goes to the
-/// engine, which runs its own registered server workload (for example `"kv"`),
-/// returning the server-computed journal root.
 pub fn run_named(config: RunConfig, name: &'static str) -> Result<RunResult, RuntimeError> {
     run_main(config, Main::Named(name))
 }
 
 /// Run `main` to completion.
-///
-/// Backend by feature set: `sim-link` drives the program on the deterministic
-/// in-process executor; with neither sim feature it blocks a current-thread
-/// tokio runtime on the program; under `sim` (IPC) caller programs cannot
-/// cross the process boundary, so this returns
-/// [`RuntimeError::ProgramNotTransportable`] - use `run_named` with a server
-/// workload or rebuild with `sim-link`. All backends poll on one thread, so
-/// futures may hold non-`Send` state.
-///
-/// The handle is installed into a thread-local for the duration of the run so
-/// host helpers can reach it via [`Handle::current`]; SUT code should take
-/// the handle passed to `main` and spawn through [`Handle::spawn`].
+/// Under `sim` IPC caller programs are refused with
+/// [`RuntimeError::ProgramNotTransportable`]; use `run_named`.
 pub fn run<F, Fut>(config: RunConfig, main: F) -> Result<RunResult, RuntimeError>
 where
     F: FnOnce(Handle) -> Fut + 'static,
@@ -876,13 +738,7 @@ fn run_with_sim(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError
 
 #[cfg(all(feature = "sim", not(feature = "sim-link")))]
 async fn run_via_ipc(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError> {
-    // Resolve engine binary from an explicit path or LEDGER_ENGINE_BIN and
-    // run a server-registered workload. Server workloads are deterministic
-    // for a given seed and actor, so equal inputs yield equal roots.
-    // The caller identity is threaded explicitly: single-actor runs use 0.
     let workload = main.into_workload()?;
-    // Spawn the engine process. The child is killed on drop. A missing engine
-    // configuration fails closed here with a typed IPC error.
     let mut engine = EngineProcess::spawn(None).await?;
     let outcome = engine.run_workload_with_steps(
         workload,
@@ -926,14 +782,11 @@ fn run_with_tokio(config: RunConfig, main: Main) -> Result<RunResult, RuntimeErr
 }
 
 // ---------------------------------------------------------------------------
-// Surface probe
+// Surface probe: one trait, one bound set per feature combo.
 // ---------------------------------------------------------------------------
-// One trait, one bound set: any drift between feature combinations fails to
-// compile right here. Per-combo `cargo check` plus the `public_contract`
-// integration test pin the contract; `probe()` keeps the gate visible in
-// test output.
+// Per-combo `cargo check` plus `public_contract` pin the contract.
 
-#[allow(dead_code)] // compile-time surface probe; see the block comment above
+#[allow(dead_code)] // compile-time surface probe
 trait Surface {
     fn clock(&self) -> Result<crate::time::SimClock, ClockError>;
     fn actor(&self) -> ActorId;
@@ -987,9 +840,7 @@ mod tests {
     use super::*;
     use core::time::Duration;
 
-    /// Assert `res` matches the per-combo contract for `run(closure)`:
-    /// the caller program executes on direct-executor backends, while
-    /// IPC-only builds refuse it loudly without needing an engine.
+    /// Per-combo contract for `run(closure)`.
     fn assert_run_program_outcome(res: Result<RunResult, RuntimeError>) {
         #[cfg(all(feature = "sim", not(feature = "sim-link")))]
         {
@@ -1157,10 +1008,7 @@ mod tests {
         assert_ne!(a.journal_root, c.journal_root);
     }
 
-    /// A bare workload name must be rejected loudly via the public `run_named`
-    /// path instead of being confused with a program. IPC-only builds forward
-    /// names to the engine instead of consulting this registry, so they are
-    /// out of scope here.
+    /// Unknown names fail as `UnknownWorkload` (direct backends only).
     #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
     #[test]
     fn unknown_named_workload_is_a_typed_error() {
@@ -1186,9 +1034,7 @@ mod tests {
         })
     }
 
-    /// Factories are consume-once-per-run by contract, so the registry must
-    /// hand out a fresh program for every named run: two sequential
-    /// `run_named` calls fire the factory exactly twice.
+    /// Registry hands out a fresh program per named run.
     #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
     #[test]
     fn registered_workload_runs_by_name_on_direct_backends() {
@@ -1222,9 +1068,7 @@ mod tests {
         );
     }
 
-    /// The registry is deliberately thread-local (programs may capture
-    /// non-`Send` state), so registrations from another thread must be
-    /// invisible here and fail loudly instead of silently succeeding.
+    /// Registry is thread-local: cross-thread registrations stay invisible.
     #[cfg(not(all(feature = "sim", not(feature = "sim-link"))))]
     #[test]
     fn registrations_on_other_threads_are_invisible() {
@@ -1240,9 +1084,7 @@ mod tests {
         assert_eq!(name.as_ref(), "thread-local-wl");
     }
 
-    /// Actor ids beyond the u32 range are undeliverable rather than
-    /// truncated to a different actor: send reports false and no queue for
-    /// any plausible destination gains a message.
+    /// Out-of-range actor ids are undeliverable, never truncated.
     #[test]
     fn net_send_rejects_ids_beyond_actor_range() {
         const BEYOND_RANGE: usize = u32::MAX as usize + 1;
@@ -1267,9 +1109,7 @@ mod tests {
         assert_run_program_outcome(res);
     }
 
-    /// Under IPC-only builds, `run(closure)` must fail loudly and fast with
-    /// the instructive typed error - before any engine spawn - instead of
-    /// silently running some other program.
+    /// IPC-only `run(closure)` fails with `ProgramNotTransportable` pre-spawn.
     #[cfg(all(feature = "sim", not(feature = "sim-link")))]
     #[test]
     fn ipc_closure_run_reports_program_not_transportable() {
@@ -1280,10 +1120,7 @@ mod tests {
         );
     }
 
-    /// Anti-substitution proof for the deterministic backend: the journal
-    /// root comes from THIS program (same closure + seed reproduce it; any
-    /// change to the program changes it), so a silent swap for another
-    /// workload cannot go unnoticed.
+    /// Journal root comes from this program: same seed reproduces it.
     #[cfg(feature = "sim-link")]
     #[test]
     fn sim_link_closure_roots_are_deterministic_and_program_sensitive() {
@@ -1305,11 +1142,6 @@ mod tests {
     }
 
     /// Probe that every build exposes an identical `Handle` surface.
-    ///
-    /// Each compilation pins one feature combo; per-combo `cargo check`
-    /// invocations are the real proof, and the `public_contract` integration
-    /// test pins every signature. This test keeps the gate visible in
-    /// `cargo nextest` output alongside [`crate::probe`].
     #[test]
     fn surface_probe_compiles() {
         crate::runtime::assert_surface();
@@ -1317,10 +1149,7 @@ mod tests {
         let _seed = RunConfig::default().seed;
     }
 
-    /// Receives must work across the full actor id space, not a bounded
-    /// sender scan: a high-id receiver gets mail from a high-id sender with
-    /// no polling of intermediate ids. Deterministic on direct executors;
-    /// under `sim` (IPC) only the refusal contract applies.
+    /// Receives work across the full actor id space.
     #[test]
     fn high_actor_ids_receive_across_full_id_space() {
         let res = run(

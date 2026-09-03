@@ -1,32 +1,23 @@
-//! Versioned, framed, sequence-checked wire protocol between the Apache-2.0
-//! `ldgr-rt` facade and the AGPL engine server (`rt-server`).
-//!
-//! The transport is a byte stream (Unix socket in production, an in-process
-//! loopback pair in tests). Frames are length-prefixed and carry a per-stream
-//! sequence number. Every decode enforces size caps before allocation and
-//! fails closed on any violation: wrong magic, wrong version, a frame larger
-//! than [`MAX_FRAME_BYTES`], a path over [`MAX_PATH_BYTES`], a payload over
-//! [`MAX_PAYLOAD_BYTES`], or a non-monotonic sequence number.
-//!
-//! Authentication is two-layered and lives outside this crate: the transport
-//! checks Unix peer credentials, and the application handshake
-//! ([`Hello`]/[`Welcome`]) binds the protocol version to the complete
-//! `ExecutionIdentity` digest before any effect request is served.
+//! Versioned, framed, sequence-checked wire protocol (`ldgr-rt` to `rt-server`).
+//! Byte stream; frames carry a per-stream sequence number. Every decode
+//! enforces size caps before allocation and fails closed. Auth lives outside
+//! this crate: Unix peer credentials plus the [`Hello`]/[`Welcome`]
+//! identity handshake.
 
 pub mod codec;
 pub mod msg;
 
 pub use codec::{CodecError, DecodeError, decode_frame, encode_frame, parse_header};
 pub use msg::{
-    Effect, EffectError, EffectRequest, EffectResponse, EffectResult, Goodbye, Hello, Message,
-    Reject, RejectReason, Welcome, decode_message, encode_message,
+    Effect, EffectError, EffectRequest, EffectResponse, EffectResult, FRAMED_HASH_LEN,
+    FRAMED_HASH_PREFIX, Goodbye, Hello, Message, Reject, RejectReason, Welcome, decode_message,
+    encode_message,
 };
 
 /// Protocol version carried in every frame header and the handshake.
 ///
-/// Bump this (and the engine server's accepted set) on any breaking change to
-/// the frame layout or message encoding.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Version 2 frames `EntryHash` values on the wire as 34-byte framed hashes
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Frame magic: the four leading bytes of every frame.
 pub const MAGIC: [u8; 4] = *b"LDRP";
@@ -46,8 +37,8 @@ pub const MAX_RANDOM_COUNT: u32 = 4096;
 /// Maximum actors addressed by one effect.
 pub const MAX_ACTOR: u32 = 1 << 20;
 
-/// Number of bytes in one `ExecutionIdentity` digest (a BLAKE3 `EntryHash`).
-pub const IDENTITY_BYTES: usize = 32;
+/// Number of bytes in one `ExecutionIdentity` digest on the wire (34 framed).
+pub const IDENTITY_BYTES: usize = 34;
 
-/// Number of bytes in a journal root (a BLAKE3 `EntryHash`).
-pub const ROOT_BYTES: usize = 32;
+/// Number of bytes in a journal root on the wire (34 framed).
+pub const ROOT_BYTES: usize = 34;

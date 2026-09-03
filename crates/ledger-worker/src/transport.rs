@@ -1,12 +1,8 @@
 // ledger-lint:allow - host daemon / non-sim passthrough, like TokioBackend
 
 //! Outbound control-plane session client for `ledger.control.v2`.
-//!
-//! The worker is a pure client: it dials the external control plane, opens
-//! ONE authenticated session stream, and lets the control plane assign
-//! tasks over that session. The worker hosts no service. Execution
-//! semantics mirror [`crate::worker::execute_task`], so this boundary stays
-//! byte-identical to the in-process dispatcher.
+//! Pure client: one authenticated session stream; execution mirrors
+//! [`crate::worker::execute_task`].
 
 use std::path::Path;
 use std::time::Duration;
@@ -23,8 +19,7 @@ use crate::r#gen::{
 use crate::queue::Task;
 use crate::worker::{TaskFailure, WorkerError, WorkerResult, execute_task};
 
-/// Hard cap for one protobuf message in either direction. A dispatch or
-/// upload never approaches 1 MiB, so anything larger is hostile input.
+/// Hard cap for one protobuf message either way.
 pub const MAX_MESSAGE_SIZE: usize = 1 << 20;
 
 /// Errors from the outbound control-plane session.
@@ -61,13 +56,8 @@ pub enum SessionError {
 
 /// Dial the control-plane endpoint and open the session stream.
 ///
-/// `endpoint` is a tonic endpoint URI such as `unix:///run/cp.sock` or
-/// `http://[::1]:50051`. Returns the stream halves: the worker sends
-/// [`SessionRequest`]s on `tx` and reads [`SessionResponse`]s from `rx`.
-///
 /// # Errors
-/// Returns the tonic transport error when the endpoint is invalid or
-/// unreachable, or the stream error when the session cannot be opened.
+/// Returns transport/stream errors when unreachable or unopenable.
 pub async fn open_session(
     endpoint: &str,
 ) -> Result<
@@ -90,12 +80,32 @@ pub async fn open_session(
     Ok((tx, response.into_inner()))
 }
 
-/// Map a [`TaskDispatch`] onto the queue task model, validating every
-/// bound the wire carries. A malformed dispatch fails closed.
+/// Wire prefix for a framed `EntryHash`.
+pub const FRAMED_HASH_PREFIX: [u8; 2] = [0x1e, 0x20];
+
+/// Wire length of one framed `EntryHash`.
+pub const FRAMED_HASH_LEN: usize = 34;
+
+/// Encode an internal digest as framed wire bytes.
+fn encode_framed_identity(hash: &ledger_format::EntryHash) -> Vec<u8> {
+    let framed = hash.to_framed_bytes();
+    debug_assert_eq!(framed.len(), FRAMED_HASH_LEN);
+    debug_assert_eq!(&framed[..2], &FRAMED_HASH_PREFIX);
+    framed.to_vec()
+}
+
+/// Decode framed wire bytes into an internal digest (`None` fails closed).
+fn decode_framed_identity(bytes: &[u8]) -> Option<ledger_format::EntryHash> {
+    if bytes.len() != FRAMED_HASH_LEN {
+        return None;
+    }
+    ledger_format::EntryHash::from_framed_bytes(bytes).ok()
+}
+
+/// Map a [`TaskDispatch`] onto the queue task model. Malformed fails closed.
 ///
 /// # Errors
-/// Returns [`SessionError::InvalidDispatch`] for a non-hex hash, an
-/// oversized string, or an unparsable config.
+/// Returns [`SessionError::InvalidDispatch`] for bad bounds or config.
 pub fn task_from_dispatch(dispatch: TaskDispatch) -> Result<Task, SessionError> {
     if dispatch.task_id.len() > 4096 {
         return Err(SessionError::InvalidDispatch {
@@ -129,18 +139,16 @@ pub fn task_from_dispatch(dispatch: TaskDispatch) -> Result<Task, SessionError> 
     })?;
     let mut task = Task::new(dispatch.task_id, run_config, dispatch.workload);
     task.run_config_hash = crate::proto::hex_to_hash(&dispatch.run_config_hash_hex).ok();
-    // The dispatch carries the pinned identity digest (B2); the worker
-    // compares its own assembly against it before executing.
+    // The dispatch carries the pinned identity digest (B2) in framed form;
+    // the worker compares its own assembly against it before executing.
     if !dispatch.execution_identity.is_empty() {
-        let mut pin = [0u8; 32];
-        if dispatch.execution_identity.len() != pin.len() {
+        let Some(pin) = decode_framed_identity(&dispatch.execution_identity) else {
             return Err(SessionError::InvalidDispatch {
                 task_id: task.id,
-                reason: "execution_identity must be 32 bytes".to_string(),
+                reason: "execution_identity must be 34 framed bytes".to_string(),
             });
-        }
-        pin.copy_from_slice(&dispatch.execution_identity);
-        task.execution_identity = Some(ledger_format::EntryHash(pin));
+        };
+        task.execution_identity = Some(pin);
     }
     Ok(task)
 }
@@ -148,9 +156,7 @@ pub fn task_from_dispatch(dispatch: TaskDispatch) -> Result<Task, SessionError> 
 /// Build the worker hello from the compiled identity and runtime profile.
 ///
 /// # Errors
-/// Returns [`SessionError::IdentityEncoding`] when the build fields exceed
-/// the identity encoding caps; the session must not open with an
-/// unhashable identity.
+/// Returns [`SessionError::IdentityEncoding`] when unhashable.
 pub fn worker_hello(worker_id: &str, version: &str) -> Result<WorkerHello, SessionError> {
     let profile = RuntimeProfile {
         engine_sha: crate::RuntimeProfile::detect().engine_sha.clone(),
@@ -164,20 +170,16 @@ pub fn worker_hello(worker_id: &str, version: &str) -> Result<WorkerHello, Sessi
     Ok(WorkerHello {
         worker_id: worker_id.to_string(),
         version: version.to_string(),
-        // The worker's own build identity, when the build data is complete.
+        // The worker's own build identity in framed form, when the build
+        // data is complete.
         execution_identity: worker_build_identity_digest()?
-            .map(|h| h.0.to_vec())
+            .map(|h| encode_framed_identity(&h))
             .unwrap_or_default(),
         profile: Some(profile),
     })
 }
 
-/// The worker's build-segment identity digest, or `None` when the build
-/// data is incomplete (dev builds without a captured revision).
-///
-/// # Errors
-/// Returns [`SessionError::IdentityEncoding`] when the build fields exceed
-/// the identity encoding caps.
+/// The worker's build-segment identity digest (`None` when incomplete).
 fn worker_build_identity_digest() -> Result<Option<ledger_format::EntryHash>, SessionError> {
     use ledger_explorer::identity::{EngineBuild, IdentityContext};
     let build = EngineBuild::detect();
@@ -212,15 +214,8 @@ pub enum TaskOutcome {
 
 /// Run one assigned task and upload its result, heartbeating while it runs.
 ///
-/// Mirrors `execute_with_heartbeat`: the task runs on the blocking pool and
-/// each heartbeat tick sends a [`Heartbeat`] on the session stream. On
-/// success the result is uploaded with the execution-identity digest; on
-/// failure the attempt is charged through the session funnel and the
-/// failure is uploaded.
-///
 /// # Errors
-/// Returns [`SessionError`] when the session stream itself fails; task
-/// failures are uploaded, not returned.
+/// Returns [`SessionError`] when the session stream itself fails.
 pub async fn run_assigned_task(
     tx: &mpsc::Sender<SessionRequest>,
     task: Task,
@@ -273,7 +268,8 @@ pub async fn run_assigned_task(
                 error: String::new(),
                 execution_identity: ok
                     .execution_identity
-                    .map(|h| h.0.to_vec())
+                    .as_ref()
+                    .map(encode_framed_identity)
                     .unwrap_or_default(),
             };
             let msg = SessionRequest {
@@ -310,9 +306,6 @@ pub async fn run_assigned_task(
 }
 
 /// Upload a failed task through the session funnel.
-///
-/// # Errors
-/// Returns [`SessionError::RequestChannelClosed`] when the stream closed.
 pub async fn upload_failure(
     tx: &mpsc::Sender<SessionRequest>,
     task_id: &str,
@@ -336,19 +329,13 @@ pub async fn upload_failure(
 }
 
 /// Read one inbound session message.
-///
-/// # Errors
-/// Returns the stream error when the session breaks.
 pub async fn next_response(
     rx: &mut tonic::Streaming<SessionResponse>,
 ) -> Result<Option<SessionResponse>, SessionError> {
     rx.message().await.map_err(SessionError::Stream)
 }
 
-/// Handle a control-plane cancel: fail the named task through the funnel.
-///
-/// # Errors
-/// Returns the request-channel error when the stream closed.
+/// Handle a control-plane cancel through the funnel.
 pub async fn handle_cancel(
     tx: &mpsc::Sender<SessionRequest>,
     cancel: CancelTask,
@@ -357,11 +344,7 @@ pub async fn handle_cancel(
     upload_failure(tx, &cancel.task_id, &failure).await
 }
 
-/// Resolve the session's assigned worker id from the hello ack.
-///
-/// # Errors
-/// Returns [`SessionError::Rejected`] when the control plane rejected the
-/// session.
+/// Resolve the assigned worker id from the hello ack.
 pub fn session_ack_worker_id(ack: &crate::r#gen::SessionAck) -> Result<String, SessionError> {
     if !ack.accepted {
         return Err(SessionError::Rejected {
@@ -372,9 +355,6 @@ pub fn session_ack_worker_id(ack: &crate::r#gen::SessionAck) -> Result<String, S
 }
 
 /// Default endpoint for a local control plane over a Unix socket.
-///
-/// # Errors
-/// Returns the invalid-endpoint error when `path` cannot be escaped.
 pub fn unix_endpoint(path: &Path) -> Result<String, SessionError> {
     let uri = format!("unix://{}", path.display());
     Endpoint::from_shared(uri.clone())
@@ -397,7 +377,9 @@ mod tests {
             run_config_bytes: crate::proto::canonical_bytes(&cfg).unwrap(),
             workload: "kv".to_string(),
             run_config_hash_hex: crate::proto::hash_to_hex(&hash),
-            execution_identity: ledger_format::EntryHash([0xabu8; 32]).0.to_vec(),
+            execution_identity: super::encode_framed_identity(&ledger_format::EntryHash(
+                [0xabu8; 32],
+            )),
         }
     }
 
@@ -447,13 +429,35 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_rejects_raw_32_byte_identity_and_bad_prefix() {
+        // Raw 32-byte digests no longer decode: the wire carries 34 framed
+        // bytes, so a raw digest fails the length check.
+        let mut raw = golden_dispatch();
+        raw.execution_identity = vec![0xabu8; 32];
+        assert!(matches!(
+            task_from_dispatch(raw),
+            Err(SessionError::InvalidDispatch { .. })
+        ));
+        // Correct length with a wrong prefix fails as well.
+        let mut bad_prefix = golden_dispatch();
+        bad_prefix.execution_identity = vec![0u8; 34];
+        assert!(matches!(
+            task_from_dispatch(bad_prefix),
+            Err(SessionError::InvalidDispatch { .. })
+        ));
+    }
+
+    #[test]
     fn hello_carries_identity_when_build_complete() {
         let hello = worker_hello("w1", "0.1.0").expect("hello builds");
         assert_eq!(hello.worker_id, "w1");
         assert_eq!(hello.version, "0.1.0");
-        // The identity is either the complete 32-byte digest or empty for
-        // an incomplete dev build; both are contract-legal.
-        assert!(hello.execution_identity.is_empty() || hello.execution_identity.len() == 32);
+        // The identity is either the complete 34-byte framed digest or empty
+        // for an incomplete dev build; both are contract-legal.
+        assert!(hello.execution_identity.is_empty() || hello.execution_identity.len() == 34);
+        if !hello.execution_identity.is_empty() {
+            assert_eq!(&hello.execution_identity[0..2], &super::FRAMED_HASH_PREFIX);
+        }
         let profile = hello.profile.expect("profile");
         assert_eq!(profile.fingerprint_hex.len(), 8);
     }

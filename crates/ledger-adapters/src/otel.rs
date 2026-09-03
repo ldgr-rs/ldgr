@@ -1,21 +1,8 @@
 // ledger-lint:allow:std::fs:: (host-side adapters read trace files on disk)
 
-//! OTel span ingest with Layer-A lineage pipeline.
-//!
-//! Each span becomes one `Outcome` entry with `Text(name)` and each
-//! event becomes a `Send` entry. Fidelity is carried structurally via
-//! `IngestedJournal`; lineage-only ingests also receive an `Epoch`
-//! marker so a bare `Journal` can still be checked.
-//!
-//! This module implements a true Layer-A lineage pipeline:
-//! - content-addressed deduplication by the full-span content hash
-//!   (`span_content_hash`: trace_id, span_id, name, parent_span_id, events,
-//!   attributes) via `HashMap<Hash, ()>` so duplicate traces execute once,
-//! - parent causality preservation via topo ordering, child before parent
-//!   still resolves,
-//! - canonical topological ordering with bounded cycle diagnostics,
-//! - fidelity enforcement and attribute limits,
-//! - host-daemon file ingest with streaming caps.
+//! OTel span ingest with Layer-A lineage pipeline: each span becomes one
+//! `Outcome` entry, each event a `Send` entry; lineage-only ingests add an
+//! `Epoch` marker. Dedup by full-span content hash, topo-ordered causality.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
@@ -33,12 +20,6 @@ pub struct OtelEvent {
 }
 
 /// An OTel span with trace context and optional parent for causality.
-///
-/// `parent_span_id` preserves OTel causality in the journal: when set,
-/// the child's journal entry includes the parent entry's hash as an
-/// observed parent. `attributes` holds span attributes for limit
-/// enforcement and dedup hashing. Serde defaults keep JSON without the
-/// field parsing.
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OtelSpan {
     pub trace_id: String,
@@ -96,19 +77,13 @@ impl OtelIngestConfig {
     }
 }
 
-/// Fold one length-prefixed field into the hasher as `len_be(u64) || bytes`
-/// so concatenated fields stay unambiguous.
+/// Fold one length-prefixed field into the hasher.
 fn hash_field(hasher: &mut blake3::Hasher, field: &[u8]) {
     hasher.update(&(field.len() as u64).to_be_bytes());
     hasher.update(field);
 }
 
-/// Compute the dedup content hash over the full span identity:
-/// length-prefixed `trace_id`, `span_id`, `name`, then the
-/// `parent_span_id` state (absent marker byte, or present marker byte plus
-/// length-prefixed value), then a canonical digest of the event sequence
-/// and sorted attributes. Length prefixes keep the encoding injective;
-/// identical span content always yields an identical hash.
+/// Dedup content hash over the full span identity (length-prefixed fields).
 fn span_content_hash(span: &OtelSpan) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hash_field(&mut hasher, span.trace_id.as_bytes());
@@ -138,11 +113,7 @@ fn span_content_hash(span: &OtelSpan) -> EntryHash {
     EntryHash(*hasher.finalize().as_bytes())
 }
 
-/// True if any span references a `parent_span_id` that is not present in
-/// the batch-wide set of span ids. Batch-wide membership means forward
-/// references never trigger this check; they resolve after topological
-/// reordering. A dangling parent makes the VC non-deterministic, so the
-/// batch is not BitExact-certifiable.
+/// True if any span references a batch-absent `parent_span_id`.
 fn has_missing_parent(spans: &[OtelSpan]) -> bool {
     let ids: HashSet<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
     spans.iter().any(|s| {
@@ -154,17 +125,8 @@ fn has_missing_parent(spans: &[OtelSpan]) -> bool {
     })
 }
 
-/// Order span indices dependency-first so every parent precedes its children.
-///
-/// Kahn's algorithm with an input-order tie-break: among spans whose
-/// batch-local parents are all emitted, the lowest input index goes next.
-/// A `parent_span_id` absent from the batch counts as a root. Duplicate
-/// `span_id`s bind to their first occurrence; later occurrences cannot
-/// serve as parents.
-///
-/// Cycle members, including self-parents, never satisfy the emission rule;
-/// they are appended in input order after the acyclic prefix, so the
-/// result always has `spans.len()` entries.
+/// Order span indices dependency-first (Kahn, input-order tie-break).
+/// Cycle members append in input order after the acyclic prefix.
 pub fn topo_order_spans(spans: &[OtelSpan]) -> Vec<usize> {
     let (mut order, emitted) = topo_order_with_count(spans);
     if emitted < spans.len() {
@@ -178,18 +140,12 @@ pub fn topo_order_spans(spans: &[OtelSpan]) -> Vec<usize> {
     order
 }
 
-/// Crate-private ordering helper built on `kahn_emission`.
-///
-/// Returns the dependency-first emission order and the emitted count.
-/// Callers must check `emitted != spans.len()` to detect cycles.
+/// Crate-private ordering helper; check `emitted != len` for cycles.
 pub(crate) fn topo_order_with_count(spans: &[OtelSpan]) -> (Vec<usize>, usize) {
     kahn_emission(spans)
 }
 
 /// Kahn emission over batch-local parent edges.
-///
-/// Returns the dependency-first emission order plus the emitted count;
-/// `emitted < spans.len()` means at least one parent cycle exists.
 fn kahn_emission(spans: &[OtelSpan]) -> (Vec<usize>, usize) {
     let n = spans.len();
     let mut first_of_id: HashMap<&str, usize> = HashMap::with_capacity(n);
@@ -244,8 +200,6 @@ fn bounded_trail(spans: &[OtelSpan], order: &[usize]) -> Vec<String> {
 }
 
 /// Enforce attribute count and total bytes limits for a batch.
-///
-/// Returns `AttributeLimitExceeded` on first violation.
 fn check_attribute_limits(
     spans: &[OtelSpan],
     config: &OtelIngestConfig,
@@ -281,15 +235,7 @@ fn check_attributes_with_defaults(spans: &[OtelSpan]) -> Result<(), AdapterError
     check_attribute_limits(spans, &cfg)
 }
 
-/// Ingest with explicit fidelity.
-///
-/// The `fidelity` param is honoured: `LineageOnly` journals receive an
-/// `Epoch` marker (`Text("lineage-only")`), `BitExact` journals do not.
-/// The marker makes `Journal`-only consumers able to reject lineage-only
-/// data even if the wrapper is stripped.
-///
-/// Validation uses the shared ordering helper so forward parent edges
-/// resolve. Cycles are rejected with `CycleDetected` and a bounded trail.
+/// Ingest with explicit fidelity (`LineageOnly` adds an `Epoch` marker).
 pub fn ingest_otel_with_fidelity(
     spans: Vec<OtelSpan>,
     fidelity: Fidelity,
@@ -347,14 +293,7 @@ pub fn ingest_otel_with_fidelity(
 }
 
 /// Ingest and return a structural `IngestedJournal` with envelope.
-///
-/// The envelope records each span/event as an `EntryMapping` with the
-/// caller-supplied fidelity. The envelope hash is content-addressed
-/// (BLAKE3 over canonical bytes) and can be used for dedup. Callers
-/// must check `is_certifiable()` before producing certificates.
-///
-/// Validation uses the shared ordering helper so forward parent edges
-/// resolve. Cycles are rejected with `CycleDetected` and a bounded trail.
+/// Callers must check `is_certifiable()` before producing certificates.
 pub fn ingest_otel_enveloped(
     spans: Vec<OtelSpan>,
     fidelity: Fidelity,
@@ -424,28 +363,8 @@ pub fn ingest_otel_enveloped(
     IngestedJournal::new(journal, fidelity, envelope)
 }
 
-/// Layer-A lineage pipeline with content-addressed dedup and fidelity enforcement.
-///
-/// Deduplicates spans by the full-span content hash (`span_content_hash`:
-/// trace_id, span_id, name, parent_span_id, events, attributes) using
-/// `HashMap<Hash, ()>` so duplicate traces (LazyMOP 99% dup) execute once.
-/// Dedup keeps the first occurrence in input order.
-///
-/// Causality is preserved regardless of input order: spans are reordered
-/// dependency-first via the shared helper before the journal build, so a
-/// child that appears before its parent still receives the parent entry
-/// hash as an observed parent. Parent lookup binds to the first occurrence
-/// of a duplicated `span_id`. Cycles are rejected with `CycleDetected`.
-///
-/// Fidelity is enforced: `BitExact` requires every referenced
-/// `parent_span_id` to exist somewhere in the batch (forward references
-/// resolve after reordering); otherwise returns
-/// `AdapterError::FidelityMismatch`.
-///
-/// Determinism: same spans in same order produce the same journal root and
-/// same envelope hash. Reordering an acyclic batch changes the journal only
-/// where spans are causally independent; a dependency chain yields the
-/// identical journal under any input permutation.
+/// Layer-A lineage pipeline with content-addressed dedup.
+/// Same spans in same order yield same journal root and envelope hash.
 pub fn ingest_otel_dedup(
     spans: Vec<OtelSpan>,
     config: OtelIngestConfig,
@@ -549,15 +468,7 @@ pub fn ingest_otel_dedup(
     IngestedJournal::new(journal, config.fidelity, envelope)
 }
 
-/// Host-daemon file ingest: read newline-delimited JSON OTel spans.
-///
-/// Each non-empty line must be a JSON `OtelSpan`. Blank lines are skipped.
-/// The file is read via `std::fs` (host daemon path, not simulation code).
-/// This is the one ambient I/O exception analogous to `TokioBackend`.
-///
-/// Default pipeline config is `OtelIngestConfig::default()` (dedup enabled,
-/// `LineageOnly`). For `BitExact` callers, use `ingest_otel_dedup` directly
-/// or `ingest_otel_file_with_config`.
+/// Host-daemon file ingest: newline-delimited JSON spans (ambient I/O by design).
 ///
 /// # Errors
 /// Returns `AdapterError` variants for I/O, JSON parse, limits, or cycles.
@@ -566,11 +477,6 @@ pub fn ingest_otel_file(path: &Path) -> Result<IngestedJournal, AdapterError> {
 }
 
 /// File ingest with explicit config and streaming caps.
-///
-/// Uses `BufReader` plus `.take(max_bytes + 1)` to enforce total byte cap
-/// without reading the whole file into memory. Enforces per-line byte cap,
-/// total byte cap, and span cap mid-stream.
-/// See `ingest_otel_file` for the host-daemon allowance.
 pub fn ingest_otel_file_with_config(
     path: &Path,
     config: OtelIngestConfig,

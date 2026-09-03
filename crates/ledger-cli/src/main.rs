@@ -26,7 +26,7 @@ use ledger_explorer::{HistoryOracle, KeyValueSpec, Oracle};
 use ledger_format::EntryHash;
 use ledger_sim::{Policy, ReplayViolation, RunConfig, RuntimeError, SimFault, Simulation};
 
-/// Cancel flag for an armed watchdog. Dropping the guard disarms the thread.
+/// Cancel flag for an armed watchdog.
 struct WatchdogGuard {
     cancel: Arc<AtomicBool>,
 }
@@ -37,12 +37,7 @@ impl Drop for WatchdogGuard {
     }
 }
 
-/// Arm a runner-level wall-clock watchdog.
-///
-/// The executor is single-threaded, so a hang inside a task or a mutex
-/// cannot be interrupted in place. The watchdog is the host-side last
-/// line of defense: on expiry it prints a diagnostic and exits with
-/// code 2. The guard must stay alive for the whole command.
+/// Arm a runner-level wall-clock watchdog (host-side hang defense; exits 2).
 fn arm_watchdog(deadline_ms: u64, context: &str) -> WatchdogGuard {
     let cancel = Arc::new(AtomicBool::new(false));
     let thread_cancel = Arc::clone(&cancel);
@@ -200,10 +195,6 @@ fn json_violation(reason: &str, steps: usize, root: EntryHash) -> String {
 }
 
 /// Print captured origins for the witness entries of a violation.
-///
-/// Origins exist only for runs that flowed through origin-capturing calls
-/// (tracked facade sends, direct backend use). Instruction-program runs have
-/// no per-effect call sites, so this prints nothing there by design.
 fn print_effect_origins(
     origins: &[(EntryHash, ledger_sim::OriginSource)],
     witnesses: &[EntryHash],
@@ -372,7 +363,7 @@ fn run_repro(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Maximum decisions artifact size (1 MiB) to bound parsing.
+/// Maximum decisions artifact size (1 MiB).
 const DECISIONS_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Read and parse a decisions artifact capped at [`DECISIONS_MAX_BYTES`].
@@ -790,6 +781,9 @@ fn describe_injection(injection: &SimFault) -> String {
         SimFault::Drop(id) => format!("drop:{}", &ledger_format::hash_to_hex(id)[..8]),
         SimFault::Delay { send, ticks } => {
             format!("delay:{}:{ticks}", &ledger_format::hash_to_hex(send)[..8])
+        }
+        SimFault::Duplicate { send } => {
+            format!("duplicate:{}", &ledger_format::hash_to_hex(send)[..8])
         }
         SimFault::Partition { src, dst } => format!("partition:{}->{}", src.0, dst.0),
         SimFault::Crash(id) => format!("crash:{}", &ledger_format::hash_to_hex(id)[..8]),

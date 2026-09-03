@@ -1,20 +1,9 @@
 // ledger-lint:allow (host daemon; rt-server binds Unix domain socket and uses std::fs for socket path setup)
-//! AGPL composition root: the deterministic engine effect server.
-//!
-//! The server binds a private Unix socket, authenticates the peer by its
-//! socket credentials, and serves one effect session per connection. A
-//! session runs the `ldgr_rt::proto` framed protocol: the client sends a
-//! `Hello` carrying the session identity, then one
-//! `EffectRequest` per deterministic effect, then
-//! `Finish`; the server replies with
-//! `Welcome`, one `EffectResponse`
-//! per request, and a final `Goodbye` carrying the
-//! journal root and entry count.
-//!
-//! Every effect is served by the deterministic `SimBackend` and journaled.
-//! Computation between effects (the SUT's business logic) is outside the
-//! deterministic boundary: the engine only ever sees the effects themselves,
-//! so the journal is a pure function of the effect stream and the seed.
+//! AGPL composition root: deterministic engine effect server.
+//! Private Unix socket, peer-credential auth, one effect session per
+//! connection (`Hello`/`EffectRequest`/`Finish` to
+//! `Welcome`/`EffectResponse`/`Goodbye`). Journal is a pure function of the
+//! effect stream and seed.
 
 #![deny(unsafe_code)]
 
@@ -36,11 +25,6 @@ use thiserror::Error;
 pub const SESSION_IDENTITY_DOMAIN: &[u8] = b"ldgr.d1.session\0";
 
 /// Derive the session identity bound by the handshake.
-///
-/// The full `ExecutionIdentity` assembly (B2) is the production source; the
-/// handshake already carries and verifies a 32-byte identity field, and this
-/// derivation is the deterministic placeholder available to both the AGPL
-/// server and the Apache-2.0 client without engine linkage.
 pub fn session_identity(seed: EntryHash) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SESSION_IDENTITY_DOMAIN);
@@ -62,9 +46,6 @@ pub enum ServerError {
 }
 
 /// One effect session against a deterministic backend.
-///
-/// The actor identity is bound during the handshake from the client's
-/// `Hello`; no session defaults to actor zero.
 pub struct Session {
     backend: SimBackend,
     actor: Option<ActorId>,
@@ -74,9 +55,6 @@ pub struct Session {
 
 impl Session {
     /// Create a session bound to `seed` and `expected_identity`.
-    ///
-    /// The actor is unbound until the handshake delivers the client's
-    /// `Hello.actor`; effect routing before the handshake fails closed.
     pub fn new(seed: EntryHash, expected_identity: EntryHash) -> Self {
         Self {
             backend: SimBackend::new(SeedTree::new(seed)),
@@ -92,9 +70,6 @@ impl Session {
     }
 
     /// Serve one session over generic read/write streams.
-    ///
-    /// Transport-agnostic so the protocol is testable with an in-process
-    /// byte pair instead of a real socket.
     pub fn serve(
         &mut self,
         mut reader: impl Read,
@@ -290,11 +265,7 @@ fn write_message(writer: &mut impl Write, seq: u64, message: &Wire) -> Result<()
     Ok(())
 }
 
-/// Run the engine server until interrupted.
-///
-/// Binds `socket` (cleaning up any stale file), verifies connecting peers,
-/// and serves one session per connection. On Linux the peer uid is checked;
-/// non-matching peers are rejected before the handshake.
+/// Run the engine server until interrupted (stale socket cleaned; peers verified).
 pub fn run(socket: &Path, seed: EntryHash) -> Result<std::process::ExitCode, ServerError> {
     if let Err(error) = std::fs::remove_file(socket)
         && error.kind() != std::io::ErrorKind::NotFound
@@ -376,11 +347,7 @@ fn peer_is_current_user(stream: &UnixStream) -> bool {
     }
 }
 
-/// Serve one session over a byte-pair in memory (tests and the acceptance
-/// harness use this to exercise the full protocol without a socket).
-///
-/// The actor is read from the `Hello` inside `input`; no actor zero default
-/// is applied.
+/// Serve one session over a byte-pair in memory (tests; no socket).
 pub fn serve_session(
     seed: EntryHash,
     identity: EntryHash,
@@ -604,14 +571,6 @@ mod tests {
 }
 
 /// The canary's business logic modeled as a deterministic [`Workload`].
-///
-/// The effect stream the external canary sends over the shim (clock, rng,
-/// filesystem write/read/sync, sleep, send, receive) is mirrored here as the
-/// scheduler [`Instruction`] set that represents it. The random effect has no
-/// scheduler instruction (RNG is drawn by the task future, outside the
-/// instruction stream), so the model omits it; the planted
-/// [`Instruction::Assert`] failure is what the campaign oracle detects, the
-/// strict replay reproduces, and the minimizer shrinks.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CanaryWorkload;
 

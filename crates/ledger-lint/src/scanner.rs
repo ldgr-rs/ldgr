@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use walkdir::{DirEntry, WalkDir};
 
-/// Forbidden ambient API patterns that break determinism when used inside simulations.
+/// Forbidden ambient API patterns for simulation paths.
 pub const FORBIDDEN_PATTERNS: &[(&str, &str)] = &[
     (
         "Instant::now()",
@@ -95,13 +95,7 @@ pub const FORBIDDEN_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Forbidden bare-module prefixes used after `use std::fs;`-style imports.
-///
-/// Import lines are skipped, so a bare `fs::read()` call evades the
-/// `std::fs::` pattern. These prefixes match only at a path-segment start:
-/// the byte before the prefix must not continue an identifier or `::`.
-/// Fully qualified spellings like `std::fs::read` and unrelated modules like
-/// `simfs::` stay unmatched, so each ambient access reports one violation.
+/// Bare-module prefixes for `use std::fs;`-style imports (segment-start match).
 const BARE_PREFIX_PATTERNS: &[(&str, &str)] = &[
     ("fs::", "Ambient std::fs bypasses SimFs; use SimFs"),
     ("net::", "Ambient std::net bypasses SimNet; use SimNet"),
@@ -112,8 +106,7 @@ const BARE_PREFIX_PATTERNS: &[(&str, &str)] = &[
     ("env::args", "ambient process args; pass inputs via Effects"),
 ];
 
-/// Files under these path prefixes are simulation-path code: hash-collection
-/// iteration order can reach replay behavior or journal-adjacent output.
+/// Simulation-path prefixes where hash-iteration order is a replay risk.
 const WARN_SCOPE_PREFIXES: &[&str] = &[
     "crates/ledger-sim/src/",
     "crates/wasm-guest/src/",
@@ -122,12 +115,6 @@ const WARN_SCOPE_PREFIXES: &[&str] = &[
 ];
 
 /// Warn-level patterns for the simulation path.
-///
-/// Hash collections are deterministic within one build, but their iteration
-/// order is not stable across builds, so any iteration that can reach
-/// journal order, decision order, or reported output is a replay risk.
-/// Lookup-only use is fine; mark it with `// ledger-lint:allow:HashMap`
-/// (or `HashSet`) plus a reason.
 const WARN_PATTERNS: &[(&str, &str)] = &[
     (
         "HashMap",
@@ -147,21 +134,13 @@ pub struct LintViolation {
     pub advice: String,
 }
 
-/// Marker that exempts a scanned file from all forbidden patterns.
-///
-/// A line with `// ledger-lint:allow (<reason>)` exempts the whole file.
-/// A line with `// ledger-lint:allow:<SUB>` exempts only patterns that
-/// contain `<SUB>`. Both directives are file-scoped.
+/// Marker exempting a file from forbidden patterns (file-scoped).
 pub const ALLOW_MARKER: &str = "ledger-lint:allow";
 
-/// Prefix for per-pattern allow directives. The substring after the colon is
-/// exempted and ends at the first whitespace character.
+/// Prefix for per-pattern allow directives.
 const ALLOW_PREFIX: &str = "ledger-lint:allow:";
 
 /// Return true when `source` carries a full-file allow marker.
-///
-/// `ALLOW_MARKER` immediately followed by a colon starts a per-pattern
-/// directive and must not exempt the whole file.
 fn has_full_allow_marker(source: &str) -> bool {
     source.lines().any(|line| {
         let mut rest = line;
@@ -246,11 +225,7 @@ impl ScanResult {
 }
 
 /// Scan a source file or a directory tree of `.rs` files.
-///
-/// A file is scanned directly; a directory is walked recursively. The walk
-/// skips `target/`, hidden, and `tests/` directories. Test code deliberately
-/// plants leaks, so the planted-leak corpus gates that class. Files with the
-/// `ALLOW_MARKER` are skipped.
+/// Directories walk recursively, skipping `target/`, hidden, and `tests/`.
 pub fn scan_rs_files(path: &Path) -> ScanResult {
     let mut result = ScanResult::default();
     if path.is_file() {
@@ -356,10 +331,6 @@ fn is_warn_scoped(path: &Path) -> bool {
 }
 
 /// Scan one source file for warn-level determinism risks.
-///
-/// Honors the same file-scoped allow directives as the forbidden-pattern
-/// scan: a full-file marker skips the file, and `ledger-lint:allow:HashMap`
-/// exempts that pattern for the whole file. Import lines never warn.
 pub fn scan_warnings(path: &Path, source: &str) -> Vec<LintViolation> {
     if !is_warn_scoped(path) || has_full_allow_marker(source) {
         return Vec::new();
@@ -395,9 +366,6 @@ pub fn scan_warnings(path: &Path, source: &str) -> Vec<LintViolation> {
 }
 
 /// Remove line and block comments from one source line.
-///
-/// Block-comment state persists across lines. A `//` inside a string literal
-/// is treated as a comment; the scanner accepts that simplification.
 fn strip_comments(line: &str, in_block_comment: &mut bool) -> String {
     let bytes = line.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -443,13 +411,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
         .map(|offset| offset + start)
 }
 
-/// Return true when `code` contains `prefix` at the start of a path segment.
-///
-/// The byte before the match must not continue an identifier (`[A-Za-z0-9_]`)
-/// and must not be `:`. A prefix at the start of the line matches. This keeps
-/// fully qualified spellings (`std::fs::read`) and unrelated modules
-/// (`simfs::`) unmatched, so the bare pattern fires only on call sites that
-/// follow a `use std::fs;`-style import.
+/// Return true when `code` contains `prefix` at a path-segment start.
 fn contains_bare_prefix(code: &str, prefix: &str) -> bool {
     let bytes = code.as_bytes();
     let needle = prefix.as_bytes();
@@ -467,9 +429,7 @@ fn contains_bare_prefix(code: &str, prefix: &str) -> bool {
     false
 }
 
-/// Return true when `trimmed` is a pure `use` or `pub use` import line.
-///
-/// Import lines declare names; they do not access the ambient environment.
+/// Return true when `trimmed` is a `use` import line.
 fn is_import_line(trimmed: &str) -> bool {
     trimmed.starts_with("use ") || trimmed.starts_with("pub use ")
 }

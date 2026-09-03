@@ -1,12 +1,5 @@
 //! Interchange envelope with magic, version and fidelity.
-//!
-//! Interchange envelope requires faithful roundtrip of every
-//! `EntryKind` variant, including those with payload fields
-//! (`RngDraw`, `InputStep`, `Fault`). The JSON body therefore carries
-//! explicit optional fields for each structured kind and reconstructs
-//! the exact variant on decode. The envelope bytes are
-//! `magic(4) || version_be(4) || json`, and `envelope_hash` is the
-//! BLAKE3 content address over those bytes.
+//! Bytes are `magic(4) || version_be(4) || json`; hash is BLAKE3 over them.
 
 use crate::AdapterError;
 use ledger_format::{ActorId, EntryHash, EntryKind, FaultSpec};
@@ -109,6 +102,7 @@ pub enum FaultSpecSerde {
     Crash,
     Corrupt,
     CrashState(u64),
+    Duplicate,
 }
 
 impl From<FaultSpec> for FaultSpecSerde {
@@ -123,6 +117,7 @@ impl From<FaultSpec> for FaultSpecSerde {
             FaultSpec::Crash => Self::Crash,
             FaultSpec::Corrupt => Self::Corrupt,
             FaultSpec::CrashState(s) => Self::CrashState(s),
+            FaultSpec::Duplicate => Self::Duplicate,
         }
     }
 }
@@ -139,6 +134,7 @@ impl From<FaultSpecSerde> for FaultSpec {
             FaultSpecSerde::Crash => Self::Crash,
             FaultSpecSerde::Corrupt => Self::Corrupt,
             FaultSpecSerde::CrashState(s) => Self::CrashState(s),
+            FaultSpecSerde::Duplicate => Self::Duplicate,
         }
     }
 }
@@ -184,6 +180,10 @@ impl InterchangeEnvelope {
     }
 
     /// Canonical bytes: `magic || version_be || json`.
+    ///
+    /// The JSON body carries only kind tags, external types, and fidelity;
+    /// it embeds no hashes, so hash wire framing does not apply here. Hex
+    /// and JSON layers stay raw by contract.
     ///
     /// # Errors
     /// Returns `AdapterError::Serialization` if JSON serialization fails.

@@ -1,24 +1,9 @@
 #![deny(unsafe_code)]
 
-//! Campaign task execution daemon.
-//!
-//! The worker is a pure client: it hosts no control-plane service. In
-//! standalone mode it drains a local queue file through the in-memory
-//! [`InMemoryQueue`]; with the `grpc` feature it dials the external control
-//! plane over one outbound `ledger.control.v2` session and executes the
-//! tasks the control plane assigns over that session, uploading results
-//! carrying the [`ExecutionIdentity`](ledger_journal::ExecutionIdentity)
-//! digest. Leases carry attempt budgets, extension (heartbeat),
-//! cancellation, and terminal states; see [`TaskStatus`]. The runtime
-//! profile handshake in [`RuntimeProfile`] binds worker identity to the
-//! engine build and host shape. Artifact publication is best-effort: the
-//! default [`NoopSink`] logs only, and the `control-plane` feature
-//! (optional, off by default) swaps in an HTTP sink.
-//!
-//! The crate exposes a curated root facade: implementation modules stay
-//! private and every public contract item is re-exported here. The
-//! generated protobuf bindings stay public as `r#gen` because they are the
-//! control-plane wire contract.
+//! Campaign task execution daemon: pure client (no control-plane service).
+//! Standalone drains a local queue file; `grpc` dials one outbound
+//! `ledger.control.v2` session. Leases, heartbeats, and best-effort artifact
+//! publication; see [`TaskStatus`] and [`RuntimeProfile`].
 
 mod artifact;
 mod config;

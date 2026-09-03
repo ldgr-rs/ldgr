@@ -1,8 +1,4 @@
 //! `ledger ldfi` campaign driver.
-//!
-//! Searches the mini key-value workload for the first violation, ranks the
-//! LDFI fault hypotheses, and replays the top hypothesis with fault
-//! injection to report how many faults applied or were voided.
 
 use ledger_explorer::FaultHypothesis;
 use ledger_explorer::oracle::{HistoryOracle, KeyValueSpec};
