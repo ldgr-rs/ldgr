@@ -1,29 +1,19 @@
-//! Attestation URI seam: one source for the predicate/build-type base.
-//!
-//! The public domain is not chosen yet; the control plane will own that
-//! decision. Until then every attestation URI derives from
-//! [`attestation_base`], which reads `LEDGER_ATTESTATION_BASE` and falls
-//! back to the reserved `.invalid` placeholder. Emission and verification
-//! must run with the same configuration, because the base is part of the
-//! emitted statement bytes.
+//! Attestation URI seam. Undecided domain stays under `.invalid`; emit and
+//! verify must share the configuration.
 
-/// Placeholder base under the RFC 2606 `.invalid` zone: it can never route,
-/// which keeps the undecided-domain status visible in every emitted artifact.
+/// Placeholder base under `.invalid`: never routes, stays visible.
 pub const DEFAULT_ATTESTATION_BASE: &str = "https://ledger.invalid";
 
 const BASE_ENV: &str = "LEDGER_ATTESTATION_BASE";
 
-/// Configured attestation base: `LEDGER_ATTESTATION_BASE` when set, else the
-/// `.invalid` placeholder.
+/// Configured base: env override or the `.invalid` placeholder.
 pub fn attestation_base() -> String {
-    // Host-side attestation domain config; never on the simulation path.
+    // Host-side config; never on the simulation path.
     // ledger-lint:allow:env::var (host-side attestation domain config; deployment seam reads the override at emit/verify time)
     attestation_base_from(std::env::var(BASE_ENV).ok().as_deref())
 }
 
-/// Pure resolver behind [`attestation_base`]: `None`, empty, or blank
-/// configuration selects the placeholder; a trailing slash is trimmed so path
-/// joins stay single-slash regardless of caller input.
+/// Pure resolver: blank selects the placeholder; trailing slash trimmed.
 pub fn attestation_base_from(configured: Option<&str>) -> String {
     let raw = configured
         .map(str::trim)

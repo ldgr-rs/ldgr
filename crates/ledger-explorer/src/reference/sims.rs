@@ -7,12 +7,7 @@ use ledger_journal::Journal;
 use ledger_sim::{Boundary, Effects, TaskBuilder};
 use std::time::Duration;
 
-/// Journal one outcome; a failed append is recorded on the boundary so the
-/// run's `journal_error` slot surfaces it instead of dropping it.
-///
-/// `send` and `send_timed` return `bool` with journal failures already
-/// recorded inside `Boundary`, so their discards lose nothing; `recv` returns
-/// the payload only.
+/// Journal one outcome; failures surface via the `journal_error` slot.
 fn outcome(b: &Boundary, value: u64) {
     if let Err(error) = b.outcome(value) {
         b.record_journal_error(error);
@@ -26,13 +21,7 @@ fn record_partition(b: &Boundary, src: usize, dst: usize) {
     }
 }
 
-/// mini-zab: ZK Bug #335 class.
-///
-/// Node 0 (leader) proposes value 1, then value 2 after a re-election. Node 1
-/// follows both. Node 2 synchronizes from its last-known-committed value only:
-/// it records the first commit and never waits for the second, so it ends with
-/// value 1 while nodes 0 and 1 hold value 2. The convergence oracle detects the
-/// permanent divergence.
+/// mini-zab: ZK Bug #335 class; follower misses the newer commit, cluster diverges.
 pub fn mini_zab() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -62,12 +51,7 @@ pub fn mini_zab() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     (builders, convergence_oracle())
 }
 
-/// mini-hdfs: lease-recovery double grant (HDFS-4472 class).
-///
-/// The NameNode (task 0) grants the pre-bump version to every request it has
-/// awaited and bumps only after both grants are issued. Both writers therefore
-/// always receive version 0: this is a deterministic planted sequence, not a
-/// schedule-dependent race. The distinctness oracle flags the double grant.
+/// mini-hdfs: lease-recovery double grant (HDFS-4472 class); deterministic plant.
 pub fn mini_hdfs() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -104,12 +88,7 @@ pub fn mini_hdfs() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     (builders, distinct_outcomes_oracle())
 }
 
-/// mini-cassandra: gossip anti-entropy staleness.
-///
-/// Node 0 (primary) writes value 7 and gossips it. Node 1 waits for the
-/// gossip. Node 2 serves a read of its local value (0) before the anti-entropy
-/// exchange reaches it and never syncs. The convergence oracle detects that
-/// node 2 served stale data.
+/// mini-cassandra: gossip staleness; node serves a read before anti-entropy arrives.
 pub fn mini_cassandra() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -135,13 +114,7 @@ pub fn mini_cassandra() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     (builders, convergence_oracle())
 }
 
-/// mini-2pc: blocking two-phase commit with a crashed coordinator.
-///
-/// The coordinator (task 0) sends PREPARE to both participants, collects both
-/// votes, then crashes after sending COMMIT to participant A only. Participant
-/// B stays prepared and never commits, so the two participants end in
-/// different transaction states. The convergence oracle detects the
-/// committed/uncommitted split.
+/// mini-2pc: blocking commit; coordinator crashes after COMMIT to A only.
 pub fn mini_2pc() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -174,14 +147,7 @@ pub fn mini_2pc() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     (builders, convergence_oracle())
 }
 
-/// mini-leader-stepdown: stale reads served after a leadership change
-/// (Raft election-restriction class).
-///
-/// Old leader (task 0) replicates value 1 to the follower, then steps down.
-/// New leader (task 2) replicates value 2 to the follower and commits it. The
-/// old leader keeps serving requests from its old term: it answers the
-/// client's (task 3) read with stale value 1 while the current leader
-/// committed 2. The convergence oracle detects the stale read.
+/// mini-leader-stepdown: stale reads after leadership change (Raft class).
 pub fn mini_leader_stepdown() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -216,14 +182,7 @@ pub fn mini_leader_stepdown() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     (builders, convergence_oracle())
 }
 
-/// mini-membership-churn: commit index stalls for a departed member.
-///
-/// Leader (task 0) replicates value 1 to followers 1 and 2. Follower 2 churns
-/// out of the membership and never acks. The leader refuses to advance its
-/// commit index until every member of its stale membership list acks, so the
-/// entry stays uncommitted even though the live follower 1 acknowledged it.
-/// The commit oracle detects that the leader failed to commit an acknowledged
-/// entry.
+/// mini-membership-churn: commit stalls on a departed member's ack.
 pub fn mini_membership_churn() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -251,15 +210,7 @@ pub fn mini_membership_churn() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) 
     (builders, live_quorum_commit_oracle())
 }
 
-/// mini-hdfs-lease-expiry: an expired lease holder keeps writing after the
-/// lease moved to a new writer (HDFS lease-recovery class).
-///
-/// The NameNode (task 0) grants the lease to old writer (task 1) and then to
-/// new writer (task 2). The old writer's lease expires but its late write
-/// still lands on the storage (task 3) after the new writer's write, so the
-/// storage ends with the stale overwrite instead of the current holder's
-/// value. The lease oracle detects that storage diverged from the current
-/// lease holder's write.
+/// mini-hdfs-lease-expiry: expired holder's late write overwrites storage.
 pub fn mini_hdfs_lease_expiry() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -294,15 +245,7 @@ pub fn mini_hdfs_lease_expiry() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool)
     ];
     (builders, current_lease_holder_write_oracle())
 }
-/// mini-reorder-lost-update: message-reorder lost update.
-///
-/// Writer A (task 1) sends sequence 1 with a 2-tick delay; writer B (task 2)
-/// sends sequence 2 with a 1-tick delay. Both sends happen at virtual time 0,
-/// so sequence 2 always overtakes sequence 1 in flight. The store (task 0)
-/// applies writes in arrival order without checking sequence numbers, so the
-/// older write lands last and the newer update is lost. The
-/// last-write-wins oracle detects that the store's final value is below the
-/// highest sequence it applied.
+/// mini-reorder-lost-update: arrival-order apply drops the newer write.
 pub fn mini_reorder_lost_update() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -327,22 +270,9 @@ pub fn mini_reorder_lost_update() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> boo
     (builders, last_write_wins_oracle(ledger_format::ActorId(0)))
 }
 
-/// mini-lease-timer-race: a renewal that lost the race with the expiry timer
-/// re-activates an expired lease (lease-manager class).
-///
-/// The manager (task 0) grants the epoch-1 lease to the old holder (task 1),
-/// then its expiry timer fires at tick 2 and it grants the same epoch to the
-/// new holder (task 2). The old holder's renewal, sent at tick 3, arrives
-/// after the lease expired and moved, but the manager checks only for a
-/// pending renewal message, not the lease clock, so it honors the late
-/// renewal and re-activates the old holder's lease. Both holders record
-/// `epoch * 10 + holder` outcomes, so epoch 1 has two distinct holders. The
-/// one-owner-per-epoch oracle (the same encoding mini-raft uses for
-/// leader-per-term) detects the double grant.
-///
-/// Distinct from mini-hdfs-lease-expiry: there the bug sits in the expired
-/// writer (its late write overwrites storage); here the bug sits in the
-/// manager (it re-grants an expired epoch on a late renewal).
+/// mini-lease-timer-race: late renewal re-activates an expired lease.
+/// Bug sits in the manager, unlike mini-hdfs-lease-expiry where the expired
+/// writer is at fault.
 #[allow(clippy::identity_op)] // planted-bug arithmetic stays visibly simple
 pub fn mini_lease_timer_race() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
@@ -375,15 +305,7 @@ pub fn mini_lease_timer_race() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) 
     (builders, single_leader_per_term_oracle())
 }
 
-/// mini-restart-dup-append: crash-restart duplicate append
-/// (crash-consistency class).
-///
-/// The appender (task 1) appends the client's record to the durable log
-/// (task 2), then acks the client (task 0) before its dedup state is
-/// durable. It crashes and restarts, replays its write-ahead log, and
-/// re-appends the same record without deduplicating, so the durable log
-/// carries the record twice. The distinctness oracle over the log's applied
-/// records detects the duplicate append.
+/// mini-restart-dup-append: WAL replay without dedup duplicates the record.
 pub fn mini_restart_dup_append() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -417,15 +339,7 @@ pub fn mini_restart_dup_append() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool
     (builders, distinct_outcomes_oracle())
 }
 
-/// mini-partition-retry-dup: partition plus retry duplicate delivery
-/// (exactly-once class).
-///
-/// The client (task 0) sends request 77, then a partition window opens on
-/// the server-to-client link so the ack is refused. The client's retry timer
-/// fires, it heals the link and retries the request. The server (task 1)
-/// applies every received request without request dedup, so the retry
-/// applies the same request twice. The distinctness oracle over the server's
-/// applied request ids detects the double apply.
+/// mini-partition-retry-dup: retry without server dedup applies twice.
 pub fn mini_partition_retry_dup() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
         Box::new(|b: Boundary| {
@@ -452,17 +366,7 @@ pub fn mini_partition_retry_dup() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> boo
     (builders, distinct_outcomes_oracle())
 }
 
-/// mini-raft: election-restriction double leader.
-///
-/// 3 actors: leader(0) and followers(1,2). Leader 0 replicates with
-///   `AppendEntries` `Send { payload = term * log_index }` and followers reply
-///   with `payload = term`. After stepdown, both old leader 0 (stale log
-///   index 1) and new candidate 2 (fresh index 2) request votes from follower
-///   1 in term 2. The follower's planted bug grants the vote to both without
-///   checking log freshness. When the follower's replies reorder with the
-///   fixed timed delays, both candidates gather a quorum and claim leadership
-///   in the same term. The single-leader-per-term oracle detects the two
-///   distinct leaders for term 2.
+/// mini-raft: follower grants two votes in one term; two leaders emerge.
 #[allow(clippy::identity_op)] // planted-bug arithmetic stays visibly simple
 pub fn mini_raft() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     let builders: Vec<TaskBuilder> = vec![
@@ -521,14 +425,9 @@ pub fn mini_raft() -> (Vec<TaskBuilder>, impl Fn(&Journal) -> bool) {
     (builders, single_leader_per_term_oracle())
 }
 
-// ---------------------------------------------------------------------------
-// Explicit support models for the corpus fixtures
-//
-// Each model names the entry roles that jointly support the planted
-// violation, using the semantic role described in the fixture doc comment.
-// A model whose mechanism is a pure timing interaction with no clean entry
-// set is declared Opaque: unknown semantics produce heuristic output only.
-// ---------------------------------------------------------------------------
+// Explicit support models for the corpus fixtures. Each model names the
+// entry roles that jointly support the violation. Pure timing interactions
+// with no clean entry set are Opaque.
 
 /// mini-zab: the leader's two proposals are jointly required for the split.
 pub fn mini_zab_support(journal: &Journal) -> crate::support::SupportExpr {

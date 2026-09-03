@@ -16,12 +16,7 @@ pub struct MotifLift {
     pub lift: f64,
 }
 
-/// Rank entry-kind transition motifs by failure-probability lift.
-///
-/// Each labeled run contributes one boolean presence per distinct transition.
-/// The lift is the ratio of the add-1 smoothed failing rate to the add-1
-/// smoothed passing rate, so no division by zero is possible. Motifs in fewer
-/// than `min_occurrences` runs total are excluded.
+/// Rank motifs by add-1 smoothed failure lift. Rare motifs excluded.
 pub fn rank_motifs_by_lift(
     labeled: &[(RunResult, bool)],
     min_occurrences: usize,
@@ -78,12 +73,7 @@ pub fn rank_motifs_by_lift(
 }
 
 fn distinct_transitions(journal: &Journal) -> HashSet<(EntryKind, EntryKind)> {
-    // Causal motif walk over vector-clock order, not append order. Append
-    // order is a total order that can interleave concurrent entries
-    // differently between runs; the causal order below is a deterministic
-    // linear extension of happens-before (vector-clock sum strictly grows
-    // along any parent edge), so concurrent interleavings map to one order
-    // and motifs name causal adjacency instead of scheduling accidents.
+    // Causal order, not append order, so concurrent interleavings map together.
     let mut ordered: Vec<_> = journal.entries().collect();
     ordered.sort_by(|a, b| {
         let sum_a: u64 = a.vector_clock.iter().map(|(_, v)| v).sum();

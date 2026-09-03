@@ -13,14 +13,8 @@ pub struct InputReduction {
     pub violation_preserved: bool,
 }
 
-/// Input-delta debugging over the generated input that produced a finding.
-///
-/// The input is read from the failing journal's `InputStep` entries, so ddmin
-/// runs over the exact sequence that violated the oracle. Every candidate
-/// replays under the finding's recorded schedule, keeping the input reduction
-/// on the finding's own schedule axis. When no reduction preserves the
-/// violation, the un-reduced journal input is returned with
-/// `violation_preserved` false; the stage never errors on that.
+/// Input-delta debugging over the journal's exact violating input. Replays
+/// under the finding's schedule; never errors on irreducible input.
 pub fn minimize_input<W, O>(
     workload_template: &W,
     oracle: &O,
@@ -34,11 +28,7 @@ where
     minimize_input_with_faults(workload_template, oracle, finding, generator, &[])
 }
 
-/// Input-delta debugging under a pinned fault schedule.
-///
-/// Every candidate replays with `schedule` injected, so the reduction runs
-/// on the finding's own (input, schedule, fault) triple. Required for joint
-/// plants whose violation needs the injected fault.
+/// Input reduction under a pinned fault schedule, for joint plants.
 pub fn minimize_input_with_faults<W, O>(
     workload_template: &W,
     oracle: &O,

@@ -6,13 +6,7 @@ use ledger_sim::{RunConfig, SeedTree, Simulation};
 
 pub(super) const INPUT_AXIS_SAMPLE: usize = 16;
 
-/// Draw a fresh PBT input sequence for one campaign attempt.
-///
-/// The attempt seed is derived per attempt, so each attempt samples an
-/// independent, reproducible `gen/<generator>` input sequence. When `dist`
-/// is `None` or `Uniform`, the uniform modulo path is used; `Power`
-/// distributions are sampled via `PbtBridge::sample_energy`, whose typed
-/// validation error propagates to the caller.
+/// Fresh input sequence per attempt; independent and reproducible.
 pub(super) fn draw_inputs(
     generator: &str,
     attempt_seed: EntryHash,
@@ -32,16 +26,7 @@ pub(super) fn draw_inputs(
     Ok(inputs)
 }
 
-/// Search the input axis: fix the schedule seed and vary the generated input.
-///
-/// Each attempt samples a fresh input sequence from the generator's
-/// `gen/<name>` stream and rebuilds the workload with those values. The
-/// schedule seed stays fixed, so a finding pins `(input, schedule)` jointly.
-///
-/// The workload must parameterize its inputs by overriding
-/// [`Workload::with_inputs`]. Workloads that keep the default identity
-/// implementation run identically on every attempt; the search then either
-/// finds a violation on the first attempt or never.
+/// Input-axis search with fixed schedule seed. Findings pin `(input, schedule)`.
 pub fn search_input<W, O>(
     workload_template: &W,
     oracle: &O,
@@ -56,12 +41,7 @@ where
     search_input_energy(workload_template, oracle, base, generator, None, attempts)
 }
 
-/// [`search_input`] with an energy distribution over the sampled inputs.
-///
-/// When `energy` is `None` or [`EnergyDistribution::Uniform`], inputs use the
-/// uniform modulo path; a `Power` distribution biases samples toward one end
-/// of the domain (see [`PbtBridge::sample_energy`]) and its exponent
-/// validation error propagates to the caller.
+/// Input-axis search with an energy distribution over inputs.
 pub fn search_input_energy<W, O>(
     workload_template: &W,
     oracle: &O,

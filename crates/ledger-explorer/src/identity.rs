@@ -1,21 +1,11 @@
-//! Host-side execution-identity derivation.
-//!
-//! [`EngineBuild`] captures the engine build segment at compile time: source
-//! revision and dirty state, engine version, toolchain, target triple, build
-//! profile, enabled features, and the workspace lockfile digest. The capture
-//! is compile-time only; a mutable runtime environment variable is never the
-//! identity source.
-//!
-//! [`assemble_identity`] combines the build segment with the run context into
-//! the canonical [`ExecutionIdentity`] from `ledger-journal`.
+//! Host-side execution-identity derivation. Build facts are compile-time
+//! only; a mutable env var is never the identity source.
 // ledger-lint:allow:env::var (host-side identity capture; the cross-process determinism test re-execs the test binary with a marker env var)
 // ledger-lint:allow:SystemTime::now (host-side identity capture; the cross-process test uniquifies the temp file name with the system clock)
 // ledger-lint:allow:std::fs:: (host-side identity capture; the cross-process test exchanges the digest through a temp file)
 
-use ledger_format::EntryHash;
-use ledger_journal::{
-    CRASH_SEMANTICS_VERSION, ExecutionIdentity, JOURNAL_FORMAT_VERSION, ResourceLimits,
-};
+use ledger_format::{EntryHash, FORMAT_VERSION};
+use ledger_journal::{CRASH_SEMANTICS_VERSION, ExecutionIdentity, ResourceLimits};
 
 /// Toolchain recorded when `LDGR_TOOLCHAIN` is not provided at build time.
 const FALLBACK_TOOLCHAIN: &str = "pinned-1.97";
@@ -127,7 +117,7 @@ pub fn assemble_identity(build: &EngineBuild, context: &IdentityContext) -> Exec
         faultspec_digest: context.faultspec_digest,
         oracle_version: context.oracle_version,
         support_provider_version: context.support_provider_version,
-        journal_format_version: JOURNAL_FORMAT_VERSION,
+        journal_format_version: FORMAT_VERSION,
         crash_semantics_version: CRASH_SEMANTICS_VERSION,
         resource_limits: context.resource_limits,
     }
@@ -230,7 +220,7 @@ mod tests {
         let identity = assemble_identity(&build, &context);
         assert_eq!(identity.engine_revision, build.revision);
         assert_eq!(identity.backend, "sim");
-        assert_eq!(identity.journal_format_version, JOURNAL_FORMAT_VERSION);
+        assert_eq!(identity.journal_format_version, FORMAT_VERSION);
         assert_eq!(identity.crash_semantics_version, CRASH_SEMANTICS_VERSION);
         assert!(
             identity.digest().expect("complete").is_some(),

@@ -40,14 +40,8 @@ fn hash_batch(next_batch: &[EntryHash]) -> EntryHash {
     EntryHash(*hasher.finalize().as_bytes())
 }
 
-/// Memoized replay keyed by `(prefix_root_hash, next_entry_batch_hash)`.
-///
-/// `prefix_root_hash` is the root of the journal state before the batch: the
-/// subgraph of the source entries strictly preceding the batch in append
-/// order. Every call verifies the caller's prefix root against that state, so
-/// a stale or tampered key is an error, never a wrong answer. The batch must
-/// be a contiguous run of the source's append order. Identical keys return
-/// the cached journal without rebuilding it.
+/// Memoized batch replay. Prefix roots verify; stale keys error, never
+/// misanswer. Batches must be contiguous; hits skip rebuilds.
 #[derive(Debug, Default)]
 pub struct MemoizedReplay {
     /// `(prefix_root, batch_hash)` to the replayed journal.
@@ -69,13 +63,7 @@ impl MemoizedReplay {
         Self::default()
     }
 
-    /// Replay one batch of entries and return the journal after the batch.
-    ///
-    /// `prefix_root_hash` must be the root of the journal state before the
-    /// batch; use [`Journal::root_hash`] of an empty journal for the initial
-    /// state. `source` provides the entry contents for each batch id. A
-    /// mismatched prefix root or a non-contiguous batch is an error, never a
-    /// wrong answer.
+    /// Replay one batch. Prefix must match; non-contiguous batches error.
     pub fn replay(
         &mut self,
         prefix_root_hash: EntryHash,
@@ -86,12 +74,7 @@ impl MemoizedReplay {
         self.replay_with_root(source_root, prefix_root_hash, next_batch, source)
     }
 
-    /// Replay one batch against a caller-verified source root.
-    ///
-    /// `source_root` must be [`Journal::root_hash`] of `source`; the caller
-    /// computes it once and reuses it, so repeat calls never re-hash the
-    /// source. A batch that cannot be located in the source's append order is
-    /// an error, so an inconsistent root can never produce a wrong answer.
+    /// Replay against a caller-verified source root; saves re-hashing.
     pub fn replay_with_root(
         &mut self,
         source_root: EntryHash,

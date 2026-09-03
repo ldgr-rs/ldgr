@@ -39,35 +39,12 @@ pub trait Oracle {
     fn check(&self, run: &RunResult) -> Verdict;
 }
 
-/// Exactly-once journal oracle over observed values.
+/// Exactly-once oracle over observed values.
 ///
-/// The oracle checks two value-dependent invariants against the journaled
-/// input stream:
-///
-/// 1. Every input value is applied at most once. A repeated value is a
-///    duplicate apply of the same command and violates exactly-once
-///    semantics. CONTRACT: the oracle's domain is exactly-once streams; a
-///    workload whose protocol legitimately re-applies a value must not use
-///    this oracle.
-/// 2. When inputs exist and an outcome exists, the outcome payload must
-///    equal the last applied input value. A different value is a torn final
-///    apply: the visible result does not match the last command.
-///
-/// STREAM SCOPE: both conditions read the JOURNAL-GLOBAL last input and the
-/// journal-global last numeric outcome, whichever actor journaled them. The
-/// oracle therefore models a single input stream feeding a single outcome
-/// stream. A journal that interleaves several independent actor streams
-/// must scope per actor or rely on the duplicate-apply condition alone;
-/// comparing streams across actors would compare unrelated values.
-///
-/// The verdict is value-dependent on the causal event set: the journal's
-/// entry values decide the outcome, not the mere presence of a marker entry.
-/// The duplicate-apply condition is monotone in the entry set: adding entries
-/// never removes a duplicate, so extending a minimal failing journal keeps it
-/// failing. A duplicate-apply violation carries the outcome and assertion
-/// entries as witnesses, matching [`PropertyOracle`]; a torn-apply violation
-/// carries only the numeric outcome entry it compares. The reason strings
-/// name the duplicated value and its entry positions.
+/// Checks: each input applies at most once, and the last numeric outcome
+/// equals the last input. CONTRACT: workloads that legitimately re-apply a
+/// value must not use this oracle. Scope is journal-global single
+/// input/output streams. Duplicate-apply is monotone in the entry set.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExactlyOnceValueOracle;
 
@@ -75,8 +52,7 @@ impl Oracle for ExactlyOnceValueOracle {
     fn check(&self, run: &RunResult) -> Verdict {
         let mut input_values: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut last_input: Option<(u64, usize)> = None;
-        // The last numeric Outcome in journal order: the terminal `Done`
-        // journals an Outcome with a text payload that must not shadow it.
+        // Last numeric Outcome in journal order; text `Done` must not shadow it.
         let mut last_numeric_outcome: Option<EntryHash> = None;
         for (index, entry) in run.journal.entries().enumerate() {
             if let EntryPayload::InputStep(step) = &entry.data.payload {
@@ -96,8 +72,7 @@ impl Oracle for ExactlyOnceValueOracle {
                 last_numeric_outcome = Some(entry.id);
             }
         }
-        // The duplicate must be reported deterministically: pick the smallest
-        // duplicated value, never a hash-map iteration artifact.
+        // Deterministic: smallest duplicated value, never map order.
         let mut duplicates: Vec<(&u64, &Vec<usize>)> = input_values
             .iter()
             .filter(|(_, positions)| positions.len() > 1)
@@ -134,10 +109,7 @@ impl Oracle for ExactlyOnceValueOracle {
     }
 }
 
-/// Composite oracle over boxed sub-oracles.
-///
-/// A run violates when any sub-oracle violates. Witness hashes merge in
-/// sub-oracle order; reasons of violating sub-oracles join with "; ".
+/// Composite oracle: violates when any sub-oracle violates.
 struct CompositeOracle {
     oracles: Vec<Box<dyn Oracle>>,
 }
@@ -167,11 +139,7 @@ impl Oracle for CompositeOracle {
     }
 }
 
-/// Combine boxed oracles into one that violates when any input violates.
-///
-/// The composite evaluates every sub-oracle on each check, merging witnesses
-/// and violation reasons, so callers can pass one composed oracle to any
-/// existing campaign function.
+/// Combine oracles into one that violates when any input violates.
 pub fn compose_oracles(oracles: Vec<Box<dyn Oracle>>) -> Box<dyn Oracle> {
     Box::new(CompositeOracle { oracles })
 }
@@ -217,11 +185,8 @@ impl HistoryOperation {
     }
 }
 
-/// One operation with the journal entries of its invoke and response events.
-///
-/// The real-time order between operations derives from the vector clocks of
-/// these entries: operation A precedes operation B when A's response entry
-/// happens before B's invoke entry.
+/// One operation with its invoke/response journal witnesses. Real-time order
+/// derives from their vector clocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinOperation {
     /// Journal entry id of the operation's invocation.
@@ -296,21 +261,11 @@ where
     }
 }
 
-/// Default bound on operations the linearizability checker explores.
-///
-/// The search is exponential in the operation count. Reference workloads stay
-/// far below the bound; larger histories are reported as not checked rather
-/// than explored blindly.
+/// Bound on operations the linearizability checker explores (exponential).
 const DEFAULT_LIN_BOUND: usize = 12;
 
-/// Linearizability oracle over journal-extracted histories.
-///
-/// Operations carry invoke and response journal witnesses. The checker builds
-/// the real-time partial order from the witnesses' vector clocks: operation A
-/// precedes B when A's response happens before B's invoke. It then searches
-/// for a serial order that extends the partial order and satisfies the
-/// sequential specification. A non-linearizable history is rejected with the
-/// failing operation and its already-serialized predecessors reported.
+/// Linearizability oracle over journal-extracted histories. Searches for a
+/// serial order extending the vector-clock real-time order.
 pub struct LinearizabilityOracle<'a, W, S> {
     workload: &'a W,
     specification: S,
@@ -337,11 +292,8 @@ struct LinFailure {
     reason: String,
 }
 
-/// Search for a serial order extending the real-time partial order.
-///
-/// Every recursion tries each ready operation in index order, so the search
-/// is deterministic. On a dead end the first unplaceable operation and the
-/// serialized prefix are recorded.
+/// Search for a serial order. Tries ready operations in index order, so the
+/// search is deterministic.
 fn find_serialization<S: SequentialSpec>(
     operations: &[LinOperation],
     predecessors: &[Vec<usize>],
@@ -528,11 +480,7 @@ fn observable_outputs(run: &RunResult) -> Vec<(ActorId, u64)> {
         .collect()
 }
 
-/// Locate the first index where two observable-output sequences disagree.
-///
-/// `None` when the sequences are equal. The reason names the actor and both
-/// payloads (or the length mismatch) so a divergence report points at the
-/// diverging step instead of only at the journal root.
+/// First index where two output sequences disagree; `None` when equal.
 fn output_divergence_reason(left: &[(ActorId, u64)], right: &[(ActorId, u64)]) -> Option<String> {
     let common = left.len().min(right.len());
     for index in 0..common {
@@ -553,16 +501,9 @@ fn output_divergence_reason(left: &[(ActorId, u64)], right: &[(ActorId, u64)]) -
     None
 }
 
-/// Differential equivalence oracle that compares two runs for equivalent behavior.
-///
-/// Compared surfaces, in order: final registers, observable outputs (the
-/// `Outcome` entries of the journals, in order), applied fault ids, and the
-/// journal root hash. Register and root equality are unchanged; the output
-/// and fault checks run before the root check so a behavioral divergence is
-/// reported with its location, not only as a hash mismatch. Scheduler
-/// decision sequences are deliberately not compared: two equivalent runs may
-/// follow different legal schedules, and every semantic surface above already
-/// pins the behavior those decisions produced.
+/// Differential oracle: compares registers, outputs, faults, then root.
+/// Decision sequences are not compared: equivalent runs may schedule legally
+/// different paths.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DifferentialOracle;
 
@@ -601,10 +542,7 @@ impl DifferentialOracle {
     }
 }
 
-/// Collect the entry ids of `Outcome` and `Assert` entries.
-///
-/// These structural entries carry the semantic outcome of a run, so they are
-/// the natural witnesses for a property violation.
+/// `Outcome` and `Assert` ids: the semantic witnesses of a violation.
 pub fn witnesses_from_journal(journal: &Journal) -> Vec<EntryHash> {
     journal
         .entries()
@@ -615,10 +553,7 @@ pub fn witnesses_from_journal(journal: &Journal) -> Vec<EntryHash> {
         .collect()
 }
 
-/// Property predicate over the journal, used as an oracle.
-///
-/// The predicate runs over the completed run's journal. A `false` result is a
-/// violation whose witnesses are the outcome and assertion entries.
+/// Property predicate over the journal. `false` is a violation.
 pub struct PropertyOracle<P: Fn(&Journal) -> bool> {
     pub property: P,
     /// Human-readable property name for the failure reason.
@@ -638,11 +573,7 @@ impl<P: Fn(&Journal) -> bool> Oracle for PropertyOracle<P> {
     }
 }
 
-/// Derive a monotonic predicate version from a property name and a counter.
-///
-/// The counter distinguishes versions of the same named property; bump it when
-/// the predicate's semantics change. A version change invalidates every cached
-/// verdict for the property.
+/// Predicate version from name and counter. Bump on semantic change.
 pub fn predicate_version(name: &str, counter: u64) -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(name.as_bytes());
@@ -652,12 +583,8 @@ pub fn predicate_version(name: &str, counter: u64) -> u64 {
     u64::from_le_bytes(out)
 }
 
-/// Cache layer over a journal predicate, keyed by `(predicate_version, root_hash)`.
-///
-/// The offline checking path evaluates a predicate once per distinct journal
-/// root and reuses the verdict on repeat roots. The version pins the property
-/// semantics: bump it when the predicate changes so a stale verdict never
-/// surfaces.
+/// Cache over a predicate keyed by `(version, root_hash)`. Bump version on
+/// predicate change so stale verdicts never surface.
 pub struct CachedPropertyOracle<P>
 where
     P: Fn(&Journal) -> bool,
@@ -1091,8 +1018,7 @@ mod tests {
             "the reason must name the duplicate: {}",
             verdict.reason
         );
-        // Extending the journal never cures the duplicate: the condition is
-        // monotone in the entry set.
+        // Monotone: extending the journal never cures the duplicate.
         let extended = value_journal(&[0, 1, 2, 2, 3, 4], Some(2));
         assert!(ExactlyOnceValueOracle.check(&extended).violated);
     }

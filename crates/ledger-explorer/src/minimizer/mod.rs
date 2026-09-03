@@ -29,11 +29,7 @@ pub enum MinimizeError {
     Memo(#[from] MemoError),
 }
 
-/// Extract the generated input sequence from a journal.
-///
-/// The sequence is the `InputStepPayload` values of the `InputStep` entries
-/// for `generator`, in journal order. This is the exact input that produced
-/// the journal, never a fresh re-sample.
+/// Extract the generated input sequence from a journal, in journal order.
 fn journal_inputs(journal: &Journal, generator: &str) -> Vec<u64> {
     let generator_id = gen_id(generator);
     journal
@@ -55,8 +51,7 @@ fn journal_inputs(journal: &Journal, generator: &str) -> Vec<u64> {
 /// Batch size for memoized prefix replay of ddmin candidates.
 const CANDIDATE_REPLAY_BATCH: usize = 8;
 
-/// Return the length of `candidate` when it is a leading run of `source`'s
-/// append order; `None` otherwise.
+/// Leading-run length of `candidate` in `source` order; `None` otherwise.
 fn source_prefix_len(source: &Journal, candidate: &[EntryHash]) -> Option<usize> {
     if candidate.is_empty() {
         return Some(0);

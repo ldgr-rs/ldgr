@@ -8,20 +8,9 @@ use crate::solver_cache::{ClauseCache, WeightedClause, engine_tag};
 use ledger_format::EntryHash;
 use ledger_journal::Journal;
 
-/// Weighted MaxSAT solver with MCS lower-bound certificates.
-///
-/// Encodes the hazard as weighted MaxSAT over deduplicated faultable-path disjunctions with per-kind costs. Two
-/// engines solve the same encoding behind one API: the default pure-Rust
-/// deterministic branch-and-bound in `crate::maxsat`, and the exact
-/// ascending-threshold CaDiCaL search behind the `solver-cadical` feature.
-///
-/// The config's [`SolverEngine`] picks the engine per solve. Resolution
-/// happens after encoding, before any cache access: `Auto` routes to CaDiCaL
-/// only when the encoding reaches `cutoff()` and the feature is compiled in,
-/// so a resolved `Auto` request always produces builtin-tagged cache keys on
-/// small encodings and cadical-tagged keys on large ones. Forcing Cadical
-/// without the feature runs the branch-and-bound fallback; `name()` reports
-/// the active backend truthfully.
+/// Weighted MaxSAT solver with MCS lower-bound certificates. Two backends
+/// behind one API: builtin branch-and-bound, and CaDiCaL threshold search
+/// under `solver-cadical`. Engine resolves post-encode; see [`cutoff()`].
 #[derive(Debug)]
 pub struct MaxSatSolver {
     inner: HittingSetSolver,
@@ -62,26 +51,13 @@ impl MaxSatSolver {
         self.inner.config()
     }
 
-    /// The engine this instance resolved to.
-    ///
-    /// The resolution of the last solve (or the no-encode resolution before
-    /// any solve): Auto and Builtin resolve to the builtin backend at every
-    /// measured encoding size, and a forced Cadical request resolves to the
-    /// CaDiCaL backend only when the feature is compiled in. The solver-state
-    /// key and the reported name are derived from this value, never from the
-    /// configured mode.
+    /// Resolved engine of the last solve (or pre-encode default). Drives
+    /// state keys and `name()`, never the configured mode.
     pub fn resolved_engine(&self) -> SolverEngine {
         self.resolved_engine
     }
 
-    /// Resolve the concrete backend for an encoding.
-    ///
-    /// Records the resolution on this solver (it is the engine identity that
-    /// participates in cache and state keys) and returns the cache-key engine
-    /// tag plus whether the CaDiCaL path runs. `Auto` applies the crossover
-    /// rule; forced engines honor the request subject to the feature gate.
-    /// Deterministic per build: the decision reads only the encoding size,
-    /// the config, and the compile-time flag.
+    /// Resolve the backend for an encoding. Deterministic per build.
     fn resolve_backend(&mut self, hard_clauses: usize) -> (u8, bool) {
         let cadical = match self.inner.config.engine {
             SolverEngine::Auto => cfg!(feature = "solver-cadical") && hard_clauses >= cutoff(),
@@ -101,11 +77,7 @@ impl MaxSatSolver {
         (tag, cadical)
     }
 
-    /// Solve and return optional recorded solver data for a certificate.
-    ///
-    /// Empty input returns no hypotheses and `None`. Any solve with an empty
-    /// cut also returns `None`, so present data always satisfies the statement
-    /// requirement for a non-empty cut.
+    /// Solve with optional certificate data. Empty cut yields `None`.
     pub fn solve_with_certificate(
         &mut self,
         journal: &Journal,
@@ -120,8 +92,7 @@ impl MaxSatSolver {
         if verdict.witnesses.is_empty() && journal.is_empty() {
             return Ok((Vec::new(), None));
         }
-        // Encode first: Auto resolves against the encoding size, so no key
-        // may be derived before this point.
+        // Encode first: Auto resolves against encoding size, so no key precedes it.
         let encoding = crate::maxsat::encode_hazard(journal, verdict, &self.inner.config)?;
         let (tag, use_cadical) = self.resolve_backend(encoding.hard.len());
         let mut witness_ids = verdict.witnesses.clone();
@@ -143,8 +114,7 @@ impl MaxSatSolver {
                 WeightedClause::new(clause.clone(), weight)
             })
             .collect();
-        // Per-solver cache only. No process-global store exists; the solver
-        // (and its cache) is constructed per campaign.
+        // Per-solver cache only; constructed per campaign.
         self.inner.cache.insert(key, clauses.clone());
         let solution = if use_cadical {
             #[cfg(feature = "solver-cadical")]
@@ -203,23 +173,13 @@ impl Clone for MaxSatSolver {
 }
 
 impl MaxSatSolver {
-    /// Backend reported by `name()`.
-    ///
-    /// Reports the resolved engine, never the configured mode: Auto below the
-    /// crossover resolves to the builtin branch-and-bound, and a forced
-    /// Cadical request without the feature falls back to the builtin backend
-    /// at runtime.
+    /// Reports the resolved engine, never the configured mode.
     fn reports_cadical(&self) -> bool {
         self.resolved_engine == SolverEngine::Cadical
     }
 }
 
-/// Honest wording for the MaxSAT solve, gated on [`SupportExpr::is_strong`].
-///
-/// The hard clauses join one `AllOf` per derivation path under `AnyOf`, plus
-/// `Opaque` when the horizon bound the walk. Only a strong support backs a
-/// minimum claim; any bounded or opaque walk reports a bounded heuristic with
-/// its horizon and the same lower-bound certificate fields.
+/// Wording for the MaxSAT solve, gated on [`SupportExpr::is_strong`].
 fn maxsat_explanation(
     faults: usize,
     hard_clauses: usize,
@@ -246,11 +206,7 @@ fn maxsat_explanation(
     }
 }
 
-/// The engine a fresh MaxSat solver resolves to before any encoding exists.
-///
-/// Auto routes to builtin at every measured encoding size (the crossover
-/// sentinel), and a forced Cadical request resolves to the CaDiCaL backend
-/// only when the feature is compiled in.
+/// Pre-encode resolution: Auto/Builtin to builtin; Cadical per feature gate.
 fn initial_resolution(config_engine: SolverEngine) -> SolverEngine {
     match config_engine {
         SolverEngine::Auto | SolverEngine::Builtin => SolverEngine::Builtin,
@@ -275,9 +231,7 @@ impl FaultSolver for MaxSatSolver {
     }
 
     fn name(&self) -> &'static str {
-        // Honest about the active backend: the CaDiCaL threshold search only
-        // runs under `solver-cadical`; otherwise the pure-Rust
-        // branch-and-bound in `crate::maxsat` does the solving.
+        // Reports the active backend truthfully per feature gate.
         if self.reports_cadical() {
             "maxsat-cadical"
         } else {
@@ -290,9 +244,7 @@ impl FaultSolver for MaxSatSolver {
         closure_hash: EntryHash,
         clauses: Vec<WeightedClause>,
     ) -> Vec<FaultHypothesis> {
-        // No encoding exists on this path, so Auto applies the crossover rule
-        // to the supplied clause count; callers feed encoding.hard clauses,
-        // which makes the tag agree with solve_with_certificate.
+        // No encoding here: Auto applies the crossover rule to the clause count.
         let (tag, _) = self.resolve_backend(clauses.len());
         let key = self.inner.incremental_key_with_tag(closure_hash, tag);
         let hit = self

@@ -1,11 +1,6 @@
 #![deny(unsafe_code)]
-//! Differential lineage maintenance: index caches witness causal closure and derivation paths.
-//!
-//! `LineageIndex` caches the witness causal closure and derivation paths for
-//! one solver configuration. `build` computes a fresh index; `refresh`
-//! recomputes the same full walk and replaces the cached state whenever the
-//! journal length or configuration fingerprint moved, so a refreshed index
-//! is always equal to a fresh build.
+//! Differential lineage: cached witness closure and derivation paths.
+//! `refresh` recomputes fully when length or fingerprint moves.
 
 use std::collections::BTreeSet;
 
@@ -184,11 +179,7 @@ fn collect_lineage(
 }
 
 impl LineageIndex {
-    /// Build a fresh lineage index for `witnesses` under `config`.
-    ///
-    /// The state key folds in `resolved_engine`, the engine the solver
-    /// actually executes, so a rebuilt index tracks the same namespace the
-    /// solver's cache keys use.
+    /// Fresh lineage index. State key folds in the resolved engine.
     pub fn build(
         journal: &Journal,
         witnesses: &[EntryHash],
@@ -206,12 +197,7 @@ impl LineageIndex {
         }
     }
 
-    /// Build lineage directly from an explicit support expression.
-    ///
-    /// Each `AllOf` becomes one path; each `AnyOf` branch stays separate so
-    /// alternative groups never flatten. Only faultable entries present in
-    /// `journal` are kept. The closure joins the witnesses and the surviving
-    /// support ids in deterministic `BTreeSet` order.
+    /// Lineage from explicit support, preserving groups; closure in sorted order.
     pub fn build_with_support(
         journal: &Journal,
         witnesses: &[EntryHash],
@@ -248,15 +234,8 @@ impl LineageIndex {
         }
     }
 
-    /// Refresh the index after the journal may have grown.
-    ///
-    /// The journal DAG is append-only: parents of existing entries never
-    /// change, so the cached closure of an already-walked witness stays
-    /// valid when only the journal length moves. This refresh walks only
-    /// witnesses absent from the cached closure (a differential update);
-    /// the return value reports whether the cached state changed. A
-    /// config-fingerprint change forces a full re-walk because the walk
-    /// semantics themselves changed.
+    /// Differential refresh. Walks only uncached witnesses; fingerprint
+    /// change forces a full re-walk.
     pub fn refresh(
         &mut self,
         journal: &Journal,

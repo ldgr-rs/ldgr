@@ -12,20 +12,12 @@ pub trait Workload {
 
     fn history(&self, run: &RunResult) -> Vec<crate::oracle::HistoryOperation>;
 
-    /// Rebuild this workload with a concrete input sequence (PBT input axis).
-    ///
-    /// The default treats the workload as unparameterized: inputs are ignored
-    /// and the base programs are returned unchanged, so existing workloads
-    /// compile without change.
+    /// Rebuild with inputs (PBT axis). Default ignores inputs.
     fn with_inputs(&self, _inputs: &[u64]) -> Box<dyn Workload> {
         Box::new(InputsWorkload::new(self.programs()))
     }
 
-    /// Extract a linearizability history from a run.
-    ///
-    /// The default collapses each operation to its witness entry: the invoke
-    /// and response events coincide. Workloads whose operations span several
-    /// journal entries override this to supply real invoke/response intervals.
+    /// Linearizability history. Default collapses each op to its witness.
     fn lin_history(&self, run: &RunResult) -> Vec<crate::oracle::LinOperation> {
         self.history(run)
             .into_iter()
@@ -55,10 +47,7 @@ pub struct CampaignReport {
     /// Number of distinct journal root hashes encountered.
     pub distinct_roots: usize,
     pub findings: Vec<Finding>,
-    /// Per-run quadruple variant descriptions, one per attempt in order.
-    ///
-    /// Each entry names the policy, swarm knobs, and fault schedule used for
-    /// that attempt, so callers can inspect which axes mutated.
+    /// Per-run variant descriptions, one per attempt in order.
     pub variants: Vec<String>,
     /// Names of monitors attached to the campaign; empty when none ran.
     pub monitors: Vec<String>,
@@ -67,13 +56,7 @@ pub struct CampaignReport {
 }
 
 impl CampaignReport {
-    /// Render the campaign's coverage as NDJSON records.
-    ///
-    /// Emits one record per finding, in finding order:
-    /// `{"root_hex":"..","run_index":N,"finding":true}` where `root_hex` is
-    /// the finding journal's root hash. Only findings carry per-run roots in
-    /// a report; passing runs are covered by the trailing summary comment
-    /// line `# runs=N distinct=D`.
+    /// Coverage as NDJSON: one record per finding plus a summary line.
     pub fn to_coverage_records(&self) -> String {
         let mut out = String::new();
         for (index, finding) in self.findings.iter().enumerate() {
@@ -97,9 +80,7 @@ pub fn run_campaign<W: Workload, O: Oracle>(
     base: RunConfig,
     attempts: usize,
 ) -> Result<CampaignReport, SearchError> {
-    // Explicit per-campaign clause cache scope. Campaign search itself is
-    // simulation-only, but any LDFI solve derived from its findings must use
-    // this campaign's cache, never a process-global store.
+    // Per-campaign cache scope; LDFI solves use this campaign's cache.
     let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
     let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
@@ -131,11 +112,7 @@ pub fn run_campaign<W: Workload, O: Oracle>(
     })
 }
 
-/// Merge the user-oracle verdict with the monitor-oracle verdict.
-///
-/// The combined verdict violates when either fires. A monitor halt contributes
-/// its reason under a `monitor:` prefix, so a finding records which monitor
-/// halted even when the user oracle also fired.
+/// Merge user and monitor verdicts. Monitor halts prefix with `monitor:`.
 fn merge_monitor_verdict(mut primary: Verdict, monitored: Verdict) -> Verdict {
     if !monitored.violated {
         return primary;
@@ -152,12 +129,7 @@ fn merge_monitor_verdict(mut primary: Verdict, monitored: Verdict) -> Verdict {
     primary
 }
 
-/// Run a seed-varying campaign under the user oracle plus online monitors.
-///
-/// Each run is checked by the user oracle and by a [`MonitorOracle`] replaying
-/// the attached monitors. The combined verdict violates when either fires; a
-/// monitor-caused violation contributes its reason under a `monitor:` prefix
-/// naming the halting monitor. The report lists monitor names in attach order.
+/// Campaign under user oracle plus monitors. Violates when either fires.
 pub fn run_monitored_campaign<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
@@ -165,7 +137,7 @@ pub fn run_monitored_campaign<W: Workload, O: Oracle>(
     monitors: Vec<Box<dyn OnlineMonitor>>,
     attempts: usize,
 ) -> Result<CampaignReport, SearchError> {
-    // Explicit per-campaign clause cache scope; see `run_campaign`.
+    // Per-campaign scope; see `run_campaign`.
     let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
     let monitor_names = monitors
         .iter()
@@ -183,9 +155,7 @@ pub fn run_monitored_campaign<W: Workload, O: Oracle>(
         let mut seed = base.seed();
         seed.0[0..8].copy_from_slice(&(attempt as u64).to_le_bytes());
         let config = base.clone().with_seed(seed);
-        // Reset monitors before the mid-run delta feed so each attempt
-        // starts from a clean state; the shared monitors are also used by
-        // the post-run oracle, which resets again at check time.
+        // Reset before the delta feed; the post-run oracle resets again.
         monitor_oracle.reset();
         let step_monitor = monitor_oracle.to_step_monitor();
         let run = Simulation::new(config.clone(), workload.programs())
@@ -231,8 +201,7 @@ mod liveness_tests {
     use ledger_format::ActorId;
     use ledger_sim::{Instruction, RunConfig};
 
-    /// A workload whose single task blocks on a receive that never has a
-    /// sender: the run quiesces with a pending task.
+    /// Single blocked task: quiesces with a pending receive.
     struct DeadlockWorkload;
 
     impl Workload for DeadlockWorkload {
@@ -281,8 +250,7 @@ mod liveness_tests {
     fn monitor_halt_becomes_liveness_style_finding() {
         use ledger_format::{CanonicalValue, EntryKind, EntryPayload};
         use ledger_journal::Journal;
-        // Effective verdict must treat MonitorHalt as a liveness-style
-        // violation with a journal-tail witness.
+        // MonitorHalt promotes to a liveness finding with a tail witness.
         let mut journal = Journal::new();
         journal
             .append(
@@ -388,8 +356,7 @@ mod liveness_tests {
                 "verdict must name monitor: {}",
                 finding.verdict.reason
             );
-            // The halted run's outcome must be MonitorHalt, and steps must be
-            // bounded strictly below max.
+            // Halted runs stay below max steps.
             assert!(
                 matches!(finding.run.outcome, ledger_sim::RunOutcome::MonitorHalt(_)),
                 "run outcome must be MonitorHalt, got {:?}",

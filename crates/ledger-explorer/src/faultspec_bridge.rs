@@ -1,27 +1,10 @@
 //! Bridge from `ledger-faultspec` compiled scenarios into the simulation engine.
 //!
-//! This module is the true porting seam: faultspec stays Apache-2.0 and
-//! string-targeted, while the engine is AGPL and hash-targeted. The bridge
-//! performs a deterministic, bijective translation using BLAKE3 over
-//! `scenario_name || block_index || target_label`.
-//!
-//! Why hash vs direct id: `ledger-format` FaultSpec values describe *what*
-//! to inject, but `ledger-sim::SimFault` must name a causal position
-//! (the 32-byte entry hash to drop/crash). No journal exists at DSL compile
-//! time, so we synthesize a stable sentinel hash. The mapping is deterministic
-//! and bijective in the sense that re-parsing the same DSL yields the same
-//! hashes, and the original (name, index, label) can be recovered if needed.
-//! For `Partition` the engine is actor-id targeted, so names resolve
-//! through the scenario-scoped registry shared with the compiler
-//! (numeric suffixes directly, opaque names at historic wrapping-hash ids
-//! with collision detection).
-//!
-//! The conversion scheme is documented here once: each block that is not a
-//! `Partition` is hashed as BLAKE3 over
-//! `scenario_name || 0xff || block_index(u64 LE) || 0xff || target_label`,
-//! where `target_label` is derived per variant in `to_sim_injections` and
-//! `block_index` is the block's position in the compiled schedule. The frozen
-//! fixture tests lock the output bytes.
+//! Faultspec stays string-targeted, the engine is hash-targeted. The bridge
+//! hashes each non-`Partition` block as BLAKE3 over
+//! `scenario_name || 0xff || block_index(u64 LE) || 0xff || target_label`;
+//! `Partition` resolves through the scenario-scoped registry. Frozen fixture
+//! tests lock the output bytes.
 
 use ledger_faultspec::{
     CompiledScenario, FaultInjection, ScenarioError, actor_id, scenario_registry,
@@ -29,12 +12,7 @@ use ledger_faultspec::{
 use ledger_format::{ActorId, EntryHash};
 use ledger_sim::{RunConfig, SimFault};
 
-/// Deterministic hash for a scenario block.
-///
-/// The bridge owns the seam hashing scheme: BLAKE3 over
-/// `scenario_name || 0xff || block_index(u64 LE) || 0xff || target_label`.
-/// The scheme is stable across crates and versions; the frozen fixture test
-/// locks the output bytes.
+/// Deterministic seam hash: BLAKE3 over the documented module scheme.
 fn block_hash(scenario_name: &str, index: usize, label: &str) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(scenario_name.as_bytes());
@@ -45,14 +23,8 @@ fn block_hash(scenario_name: &str, index: usize, label: &str) -> EntryHash {
     EntryHash(*hasher.finalize().as_bytes())
 }
 
-/// Convert a compiled faultspec into engine fault injections.
-///
-/// Deterministic: same compiled scenario yields same injections. The
-/// per-variant labels and actor-id parsing implement the documented seam
-/// scheme above; the frozen fixture tests guard the output bytes.
-/// Partition actor names resolve through the same scenario-scoped registry
-/// the compiler uses (opaque names at their historic wrapping-hash ids
-/// with collision detection), so bridge ids always match compiled ids.
+/// Convert a compiled faultspec into engine injections. Deterministic;
+/// frozen fixture tests guard the bytes.
 ///
 /// # Errors
 ///
@@ -104,14 +76,17 @@ pub fn to_sim_injections(compiled: &CompiledScenario) -> Result<Vec<SimFault>, S
                     ticks: *ticks,
                 });
             }
+            FaultInjection::Duplicate { src, dst } => {
+                let label = format!("duplicate:{src}->{dst}");
+                let h = block_hash(&compiled.name, idx, &label);
+                out.push(SimFault::Duplicate { send: h });
+            }
         }
     }
     Ok(out)
 }
 
 /// Apply a compiled scenario to a `RunConfig`'s fault schedule.
-///
-/// Appends to the config's fault schedule and preserves determinism.
 ///
 /// # Errors
 ///
@@ -124,9 +99,7 @@ pub fn apply_to_run_config(
     Ok(())
 }
 
-/// Parse DSL, compile, validate storm heuristics, and convert to engine injections.
-///
-/// This is the one-stop helper for Explorer and CLI: parse -> compile -> translate.
+/// Parse DSL, compile, validate, and convert to engine injections.
 ///
 /// # Errors
 ///
@@ -149,11 +122,7 @@ pub fn apply_dsl_to_config(dsl: &str, config: &mut RunConfig) -> Result<(), Scen
     Ok(())
 }
 
-/// Actor names a compiled injection addresses.
-///
-/// Mirrors the compiler's scenario name collection so bridge resolution
-/// matches compiled ids exactly. Storage-targeted variants carry no actor
-/// names.
+/// Actor names an injection addresses; mirrors the compiler's collection.
 fn injection_actor_names(injection: &FaultInjection) -> Vec<String> {
     match injection {
         FaultInjection::Drop { src, dst, .. } => vec![src.clone(), dst.clone()],
@@ -163,24 +132,16 @@ fn injection_actor_names(injection: &FaultInjection) -> Vec<String> {
         FaultInjection::TornWrite { .. } => Vec::new(),
         FaultInjection::ClockSkew { actor, .. } => vec![actor.clone()],
         FaultInjection::Delay { src, dst, .. } => vec![src.clone(), dst.clone()],
+        FaultInjection::Duplicate { src, dst } => vec![src.clone(), dst.clone()],
     }
 }
 
-/// Re-derive the synthetic hash for a given scenario name/index/label.
-///
-/// Exposed for testing and for drivers that need to resolve synthetic ids to
-/// real journal entry ids.
+/// Re-derive the synthetic hash. Exposed for tests and drivers.
 pub fn synthetic_hash(scenario_name: &str, index: usize, label: &str) -> EntryHash {
     block_hash(scenario_name, index, label)
 }
 
-/// Parse actor id using the shared `ledger-faultspec` scheme.
-///
-/// Numeric suffixes (`replica-2` -> 2) resolve directly; opaque names resolve
-/// through the canonical registry. Unknown opaque names fail with
-/// [`ScenarioError::UnknownActor`]. The single implementation lives in
-/// `ledger_faultspec::actor_id`; the table test here locks the shared
-/// behavior against drift.
+/// Parse actor id via the shared `ledger-faultspec` scheme.
 ///
 /// # Errors
 ///
@@ -206,11 +167,7 @@ mod tests {
 
     #[test]
     fn bridge_output_frozen_fixture() {
-        // Frozen lock of the seam conversion. Expected values are computed
-        // from the documented scheme - BLAKE3(name || 0xff || index u64 LE ||
-        // 0xff || label) with labels from the variant mapping in
-        // to_sim_injections - and verified by reviewer recomputation. They
-        // must not drift.
+        // Frozen seam lock; must not drift.
         let dsl = "scenario x\ndrop 10% of a->b Msgs for 1s every 10s\npartition replica-2->replica-7\ncrash-restart replica-2 after FsFsync\ncorrupt sector range [0x10,0x20) of seg-1\ntorn-write on O_APPEND";
         let s = parse_scenario(dsl).unwrap();
         let c = compile(&s).unwrap();
@@ -265,11 +222,7 @@ mod tests {
 
     #[test]
     fn bridge_output_frozen_skew_latency() {
-        // Frozen lock for ClockSkew and BoundedLatency, both mapping to
-        // SimFault::Delay through the documented scheme. "ms" values parse to
-        // microsecond ticks (ms * 1000): 100ms -> 100_000, 50ms -> 50_000.
-        // Expected hashes computed per the documented scheme and verified by
-        // reviewer recomputation; they must not drift.
+        // Frozen lock for ClockSkew/BoundedLatency Delay mapping.
         let dsl = "scenario y\nclock-skew n1 by 100ms\ndelay a->b by 50ms";
         let s = parse_scenario(dsl).unwrap();
         let c = compile(&s).unwrap();
@@ -301,9 +254,7 @@ mod tests {
 
     #[test]
     fn parse_actor_id_table() {
-        // Locks the shared ledger-faultspec actor-id parsing against drift:
-        // numeric suffixes resolve directly; canonical opaque names keep
-        // historic ids; unknown opaque names fail closed.
+        // Locks shared actor-id parsing against drift.
         assert_eq!(parse_actor_id("replica-2").unwrap(), ActorId(2));
         assert_eq!(parse_actor_id("replica-7").unwrap(), ActorId(7));
         assert_eq!(parse_actor_id("node:3").unwrap(), ActorId(3));
@@ -389,7 +340,8 @@ mod tests {
                     | SimFault::Crash(h)
                     | SimFault::Corrupt { write: h, .. }
                     | SimFault::CrashState { write: h, .. }
-                    | SimFault::Delay { send: h, .. } => {
+                    | SimFault::Delay { send: h, .. }
+                    | SimFault::Duplicate { send: h } => {
                         assert_ne!(h, EntryHash([0; 32]));
                     }
                     SimFault::Partition { .. } => {}
@@ -431,5 +383,27 @@ mod tests {
             let b = compile_and_convert(dsl).unwrap();
             assert_eq!(a, b, "stable for {:?}", id);
         }
+    }
+
+    #[test]
+    fn bridge_output_frozen_duplicate() {
+        // Frozen lock for Duplicate mapping; existing frozen tests unmodified.
+        let dsl = "scenario z\nduplicate a->b";
+        let s = parse_scenario(dsl).unwrap();
+        let c = compile(&s).unwrap();
+        let sim = to_sim_injections(&c).unwrap();
+        assert_eq!(sim.len(), 1);
+        let expected = synthetic_hash("z", 0, "duplicate:a->b");
+        assert_eq!(sim[0], SimFault::Duplicate { send: expected });
+        assert_eq!(
+            sim[0],
+            SimFault::Duplicate {
+                send: EntryHash([
+                    0x0f, 0x9c, 0x15, 0xfb, 0x99, 0xe9, 0x95, 0x94, 0xd0, 0x8f, 0xc1, 0xc4, 0x79,
+                    0x30, 0x3d, 0x8f, 0x74, 0x65, 0x47, 0xb2, 0xba, 0x91, 0x87, 0xcb, 0x29, 0x53,
+                    0x0c, 0xde, 0x90, 0xa7, 0xf6, 0xb0,
+                ])
+            }
+        );
     }
 }

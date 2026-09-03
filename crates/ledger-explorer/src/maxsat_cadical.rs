@@ -1,26 +1,14 @@
 #![deny(unsafe_code)]
 
-//! CaDiCaL-backed weighted-MaxSAT engine behind `solver-cadical`.
-//!
-//! Exact optimum via bounded binary threshold search. Each threshold K builds
-//! a fresh CaDiCaL instance encoding hard clauses, unit equivalences (event
-//! var <-> cost unit copies), and a sequential-counter at-most-K constraint
-//! over all unit copies. Feasibility is monotone in K (a larger bound only
-//! relaxes the counter), so binary search finds the first SAT K with
-//! O(log total_units) probes instead of a linear scan. Each probe is fresh,
-//! but the instances are tiny (journal bounded horizon 64, ~10 distinct
-//! events) so search is milliseconds. Determinism is via sorted-hash
-//! variable numbering.
+//! CaDiCaL MaxSAT behind `solver-cadical`. Binary threshold search;
+//! sorted-hash numbering keeps cuts byte-identical per build.
 
 use crate::maxsat::{LOWER_BOUND_METHOD, LowerBoundProof, MaxSatSolution};
 use crate::solver::SolverError;
 use ledger_format::EntryHash;
 use std::collections::BTreeMap;
 
-/// Upper bound on binary-search probes.
-///
-/// `total_units` fits in `u64`, so 64 probes always suffice; the loop also
-/// breaks on convergence, typically in `log2(total_units)` steps.
+/// Probe bound. 64 always suffices for `u64`; loop breaks on convergence.
 const MAX_THRESHOLD_PROBES: usize = 64;
 
 pub(crate) fn solve_maxsat_incremental(
@@ -46,11 +34,7 @@ pub(crate) fn solve_maxsat_incremental(
     events.sort();
     let total_units: u64 = event_cost.values().sum();
     let hard = &encoding.hard;
-    // Bounded binary search for the least feasible K. Feasibility is monotone:
-    // when K is SAT, every larger K is SAT because the at-most-K counter only
-    // relaxes. The probe order is deterministic and the variable numbering
-    // inside `try_threshold` is sorted-hash order, so the same encoding
-    // yields byte-identical cuts within one build.
+    // Binary search: feasibility is monotone in K; numbering is sorted-hash.
     if try_threshold(total_units, hard, &events, &event_cost, encoding).is_none() {
         return Err(SolverError::Unsupported);
     }

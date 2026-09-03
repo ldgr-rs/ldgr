@@ -1,14 +1,7 @@
 #![deny(unsafe_code)]
 
-//! Exploration coverage export for campaign data.
-//!
-//! "Coverage" here means scenario-space exploration coverage:
-//! `distinct journal roots / runs executed`, derived from campaign journals
-//! and exported in CI-renderable formats (lcov, SARIF, JaCoCo).
-//!
-//! Input for the CLI is NDJSON of `{root_hex, run_index, finding}` lines
-//! produced by campaigns. Use [`CoverageBuilder`] for incremental collection
-//! at call sites where `RunResult` values exist.
+//! Exploration coverage export: distinct roots over runs, in CI formats.
+//! NDJSON input via campaigns; [`CoverageBuilder`] where `RunResult` exists.
 
 use std::collections::HashSet;
 
@@ -49,9 +42,7 @@ pub enum CovError {
     Serialization(String),
 }
 
-/// Incremental builder for [`CoverageReport`].
-///
-/// Records are accumulated out of order and sorted on `finish`.
+/// Incremental builder. Records sort on `finish`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CoverageBuilder {
     records: Vec<RootRecord>,
@@ -75,9 +66,7 @@ impl CoverageBuilder {
         });
     }
 
-    /// Record a pre-encoded hex string for one run.
-    ///
-    /// The hex must be 64 lowercase hex digits, otherwise an error is returned.
+    /// Hex must be 64 lowercase hex digits.
     pub fn record_hex(
         &mut self,
         root_hex: String,
@@ -108,12 +97,7 @@ impl CoverageBuilder {
         self.records.is_empty()
     }
 
-    /// Finish the build into a sorted [`CoverageReport`].
-    ///
-    /// `total_runs` is the total attempts of the campaign. When zero and
-    /// records exist, `max(run_index)+1` is used. Records are sorted by
-    /// `run_index` for deterministic output. `distinct_roots` counts unique
-    /// `root_hex` values, `findings` counts records where `finding` is true.
+    /// Finish into a sorted report. Zero `total_runs` derives from records.
     pub fn finish(mut self, total_runs: usize) -> CoverageReport {
         self.records.sort_by_key(|record| record.run_index);
         let distinct = {
@@ -145,14 +129,8 @@ impl CoverageBuilder {
 }
 
 impl CoverageReport {
-    /// Derive a report from a [`CampaignReport`] aggregate.
-    ///
-    /// Only finding roots are available from [`CampaignReport`]; non-finding
-    /// distinct roots cannot be reconstructed from aggregates alone. This
-    /// constructor emits one record per finding (with the true journal root
-    /// hex) and preserves `distinct_roots` and `runs_executed` as counts for
-    /// export totals. For per-run tracking with complete root hexes, use
-    /// [`CoverageBuilder`] at call sites where each `RunResult` is available.
+    /// Derive from a report. Only finding roots are available; use the builder
+    /// for per-run tracking.
     pub fn from_campaign(report: &CampaignReport) -> Self {
         let mut builder = CoverageBuilder::new();
         for (index, finding) in report.findings.iter().enumerate() {
@@ -160,12 +138,10 @@ impl CoverageReport {
             builder.record(root, index, true);
         }
         let mut out = builder.finish(report.runs_executed);
-        // Preserve the campaign-level distinct count even when builder sees
-        // fewer unique hexes (findings only).
+        // Findings only, so preserve the campaign aggregate counts.
         out.distinct_roots = report.distinct_roots;
         out.findings = report.findings.len();
-        // When there were no findings but distinct roots existed, roots stays
-        // empty and exporters use the aggregate counts for LF/LH.
+        // No findings: exporters use aggregate counts.
         out
     }
 }
@@ -176,12 +152,7 @@ fn sorted_roots(report: &CoverageReport) -> Vec<RootRecord> {
     sorted
 }
 
-/// Export coverage as lcov tracefile format.
-///
-/// - `SF:ledger-campaign` is the source file marker.
-/// - Each distinct root is one `DA` line: `DA:<run_index+1>,<1 if finding else 0>`.
-/// - `LF` is `distinct_roots`, `LH` is `findings`.
-/// - Deterministic: records sorted by `run_index` before emission.
+/// lcov export. Deterministic: sorted by `run_index`.
 pub fn to_lcov(report: &CoverageReport) -> String {
     let sorted = sorted_roots(report);
     let mut out = String::new();
@@ -197,11 +168,7 @@ pub fn to_lcov(report: &CoverageReport) -> String {
     out
 }
 
-/// Export coverage as SARIF 2.1.0 JSON.
-///
-/// Each root record becomes one result: level `error` for findings, `note`
-/// for covered non-finding roots, with the root hex in the message text.
-/// Deterministic: results sorted by `run_index`.
+/// SARIF 2.1.0 export. Deterministic: sorted by `run_index`.
 pub fn to_sarif(report: &CoverageReport) -> Result<String, CovError> {
     let sorted = sorted_roots(report);
     let results: Vec<serde_json::Value> = sorted
@@ -239,15 +206,11 @@ pub fn to_sarif(report: &CoverageReport) -> Result<String, CovError> {
     serde_json::to_string(&sarif).map_err(|error| CovError::Serialization(error.to_string()))
 }
 
-/// Export coverage as minimal JaCoCo XML.
-///
-/// Produces `<report><counter type="LINE" missed=.. covered=.. />`.
-/// `missed = distinct_roots - findings`, `covered = findings`.
-/// Deterministic: single counter element.
+/// JaCoCo XML export. `missed = distinct - findings`.
 pub fn to_jacoco(report: &CoverageReport) -> Result<String, CovError> {
     let missed = report.distinct_roots.saturating_sub(report.findings);
     let covered = report.findings;
-    // Build XML by hand for determinism and no extra dependencies.
+    // Hand-built XML keeps determinism without extra dependencies.
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <report name=\"ledger-campaign\">\n\

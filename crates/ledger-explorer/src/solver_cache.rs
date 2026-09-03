@@ -1,35 +1,19 @@
 #![deny(unsafe_code)]
 
-//! Content-addressed clause cache for the LDFI solver.
-//!
-//! The cache is keyed by a BLAKE3 digest over the causal closure hash,
-//! the horizon bound, and the oracle predicate version. All operations
-//! are deterministic and do not use time or ambient threads. The cache is
-//! always explicit and per-campaign/per-solver: each campaign entry point
-//! constructs its own [`ClauseCache`] (or its solver, which owns one), so
-//! concurrent campaigns never observe each other's entries. No
-//! process-global store exists.
+//! Content-addressed clause cache. Per-campaign/per-solver; deterministic,
+//! no ambient state, no process-global store.
 
 use crate::solver::SolverConfig;
 use ledger_format::EntryHash;
 use std::collections::HashMap;
 
-/// Engine discriminator folded into content-addressed cache keys.
-///
-/// The builtin pure-Rust engines (hitting set, MaxSAT branch-and-bound) tag
-/// with [`BUILTIN`]. The CaDiCaL-backed MaxSAT tags with [`CADICAL`], so a
-/// clause or hypothesis entry derived by one engine never satisfies another.
-/// Without the `solver-cadical` feature no caller produces [`CADICAL`] keys.
+/// Engine tag in cache keys; entries never cross engines.
 pub mod engine_tag {
     pub const BUILTIN: u8 = 0;
     pub const CADICAL: u8 = 1;
 }
 
-/// A weighted clause over fault events.
-///
-/// Each clause is a disjunction over fault events; the weight is the cost of
-/// breaking that clause. The hitting-set formulation becomes a weighted MaxSAT
-/// where soft clauses correspond to derivation paths.
+/// Weighted disjunction over fault events; weight is the break cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightedClause {
     pub literals: Vec<EntryHash>,
@@ -46,12 +30,8 @@ impl WeightedClause {
     }
 }
 
-/// Deterministic content-addressed cache for derived clauses.
-///
-/// The key is `BLAKE3(closure_hash || max_horizon || oracle_version ||
-/// input_class || max_faults || engine_tag || run_config_hash)`.
-/// The value is the exact clause set that was derived for that closure
-/// so repeat solves hit the cache without re-walking the journal.
+/// Deterministic clause cache. Key covers closure, horizon, oracle,
+/// input, faults, engine, run-config, and support pins.
 #[derive(Debug, Clone, Default)]
 pub struct ClauseCache {
     inner: HashMap<EntryHash, Vec<WeightedClause>>,
@@ -92,9 +72,7 @@ impl ClauseCache {
         self.inner.contains_key(key)
     }
 
-    /// Compute the closure hash over sorted fault hypothesis ids.
-    ///
-    /// Deterministic: sorts the input, hashes with BLAKE3.
+    /// Closure hash over sorted ids. Deterministic.
     pub fn closure_hash(sorted_ids: &[EntryHash]) -> EntryHash {
         let mut ids = sorted_ids.to_vec();
         ids.sort();
@@ -105,10 +83,7 @@ impl ClauseCache {
         EntryHash(*hasher.finalize().as_bytes())
     }
 
-    /// EntryHash a clause set deterministically.
-    ///
-    /// Sorts literals within each clause and sorts clauses by their
-    /// literal bytes so the hash is stable under permutation.
+    /// Hash a clause set stably under permutation.
     pub fn clauses_hash(clauses: &[WeightedClause]) -> EntryHash {
         let mut hasher = blake3::Hasher::new();
         let mut sorted = clauses.to_vec();
@@ -128,17 +103,7 @@ impl ClauseCache {
         EntryHash(*hasher.finalize().as_bytes())
     }
 
-    /// Compute the content-addressed key for a solver invocation.
-    ///
-    /// `closure_hash` is `BLAKE3(sorted event ids in the causal closure)`.
-    /// `engine_tag` separates entries per solver engine
-    /// ([`engine_tag::BUILTIN`] / [`engine_tag::CADICAL`]); an entry derived
-    /// by one engine must never satisfy another.
-    /// `config` carries the remaining cache dimensions: horizon,
-    /// oracle version, input class, max faults, run-config hash, and the
-    /// support-provider version and digest. Entries derived under different
-    /// values of any dimension must never satisfy each other, and each
-    /// presence byte keeps `None` apart from `Some(0)`.
+    /// Content-addressed key. Every `None`/`Some` pair hashes apart.
     pub fn compute_key(
         closure_hash: EntryHash,
         engine_tag: u8,
@@ -260,9 +225,7 @@ mod tests {
 
     #[test]
     fn compute_key_separates_oracle_none_from_some_zero() {
-        // An absent oracle version and a pinned version 0 are different
-        // configurations: the presence byte must keep them apart, mirroring
-        // the state fingerprint's None-vs-Some(0) behavior.
+        // Presence byte keeps `None` apart from `Some(0)`.
         let closure = hash_of(9);
         let none = ClauseCache::compute_key(closure, engine_tag::BUILTIN, &SolverConfig::default());
         let zero = ClauseCache::compute_key(
@@ -281,8 +244,7 @@ mod tests {
 
     #[test]
     fn compute_key_differs_on_support_version() {
-        // A provider version change must isolate the cache: same closure,
-        // horizon, oracle, and run config, different support version.
+        // Provider version change must isolate the cache.
         let closure = hash_of(11);
         let digest = hash_of(3);
         let v1 = ClauseCache::compute_key(
@@ -304,8 +266,7 @@ mod tests {
 
     #[test]
     fn compute_key_differs_on_support_digest() {
-        // A provider model change must isolate the cache even when the
-        // version is unchanged: different digest, all else equal.
+        // Model change must isolate the cache even at the same version.
         let closure = hash_of(13);
         let a = ClauseCache::compute_key(
             closure,
@@ -364,8 +325,7 @@ mod tests {
 
     #[test]
     fn compute_key_differs_per_engine_tag() {
-        // A clause set derived by the CaDiCaL engine must never satisfy the
-        // builtin engine: the tag separates their cache namespaces.
+        // Tags separate engine namespaces.
         let closure = hash_of(7);
         let builtin = ClauseCache::compute_key(
             closure,
@@ -404,8 +364,7 @@ mod tests {
 
     #[test]
     fn compute_key_differs_on_run_config_hash() {
-        // Entries derived under different run configs must never satisfy each
-        // other, and an entry without a run-config hash is its own namespace.
+        // Different run configs never share entries.
         let closure = hash_of(7);
         let none = ClauseCache::compute_key(
             closure,
@@ -442,9 +401,7 @@ mod tests {
 
     #[test]
     fn per_campaign_caches_are_isolated() {
-        // Two explicit per-campaign caches never share entries: each entry
-        // point constructs its own `ClauseCache`, so isolation is structural
-        // instead of relying on a process-global clear.
+        // Isolation is structural: each entry point owns its cache.
         let mut first = ClauseCache::new();
         let second = ClauseCache::new();
         let key = hash_of(11);

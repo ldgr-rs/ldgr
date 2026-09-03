@@ -12,13 +12,7 @@ use ledger_journal::Journal;
 use ledger_sim::{Policy, RunConfig, SeedTree, Simulation, canonical_hash};
 use std::collections::HashSet;
 
-/// Opt-in cross-round state for the stateful campaign variants.
-///
-/// Holds a crate-local in-memory journal of solver-state artifacts plus a
-/// campaign memo. After each LDFI solve the campaign persists solver caches
-/// into the journal; later rounds and later campaigns sharing one handle
-/// resume them, pre-warming clause and hypothesis caches. The memo dedups
-/// identical replay attempts by journal root.
+/// Opt-in cross-round state: persisted solver artifacts plus campaign memo.
 pub struct CampaignPersist {
     pub(super) journal: Journal,
     memo: CampaignMemo,
@@ -41,12 +35,7 @@ impl CampaignPersist {
         }
     }
 
-    /// Resume every stored artifact into `solver`, pre-warming its caches.
-    ///
-    /// Works for any routed engine: engines without artifact support no-op
-    /// via the trait defaults. An artifact whose state key, resolved engine,
-    /// or run-config hash does not match the solver fails loudly instead of
-    /// pre-warming with foreign state.
+    /// Resume stored artifacts; mismatched state fails loudly.
     pub(super) fn resume_into(&self, solver: &mut dyn FaultSolver) -> Result<(), SearchError> {
         let artifacts = load_solver_state(&self.journal)?;
         for artifact in &artifacts {
@@ -55,8 +44,7 @@ impl CampaignPersist {
         Ok(())
     }
 
-    /// Persist `solver`'s cache state. Identical states dedup by content
-    /// address, so repeated saves never grow the internal journal.
+    /// Persist cache state; identical states dedup by content address.
     pub(super) fn persist_from(&mut self, solver: &dyn FaultSolver) -> Result<(), SearchError> {
         let Some(artifact) = solver.snapshot_state() else {
             return Ok(());
@@ -66,9 +54,7 @@ impl CampaignPersist {
     }
 }
 
-/// Run the joint campaign without cross-campaign state.
-///
-/// See [`run_joint_campaign_with_state`] for the stateful variant.
+/// Run without cross-campaign state. See the `with_state` variant.
 pub fn run_joint_campaign<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
@@ -78,19 +64,8 @@ pub fn run_joint_campaign<W: Workload, O: Oracle>(
     run_joint_campaign_with_state(workload, oracle, base, attempts, None)
 }
 
-/// Run the joint campaign: fault-adjacent schedule perturbation plus inputs
-/// that reach the candidate witnesses.
-///
-/// The first phase searches for a violating run. Its LDFI hypothesis becomes
-/// the fault schedule, and its recorded decisions are replayed per attempt
-/// with one adjacent swap near the witness, while fresh inputs are sampled
-/// through the input axis. The total run count is exactly `attempts`.
-///
-/// Each replay is keyed by `(Replay, swarm, schedule, input hash, decisions)`
-/// in the campaign memo. A hit reuses the cached journal root instead of
-/// re-executing and counts as a memo hit; with `state`, the memo and the
-/// persisted solver state survive across calls, so an identical rerun hits
-/// for every round instead of executing.
+/// Joint campaign: fault-adjacent perturbation plus inputs reaching witnesses.
+/// Total run count is exactly `attempts`; memo hits reuse cached roots.
 pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
@@ -98,8 +73,7 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
     attempts: usize,
     mut state: Option<&mut CampaignPersist>,
 ) -> Result<CampaignReport, SearchError> {
-    // Explicit per-campaign clause cache scope. Each solver built below owns
-    // its cache; no process-global store exists.
+    // Per-campaign cache scope; each solver owns its cache.
     let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
     let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
@@ -120,10 +94,7 @@ pub fn run_joint_campaign_with_state<W: Workload, O: Oracle>(
     let mut decisions = Vec::new();
     let mut witness_position = 0usize;
     if let Some(finding) = &base_finding {
-        // Production solver uses bounded horizon 64 and per-input-class cache
-        // for the joint generator. The canonical run-config hash joins the
-        // solver keys so state persisted under one run config never pre-warms
-        // a campaign under another.
+        // Bounded horizon 64; run-config hash separates solver keys.
         let run_config_hash = canonical_hash(&base)?;
         let base_cfg = HittingSetSolver::new().config().clone();
         let cfg = SolverConfig {

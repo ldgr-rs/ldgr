@@ -30,10 +30,7 @@ use ledger_sim::{Probability, RunConfig, SeedTree, SimFault, Simulation, SwarmCo
 use rand_core::Rng;
 use std::collections::HashSet;
 
-/// Typed error for campaign search and replay paths.
-///
-/// Preserves the underlying [`ledger_sim::RuntimeError`] instead of
-/// flattening it into a string, so callers keep the typed cause.
+/// Typed search/replay errors; preserves the typed cause.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     #[error("simulation failed: {0}")]
@@ -70,6 +67,7 @@ fn fault_injection_target(injection: &SimFault) -> Option<EntryHash> {
     match injection {
         SimFault::Drop(id)
         | SimFault::Delay { send: id, .. }
+        | SimFault::Duplicate { send: id }
         | SimFault::Crash(id)
         | SimFault::Corrupt { write: id, .. }
         | SimFault::CrashState { write: id, .. } => Some(*id),
@@ -77,10 +75,7 @@ fn fault_injection_target(injection: &SimFault) -> Option<EntryHash> {
     }
 }
 
-/// Search deterministic seeds sequentially until the first oracle violation.
-///
-/// Returns the finding, if any, and the number of runs consumed. The total is
-/// always exactly `budget`, so a campaign can compute its remaining budget.
+/// Sequential seed search. Returns the finding and runs consumed (always `budget`).
 fn find_first_violation<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
@@ -107,12 +102,8 @@ fn find_first_violation<W: Workload, O: Oracle>(
     Ok((None, budget))
 }
 
-/// Promote an incomplete run to a liveness violation.
-///
-/// A run that never completed is a finding regardless of what the oracle
-/// saw on the partial journal: an exhausted step budget, pending tasks
-/// at quiescence, or a mid-run monitor halt all mean the system under test
-/// failed to make progress.
+/// Incomplete runs are liveness findings: budget exhaustion, quiescence
+/// with pending tasks, or monitor halt all mean no progress.
 pub fn effective_verdict(run: &ledger_sim::RunResult, verdict: crate::Verdict) -> crate::Verdict {
     let reason = match &run.outcome {
         ledger_sim::RunOutcome::Completed => return verdict,
@@ -127,9 +118,7 @@ pub fn effective_verdict(run: &ledger_sim::RunResult, verdict: crate::Verdict) -
             format!("monitor halt: {reason}")
         }
     };
-    // Structural witnesses first; a stalled or halted run may have none, so
-    // fall back to the journal tail: the last entries show where progress
-    // stopped.
+    // Structural witnesses first; else the journal tail shows the stall.
     let mut witnesses = crate::oracle::witnesses_from_journal(&run.journal);
     if witnesses.is_empty() {
         witnesses = run.journal.tail_ids(8);
@@ -137,19 +126,13 @@ pub fn effective_verdict(run: &ledger_sim::RunResult, verdict: crate::Verdict) -
     crate::oracle::Verdict::fail(witnesses, reason)
 }
 
-/// Shared fault-class budget for the swarm axis across every campaign type.
-///
-/// This is a budget, not a semantic guarantee: once this many distinct
-/// post-crash state classes have been applied in one run, further sampled
-/// crashes are skipped. Matches [`SwarmConfig::default`].
+/// Shared fault-class budget for the swarm axis. A budget, not a guarantee.
 const SWARM_FAULT_CLASSES_PER_RUN: usize = 2;
 
-/// Shared crash-probability ceiling for the swarm axis across every campaign
-/// type, so quad and swarm-only campaigns draw comparable distributions.
+/// Crash-probability ceiling shared by quad and swarm campaigns.
 const SWARM_CRASH_CEILING: f64 = 0.1;
 
-/// Max-delay budget for the swarm-only campaign, so its swarm draws match the
-/// quad campaign's default budget.
+/// Max-delay budget matching the quad default.
 const SWARM_CAMPAIGN_MAX_DELAY_BUDGET: u64 = 8;
 
 fn unbiased_range(rng: &mut impl Rng, bound: u64) -> u64 {

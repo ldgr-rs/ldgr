@@ -15,11 +15,7 @@ pub fn causal_slice(journal: &Journal, witness: EntryHash) -> Result<Vec<EntryHa
     journal.causal_slice(&[witness])
 }
 
-/// Causal slice closed forward over its boundary inputs.
-///
-/// The minimizer's slice path uses the forward-closed slice so the repro
-/// journal is self-contained for replay: the entries that consume the sliced
-/// boundary events are kept alongside their causes.
+/// Forward-closed slice keeps the repro self-contained for replay.
 pub fn causal_slice_forward(
     journal: &Journal,
     witness: EntryHash,

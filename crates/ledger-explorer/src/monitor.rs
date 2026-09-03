@@ -1,9 +1,5 @@
-//! Coyote-style online monitors consuming per-step journal deltas.
-//!
-//! Monitors observe each journal entry in append order and can halt on safety
-//! violations or warn on liveness bound pressure. The [`MonitorOracle`] replays
-//! a completed [`RunResult`] journal through each monitor in deterministic
-//! order and aggregates halts into a [`Verdict`].
+//! Coyote-style monitors over per-step journal deltas. [`MonitorOracle`]
+//! replays journals deterministically into a [`Verdict`].
 
 use ledger_format::{EntryHash, EntryKind};
 use ledger_journal::Entry;
@@ -32,21 +28,11 @@ pub trait OnlineMonitor {
     fn on_quiescence(&mut self) -> MonitorAction;
     /// Human-readable monitor name.
     fn name(&self) -> &str;
-    /// Reset per-run state before replaying a new journal.
-    ///
-    /// Default is a no-op for stateless monitors. Stateful monitors (e.g.
-    /// [`LivenessMonitor`]) reset counters so a single oracle remains reusable
-    /// across campaign runs.
+    /// Reset per-run state. Default no-op; stateful monitors reset counters.
     fn reset(&mut self) {}
 }
 
-/// Adapter that feeds journal deltas to a set of `OnlineMonitor`s.
-///
-/// The returned `StepMonitor` iterates the journal delta in append order
-/// and calls each monitor's `on_entry` in sequence; the first `Halt` wins
-/// and is surfaced as `OnlineAction::Halt`. The adapter is read-only over
-/// the journal and consumes no seed draws, so the partial journal remains
-/// deterministic and replayable.
+/// Feed deltas in order; first `Halt` wins. Read-only and deterministic.
 pub fn monitors_to_step_monitor(mut monitors: Vec<Box<dyn OnlineMonitor>>) -> StepMonitor {
     Box::new(move |journal: &ledger_journal::Journal, start: usize| {
         for entry in journal.entries().skip(start) {
@@ -66,10 +52,7 @@ pub fn monitors_to_step_monitor(mut monitors: Vec<Box<dyn OnlineMonitor>>) -> St
     })
 }
 
-/// Oracle that replays the journal through a set of online monitors.
-///
-/// Deterministic: replay order is [`Journal::entries`] append order and no
-/// ambient state is consulted.
+/// Oracle replaying the journal through monitors. Deterministic append-order replay.
 pub struct MonitorOracle {
     monitors: Rc<RefCell<Vec<Box<dyn OnlineMonitor>>>>,
     warnings: RefCell<Vec<String>>,
@@ -96,14 +79,7 @@ impl MonitorOracle {
         self
     }
 
-    /// Build a mid-run `StepMonitor` sharing the same monitor state.
-    ///
-    /// The returned monitor feeds delta entries in order and the first halt
-    /// wins, matching `monitors_to_step_monitor` semantics. Sharing the
-    /// underlying monitors lets a campaign attach the same logical monitors
-    /// for mid-run halting and post-run `Oracle::check` without cloning
-    /// trait objects. The mid-run path only calls `on_entry`; quiescence
-    /// halts are still surfaced by the post-run `Oracle`.
+    /// Mid-run monitor sharing state; quiescence still surfaces post-run.
     pub fn to_step_monitor(&self) -> StepMonitor {
         let shared = Rc::clone(&self.monitors);
         Box::new(move |journal: &ledger_journal::Journal, start: usize| {
@@ -125,11 +101,7 @@ impl MonitorOracle {
         })
     }
 
-    /// Warnings surfaced by the last [`Oracle::check`] run.
-    ///
-    /// A warning is a non-violation signal (for example a liveness gap at
-    /// its bound); halts stay in the [`Verdict`]. Empty before the first
-    /// check or when no monitor warned.
+    /// Warnings from the last check. Halts stay in the [`Verdict`].
     pub fn warnings(&self) -> Vec<String> {
         self.warnings.borrow().clone()
     }
@@ -202,10 +174,7 @@ impl Oracle for MonitorOracle {
     }
 }
 
-/// Safety monitor that halts when the invariant predicate is false.
-///
-/// The invariant receives each entry; return `true` to continue, `false` to
-/// halt. Only entries where the predicate is false cause a halt.
+/// Safety monitor: `false` invariant halts on that entry.
 pub struct SafetyMonitor {
     invariant: Box<dyn Fn(&Entry) -> bool>,
     message: String,
@@ -213,9 +182,7 @@ pub struct SafetyMonitor {
 }
 
 impl SafetyMonitor {
-    /// Create a safety monitor.
-    ///
-    /// `invariant` returns `true` for safe entries, `false` for violations.
+    /// Create a safety monitor. `false` means violation.
     pub fn new<F>(invariant: F, message: impl Into<String>) -> Self
     where
         F: Fn(&Entry) -> bool + 'static,
@@ -252,11 +219,8 @@ impl OnlineMonitor for SafetyMonitor {
     }
 }
 
-/// Liveness monitor that warns then halts when steps between occurrences of
-/// `expected_kind` exceed `max_gap_steps`.
-///
-/// Eventually-style bound: every `max_gap_steps` entries an occurrence of
-/// `expected_kind` must appear. Gaps are counted in journal append order.
+/// Liveness monitor: halts past `max_gap_steps` without `expected_kind`.
+/// Gaps count in append order.
 pub struct LivenessMonitor {
     expected_kind: EntryKind,
     max_gap_steps: usize,

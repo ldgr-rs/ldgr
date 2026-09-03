@@ -51,13 +51,8 @@ fn run_for_check(journal: Journal) -> RunResult {
     }
 }
 
-/// Compose the four-stage minimization pipeline.
-///
-/// The pipeline runs in order: backward causal slice from the first oracle
-/// witness, ddmin over the slice entry set, schedule-delta debugging over
-/// the recorded decisions, and input-delta debugging when `generator` is
-/// non-empty. The slice is kept only if it still violates the oracle;
-/// otherwise the full journal is used.
+/// Four-stage pipeline: slice, ddmin, schedule-delta, input-delta. Slice
+/// keeps only when it still violates.
 pub fn minimize_full<W, O>(
     workload: &W,
     oracle: &O,

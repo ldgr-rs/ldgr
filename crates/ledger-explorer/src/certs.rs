@@ -29,16 +29,10 @@ fn check_lineage_not_certifiable(journal: &Journal) -> Result<(), CertError> {
     Ok(())
 }
 
-/// Maximum per-event fault cost of the solver's cost model.
-///
-/// The single cost table is [`crate::solver::event_fault_cost`]; per-kind
-/// costs run 2..=5 and this constant is its maximum. Shared by `verify()` -
-/// which has no journal, so it bounds a cut's summed event cost with this
-/// maximum - and by gate tests that need the same cut-cost upper bound or a
-/// tampered bound just above it.
+/// Maximum per-event fault cost. Maximum of [`crate::solver::event_fault_cost`].
 pub const MAX_EVENT_COST: u64 = 5;
 
-/// Maximum raw JSON statement size in bytes (1 MiB).
+/// Maximum raw JSON statement size (1 MiB).
 pub const CERT_MAX_BYTES: usize = 1024 * 1024;
 
 /// Cap for `resolvedDependencies` entries in a parsed statement.
@@ -53,10 +47,7 @@ const MAX_STRING_BYTES: usize = 4096;
 /// Maximum recorded solver horizon accepted by Wave 1.
 const MAX_RECORDED_HORIZON: usize = 64;
 
-/// Policy for lineage-only journals.
-///
-/// Strict rejects lineage-only journals, AllowLineage accepts them for
-/// debugging or lineage export.
+/// Lineage-only journal policy. Strict rejects; AllowLineage aids debugging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineagePolicy {
     /// Reject lineage-only journals.
@@ -65,10 +56,7 @@ pub enum LineagePolicy {
     AllowLineage,
 }
 
-/// Check that `len` fits within the certificate byte limit.
-///
-/// Single source for the 1 MiB limit used by parsing, emission, and CLI
-/// bounded readers.
+/// Check `len` against the 1 MiB certificate limit.
 pub fn check_cert_bytes(len: usize) -> Result<(), CertError> {
     if len > CERT_MAX_BYTES {
         return Err(CertError::Serialization(format!(
@@ -78,12 +66,7 @@ pub fn check_cert_bytes(len: usize) -> Result<(), CertError> {
     Ok(())
 }
 
-/// Serde bridge for [`EntryHash`] as a 32-byte array.
-///
-/// `ledger-format` is `no_std` without a serde dependency, so the newtype
-/// cannot implement `Serialize`/`Deserialize` itself. The bridge serializes
-/// the inner `[u8; 32]` exactly as the old `Hash = [u8; 32]` alias did, so
-/// derived JSON for certificates stays byte-identical.
+/// Serde bridge for [`EntryHash`]; keeps derived JSON byte-identical.
 mod serde_entryhash {
     use ledger_format::EntryHash;
     use serde::{Deserializer, Serializer};
@@ -137,15 +120,12 @@ pub struct ResolvedDependency {
 pub struct RecordedSolverData {
     #[serde(with = "serde_entryhash_vec")]
     pub cut: Vec<EntryHash>,
-    /// Exact cut cost recomputed from the journal fault model at emission.
+    /// Exact cut cost at emission.
     pub cost: u64,
     pub method: String,
-    /// Solver horizon recorded at emission time. `None` records an unbounded
-    /// solver configuration. Inclusion-minimal validation refuses an
-    /// unbounded configuration because it cannot bound the walk.
+    /// Recorded horizon. `None` is unbounded and fails minimal validation.
     pub horizon: Option<usize>,
-    /// Support-provider version pinned at emission. Tampering with this value
-    /// after the fact is rejected by support-aware validation.
+    /// Support-provider version pinned at emission; tampering fails validation.
     pub support_provider_version: Option<u64>,
     /// Violation witnesses the cut was derived against.
     #[serde(with = "serde_entryhash_vec")]
@@ -192,16 +172,12 @@ pub struct CampaignCertificate {
     pub findings_count: usize,
     pub solver_data: Option<RecordedSolverData>,
     pub statistical: Option<StatisticalBound>,
-    /// Result of journal-anchored validation when it has been run.
+    /// Journal-anchored validation result, when run.
     pub journal_validation: Option<JournalValidation>,
-    /// Result of bounded inclusion-minimal fault-cut validation when checked.
+    /// Inclusion-minimal result, when checked.
     pub inclusion_minimal: Option<InclusionMinimal>,
-    /// Execution-identity digest of the run that produced this statement.
-    ///
-    /// `None` on certificates emitted without identity binding; the
-    /// identity-aware journal verification ([`Self::verify_with_journal_and_identity`])
-    /// treats a present-but-unmatched digest as a failure before any root
-    /// comparison.
+    /// Execution-identity digest. Present-but-unmatched fails verification
+    /// before root comparison.
     pub execution_identity: Option<EntryHash>,
 }
 
@@ -228,8 +204,7 @@ pub enum CertError {
     },
 }
 
-/// Shared lowercase-hex renderer for 32-byte hashes, used by certificate and
-/// coverage emission.
+/// Shared lowercase-hex renderer for certificate and coverage emission.
 pub(crate) fn hash_to_hex(hash: &EntryHash) -> String {
     hash.0.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -903,11 +878,7 @@ impl CampaignCertificate {
         Ok(())
     }
 
-    /// Validate the statement and bind it to one concrete journal.
-    ///
-    /// Wave 1 checks the subject root, cut membership, faultability, and the
-    /// recorded solver cost fields. It does not inspect causal parent paths.
-    /// Use [`Self::verify_with_journal_with`] to select a lineage policy.
+    /// Bind to one journal. Checks root, cut membership, faultability, cost.
     pub fn verify_with_journal_with(
         &self,
         journal: &Journal,
@@ -983,23 +954,13 @@ impl CampaignCertificate {
         Ok(())
     }
 
-    /// Validate and bind the certificate to a journal.
-    ///
-    /// Lineage-only journals are rejected. Use
-    /// [`Self::verify_with_journal_with`] with [`LineagePolicy::AllowLineage`]
-    /// to override.
+    /// Bind under strict lineage. See `verify_with_journal_with` for override.
     pub fn verify_with_journal(&self, journal: &Journal) -> Result<(), CertError> {
         self.verify_with_journal_with(journal, LineagePolicy::Strict)
     }
 
-    /// Validate and bind the certificate to a journal, gated on execution
-    /// identity.
-    ///
-    /// The identity gate runs before any root comparison: a certificate that
-    /// carries an identity digest must match the expected digest of the run
-    /// that produced the journal, and a digest present on only one side is
-    /// treated as incomplete and rejected. When both sides carry no identity
-    /// the legacy comparison path is used.
+    /// Bind gated on execution identity. Identity checks precede root
+    /// comparison; one-sided digests fail.
     pub fn verify_with_journal_and_identity(
         &self,
         journal: &Journal,
@@ -1027,13 +988,8 @@ impl CampaignCertificate {
         self.verify_with_journal(journal)
     }
 
-    /// Bound the statement to a journal and verify the recorded cut is
-    /// inclusion-minimal: every member is essential, so no proper subset of
-    /// the cut still covers every witness derivation path.
-    ///
-    /// Requires a non-empty reproduced cut and a passing no-fault baseline;
-    /// a baseline violation may still produce a campaign statement, but it is
-    /// not fault-causation evidence and this operation refuses it.
+    /// Inclusion-minimal cut: every member essential. Requires reproduced cut
+    /// and passing baseline; refuses campaign-only statements.
     pub fn verify_inclusion_minimal_with(
         &self,
         journal: &Journal,
@@ -1042,12 +998,8 @@ impl CampaignCertificate {
         self.verify_inclusion_minimal_with_support(journal, policy, None)
     }
 
-    /// Inclusion-minimal validation bound to an expected support-provider
-    /// version.
-    ///
-    /// When the statement records a support-provider version and an expected
-    /// version is supplied, the two must agree; a disagreement fails before
-    /// any traversal, so an altered support binding can never certify a cut.
+    /// Minimal check bound to an expected support version. Mismatch fails
+    /// before traversal.
     pub fn verify_inclusion_minimal_with_support(
         &self,
         journal: &Journal,
@@ -1113,25 +1065,17 @@ impl CampaignCertificate {
         Ok(())
     }
 
-    /// Journal-bound inclusion-minimal validation under the strict lineage
-    /// policy. See [`Self::verify_inclusion_minimal_with`].
+    /// Strict-lineage minimal validation. See `verify_inclusion_minimal_with`.
     pub fn verify_inclusion_minimal(&self, journal: &Journal) -> Result<(), CertError> {
         self.verify_inclusion_minimal_with(journal, LineagePolicy::Strict)
     }
 }
 
-/// Maximum derivation paths a bounded inclusion-minimal check will walk
-/// before failing closed: a cut whose witness closure is wider than this
-/// cannot be certified with the recorded horizon.
+/// Path budget for minimal checks; excess fails closed.
 const MAX_INCLUSION_PATHS: usize = 65536;
 
-/// Iteratively collect faultable derivation paths from `witnesses`, bounded
-/// by `horizon`.
-///
-/// The explicit stack keeps journal-derived graph depth off the call stack,
-/// and the per-walk visited set bounds re-expansion of shared ancestors, so
-/// a deep or wide graph cannot overflow or explode the walk. Returns an
-/// error when the path budget is exceeded, which fails the check closed.
+/// Collect faultable paths bounded by `horizon`. Iterative; budget excess
+/// fails closed.
 fn collect_fault_paths_iterative(
     journal: &Journal,
     witnesses: &[EntryHash],
@@ -1181,17 +1125,10 @@ fn collect_fault_paths_iterative(
 }
 
 impl CampaignReport {
-    /// Write an in-toto Statement certificate for this report to `path`.
-    ///
-    /// The JSON is produced by [`CampaignCertificate::to_json`] and written
-    /// with `std::fs` (host-side, not simulation code). The digest covers the
-    /// base `RunConfig` canonical bytes and the builder is recorded as
-    /// `builder_id`.
+    /// Write an in-toto Statement to `path` via `std::fs` (host-side).
     ///
     /// # Errors
-    /// Returns [`CertError::Io`] when the parent directory cannot be created
-    /// or the file cannot be written, and the certificate serialize error
-    /// from [`CampaignCertificate::to_json`] otherwise.
+    /// Returns [`CertError::Io`] on filesystem failure, else JSON errors.
     pub fn write_certificate(
         &self,
         path: &Path,

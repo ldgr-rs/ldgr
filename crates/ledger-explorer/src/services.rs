@@ -163,20 +163,10 @@ pub struct CutQualification {
 
 /// Qualify one fault schedule as the cause of one finding.
 ///
-/// Runs the six-conditions evidence chain for one candidate schedule
-/// against the witness run:
-///
-/// 1. the no-fault baseline rerun passes;
-/// 2. the schedule applies at least one fault under strict decision replay;
-/// 3. the replayed run violates under the oracle;
-/// 4. the replay does not diverge before the first applied fault;
-/// 5. a final no-fault rerun passes.
-///
-/// Condition 6 (the same workload, vocabulary, seeds, budget, and oracle
-/// serve every method) is structural and owned by the calling gate. A
-/// passing qualification is the raw material for
-/// `RecordedSolverData::reproduced` and `::baseline_passed`; callers that
-/// record a certificate must set both from this result, never assert them.
+/// Checks: baseline passes, schedule applies a fault under strict replay,
+/// replay violates, no pre-fault divergence, final rerun passes. Condition 6
+/// (shared workload, seeds, budget, oracle) is owned by the calling gate.
+/// Callers record `reproduced`/`baseline_passed` from this result.
 pub fn qualify_cut<W: Workload + ?Sized, O: Oracle + ?Sized>(
     workload: &W,
     oracle: &O,
@@ -231,20 +221,10 @@ pub fn qualify_cut<W: Workload + ?Sized, O: Oracle + ?Sized>(
 
 /// End-to-end hazard certification for one journal and one verdict.
 ///
-/// Chains the stages the Stage-2 scaling criterion names - witness closure
-/// extraction and hazard encoding, solver routing and solve, statement
-/// emission, and journal-anchored validation - into one measured call.
-///
-/// `recorded_witness_cap` bounds the witness list RECORDED in the
-/// statement. The solve always runs over every witness; a statement that
-/// carried hundreds of thousands of witness ids would exceed
-/// `CERT_MAX_BYTES`, so the recorded list is deterministically truncated
-/// (sorted, first `cap`). The cap bounds the record, never the analysis.
-///
-/// The recorded cut is evidence of the hazard structure only: this service
-/// executes no campaign, so `reproduced` and `baseline_passed` stay false
-/// and inclusion-minimal validation will (correctly) refuse the statement.
-/// Pair it with [`qualify_cut`] for fault-causation evidence.
+/// `recorded_witness_cap` bounds the recorded witness list (sorted, first
+/// `cap`); the solve always runs over every witness. The recorded cut is
+/// hazard evidence only: `reproduced`/`baseline_passed` stay false here, so
+/// pair with [`qualify_cut`] for fault-causation evidence.
 pub fn certify_hazard(
     journal: Journal,
     verdict: &Verdict,
@@ -360,11 +340,7 @@ pub fn validate_cut_against_journal(
     Ok(())
 }
 
-/// Bind a statement to a journal and verify the recorded cut is
-/// inclusion-minimal under the strict lineage policy.
-///
-/// Refuses statements whose cut is not reproduced or whose no-fault baseline
-/// violates: those are campaign statements, not fault-causation evidence.
+/// Bind a statement to a journal; refuses non-reproduced or baseline-violating cuts.
 pub fn validate_inclusion_minimal_cut(
     certificate: &CampaignCertificate,
     journal: &Journal,
@@ -373,12 +349,8 @@ pub fn validate_inclusion_minimal_cut(
     Ok(())
 }
 
-/// Inclusion-minimal validation bound to the support provider that derived
-/// the recorded cut.
-///
-/// The recorded support-provider version must match the provider actually
-/// used; a disagreement fails before traversal, so an altered support binding
-/// can never certify a cut.
+/// Inclusion-minimal validation bound to the deriving support provider.
+/// A version mismatch fails before traversal.
 pub fn validate_inclusion_minimal_cut_with_support(
     certificate: &CampaignCertificate,
     journal: &Journal,

@@ -48,12 +48,7 @@ pub fn current_lease_holder_write_oracle() -> impl Fn(&Journal) -> bool {
     }
 }
 
-/// Last-write-wins oracle: the actor's applied writes must end on the
-/// highest sequence number it applied.
-///
-/// Each applied write journals its sequence number as an `Outcome`. A final
-/// value below the applied maximum means a newer write was overwritten by an
-/// older one: a lost update. An actor with no applied writes holds.
+/// Last-write-wins: final value must equal the applied maximum.
 pub fn last_write_wins_oracle(actor: ledger_format::ActorId) -> impl Fn(&Journal) -> bool {
     move |journal: &Journal| {
         let applied = outcome_by_actor(journal, actor);
@@ -61,10 +56,7 @@ pub fn last_write_wins_oracle(actor: ledger_format::ActorId) -> impl Fn(&Journal
     }
 }
 
-/// Oracle that enforces one leader per term.
-///
-/// Each `Outcome` value encodes `term * 10 + leader_id`. A term with two
-/// distinct leaders indicates the planted double-leader bug fired.
+/// One leader per term. Outcomes encode `term * 10 + leader`.
 pub fn single_leader_per_term_oracle() -> impl Fn(&Journal) -> bool {
     |journal: &Journal| {
         let outcomes = outcome_values(journal);

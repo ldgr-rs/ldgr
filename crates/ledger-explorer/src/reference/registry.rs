@@ -20,11 +20,7 @@ use ledger_sim::{Policy, RunConfig, RunResult, RuntimeError, SimFault, Simulatio
 // Corpus scenario registry
 // ---------------------------------------------------------------------------
 
-/// Typed failure of a reference-scenario fault replay.
-///
-/// Strict-replay rejections surface as the typed
-/// [`RuntimeError::StrictReplay`] source, so callers match the variant
-/// instead of error text.
+/// Reference replay failure; strict rejections stay typed for matching.
 #[derive(Debug, thiserror::Error)]
 pub enum ReferenceReplayError {
     /// The engine rejected the replay run.
@@ -233,6 +229,7 @@ pub fn scenario_class(name: &str) -> Option<ScenarioClass> {
         "mini-cloud-drain-completion" => Some(ScenarioClass::CloudInfra),
         "mini-cloud-dual-region-commit" => Some(ScenarioClass::CloudInfra),
         "mini-cloud-canary-promote" => Some(ScenarioClass::CloudInfra),
+        "mini-cloud-duplicate-redelivery" => Some(ScenarioClass::CloudInfra),
         _ => None,
     }
 }
@@ -245,19 +242,13 @@ pub fn corpus_scenario(name: &str) -> Option<CorpusScenario> {
 }
 
 impl CorpusScenario {
-    /// Versioned support provider for this scenario's declared model,
-    /// evaluated on a concrete journal.
-    ///
-    /// The expression ids are content hashes of the journal's entries, so a
-    /// model built from one run's journal is only meaningful for that run.
-    /// Callers pass the canonical run of the scenario (its pinned violating
-    /// run, or a no-fault probe).
+    /// Support provider for the declared model. Journal-bound; pass the
+    /// canonical run.
     pub fn support_provider(&self, journal: &Journal) -> crate::support::StaticSupportProvider {
         crate::support::StaticSupportProvider::new(1, (self.support)(journal))
     }
 
-    /// Run the scenario at `seed` with optional injected faults under the
-    /// corpus gate config (Random policy, 4096-step budget).
+    /// Run at `seed` with faults under the gate config (Random, 4096 steps).
     pub fn run(&self, seed: EntryHash, faults: Vec<SimFault>) -> Result<RunResult, RuntimeError> {
         let config = RunConfig::builder()
             .seed(seed)
@@ -289,9 +280,8 @@ impl CorpusScenario {
         self.oracle().check(run)
     }
 
-    /// The canonical violating run: reference sims run at the base seed;
-    /// Mini-Kv searches from the base seed because its bug is
-    /// schedule-dependent.
+    /// Canonical violating run. Reference sims run at base seed; Mini-Kv
+    /// searches since its bug is schedule-dependent.
     pub fn reproduce(&self) -> Result<Finding, String> {
         match &self.runner {
             CorpusRunner::Tasks { .. } => {
@@ -322,13 +312,8 @@ impl CorpusScenario {
         }
     }
 
-    /// Replay a fault schedule against a recorded witness run under its
-    /// finding seed.
-    ///
-    /// Reference sims re-run their task builders under the same seed with
-    /// the schedule injected; the Mini-Kv workload replays the witness's
-    /// recorded decisions with the schedule injected (the witness-cut
-    /// mechanic).
+    /// Replay a fault schedule against a witness. Reference sims re-run
+    /// builders; Mini-Kv replays recorded decisions (witness-cut).
     pub fn replay_faults(
         &self,
         seed: EntryHash,

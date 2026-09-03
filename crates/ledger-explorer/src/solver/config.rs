@@ -30,16 +30,9 @@ pub enum SolverError {
 
 /// Solver engine requested by the caller.
 ///
-/// The engines behind [`select_solver`]:
-///
-/// - [`SolverEngine::Auto`] picks the builtin hitting-set engine below the
-///   measured crossover point and the CaDiCaL-backed MaxSAT at or above it
-///   (only when built with `solver-cadical`).
-/// - [`SolverEngine::Builtin`] forces the pure-Rust exact hitting-set engine.
-/// - [`SolverEngine::Cadical`] forces the MaxSAT engine. Without the
-///   `solver-cadical` feature the forced request still compiles, but the
-///   MaxSAT solver falls back to its pure-Rust branch-and-bound at runtime
-///   (`name()` keeps reporting the active backend truthfully).
+/// `Auto` routes via [`cutoff()`]; `Builtin` forces the pure-Rust engine;
+/// `Cadical` forces MaxSAT (falls back to branch-and-bound without the
+/// `solver-cadical` feature).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SolverEngine {
     #[default]
@@ -48,16 +41,9 @@ pub enum SolverEngine {
     Cadical,
 }
 
-/// Routing sentinel for [`select_solver`] in hard clauses.
-///
-/// `benches/solver_crossover.rs` swept 8..512 hard clauses and found NO
-/// count where the CaDiCaL backend beat the builtin engines; its CNF
-/// construction and threshold search cost more than the exact pure-Rust
-/// engines on every measured point. `usize::MAX` therefore encodes
-/// "crossover not yet observed": `Auto` keeps routing to the builtin
-/// engines in every build. Rerun the bench after any encoding or engine
-/// change; replace this sentinel with a real measured point only when the
-/// bench shows one consistently across runs. See the solver crossover benchmark for the measurement table.
+/// Routing sentinel for [`select_solver`]: crossover not yet observed, so
+/// `Auto` always routes to builtin. Rerun `benches/solver_crossover.rs`
+/// after encoding or engine changes.
 pub const CADICAL_CUTOFF_HARD_CLAUSES: usize = usize::MAX;
 
 /// Routing threshold for [`select_solver`] in hard clauses.
@@ -65,24 +51,9 @@ pub fn cutoff() -> usize {
     CADICAL_CUTOFF_HARD_CLAUSES
 }
 
-/// Solver horizon and oracle version configuration.
-///
-/// `max_horizon` limits derivation closure depth for scale; `None` means
-/// unbounded (walk until roots). `oracle_version` pins the predicate
-/// semantics for content-addressed caching. `input_class` partitions the
-/// cache per PBT generator stream (None means no input axis). `max_faults`
-/// bounds the cardinality of crash faults for hazard encodings. `engine`
-/// selects the solver engine; see [`SolverEngine`] and [`select_solver`].
-/// `run_config_hash` is the canonical `RunConfig` hash under which the
-/// encoding was produced (see `ledger_sim::canonical_hash`); it joins the
-/// cache keys and the solver-state fingerprint so artifacts from different
-/// run configs never satisfy each other. `None` keeps callers that do not
-/// run a simulation on the historical key space.
-///
-/// `support_version` and `support_digest` pin the support-provider
-/// semantics (see [`crate::support`]). A provider change must never reuse
-/// clauses or hypotheses derived under an older model, so both values join
-/// the cache keys and the solver-state fingerprint.
+/// Solver horizon, oracle, input, fault, engine, and run/support pins.
+/// `run_config_hash` and the support pins join cache keys and the
+/// solver-state fingerprint so foreign artifacts never satisfy this solver.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SolverConfig {
     pub max_horizon: Option<usize>,
@@ -143,16 +114,9 @@ impl SolverConfig {
     }
 }
 
-/// Select the fault solver for an already-computed hazard encoding.
-///
-/// Callers encode first, then route through this factory so every engine
-/// construction site shares one post-encode decision. `Auto` resolves to the
-/// CaDiCaL-backed MaxSAT when `encoded.hard.len()` reaches [`cutoff()`] and
-/// the build has `solver-cadical`, else to the builtin hitting-set engine.
-/// Forcing [`SolverEngine::Cadical`] without the feature builds and runs,
-/// but the MaxSAT solver then solves via its branch-and-bound fallback, so
-/// results stay deterministic in every build. The returned solver carries
-/// `config`; clone it before the call if the caller must keep the original.
+/// Select the solver for an already-computed encoding. Single post-encode
+/// routing point; `Auto` applies [`cutoff()`] under the feature gate.
+/// Deterministic in every build.
 pub fn select_solver(config: &SolverConfig, encoded: &HazardEncoding) -> Box<dyn FaultSolver> {
     match config.engine {
         SolverEngine::Auto => {
@@ -184,9 +148,6 @@ pub trait FaultSolver {
     fn name(&self) -> &'static str;
 
     /// Stateful incremental solve over a content-addressed clause key.
-    ///
-    /// Checks the per-solver clause cache first, then the global cache,
-    /// else computes minimal hitting sets from the supplied clauses.
     /// Deterministic: same closure hash and clause set yield same hypotheses.
     fn solve_incremental(
         &mut self,
@@ -202,12 +163,8 @@ pub trait FaultSolver {
         None
     }
 
-    /// Pre-warm caches from a previously snapshotted artifact.
-    ///
-    /// Engines that cannot consume artifacts keep the default no-op.
-    /// Returning an error rejects an artifact whose state key, resolved
-    /// engine, or run-config hash does not match this solver, or whose
-    /// hypotheses are not covered by their recorded clauses.
+    /// Pre-warm caches from a snapshot. Rejects artifacts whose state key,
+    /// engine, or run-config hash mismatches, or whose hypotheses are uncovered.
     fn warm_from_artifact(
         &mut self,
         _artifact: &crate::solver_state::SolverStateArtifact,

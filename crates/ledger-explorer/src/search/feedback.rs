@@ -19,17 +19,11 @@ fn injection_kind(injection: &SimFault) -> &'static str {
         SimFault::Crash(_) => "Crash",
         SimFault::Corrupt { .. } => "Corrupt",
         SimFault::CrashState { .. } => "CrashState",
+        SimFault::Duplicate { .. } => "Duplicate",
     }
 }
 
-/// Escalate a fault to the next severity level.
-///
-/// Ladder (deterministic):
-/// - `Drop(id)` -> `Crash(id)` (stronger loss)
-/// - `Delay{send, ticks}` -> `Delay{send, ticks*2}` capped at 32
-/// - `Corrupt{write, xor_mask}` -> wider mask `1 -> 0xFF -> 0xFFFF -> 0xFFFFFFFF -> 0xFFFFFFFFFFFFFFFF`
-/// - `CrashState{write, state}` -> `state+1` capped at 3
-/// - `Crash` and `Partition` have no escalation
+/// Escalate a fault. Deterministic ladder; `Crash`/`Partition` return `None`.
 pub fn escalate(injection: &SimFault) -> Option<SimFault> {
     match injection {
         SimFault::Drop(id) => Some(SimFault::Crash(*id)),
@@ -75,16 +69,12 @@ pub fn escalate(injection: &SimFault) -> Option<SimFault> {
                 })
             }
         }
-        SimFault::Crash(_) | SimFault::Partition { .. } => None,
+        SimFault::Crash(_) | SimFault::Partition { .. } | SimFault::Duplicate { .. } => None,
     }
 }
 
-/// Run the feedback reproduction campaign without cross-campaign state.
-///
-/// See [`run_feedback_campaign_with_state`] for the stateful variant.
-/// Rebuild one feedback schedule: drop suppressed or voided injections,
-/// replace targets with their escalated fault, and finish in the canonical
-/// `Ord` order so the schedule stays deterministic.
+/// Stateless feedback campaign. See the `with_state` variant. Rebuilds in
+/// canonical order so the schedule stays deterministic.
 fn rebuild_schedule(
     base: Vec<SimFault>,
     suppressed: &BTreeSet<EntryHash>,
@@ -137,18 +127,9 @@ pub fn run_feedback_campaign<W: Workload, O: Oracle>(
     run_feedback_campaign_with_state(workload, oracle, base, attempts, None)
 }
 
-/// Run the feedback reproduction campaign closing the voided-fault loop.
-///
-/// Phase 0 finds the first violation with up to `attempts/2` budget.
-/// Phase 1 replays the LDFI schedule and feeds voided faults back:
-///
-/// - voided injections are dropped and their target hashes are suppressed
-/// - applied but non-reproducing faults are escalated via [`escalate`]
-/// - the original finding's journal is re-solved, filtering hypotheses whose
-///   cut intersects the suppressed set, and the schedule is rebuilt
-///
-///   Every executed run counts toward `runs_executed`. Variants are
-///   deterministic via sorted iteration.
+/// Feedback campaign closing the voided-fault loop. Phase 0 searches;
+/// Phase 1 replays, suppresses voided targets, and escalates the rest.
+/// Every run counts; variants iterate deterministically.
 pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
@@ -156,8 +137,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
     attempts: usize,
     mut state: Option<&mut CampaignPersist>,
 ) -> Result<CampaignReport, SearchError> {
-    // Explicit per-campaign clause cache scope. Each LDFI solver built below
-    // owns its cache; no process-global store exists.
+    // Explicit per-campaign scope; no process-global store exists.
     let _campaign_clause_cache = crate::solver_cache::ClauseCache::new();
     if attempts == 0 {
         return Ok(CampaignReport {
@@ -228,11 +208,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         });
     }
 
-    // Phase 1: feedback loop.
-    // Initial schedule from LDFI on the original finding. Shared state
-    // pre-warms this solver from prior rounds and stores this round's caches.
-    // The canonical run-config hash joins the solver keys, so artifacts
-    // persisted under another run config never pre-warm this campaign.
+    // Phase 1. Solver keys join the run-config hash, isolating campaigns.
     let run_config_hash = canonical_hash(&base)?;
     let cfg = SolverConfig {
         max_horizon: Some(64),
@@ -252,7 +228,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         .first()
         .map(|hyp| hypothesis_to_schedule(hyp, &finding.run.journal))
         .unwrap_or_default();
-    // Canonical deterministic order from the derived `Ord` on `SimFault`.
+    // Canonical order from derived `Ord`.
     schedule.sort();
     schedule.dedup();
 
@@ -272,12 +248,8 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         let report = match report_res {
             Ok(report) => report,
             Err(FaultReplayError::StrictReplay(_)) => {
-                // Strict replay surfaces ready-set drift as a typed
-                // violation instead of normalizing it. For fault injection
-                // this drift is expected after the first fault diverges the
-                // ready set, so treat it as a non-reproducing attempt and
-                // continue the feedback loop rather than failing the campaign.
-                // Mark the whole schedule voided for the suppression loop.
+                // Ready-set drift after fault divergence is expected: treat as
+                // non-reproducing and continue; void the schedule.
                 for injection in &schedule {
                     if let Some(hash) = fault_injection_target(injection) {
                         suppressed.insert(hash);
@@ -290,10 +262,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
                     schedule.len(),
                     suppressed.len()
                 ));
-                // Use a synthetic root for distinct counting so the
-                // violation still contributes deterministically. The round
-                // number fills the full width so late rounds cannot collide
-                // with earlier ones.
+                // Synthetic root per round keeps distinct counting deterministic.
                 let mut synthetic = EntryHash([0u8; 32]);
                 synthetic.0[..8].copy_from_slice(&round.to_le_bytes());
                 distinct_roots.insert(synthetic);
@@ -366,7 +335,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         } else {
             escalated_descs.join(",")
         };
-        // Variant describes round and counts; includes suppressed for test visibility.
+        // Variant names round counts for test visibility.
         variants.push(format!(
             "round={round} applied={} voided={} escalated={escalated_str} suppressed={}",
             applied.len(),

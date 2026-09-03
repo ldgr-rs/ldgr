@@ -24,12 +24,7 @@ pub struct FaultHypothesis {
     pub explanation: String,
 }
 
-/// Solve with an explicit [`FaultSolver`] implementation.
-///
-/// This is the generic path for call sites that need to inject a solver, for
-/// example the CaDiCaL-backed [`crate::solver::MaxSatSolver`] behind the
-/// `solver-cadical` feature. Unlike swallowing the result, the solver error
-/// propagates to the caller.
+/// Generic solver path. Errors propagate to the caller.
 pub fn solve_with(
     solver: &mut dyn FaultSolver,
     journal: &Journal,
@@ -38,13 +33,8 @@ pub fn solve_with(
     solver.solve(journal, verdict)
 }
 
-/// Convert an LDFI hypothesis cut into an executable fault schedule.
-///
-/// Recv and FsRead faults target the event they observe, not the observing
-/// entry: a Recv faults the Send it observes, an FsRead faults the FsWrite it
-/// observes. Every applicable injection class is emitted per event kind, so a
-/// cut exercises Drop, Delay, Partition, Corrupt, and CrashState instead of
-/// only two classes. A target id is injected at most once per schedule.
+/// Hypothesis cut to executable schedule. Recv/FsRead fault the observed
+/// write; every class per kind; each target once.
 pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<SimFault> {
     let mut schedule = Vec::new();
     let mut seen = HashSet::new();
@@ -164,11 +154,7 @@ pub fn hypothesis_to_schedule(hyp: &FaultHypothesis, journal: &Journal) -> Vec<S
     schedule
 }
 
-/// The dedup key for one injection: its class tag plus its target.
-///
-/// Entry-targeted injections key on the entry id; a partition keys on the
-/// directed link. The class tag keeps distinct injection classes for the same
-/// target (drop, delay, partition, corrupt, crash-state) all executable.
+/// Dedup key: class tag plus target (partitions hash the link).
 fn injection_key(injection: &SimFault) -> (u8, EntryHash) {
     match injection {
         SimFault::Drop(id) => (0, *id),
@@ -176,6 +162,7 @@ fn injection_key(injection: &SimFault) -> (u8, EntryHash) {
         SimFault::Crash(id) => (2, *id),
         SimFault::Corrupt { write, .. } => (3, *write),
         SimFault::CrashState { write, .. } => (4, *write),
+        SimFault::Duplicate { send } => (6, *send),
         SimFault::Partition { src, dst } => {
             let mut hasher = blake3::Hasher::new();
             hasher.update(&src.0.to_le_bytes());
@@ -185,10 +172,7 @@ fn injection_key(injection: &SimFault) -> (u8, EntryHash) {
     }
 }
 
-/// The `Send` parent of an entry, if any.
-///
-/// A `Recv` observes a `Send`, but its parent list also carries block or
-/// wake dependencies. Search the parents for the `Send` kind specifically.
+/// `Send` parent of an entry, skipping block/wake parents.
 fn send_parent(parents: &[EntryHash], journal: &Journal) -> Option<EntryHash> {
     parents.iter().copied().find(|parent| {
         journal
@@ -213,11 +197,7 @@ mod tests {
     use ledger_format::CanonicalValue;
     #[test]
     fn empty_provenance_fails_closed_with_typed_error() {
-        // Faultable Sends on actor 1 and a witness outcome on actor 2 with no
-        // faultable ancestors: backward provenance yields no paths. The typed
-        // hazard walk must fail closed with `EmptyProvenance` instead of
-        // ranking an unrelated single max-cost event. The support for an
-        // empty path set is `Opaque`, so no minimum claim is possible.
+        // Empty paths yield `Opaque`; solve and encode fail `EmptyProvenance`.
         use crate::solver::SolverError;
         use crate::support::{SupportExpr, support_from_paths};
         let mut journal = Journal::new();

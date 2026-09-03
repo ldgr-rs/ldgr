@@ -7,14 +7,8 @@ use ledger_format::{EntryHash, EntryKind};
 use ledger_journal::{Journal, JournalError, VectorClock};
 use std::collections::HashMap;
 
-/// Deterministic exact hitting-set solver.
-///
-/// Enumerates minimal hitting sets over causal derivation paths using
-/// iterative expansion with superset pruning. The expansion order is
-/// deterministic: path literals are sorted and candidates are deduplicated via
-/// `BTreeSet`, so repeated runs with the same journal and verdict produce
-/// byte-identical hypotheses. A content-addressed clause cache memoizes
-/// clause-derived hypotheses keyed by `BLAKE3(closure_hash || horizon || oracle_version || input_class)`.
+/// Deterministic exact hitting-set solver. Sorted literals and `BTreeSet`
+/// dedup keep hypotheses byte-identical; clause cache is content-addressed.
 #[derive(Debug, Clone)]
 pub struct HittingSetSolver {
     pub(crate) cache: ClauseCache,
@@ -62,11 +56,7 @@ impl HittingSetSolver {
         }
     }
 
-    /// The engine this instance actually executes.
-    ///
-    /// The hitting-set engine is the builtin engine: it resolves to
-    /// [`SolverEngine::Builtin`] regardless of the configured mode, and the
-    /// solver-state key is derived from that resolution.
+    /// Resolves to [`SolverEngine::Builtin`]; derives the solver-state key.
     pub fn resolved_engine(&self) -> SolverEngine {
         SolverEngine::Builtin
     }
@@ -95,11 +85,8 @@ impl HittingSetSolver {
         self.incremental_key_with_tag(closure_hash, engine_tag::BUILTIN)
     }
 
-    /// Cache key for a specific engine. The hitting-set engine always tags
-    /// builtin; `MaxSatSolver` passes the tag of its resolved backend so the
-    /// two engines never share cache entries. The key also folds in the
-    /// canonical run-config hash and the max-faults bound, so every encoding
-    /// input the solver consumes separates the cache namespace.
+    /// Cache key for an engine tag. Tags plus run-config hash and max-faults
+    /// separate the cache namespace per encoding input.
     pub(crate) fn incremental_key_with_tag(
         &self,
         closure_hash: EntryHash,
@@ -124,15 +111,9 @@ impl HittingSetSolver {
         &mut self.hypothesis_cache
     }
 
-    /// Solve from an explicit support expression, preserving groups.
-    ///
-    /// Each `AllOf` becomes one derivation path; each `AnyOf` branch stays a
-    /// separate path so alternative groups never flatten. Only faultable
-    /// entries present in `journal` are kept. An expression with no surviving
-    /// path fails closed with [`SolverError::EmptyProvenance`]. Wording is
-    /// gated on [`crate::support::SupportExpr::is_strong`]: only a strong
-    /// support backs a minimum claim, otherwise the cut reports a bounded
-    /// heuristic with the horizon.
+    /// Solve from an explicit support expression, preserving groups. Fails
+    /// closed with [`SolverError::EmptyProvenance`]; wording follows
+    /// [`crate::support::SupportExpr::is_strong`].
     pub fn solve_with_support(
         &mut self,
         journal: &Journal,
@@ -244,10 +225,7 @@ impl HittingSetSolver {
         Ok(hypotheses)
     }
 
-    /// Incremental solve under an explicit engine tag.
-    ///
-    /// `MaxSatSolver` passes its resolved backend tag so hit checks and the
-    /// memoized insert land in the same cache namespace as its encode path.
+    /// Incremental solve under an explicit engine tag; shares the encode-path namespace.
     pub(crate) fn solve_incremental_with_tag(
         &mut self,
         closure_hash: EntryHash,
@@ -255,9 +233,7 @@ impl HittingSetSolver {
         engine_tag: u8,
     ) -> Vec<FaultHypothesis> {
         let key = self.incremental_key_with_tag(closure_hash, engine_tag);
-        // Check per-solver hypothesis cache first. The per-campaign
-        // `ClauseCache` is the only memo: no process-global store exists, so
-        // concurrent campaigns cannot observe each other's entries.
+        // Per-solver cache only; no process-global store exists.
         if let Some(cached) = self.hypothesis_cache.get(&key) {
             // A clause mismatch invalidates the cached derivation; fall
             // through to recompute. A missing clause entry is stale or
@@ -270,13 +246,8 @@ impl HittingSetSolver {
             }
         }
 
-        // Compute hypotheses from clauses via minimal hitting sets.
-        // Convert clauses to FaultableEvent-like paths for the hitting-set engine.
-        // No journal flows through this path, so the per-event cost comes from
-        // the clause weights (a clause's weight is the cost of breaking it;
-        // the minimum weight across the clauses containing an event is that
-        // event's cost) and the kind is unavailable: Send stands in because
-        // the hitting-set engine only reads the event hash.
+        // No journal here: per-event cost is the minimum clause weight;
+        // kind is unavailable so Send stands in (only the hash is read).
         let mut event_costs: HashMap<EntryHash, u64> = HashMap::new();
         let paths: Vec<Vec<FaultableEvent>> = clauses
             .iter()
@@ -307,9 +278,7 @@ impl HittingSetSolver {
             .into_iter()
             .map(|events_set| {
                 let events: Vec<EntryHash> = events_set.into_iter().collect();
-                // Every hitting-set event is a clause literal, so the lookup
-                // always hits; the 1 fallback only guards a malformed clause
-                // set and mirrors the minimum admissible clause weight.
+                // Fallback only for malformed clauses; mirrors minimum weight.
                 let total_cost: u64 = events
                     .iter()
                     .map(|hash| event_costs.get(hash).copied().unwrap_or(1))
@@ -333,19 +302,15 @@ impl HittingSetSolver {
             .collect();
         hypotheses.sort_by_key(|h| (h.total_cost, h.events.len()));
 
-        // Memoize into the per-solver cache only. No process-global store
-        // exists; each campaign constructs its solver (and its cache) anew.
+        // Per-solver memo only; each campaign constructs its solver anew.
         self.cache.insert(key, clauses.clone());
         self.hypothesis_cache.insert(key, hypotheses.clone());
         hypotheses
     }
 }
 
-/// Honest wording for the incremental path, gated on support strength.
-///
-/// A bounded horizon cannot back a strong claim: the walk may have cut
-/// derivations, so the support carries `Opaque` and `is_strong` is false.
-/// Non-strong results name the bound and the horizon.
+/// Wording for the incremental path, gated on support strength: bounded
+/// walks report a heuristic with the horizon.
 fn incremental_explanation(
     faults: usize,
     clauses: usize,
@@ -368,12 +333,7 @@ fn incremental_explanation(
     }
 }
 
-/// Honest wording for the full solve, gated on [`SupportExpr::is_strong`].
-///
-/// The support joins one `AllOf` per derivation path under `AnyOf`, plus
-/// `Opaque` when the horizon bound the walk. Only a strong support backs a
-/// minimum claim; any bounded or opaque walk reports a heuristic with its
-/// horizon.
+/// Wording for the full solve, gated on [`SupportExpr::is_strong`].
 fn solve_explanation(
     faults: usize,
     paths: usize,
@@ -408,9 +368,7 @@ impl FaultSolver for HittingSetSolver {
             return Ok(Vec::new());
         }
 
-        // Derive closure hash over witnesses for cache key. The per-solver
-        // `ClauseCache` is the only memo; it is constructed with the solver
-        // and never shared across campaigns.
+        // Per-solver cache only; never shared across campaigns.
         let mut witness_ids = verdict.witnesses.clone();
         witness_ids.sort();
         let closure_hash = ClauseCache::closure_hash(&witness_ids);
@@ -443,10 +401,7 @@ impl FaultSolver for HittingSetSolver {
         };
 
         if all_paths.is_empty() {
-            // No faultable provenance reaches the witnesses under this
-            // horizon. Fail closed with a typed error instead of ranking an
-            // unrelated event. An empty witness set with an empty journal is
-            // the only empty success, handled above.
+            // Fail closed; only empty/empty succeeds (handled above).
             if verdict.witnesses.is_empty() {
                 return Ok(Vec::new());
             }
@@ -463,11 +418,7 @@ impl FaultSolver for HittingSetSolver {
             })
             .collect();
 
-        // Fast path: a cached derivation is served only when the entry's
-        // clauses equal the journal-derived clauses, mirroring the clause
-        // equality check of the incremental path. A missing or mismatched
-        // entry recomputes below, so a resumed or stale entry can never be
-        // returned for a derivation it does not match.
+        // Cached derivation serves only on clause equality; stale entries recompute.
         if let Some(cached) = self.hypothesis_cache.get(&key)
             && self
                 .cache
@@ -506,7 +457,6 @@ impl FaultSolver for HittingSetSolver {
             .collect();
 
         hypotheses.sort_by_key(|hypothesis| (hypothesis.total_cost, hypothesis.events.len()));
-        // Semantic pruning: coalesce concurrent swaps (SAMC-like LMI).
         hypotheses = samc_prune(journal, hypotheses);
         self.hypothesis_cache.insert(key, hypotheses.clone());
         Ok(hypotheses)
@@ -536,10 +486,7 @@ impl FaultSolver for HittingSetSolver {
     }
 }
 
-/// True for entry kinds that model a faultable boundary.
-///
-/// Single source of truth for the fault model: the hitting-set solver, the
-/// MaxSAT encoding, and the lineage index all ask this fn.
+/// Faultable boundary kinds. Single source for solver, encoding, lineage.
 pub fn is_faultable(kind: EntryKind) -> bool {
     matches!(
         kind,
@@ -552,13 +499,8 @@ pub fn is_faultable(kind: EntryKind) -> bool {
     )
 }
 
-/// Fault-injection cost of one journal event under the solver cost model.
-///
-/// Send/Recv cost 2, timer events 3, fs events 4, other faultable kinds 5,
-/// and an event missing from the journal 10. The table feeds hypothesis
-/// ranking, clause weights, and the certificate lower-bound check
-/// (`crate::certs::MAX_EVENT_COST` is its maximum); any change here changes
-/// solver costs deterministically but never journal content.
+/// Fault-injection cost per event: Send/Recv 2, timer 3, fs 4, other 5,
+/// missing 10. Feeds ranking, weights, and the certificate bound.
 pub fn event_fault_cost(journal: &Journal, hash: &EntryHash) -> u64 {
     journal
         .get(hash)
@@ -571,11 +513,7 @@ pub fn event_fault_cost(journal: &Journal, hash: &EntryHash) -> u64 {
         .unwrap_or(10)
 }
 
-/// Bounded-horizon causal closure.
-///
-/// Returns entry hashes in journal order whose distance from `targets`
-/// through parent edges is at most `max_depth`. When `max_depth` is 0,
-/// only the targets are returned. Deterministic and does not use time.
+/// Bounded-horizon causal closure in journal order. Deterministic, no time.
 pub fn causal_closure_with_horizon(
     journal: &Journal,
     targets: &[EntryHash],
@@ -616,13 +554,8 @@ pub fn causal_closure_with_horizon(
         .collect())
 }
 
-/// SAMC-like semantic pruning over fault hypotheses.
-///
-/// Prunes hypotheses where two candidates differ only by swapping a pair
-/// of concurrent faultable events. Concurrent events can be coalesced under
-/// the logical monotonicity assumption, so the cheaper of the two is kept.
-/// Checks `VectorClock::concurrent_with` on the events' clocks from the journal.
-/// Deterministic: sorts by cost then size, and tie-breaks by hash order.
+/// Prune hypotheses differing by one concurrent-event swap; keeps the
+/// cheaper. Deterministic: cost, size, then hash order.
 pub fn samc_prune(journal: &Journal, hypotheses: Vec<FaultHypothesis>) -> Vec<FaultHypothesis> {
     if hypotheses.len() <= 1 {
         return hypotheses;

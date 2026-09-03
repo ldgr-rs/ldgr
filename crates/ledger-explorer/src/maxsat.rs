@@ -134,10 +134,7 @@ pub fn encode_hazard(
             }
         }
     }
-    // Typed hazard walk over explicit support semantics. Each parent-derived
-    // path becomes one `AllOf` branch under a single `AnyOf`, so alternative
-    // groups stay separate and never flatten into one clause. A horizon cut
-    // joins an `Opaque` branch and forces `is_strong` to false.
+    // Support walk: paths join as `AllOf` under `AnyOf`; horizon cut joins `Opaque`.
     let support =
         crate::support::support_from_paths(&all, truncated && config.max_horizon.is_some());
     let support_clauses = crate::support::hard_clauses_from_support(&support);
@@ -178,13 +175,8 @@ pub fn encode_hazard(
     })
 }
 
-/// Encode a hazard from an explicit support expression, preserving groups.
-///
-/// Each `AllOf` becomes one hard clause; each `AnyOf` branch contributes its
-/// own clauses without flattening into a single clause. Only faultable
-/// entries present in `journal` are kept; an expression with no surviving
-/// clause fails closed with [`SolverError::EmptyProvenance`]. `Opaque`
-/// support never backs a strong claim and yields no clause.
+/// Hazard encoding from explicit support. Groups preserved; `Opaque` yields
+/// none; empty fails closed with [`SolverError::EmptyProvenance`].
 pub fn encode_hazard_with_support(
     journal: &Journal,
     verdict: &Verdict,
@@ -210,8 +202,7 @@ pub fn encode_hazard_with_support(
     if hard.is_empty() && !verdict.witnesses.is_empty() {
         return Err(SolverError::EmptyProvenance);
     }
-    // A violated verdict with no witnesses names no provenance to cut, even
-    // under an explicit support model that names nothing present.
+    // No witnesses means no provenance, even under explicit support.
     if hard.is_empty() && verdict.violated {
         return Err(SolverError::EmptyProvenance);
     }
@@ -263,11 +254,7 @@ pub(crate) fn disjoint_lower(hard: &[Vec<EntryHash>], w: &BTreeMap<EntryHash, u6
     }
     sum
 }
-/// Solve the encoding with the default engine for this build.
-///
-/// With `solver-cadical` this is the exact CaDiCaL threshold search;
-/// without it the pure-Rust branch-and-bound runs. See
-/// [`solve_maxsat_bnb`] for an engine that is explicit at the call site.
+/// Default-engine solve. CaDiCaL under `solver-cadical`, else branch-and-bound.
 pub fn solve_maxsat(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverError> {
     #[cfg(feature = "solver-cadical")]
     {
@@ -279,32 +266,14 @@ pub fn solve_maxsat(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverError>
     }
 }
 
-/// Deterministic clause-count budget for the branch-and-bound search.
-///
-/// Bounds the number of hard clauses the exact search will attempt. Larger
-/// encodings fail closed with [`SolverError::BudgetExhausted`] instead of
-/// walking an exponential space. Deterministic: counts clauses, never time.
-/// Sized at 2M so the Stage-2 scaling gate (10^6 clauses on the fan-in
-/// closure, where the greedy incumbent keeps the search linear) passes in
-/// every profile; genuinely exponential shapes still fail closed.
+/// Clause-count budget. Breach fails closed; deterministic, never time.
 pub const MAXSAT_BNB_MAX_CLAUSES: usize = 2_000_000;
-/// Deterministic cost-unit budget for the branch-and-bound search.
-///
-/// Bounds the sum of soft weights (total unit copies) the exact search will
-/// attempt. Larger cost spaces fail closed. Deterministic: sums weights.
+/// Cost-unit budget. Breach fails closed; deterministic.
 pub const MAXSAT_BNB_MAX_COST_UNITS: u64 = 10_000_000;
-/// Deterministic node budget for the branch-and-bound DFS.
-///
-/// Bounds the number of DFS node visits. Exhaustion fails closed with
-/// [`SolverError::BudgetExhausted`]. No wall-clock timeout is used.
+/// DFS node budget. Breach fails closed; no wall-clock timeout.
 pub const MAXSAT_BNB_MAX_NODES: usize = 10_000_000;
 
-/// Pure-Rust deterministic branch-and-bound engine, compiled in every build.
-///
-/// Exists so runtime routing (`crate::solver::select_solver`) and the
-/// crossover bench can drive the builtin engine even when the CaDiCaL
-/// feature is on. Deterministic: sorted clause and literal orders fix the
-/// search order, so the same encoding yields byte-identical solutions.
+/// Builtin branch-and-bound, compiled in every build. Deterministic.
 pub fn solve_maxsat_bnb(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverError> {
     solve_maxsat_bnb_with_budget(
         enc,
@@ -314,11 +283,7 @@ pub fn solve_maxsat_bnb(enc: &HazardEncoding) -> Result<MaxSatSolution, SolverEr
     )
 }
 
-/// Branch-and-bound with explicit deterministic budgets.
-///
-/// `max_clauses` bounds the hard-clause count, `max_cost_units` bounds the
-/// summed soft weights, and `max_nodes` bounds DFS node visits. Any breach
-/// fails closed with [`SolverError::BudgetExhausted`].
+/// Branch-and-bound with explicit budgets. Breach fails closed.
 pub fn solve_maxsat_bnb_with_budget(
     enc: &HazardEncoding,
     max_clauses: usize,
@@ -359,10 +324,7 @@ pub fn solve_maxsat_bnb_with_budget(
     hard_sets.sort_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)));
     let mut best_cut = BTreeSet::new();
     let mut best_cost = u64::MAX;
-    // Greedy warm start: a deterministic max-coverage incumbent before the
-    // exact search. On shared-literal encodings (one event covering every
-    // clause) the greedy pick is optimal, and the DFS then prunes every
-    // branch at the root instead of walking an exponential literal chain.
+    // Greedy warm start: optimal on shared-literal shapes, prunes DFS at root.
     greedy_incumbent(&hard_sets, &weights, &mut best_cut, &mut best_cost);
     let mut cur = BTreeSet::new();
     let mut state = SearchState {
@@ -389,15 +351,7 @@ pub fn solve_maxsat_bnb_with_budget(
         },
     })
 }
-/// Deterministic greedy max-coverage incumbent.
-///
-/// Rounds pick the literal that satisfies the most unsatisfied hard clauses
-/// (ties: cheaper cost first, then hash order), until every clause is
-/// covered or no literal covers anything new. The result seeds the exact
-/// search: on shared-literal encodings the greedy pick is already optimal,
-/// so the DFS prunes every branch at the root instead of walking an
-/// exponential literal chain. The incumbent never worsens the result: the
-/// DFS still runs and only improves on it.
+/// Greedy max-coverage incumbent seeding the exact search. Never worsens it.
 fn greedy_incumbent(
     hard: &[BTreeSet<EntryHash>],
     weights: &BTreeMap<EntryHash, u64>,
@@ -427,8 +381,7 @@ fn greedy_incumbent(
         uncovered.retain(|clause| !clause.contains(&literal));
     }
     if !uncovered.is_empty() {
-        // Some clauses have no faultable literal: leave the exact DFS in
-        // charge of reporting the failure.
+        // No covering literal: leave failure to the exact DFS.
         return;
     }
     *best_cut = chosen;
@@ -844,8 +797,7 @@ mod tests {
     }
     #[test]
     fn solve_budget_exhaustion_fails_closed() {
-        // Deterministic budgets count clauses, cost units, and DFS nodes,
-        // never wall-clock time. Each breach fails with `BudgetExhausted`.
+        // Budgets count clauses, cost, nodes; each breach fails typed.
         let encoding = HazardEncoding {
             hard: vec![vec![EntryHash([1u8; 32])], vec![EntryHash([2u8; 32])]],
             soft: vec![

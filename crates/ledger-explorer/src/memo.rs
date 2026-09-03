@@ -1,17 +1,7 @@
 #![deny(unsafe_code)]
 
-//! Content-addressed campaign memo for LazyMOP / AgentReplay style dedup.
-//!
-//! The memo keys on the canonical variant (policy, swarm, faults) plus the
-//! optional input sample hash and replay decisions. The value stores the
-//! journal root so a duplicate arm reuses the cached root without re-executing
-//! the simulator. This saves budget when the bandit repeatedly pulls the same
-//! arm.
-//!
-//! The cache is orthogonal to the solver clause cache: solver memo is per
-//! causal closure, campaign memo is per quadruple variant. The memo lives in
-//! the campaign run that owns it; it is never global, so concurrent
-//! campaigns cannot observe each other's entries.
+//! Content-addressed campaign memo for variant dedup. Keys on the canonical
+//! variant plus input and replay hashes; per-campaign only, never global.
 
 use ledger_format::EntryHash;
 use ledger_sim::{Policy, SimFault, SwarmConfig};
@@ -29,12 +19,7 @@ pub struct MemoEntry {
     pub distinct: bool,
 }
 
-/// Content-addressed campaign memo.
-///
-/// The key is `BLAKE3(variant_hash || input_hash || replay_decisions)` where
-/// `variant_hash` is the blake3 of the canonical quadruple bytes. A hit means
-/// the same variant, same input sample, and same replay decisions were already
-/// executed, so the caller can reuse the cached journal root.
+/// Campaign memo. A hit reuses the cached root without re-executing.
 #[derive(Debug, Clone, Default)]
 pub struct CampaignMemo {
     cache: HashMap<EntryHash, MemoEntry>,
@@ -76,10 +61,7 @@ impl CampaignMemo {
     }
 }
 
-/// EntryHash a slice of PBT inputs into a content address.
-///
-/// Each input is a u64 sampled from the input axis. The hash is
-/// `BLAKE3(len || inputs[*])` so distinct samples always hash distinct.
+/// Hash PBT inputs: `BLAKE3(len || inputs[*])`.
 pub fn hash_inputs(inputs: &[u64]) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(inputs.len() as u64).to_le_bytes());
@@ -89,20 +71,8 @@ pub fn hash_inputs(inputs: &[u64]) -> EntryHash {
     EntryHash(*hasher.finalize().as_bytes())
 }
 
-/// Canonical bytes for one quadruple variant.
-///
-/// Single source of truth for the variant byte layout: the campaign memo key
-/// and [`crate::search::QuadBandit::variant_hash`] both build on these bytes,
-/// so an arm hash and a memo key can never disagree about variant identity.
-///
-/// Deliberately NOT the v1 canonical `RunConfig` encoding
-/// (`ledger_sim::to_canonical_bytes` / `canonical_hash`, CBOR document over
-/// the full config): that encoding spans seed, time, and backend fields that
-/// do not define search-variant identity, and a key built from it would fail
-/// to dedup two attempts that differ only in seed. This layout keys on
-/// (policy, swarm, faults) only, stays in memory, and never persists, so it
-/// needs no format version. Do not extend it with `RunConfig` fields;
-/// keep the two encodings separate.
+/// Canonical variant bytes. Single layout source for memo keys and arm
+/// hashes. Keys on (policy, swarm, faults) only; never extend with `RunConfig`.
 pub fn canonical_variant_bytes(
     policy: &Policy,
     swarm: &SwarmConfig,
@@ -162,17 +132,16 @@ pub fn canonical_variant_bytes(
                 bytes.extend_from_slice(&write.0);
                 bytes.extend_from_slice(&state.to_le_bytes());
             }
+            SimFault::Duplicate { send } => {
+                bytes.push(6);
+                bytes.extend_from_slice(&send.0);
+            }
         }
     }
     bytes
 }
 
-/// Content-addressed key for a campaign attempt.
-///
-/// The key is `BLAKE3(variant_digest || input_hash || replay)` where
-/// `variant_digest` is `BLAKE3(canonical_variant_bytes)`. Input and replay
-/// are optional and each contributes a domain separator so `(None)` and
-/// `(Some(empty))` never collide.
+/// Campaign attempt key. Domain separators keep `None` apart from `Some(empty)`.
 pub fn memo_key(
     policy: &Policy,
     swarm: &SwarmConfig,
@@ -316,8 +285,7 @@ mod tests {
 
     #[test]
     fn memo_dedup_saves_duplicate_pulls() {
-        // Simulate 8 attempts over 4 variants. The memo should deduplicate
-        // the 4 repeated pulls so only 4 distinct runs are executed.
+        // 8 attempts over 4 variants dedup to 4 runs.
         let swarm = test_swarm();
         let policies = [
             Policy::Random,
@@ -389,8 +357,7 @@ mod tests {
 
     #[test]
     fn memo_key_extends_variant_hash() {
-        // Same swarm and policy must give same variant base; adding input hash or
-        // replay must change the final memo key.
+        // Input or replay extensions must change the key.
         let swarm = test_swarm();
         let base = memo_key(&Policy::Random, &swarm, &[], None, None, None);
         let with_input = memo_key(

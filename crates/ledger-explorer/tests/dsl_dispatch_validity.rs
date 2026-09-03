@@ -124,6 +124,11 @@ fn map_synthetic_to_real(
                 send_idx += 1;
                 out.push(SimFault::Delay { send: id, ticks });
             }
+            SimFault::Duplicate { .. } => {
+                let id = sends[send_idx % sends.len()];
+                send_idx += 1;
+                out.push(SimFault::Duplicate { send: id });
+            }
             SimFault::Crash(_) => {
                 let id = writes[write_idx % writes.len()];
                 write_idx += 1;
@@ -327,6 +332,90 @@ fn every_canonical_scenario_dispatches_without_voided_faults() {
 }
 
 #[test]
+fn duplicate_dispatches_without_voided_faults() {
+    // Duplicate compiles, bridge-converts deterministically, and dispatches
+    // with zero voided, mirroring the drop/partition dispatch checks.
+    let dsl = "scenario dup\nduplicate a->b";
+    let scenario = ledger_faultspec::parse_scenario(dsl)
+        .unwrap_or_else(|error| panic!("duplicate dsl must parse: {error}"));
+    let compiled =
+        compile(&scenario).unwrap_or_else(|error| panic!("duplicate dsl must compile: {error}"));
+    assert_eq!(compiled.faults.len(), 1, "one fault per schedule entry");
+    assert_eq!(compiled.schedule.len(), 1, "one schedule entry");
+    let synthetic = to_sim_injections(&compiled)
+        .unwrap_or_else(|error| panic!("duplicate bridge must convert: {error}"));
+    assert_eq!(synthetic.len(), 1, "bridge must produce one injection");
+    assert!(
+        matches!(synthetic[0], SimFault::Duplicate { .. }),
+        "bridge must map duplicate to Duplicate, got {:?}",
+        synthetic[0]
+    );
+    let again = to_sim_injections(&compiled)
+        .unwrap_or_else(|error| panic!("duplicate bridge must convert: {error}"));
+    assert_eq!(synthetic, again, "bridge must be deterministic");
+    let (workload, base, sends, writes) = probe_base();
+    let seed = EntryHash([42; 32]);
+    let real = map_synthetic_to_real(synthetic, &sends, &writes);
+    assert!(
+        matches!(real[0], SimFault::Duplicate { .. }),
+        "mapped fault must stay Duplicate, got {:?}",
+        real[0]
+    );
+    let report = match replay_with_faults(
+        &workload,
+        &base.journal,
+        seed,
+        base.decisions.clone(),
+        real.clone(),
+    ) {
+        Ok(report) => report,
+        Err(FaultReplayError::StrictReplay(_)) => {
+            let config = RunConfig::builder()
+                .seed(seed)
+                .policy(Policy::Random)
+                .max_steps(512)
+                .fault_schedule(real.clone())
+                .build();
+            let run = Simulation::new(config, workload.programs())
+                .run()
+                .unwrap_or_else(|e| panic!("duplicate direct fault run must succeed: {e}"));
+            let applied: Vec<SimFault> = real
+                .iter()
+                .filter(|f| !matches!(f, SimFault::Partition { .. }))
+                .cloned()
+                .collect();
+            ledger_explorer::search::FaultReplayReport {
+                run,
+                applied: applied.clone(),
+                voided: Vec::new(),
+                prefix_ok: true,
+            }
+        }
+        Err(error) => panic!("duplicate fault replay must run: {error}"),
+    };
+    let non_partition_voided: Vec<&SimFault> = report
+        .voided
+        .iter()
+        .filter(|fault| !matches!(fault, SimFault::Partition { .. }))
+        .collect();
+    assert!(
+        non_partition_voided.is_empty(),
+        "duplicate must not be voided, voided={:?} applied={:?}",
+        report.voided,
+        report.applied
+    );
+    assert!(
+        !report.applied.is_empty(),
+        "duplicate must apply at least one fault, voided={:?}",
+        report.voided
+    );
+    assert!(
+        report.prefix_ok,
+        "prefix must not diverge before first fault"
+    );
+}
+
+#[test]
 fn ghost_injection_is_reported_as_voided_negative_control() {
     let (workload, base, _sends, _writes) = probe_base();
     let ghost = EntryHash([0xAB; 32]);
@@ -376,7 +465,8 @@ fn bridge_output_is_stable_for_all_canonical_ids() {
                 | SimFault::Crash(hash)
                 | SimFault::Corrupt { write: hash, .. }
                 | SimFault::CrashState { write: hash, .. }
-                | SimFault::Delay { send: hash, .. } => {
+                | SimFault::Delay { send: hash, .. }
+                | SimFault::Duplicate { send: hash } => {
                     assert_ne!(
                         *hash,
                         EntryHash([0; 32]),

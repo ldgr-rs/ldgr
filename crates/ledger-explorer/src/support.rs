@@ -1,13 +1,8 @@
 //! Typed support semantics for fault-cut evidence.
 //!
-//! Journal parent edges represent causal order only. They never imply that a
-//! parent is sufficient or necessary support for an outcome. Support is
-//! declared explicitly by a [`SupportProvider`]; no code path in this module
-//! infers support from parent count, path shape, or vector-clock order.
-//!
-//! The [`SupportExpr`] tree is the single source of support semantics. An
-//! expression with any [`SupportExpr::Opaque`] child cannot back strong
-//! fault-cut or optimality claims ([`SupportExpr::is_strong`] reports that).
+//! Parent edges are causal order only, never support. Support is declared
+//! explicitly; [`SupportExpr`] is the single source. Any `Opaque` child
+//! degrades strong claims (`is_strong` is false).
 
 use std::collections::BTreeSet;
 
@@ -44,15 +39,8 @@ impl SupportOutcome {
     }
 }
 
-/// Explicit support expression over journal entry ids.
-///
-/// `AllOf` means every child is jointly required. `AnyOf` means one listed
-/// branch is sufficient. `Opaque` prevents strong fault-cut and optimality
-/// claims: any `Opaque` child forces [`SupportExpr::is_strong`] to `false`.
-///
-/// The variants are public for pattern matching, but construction goes
-/// through [`SupportExpr::all_of`] and [`SupportExpr::any_of`] (or the
-/// `TryFrom` impls) so an empty `AllOf` or `AnyOf` cannot be built.
+/// Explicit support over entry ids. `Opaque` forces `is_strong` false.
+/// Construct via `all_of`/`any_of` so empty sets cannot be built.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SupportExpr {
     /// Every listed entry is jointly required.
@@ -80,8 +68,7 @@ impl SupportExpr {
         Ok(Self::AnyOf(branches))
     }
 
-    /// Whether this expression supports strong fault-cut and optimality
-    /// claims. Any `Opaque` child degrades the whole expression to heuristic.
+    /// Strong claims require no `Opaque` child.
     pub fn is_strong(&self) -> bool {
         match self {
             Self::AllOf(_) => true,
@@ -95,10 +82,7 @@ impl SupportExpr {
         self.evaluate_with_horizon(journal, None)
     }
 
-    /// Evaluate with an optional derivation-depth horizon.
-    ///
-    /// Nested `AnyOf` branches beyond the horizon evaluate to
-    /// [`SupportOutcome::Unknown`], so a bounded walk cannot over-claim.
+    /// Evaluate with a depth horizon; beyond-horizon branches are `Unknown`.
     pub fn evaluate_with_horizon(
         &self,
         journal: &Journal,
@@ -145,10 +129,7 @@ impl SupportExpr {
         }
     }
 
-    /// Canonical encoding: a variant tag byte followed by sorted child bytes.
-    ///
-    /// `BTreeSet` iteration and the recursive visit order are deterministic,
-    /// so equal expressions always encode to equal bytes.
+    /// Canonical bytes: tag plus sorted children; deterministic.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_into(&mut out);
@@ -195,12 +176,7 @@ impl TryFrom<Vec<SupportExpr>> for SupportExpr {
     }
 }
 
-/// Versioned support provider.
-///
-/// Derives support from workload, effect, oracle, or adapter semantics.
-/// [`SupportProvider::version`] and [`SupportProvider::digest`] identify the
-/// provider; both feed solver cache keys so a provider change never reuses
-/// derived clauses or hypotheses.
+/// Versioned support provider. Version and digest join solver cache keys.
 pub trait SupportProvider {
     /// Provider version. Bump when the derived semantics change.
     fn version(&self) -> u64;
@@ -212,10 +188,7 @@ pub trait SupportProvider {
     fn support(&self, journal: &Journal) -> SupportExpr;
 }
 
-/// Provider that serves one explicitly declared expression.
-///
-/// The fixture registry uses this type to attach a versioned, digest-pinned
-/// support model to every certifiable corpus scenario.
+/// Provider serving one declared expression; used by the corpus registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticSupportProvider {
     version: u64,
@@ -224,7 +197,7 @@ pub struct StaticSupportProvider {
 }
 
 impl StaticSupportProvider {
-    /// Construct a provider whose digest pins `version` and `expression`.
+    /// Construct a provider pinning `version` and `expression` in the digest.
     pub fn new(version: u64, expression: SupportExpr) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&version.to_le_bytes());
@@ -267,10 +240,7 @@ impl SupportProvider for StaticSupportProvider {
     }
 }
 
-/// Collect every entry id of `kind` written by `actor`.
-///
-/// The result is a `BTreeSet`, so ids arrive canonically sorted for
-/// [`SupportExpr::all_of`].
+/// Collect entry ids of `kind` by `actor`, canonically sorted.
 pub fn entry_ids_by(journal: &Journal, kind: EntryKind, actor: ActorId) -> BTreeSet<EntryHash> {
     journal
         .entries()
@@ -279,10 +249,7 @@ pub fn entry_ids_by(journal: &Journal, kind: EntryKind, actor: ActorId) -> BTree
         .collect()
 }
 
-/// Build `AllOf` over `ids`, degrading to `Opaque` when the set is empty.
-///
-/// A run without the named semantic role cannot support a strong claim, so
-/// the model reports unknown instead of an empty requirement set.
+/// `AllOf` over `ids`; empty sets degrade to `Opaque`.
 pub fn all_of_ids(ids: impl IntoIterator<Item = EntryHash>) -> SupportExpr {
     match SupportExpr::all_of(ids.into_iter().collect()) {
         Ok(expr) => expr,
@@ -290,13 +257,7 @@ pub fn all_of_ids(ids: impl IntoIterator<Item = EntryHash>) -> SupportExpr {
     }
 }
 
-/// Hard clauses for one support expression, preserving alternative groups.
-///
-/// Each `AllOf` member set becomes one hard clause. Each `AnyOf` branch
-/// contributes its own clauses without merging into a single flattened
-/// clause: alternative derivations stay separate so a cut must break every
-/// branch. `Opaque` contributes no clause; callers treat an empty result as
-/// unknown support and fail closed.
+/// Hard clauses preserving `AnyOf` groups. `Opaque` yields none; callers fail closed.
 pub fn hard_clauses_from_support(expr: &SupportExpr) -> Vec<Vec<EntryHash>> {
     match expr {
         SupportExpr::AllOf(ids) => {
@@ -318,13 +279,7 @@ pub fn hard_clauses_from_support(expr: &SupportExpr) -> Vec<Vec<EntryHash>> {
     }
 }
 
-/// Build a support expression from faultable derivation paths.
-///
-/// Each non-empty path becomes one `AllOf` branch; the branches join under
-/// one `AnyOf` so alternatives stay separate. When `truncated` is true the
-/// horizon cut the walk, so an `Opaque` branch joins the alternatives and
-/// forces [`SupportExpr::is_strong`] to false. An empty path list yields
-/// `Opaque`, never an empty `AnyOf`.
+/// Support from faultable paths. `truncated` joins `Opaque`; empty yields `Opaque`.
 pub fn support_from_paths(paths: &[Vec<EntryHash>], truncated: bool) -> SupportExpr {
     let mut branches = Vec::new();
     for path in paths {

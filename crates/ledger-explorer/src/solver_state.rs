@@ -1,16 +1,8 @@
 #![deny(unsafe_code)]
 
-//! Persisted content-addressed solver state.
-//!
-//! Search state is a persisted, content-addressed artifact over the segment
-//! pool. The artifact rebuilds exactly on another machine and pre-warms the
-//! clause and hypothesis caches.
-//!
-//! The artifact records, per closure cache key, the exact clauses the live
-//! solver derived and the exact hypotheses it computed (with their exact
-//! costs). Resume restores those entries without recomputing anything and
-//! rejects artifacts whose state key, resolved engine, or run-config hash do
-//! not match the receiving solver.
+//! Persisted content-addressed solver state. Rebuilds exactly on another
+//! machine and pre-warms clause/hypothesis caches. Resume rejects mismatched
+//! keys, engines, or run-config hashes.
 
 use crate::ldfi::FaultHypothesis;
 use crate::solver::{HittingSetSolver, SolverConfig, SolverEngine, SolverError};
@@ -20,39 +12,20 @@ use ledger_journal::{Journal, JournalError};
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 
-/// Magic prefix for solver-state payloads.
-///
-/// Distinguishes solver-state Outcome entries from other Outcome entries. The
-/// format version byte inside the payload is authoritative; the `V1` suffix
-/// only discriminates the payload class.
+/// Magic prefix. The version byte inside is authoritative.
 const MAGIC: &[u8; 8] = b"LDGRSSV1";
 
-/// Current solver-state format version.
-///
-/// Bumped when the encoded fields change. Decoders reject any other version
-/// with a typed error, so an artifact written by an older or newer binary
-/// never pre-warms a solver silently.
+/// Format version. Decoders reject any other version.
 const FORMAT_VERSION: u8 = 2;
 
-/// One hypothesis as persisted in a solver-state artifact.
-///
-/// `events` is the sorted event set; `total_cost` is the exact cost the live
-/// solver computed for it (the sum of the per-event costs under the solver
-/// cost model). The artifact copies the value from the live hypothesis, so
-/// resume never re-derives costs from approximations.
+/// Persisted hypothesis: sorted events plus the live exact cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedHypothesis {
     pub events: Vec<EntryHash>,
     pub total_cost: u64,
 }
 
-/// One closure cache entry as persisted in a solver-state artifact.
-///
-/// `clauses` are the exact clauses the live solver derived for `key`, and
-/// `hypotheses` are the hypotheses derived from those clauses, in the order
-/// the live solver produced them. Resume restores both under `key`, so a
-/// resumed hypothesis can only ever be returned by a closure whose clauses
-/// actually produced it.
+/// Persisted closure entry: exact clauses and hypotheses under `key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedClosure {
     pub key: EntryHash,
@@ -60,14 +33,8 @@ pub struct PersistedClosure {
     pub hypotheses: Vec<PersistedHypothesis>,
 }
 
-/// Persisted solver state artifact.
-///
-/// `closures` holds one entry per closure cache key seen by the solver.
-/// `config_fingerprint` is the state key: it domain-separates the solver
-/// configuration, the resolved engine, and the run-config hash, so artifacts
-/// derived under different contexts never satisfy each other.
-/// `run_config_hash` and `resolved_engine` record the encoding context that
-/// produced the artifact; resume validates them explicitly.
+/// Persisted artifact. `config_fingerprint` domain-separates config, engine,
+/// and run-config hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolverStateArtifact {
     pub closures: Vec<PersistedClosure>,
@@ -191,24 +158,11 @@ impl From<JournalError> for SolverStateError {
     }
 }
 
-/// Version of the solver cost and certificate model bound by the state key.
-///
-/// Bump whenever the semantics of `crate::solver::event_fault_cost` (the
-/// per-kind cost table) or `crate::maxsat::LOWER_BOUND_METHOD` (the
-/// certificate method tag) change. The state fingerprint folds this tag into
-/// its domain, so artifacts persisted under an older cost model are rejected
-/// on resume instead of being pre-warmed with stale costs.
+/// Cost-model version bound by the state key. Bump on cost or method change.
 pub const COST_MODEL_VERSION: u8 = 1;
 
-/// Compute the state key for a solver configuration and its resolved engine.
-///
-/// The hash covers the cost-model version tag, horizon, oracle version,
-/// input class, max faults, the RESOLVED engine (never the configured mode:
-/// Auto resolves before the key is derived), and the canonical run-config
-/// hash, with domain separators. Deterministic and stable across machines.
-/// Two artifacts derived by different engines, cost models, or under
-/// different run configs always hash apart, so resuming one into the other
-/// can never satisfy the state-key check.
+/// State key over cost tag, config, resolved engine, and run-config hash.
+/// Deterministic across machines.
 pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> EntryHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ldgr.solver_state.config.fingerprint.v2");
@@ -255,9 +209,7 @@ pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> Entr
             hasher.update(&[0x00]);
         }
     }
-    // Engine discriminator: the RESOLVED engine. Auto is not an engine and
-    // hashes to a byte that matches neither concrete engine, so an unresolved
-    // caller cannot collude with either namespace.
+    // Unresolved Auto hashes apart from both engines.
     hasher.update(&[0x05]);
     let engine_byte = match resolved_engine {
         SolverEngine::Builtin => engine_tag::BUILTIN,
@@ -298,10 +250,7 @@ pub fn fingerprint(config: &SolverConfig, resolved_engine: SolverEngine) -> Entr
     EntryHash(*hasher.finalize().as_bytes())
 }
 
-/// Encode an artifact into deterministic canonical bytes.
-///
-/// Length-prefixed little-endian fields. `resolved_engine` must be a concrete
-/// engine; an unresolved Auto artifact cannot be persisted.
+/// Encode deterministically. Unresolved Auto cannot persist.
 fn encode_artifact(artifact: &SolverStateArtifact) -> Result<Vec<u8>, SolverStateError> {
     let engine_byte = match artifact.resolved_engine {
         SolverEngine::Builtin => engine_tag::BUILTIN,
@@ -343,10 +292,7 @@ fn encode_artifact(artifact: &SolverStateArtifact) -> Result<Vec<u8>, SolverStat
     Ok(out)
 }
 
-/// Bounded cursor over a solver-state payload.
-///
-/// Every read checks the remaining bytes first, so no read can run past the
-/// payload and no count can drive an allocation.
+/// Bounded cursor. Every read checks remaining bytes first.
 struct Cursor<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -383,12 +329,7 @@ impl Cursor<'_> {
     }
 }
 
-/// Convert one declared count into a usize and prove the payload can hold
-/// `count` elements of `elem_bytes` bytes, before any caller allocates.
-///
-/// The check bounds every allocation by the actual payload size: a hostile
-/// declared count can never cause `Vec::with_capacity` to reserve more than
-/// the surviving bytes can describe.
+/// Bound a declared count by surviving bytes before allocating.
 fn bounded_count(
     cursor: &mut Cursor,
     declared: u64,
@@ -417,11 +358,7 @@ fn bounded_count(
     Ok(count)
 }
 
-/// Decode canonical bytes into an artifact.
-///
-/// Every declared length is checked against the remaining payload before any
-/// allocation, so malformed or hostile payloads fail cleanly with a typed
-/// error instead of reserving attacker-controlled sizes.
+/// Decode canonical bytes. Lengths check before allocation; hostile sizes fail typed.
 fn decode_artifact(bytes: &[u8]) -> Result<SolverStateArtifact, SolverStateError> {
     if bytes.len() < MAGIC.len() + 1 + 1 + 1 + 32 + 8 {
         return Err(SolverStateError::Truncated { offset: 0 });
@@ -501,12 +438,7 @@ fn decode_artifact(bytes: &[u8]) -> Result<SolverStateArtifact, SolverStateError
     })
 }
 
-/// Persist an artifact to the journal.
-///
-/// The artifact is appended as a single `Outcome` entry with
-/// A `Snapshot` payload containing the deterministic encoding. The entry id is the
-/// content address. Saving an identical artifact twice returns the same entry
-/// id without duplicating the entry (payload equality check).
+/// Persist as one content-addressed `Outcome`; identical payloads dedup.
 pub fn save(
     journal: &mut Journal,
     actor: ActorId,
@@ -537,11 +469,7 @@ pub fn save(
         .map_err(SolverStateError::from)
 }
 
-/// Load all solver-state artifacts from the journal.
-///
-/// Scans entries in append order, decodes those whose payload starts with the
-/// solver-state magic. Returns them in journal order. Malformed or
-/// version-mismatched payloads produce a typed `SolverError::SolverState`.
+/// Load artifacts in journal order. Bad payloads fail typed.
 pub fn load(journal: &Journal) -> Result<Vec<SolverStateArtifact>, SolverError> {
     let mut out = Vec::new();
     for entry in journal.entries() {
@@ -561,11 +489,7 @@ pub fn load(journal: &Journal) -> Result<Vec<SolverStateArtifact>, SolverError> 
 }
 
 impl HittingSetSolver {
-    /// Persist the current solver state to the journal.
-    ///
-    /// Captures per-closure clauses and hypotheses with exact costs, plus the
-    /// state key and the resolved engine, into an artifact appended as a
-    /// content-addressed entry.
+    /// Persist current caches as a content-addressed entry.
     pub fn persist_state(
         &self,
         journal: &mut Journal,
@@ -578,19 +502,8 @@ impl HittingSetSolver {
         })
     }
 
-    /// Pre-warm the clause and hypothesis caches from a persisted artifact.
-    ///
-    /// The artifact must have been produced under the same state key
-    /// (configuration, resolved engine, and run-config hash); anything else is
-    /// rejected with a typed error before any cache entry is touched.
-    /// Hypotheses are restored only under their own closure key and only
-    /// alongside a non-empty recorded clause set (an empty clause set cannot
-    /// determine costs or hitting sets, and the trivial empty case must
-    /// recompute like a fresh solver), and an entry whose hypothesis names an
-    /// event absent from the key's clauses is rejected, so resume never
-    /// returns a hypothesis without matching clauses. `resolved_engine` is
-    /// the engine the receiving solver resolves to; the artifact must have
-    /// been produced by that engine.
+    /// Pre-warm from an artifact. Key, engine, and run-config must match;
+    /// hypotheses restore only under covering non-empty clause sets.
     pub fn resume(
         &mut self,
         artifact: &SolverStateArtifact,
@@ -619,8 +532,7 @@ impl HittingSetSolver {
                 },
             ));
         }
-        // Validate every entry before applying any, so a forged artifact can
-        // never leave the solver half-warmed.
+        // Validate all before applying any: no half-warmed solver.
         for closure in &artifact.closures {
             let mut literals: HashSet<EntryHash> = HashSet::new();
             for clause in &closure.clauses {
@@ -642,29 +554,17 @@ impl HittingSetSolver {
             }
         }
         for closure in &artifact.closures {
-            // Every recorded clause set is restored under its key, including
-            // an empty one: the live solver stores empty clause sets (for
-            // example the MaxSAT empty-hard cut), and a missing entry would
-            // split the state and let a stale hypothesis pass an unvalidated
-            // hit check. The restore lands only in the receiving solver's
-            // per-campaign cache; no process-global store exists.
+            // Restore every recorded set, including empty ones, to keep state whole.
             self.clause_cache_mut()
                 .insert(closure.key, closure.clauses.clone());
-            // Hypotheses are restored only alongside a non-empty recorded
-            // clause set. An empty clause set cannot determine any cost or
-            // hitting set, and an empty clause query must behave like a
-            // fresh solver, which returns no hypotheses; restoring a
-            // recorded empty-cut hypothesis would let that query be served
-            // instead. Both engines recompute the trivial empty case.
+            // Hypotheses restore only with non-empty clauses; empty queries recompute.
             if !closure.hypotheses.is_empty() && !closure.clauses.is_empty() {
                 let hyps: Vec<FaultHypothesis> = closure
                     .hypotheses
                     .iter()
                     .map(|persisted| FaultHypothesis {
-                        // Recorded order is the live solver's order, so the
-                        // resumed cache reproduces the live decisions.
+                        // Recorded order and exact cost reproduce live decisions.
                         events: persisted.events.clone(),
-                        // Exact cost captured from the live solver.
                         total_cost: persisted.total_cost,
                         explanation: format!(
                             "resumed hypothesis with {} fault(s)",
@@ -678,12 +578,7 @@ impl HittingSetSolver {
         Ok(())
     }
 
-    /// Snapshot the solver's current cache state into an artifact.
-    ///
-    /// Closure keys are the sorted union of the clause and hypothesis cache
-    /// keys. Each closure entry records the exact clauses derived for that
-    /// key and the exact hypotheses (with exact costs) derived from them, in
-    /// the live cache order.
+    /// Snapshot caches into an artifact, preserving exact clauses and costs.
     pub(crate) fn snapshot_artifact(&self, resolved_engine: SolverEngine) -> SolverStateArtifact {
         let mut keys: BTreeSet<EntryHash> = self.hypothesis_cache().keys().copied().collect();
         keys.extend(self.clause_cache().iter().map(|(key, _)| *key));

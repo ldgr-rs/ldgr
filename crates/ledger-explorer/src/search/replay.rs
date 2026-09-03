@@ -3,26 +3,18 @@ use crate::diagnosis::{Divergence, first_divergence};
 use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, RunResult, SimFault, Simulation};
 
-/// Strict replay for reproduction gates.
-///
-/// Alias to [`replay_strict`]; ready-set drift is surfaced as a typed
-/// `StrictReplay` violation instead of being normalized. Use
-/// [`replay_prefix`] for lenient minimization-only prefix replay.
+/// Strict replay for reproduction gates. See [`replay_prefix`] for lenient use.
 pub fn replay<W: Workload + ?Sized>(
     workload: &W,
     seed: EntryHash,
     decisions: Vec<usize>,
 ) -> Result<RunResult, ledger_sim::RuntimeError> {
-    // Strict alias: every reproduction path is strict. Lenient is only via
-    // `replay_prefix` for the private minimization prefix.
+    // Strict alias; lenient only via `replay_prefix`.
     replay_strict(workload, seed, decisions)
 }
 
-/// Replay one workload under a strict scheduling decision sequence.
-///
-/// Strict replay rejects out-of-range, exhausted, or trailing decisions
-/// and surfaces a typed [`ledger_sim::RuntimeError::StrictReplay`] error.
-/// Callers needing to distinguish violations should match on the typed error.
+/// Strict replay under a decision sequence. Drift surfaces as typed
+/// [`ledger_sim::RuntimeError::StrictReplay`].
 pub fn replay_strict<W: Workload + ?Sized>(
     workload: &W,
     seed: EntryHash,
@@ -36,11 +28,7 @@ pub fn replay_strict<W: Workload + ?Sized>(
     Simulation::with_replay_strict(config, workload.programs(), decisions).run()
 }
 
-/// Minimization-only prefix replay that cannot satisfy a reproduction gate.
-///
-/// This uses lenient replay with a seeded fallback for the suffix, so it is
-/// suitable for delta debugging but must not be used to claim a bug
-/// reproduction. Use [`replay_strict`] to validate a reproduction gate.
+/// Lenient prefix replay for delta debugging only; never a reproduction claim.
 pub fn replay_prefix<W: Workload + ?Sized>(
     workload: &W,
     seed: EntryHash,
@@ -133,13 +121,8 @@ fn write_path_of(
     })
 }
 
-/// Replay one workload with a fault schedule injected at causal positions.
-///
-/// Strict-only reproduction: ready-set drift is surfaced as a typed
-/// [`FaultReplayError::StrictReplay`] violation instead of being normalized
-/// by a seeded fallback. No lenient fallback is performed. Callers that need
-/// lenient prefix behavior for delta debugging use [`replay_prefix`], which
-/// must never back a reproduction claim.
+/// Strict fault replay at causal positions. No lenient fallback; see
+/// [`replay_prefix`] for delta debugging.
 pub fn replay_with_faults<W: Workload + ?Sized>(
     workload: &W,
     base: &ledger_journal::Journal,
@@ -167,8 +150,7 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
     let mut voided = Vec::new();
     for injection in schedule {
         match super::fault_injection_target(&injection) {
-            // A link partition targets no single event, so it cannot be
-            // attributed to an applied event id; it is reported voided.
+            // Link partitions target no event; report voided.
             None => voided.push(injection),
             Some(id) if applied_set.contains(&id) && seen_applied.insert(id) => {
                 applied.push(injection);
@@ -191,10 +173,7 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
             .zip(replay_ids.iter())
             .take(first_fault)
             .all(|(base, replay)| base == replay);
-    // Crash-semantics verification: every applied crash-type fault must have
-    // journaled exactly the canonical operation it requests. A drift between
-    // the requested semantics and what the run applied fails the replay
-    // closed instead of silently trusting a mismatched crash.
+    // Crash check: applied crash faults must journal the requested operation.
     if !applied.is_empty() {
         let journaled = journaled_crash_operations(&run);
         for fault in &applied {
@@ -208,9 +187,7 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
             let Some(requested) = fault.crash_operation_for(&path) else {
                 continue;
             };
-            // The executor rejects unknown crash-state identifiers before
-            // this point (fail closed), so the error arm is defense in
-            // depth: it surfaces the same typed mismatch without a panic.
+            // Executor rejects unknown crash ids; this arm is defense in depth.
             let requested = match requested {
                 Ok(operation) => operation,
                 Err(_) => {
@@ -242,13 +219,7 @@ pub fn replay_with_faults<W: Workload + ?Sized>(
     })
 }
 
-/// Outcome of comparing two runs journal by journal.
-///
-/// `Identical` means the vector-clock ordered streams match exactly.
-/// `Diverged` carries the first differing entry ids. `Truncated` means one
-/// run is a strict prefix of the other; the longer side's first extra id is
-/// carried (`None` on the shorter side). Callers must handle `Truncated`
-/// explicitly instead of collapsing it to identical.
+/// Journal-by-journal comparison. `Truncated` must be handled explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalDiff {
     Identical,
@@ -469,12 +440,7 @@ mod tests {
                 .expect("base run")
         };
         let decisions = base.decisions.clone();
-        // Forge a decision that is out of range for the faulted run's ready
-        // set. With no faults, lenient and strict agree; with a fault that
-        // blocks the receiver, the same decision becomes out of range.
-        // We do not need an actual fault to demonstrate the strict path:
-        // a single out-of-range decision is enough to prove the typed error
-        // is surfaced instead of normalized.
+        // Out-of-range decision proves the typed strict path.
         let out_of_range = vec![99];
         let strict_err = replay_strict(&workload, seed, out_of_range.clone())
             .expect_err("out of range must be StrictReplay");

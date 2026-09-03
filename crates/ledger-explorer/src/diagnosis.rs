@@ -2,24 +2,15 @@
 
 use ledger_journal::{Entry, Journal};
 
-/// Collect a journal's entries in vector-clock order.
-///
-/// Append order is a total order that can interleave concurrent entries
-/// differently between two runs; the vector-clock projection orders by
-/// `(actor, per-actor sequence)`, which is independent of the interleaving.
+/// Append order can interleave concurrent entries; vector-clock order cannot.
 fn entries_in_vc_order(journal: &Journal) -> Vec<&Entry> {
     let mut entries = journal.entries().collect::<Vec<_>>();
     entries.sort_by_key(|entry| (entry.data.actor, entry.data.sequence));
     entries
 }
 
-/// Outcome of comparing two journals at their first divergence.
-///
-/// `Identical` means the vector-clock ordered streams match exactly.
-/// `Diverged` carries the first differing pair. `Truncated` means one stream
-/// is a strict prefix of the other: the longer side's first extra entry is
-/// carried so callers can distinguish a truncated replay from a behavior
-/// change instead of collapsing both to `None`.
+/// First-divergence outcome. `Truncated` carries the longer side's extra
+/// entry; never collapse to `Identical`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Divergence<'a> {
     Identical,
@@ -41,14 +32,8 @@ impl<'a> Divergence<'a> {
     }
 }
 
-/// Compare two journals at their first divergent entry pair.
-///
-/// Both streams are walked in vector-clock order, so a difference in append
-/// order of concurrent entries is not a divergence. A strict prefix of one
-/// journal is a truncated replay, not a behavior change: it returns
-/// [`Divergence::Truncated`] with the longer side's first extra entry,
-/// never [`Divergence::Identical`]. When the journals do diverge, the
-/// [`Divergence::Diverged`] pair carries both sides.
+/// Compare in vector-clock order; concurrent append interleavings are not
+/// divergences. Prefixes report `Truncated`, never `Identical`.
 pub fn first_divergence<'a>(left: &'a Journal, right: &'a Journal) -> Divergence<'a> {
     let mut left_iter = entries_in_vc_order(left).into_iter();
     let mut right_iter = entries_in_vc_order(right).into_iter();
@@ -63,9 +48,7 @@ pub fn first_divergence<'a>(left: &'a Journal, right: &'a Journal) -> Divergence
                     };
                 }
             }
-            // One journal truncated early. A truncated replay is an explicit
-            // case, not an identical match: the longer side's first extra
-            // entry is carried.
+            // Truncation is explicit, not identical.
             (Some(extra), None) => {
                 return Divergence::Truncated {
                     left: Some(extra),

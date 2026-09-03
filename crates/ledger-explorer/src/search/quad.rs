@@ -22,24 +22,14 @@ pub struct QuadMutation {
     /// Pool of faults; empty = no fault axis.
     pub fault_library: Vec<SimFault>,
     pub max_faults_per_run: usize,
-    /// PBT input generator for the input axis; `None` disables the axis.
-    ///
-    /// When set, every attempt draws a fresh input sequence from the
-    /// generator's seed-tree `gen/<generator>` stream and rebuilds the
-    /// workload with those values, mutating all four quadruple axes together.
+    /// PBT input generator; `None` disables the axis.
     pub input_generator: Option<String>,
     /// Energy distribution for sampled inputs; `None` keeps the uniform
     /// modulo path for backward compatibility.
     pub input_energy: Option<EnergyDistribution>,
 }
 
-/// Run a campaign that mutates all four axes of the search quadruple.
-///
-/// Per attempt the policy is drawn from `mutation.policies`, the swarm knobs
-/// are drawn from the seeded stream when `use_swarm`, a fault subset is drawn
-/// from `mutation.fault_library` when it is non-empty, and a fresh PBT input
-/// is drawn from `mutation.input_generator` when it is set. The base seed
-/// still varies across attempts for determinism.
+/// Campaign over all four quadruple axes. Seeds vary per attempt.
 pub fn run_campaign_quad<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
@@ -53,11 +43,7 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
     let base_seed = base.seed();
-    // LazyMOP-style campaign memo: content-addressed dedup keyed by
-    // `BLAKE3(variant_hash || input_hash || replay)`. A hit reuses the
-    // cached journal root without re-executing the simulator, which saves
-    // budget when the same quadruple variant is drawn repeatedly. The memo
-    // is per-campaign (local HashMap) and orthogonal to the solver cache.
+    // Per-campaign memo: dedups repeated variant draws.
     let mut memo = CampaignMemo::new();
 
     for attempt in 0..attempts {
@@ -158,13 +144,7 @@ pub fn run_campaign_quad<W: Workload, O: Oracle>(
     })
 }
 
-/// Run a campaign that mutates only the swarm axis of the quadruple.
-///
-/// Per attempt the swarm knobs are drawn from the seeded stream with the same
-/// distribution as the quad campaign's swarm axis: drop and delay
-/// probabilities in `0.0 .. 1.0`, `max_delay_ticks` in `0 ..= 8`, crash
-/// probability in `0.0 .. 0.1`, and the shared fault-class budget. The seed
-/// varies as in [`crate::search::run_campaign`].
+/// Swarm-axis-only campaign; same swarm distribution as the quad axis.
 pub fn run_swarm_campaign<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,

@@ -1,8 +1,5 @@
-//! PBT-in-sim input axis: per-generator samplers and input-parameterized workloads.
-//!
-//! Each generator draws from its own `gen/<generator>` seed-tree stream.
-//! The same name plus seed always reproduces the same input sequence, and
-//! distinct generator names are mutually independent.
+//! PBT input axis: per-generator samplers over `gen/<name>` streams. Same
+//! name plus seed reproduces; names are independent.
 
 use crate::oracle::HistoryOperation;
 use crate::search::Workload;
@@ -27,10 +24,7 @@ pub enum PbtError {
     InvalidExponent { exponent: f64 },
 }
 
-/// Upper bound (exclusive) for input-axis samples.
-///
-/// A small bounded domain keeps specific target values (for example 42)
-/// reachable by search and minimizer while staying deterministic.
+/// Bounded sample domain keeping targets reachable and deterministic.
 pub const INPUT_SAMPLE_RANGE: u64 = 100;
 
 /// Input energy sampling distribution.
@@ -57,20 +51,12 @@ impl PbtBridge {
         self.sample_u64() % modulus
     }
 
-    /// Draw a deterministic `u64` uniformly in `lo .. hi`.
-    ///
-    /// Requires `hi > lo`; the modulo is biased but deterministic, which is
-    /// the property the PBT input axis needs.
+    /// Uniform `lo .. hi`. Modulo is biased but deterministic.
     pub fn sample_range(&mut self, lo: u64, hi: u64) -> u64 {
         lo + self.uniform_mod(hi - lo)
     }
 
-    /// Sample `0 .. range` under the requested energy distribution.
-    ///
-    /// Uniform draws use the shared modulo helper; power draws compute
-    /// `u = v / u64::MAX`, `value = (range as f64 * u.pow(e)) as u64`
-    /// clamped to `< range`. Returns `Err` when `range == 0` or when `e` is
-    /// non-finite or `<= 0`. Deterministic from the existing `gen/<name>` stream.
+    /// Sample `0 .. range` under `dist`. Errors on empty range or bad exponent.
     pub fn sample_energy(
         &mut self,
         range: u64,

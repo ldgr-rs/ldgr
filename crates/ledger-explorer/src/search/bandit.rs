@@ -9,12 +9,8 @@ use ledger_format::EntryHash;
 use ledger_sim::{Policy, RunConfig, SeedTree, SimFault, Simulation, SwarmConfig};
 use std::collections::{HashMap, HashSet};
 
-/// UCB1 bandit over quadruple variants.
-///
-/// The variant hash is the arm and findings feed rewards. An untried
-/// candidate scores infinity, so every arm is probed once before
-/// exploitation. Ties break to the smaller hash, keeping picks
-/// deterministic.
+/// UCB1 bandit over quadruple variants. Untried arms score infinity;
+/// ties break to the smaller hash, deterministically.
 #[derive(Debug, Clone)]
 pub struct QuadBandit {
     pulls: HashMap<u64, usize>,
@@ -39,18 +35,14 @@ impl QuadBandit {
         }
     }
 
-    /// Add a candidate arm. Registration never counts as a pull, so a
-    /// registered-but-unpulled arm keeps the infinite untried score.
+    /// Add a candidate arm; registration is never a pull.
     pub fn register(&mut self, variant: u64) {
         if !self.candidates.contains(&variant) {
             self.candidates.push(variant);
         }
     }
 
-    /// Register a candidate by its quadruple parts.
-    ///
-    /// The canonical arm hash is computed once at registration and reused on
-    /// every pick, so a campaign never re-hashes the variant.
+    /// Register by parts; arm hash computed once and reused.
     pub fn register_variant(
         &mut self,
         policy: &Policy,
@@ -62,13 +54,7 @@ impl QuadBandit {
         arm
     }
 
-    /// Canonical content hash of one quadruple variant.
-    ///
-    /// The hash covers the policy tag and fields, the full swarm config, and
-    /// every fault in canonical order (see
-    /// [`crate::memo::canonical_variant_bytes`], the single byte-layout
-    /// source shared with the campaign memo), so equal variants always hash
-    /// equal.
+    /// Canonical arm hash over policy, swarm, and faults in canonical order.
     pub fn variant_hash(policy: &Policy, swarm: &SwarmConfig, faults: &[SimFault]) -> u64 {
         let digest = blake3::hash(&crate::memo::canonical_variant_bytes(policy, swarm, faults));
         let mut out = [0u8; 8];
@@ -76,10 +62,7 @@ impl QuadBandit {
         u64::from_le_bytes(out)
     }
 
-    /// UCB1 pick over the registered candidates.
-    ///
-    /// Untried candidates score infinity. Otherwise the score is the average
-    /// reward plus the UCB1 exploration bonus. Ties break to the smaller arm.
+    /// UCB1 pick. Untried scores infinity; ties break to the smaller arm.
     pub fn arm(&self, exploration: f64) -> u64 {
         let mut best: Option<(f64, u64)> = None;
         for &variant in &self.candidates {
@@ -120,11 +103,8 @@ struct QuadVariant {
 const BANDIT_SWARM_SAMPLES: usize = 4;
 const BANDIT_FAULT_SAMPLES: usize = 4;
 
-/// Enumerate the deterministic candidate quadruple variants for a campaign.
-///
-/// The enumeration crosses every policy with the drawn swarm samples and the
-/// drawn fault subsets. The bandit derives each variant's canonical arm hash
-/// once at registration.
+/// Enumerate deterministic candidate variants: policies crossed with drawn
+/// swarm and fault samples.
 fn enumerate_variants(
     base: &RunConfig,
     mutation: &QuadMutation,
@@ -178,14 +158,8 @@ fn enumerate_variants(
     Ok(variants)
 }
 
-/// Run a UCB1 bandit campaign over the mutated quadruple variants.
-///
-/// The candidate variants are enumerated once from the seed stream; each
-/// carries a canonical arm hash computed at registration. Every attempt pulls
-/// the arm selected by UCB1, runs that quadruple variant (with a fresh PBT
-/// input when the input axis is set), and rewards the arm with 1.0 when the
-/// oracle fires. The per-attempt run seed still varies, so every arm runs
-/// under fresh schedules.
+/// UCB1 campaign over the variants. Rewards 1.0 on oracle fire; run seeds
+/// still vary per attempt.
 pub fn run_bandit_campaign<W: Workload, O: Oracle>(
     workload: &W,
     oracle: &O,
@@ -207,9 +181,7 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
     let mut distinct_roots: HashSet<EntryHash> = HashSet::new();
     let mut findings: Vec<Finding> = Vec::new();
     let mut variants: Vec<String> = Vec::new();
-    // LazyMOP / AgentReplay memo: per-campaign local dedup over
-    // `BLAKE3(variant_hash || input_hash || replay)`. Duplicate bandit arms
-    // hit the cache and skip re-execution, saving budget.
+    // Per-campaign memo: dedups repeated variant draws without re-executing.
     let mut memo = CampaignMemo::new();
 
     for attempt in 0..attempts {
@@ -252,10 +224,7 @@ pub fn run_bandit_campaign<W: Workload, O: Oracle>(
         );
         if let Some(entry) = memo.get(&key) {
             distinct_roots.insert(entry.journal_root);
-            // Duplicate arm+input: reuse cached root without simulation.
-            // Give a conservative 0 reward for the duplicate pull so UCB1
-            // keeps exploring without budget cost. A cache that also stored
-            // the violated flag could replay the exact reward.
+            // Duplicate arm+input: reuse root; 0 reward keeps exploring.
             bandit.reward(arm, 0.0);
             variants.push(describe_variant(&config, attempt, input_label.as_deref()));
             continue;

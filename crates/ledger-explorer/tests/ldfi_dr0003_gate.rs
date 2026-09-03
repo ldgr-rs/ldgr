@@ -111,6 +111,7 @@ fn injection_target(fault: &SimFault) -> Option<ledger_format::EntryHash> {
         SimFault::Drop(id)
         | SimFault::Crash(id)
         | SimFault::Delay { send: id, .. }
+        | SimFault::Duplicate { send: id }
         | SimFault::Corrupt { write: id, .. }
         | SimFault::CrashState { write: id, .. } => Some(*id),
         SimFault::Partition { .. } => None,
