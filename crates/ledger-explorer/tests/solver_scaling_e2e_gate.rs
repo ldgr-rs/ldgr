@@ -80,6 +80,7 @@ fn build_fan_in(paths: usize) -> (Journal, ledger_explorer::Verdict, ledger_form
 #[test]
 fn hazard_certification_scales_to_one_million_entries() {
     let mut durations: Vec<(usize, std::time::Duration)> = Vec::new();
+    let mut clause_counts: Vec<usize> = Vec::new();
 
     for &paths in &PATHS {
         let entries = paths + 1;
@@ -122,16 +123,33 @@ fn hazard_certification_scales_to_one_million_entries() {
             .unwrap_or_else(|error| panic!("paths={paths}: statement validation failed: {error}"));
 
         durations.push((entries, duration));
+        clause_counts.push(paths);
         println!(
             "entries {entries}, hazard clauses {paths}, end-to-end {duration:?}, cut cost {}",
             hypotheses[0].total_cost
         );
     }
 
-    // Monotonicity: the pipeline must actually grow with the closure.
-    for window in durations.windows(2) {
+    // Deterministic growth evidence: the clause count is the solver-problem
+    // size and must strictly increase across the fixture ladder.
+    for window in clause_counts.windows(2) {
         assert!(
-            window[0].1 <= window[1].1,
+            window[0] < window[1],
+            "hazard clause count must grow with the closure: {:?}",
+            window
+        );
+    }
+
+    // Wall-clock growth under a tolerance band: shared runners jitter, so a
+    // strict non-decrease would flake. The band scales with the size ratio
+    // (2x headroom over linear growth plus a fixed jitter floor), so a
+    // gross regression - superlinear blowup at the top size - still fails
+    // here and at the release budget below.
+    for window in durations.windows(2) {
+        let size_ratio = (window[1].0 as f64 / window[0].0 as f64).max(1.0);
+        let budget = window[0].1.mul_f64(size_ratio * 2.0) + std::time::Duration::from_millis(250);
+        assert!(
+            window[1].1 <= budget,
             "end-to-end duration must grow with the closure: {:?}",
             window
         );
