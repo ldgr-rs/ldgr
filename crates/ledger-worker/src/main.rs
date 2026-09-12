@@ -81,6 +81,7 @@ fn load_queue_file(path: &PathBuf, queue: &mut InMemoryQueue) -> Result<usize, Q
     })?;
     let reader = std::io::BufReader::new(file);
     let mut loaded = 0usize;
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (index, line) in reader.lines().enumerate() {
         let line = line.map_err(QueueLoadError::Read)?;
         let trimmed = line.trim();
@@ -102,6 +103,16 @@ fn load_queue_file(path: &PathBuf, queue: &mut InMemoryQueue) -> Result<usize, Q
             });
         match parsed {
             Ok(task) => {
+                // A duplicate task id would silently overwrite the first
+                // lease on pull and lose one task's accounting; reject it.
+                if !seen_ids.insert(task.id.clone()) {
+                    eprintln!(
+                        "ledger-worker: skipping duplicate task id {} at line {}",
+                        task.id,
+                        index + 1
+                    );
+                    continue;
+                }
                 queue.push(task);
                 loaded += 1;
             }
