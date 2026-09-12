@@ -710,7 +710,8 @@ mod tests {
                 "resource_limits",
                 ExecutionIdentity {
                     resource_limits: ResourceLimits { max_steps: 20_000 },
-                    ..base.clone()
+                    // Final arm: `base` moves here; no clone is needed.
+                    ..base
                 },
             ),
         ];

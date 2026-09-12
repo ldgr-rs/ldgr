@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! LDFI efficiency measurement: 12 bug-corpus-v1 scenarios (shared
 //! registry) plus four clearly-labeled synthetic scenarios, measured with an
 //! INDEPENDENT random-schedule control.

@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Corpus-v2 gate: the fault-triggered cloud-infra scenario set.
 //!
 //! Unlike corpus v1 (reproduction fixtures whose plants fire unconditionally),

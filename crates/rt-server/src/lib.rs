@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::redundant_clone,
+        clippy::needless_collect
+    )
+)]
 // ledger-lint:allow (host daemon; rt-server binds Unix domain socket and uses std::fs for socket path setup)
 //! AGPL composition root: deterministic engine effect server.
 //! Private Unix socket, peer-credential auth, one effect session per

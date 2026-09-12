@@ -696,7 +696,7 @@ fn run_with_sim(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError
     let seed = config.seed();
     let max_steps = config.max_steps();
     let shared_net = shared_network();
-    let net_for_sim = shared_net.clone();
+    let net_for_sim = shared_net;
     let sim_cfg = SimRunConfig::builder()
         .seed(seed)
         .max_steps(max_steps)

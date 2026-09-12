@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Search-axis tests: quadruple mutation, swarm axis, bandit campaign
 //! scheduling, and the joint campaign, plus PLANTED counterexamples for the
 //! three documented search axes: linearizability, quorum, and exactly-once.

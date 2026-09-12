@@ -1,3 +1,5 @@
+// Host build tooling: protoc/env failures fail closed via expect/unwrap.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Emit compile-time build facts for execution identity.
 //!
 //! The target triple and build profile are captured here and re-emitted as

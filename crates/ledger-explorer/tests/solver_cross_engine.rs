@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Cross-engine solver differential: the pure-Rust branch-and-bound engine
 //! (builtin, `crate::maxsat::solve_maxsat_bnb`) vs the CaDiCaL
 //! ascending-threshold search (behind the `solver-cadical` feature) over

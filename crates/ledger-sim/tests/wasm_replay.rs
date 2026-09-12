@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Wasm replay: the guest `run` entry reproduces byte-identical stdout twice
 //! and matches the host-computed golden.
 #![cfg(feature = "backend-wasm")]

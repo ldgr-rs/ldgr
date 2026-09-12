@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn snapshot_hash_detects_corruption() {
-        let snapshot = Snapshot::new(
+        let mut snapshot = Snapshot::new(
             ActorId(1),
             7,
             EntryHash([0u8; 32]),
@@ -290,10 +290,9 @@ mod tests {
         );
         snapshot.validate().unwrap();
 
-        let mut tampered = snapshot.clone();
-        tampered.state_data = vec![1, 2, 3, 5];
+        snapshot.state_data = vec![1, 2, 3, 5];
         assert!(matches!(
-            tampered.validate(),
+            snapshot.validate(),
             Err(JournalError::SnapshotHashMismatch)
         ));
     }

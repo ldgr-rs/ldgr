@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::redundant_clone,
+        clippy::needless_collect
+    )
+)]
 //! Deterministic Wasm guest for the ledger journaling engine.
 //!
 //! The guest is a `crate-type = ["cdylib"]` core module targeting

@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 // ledger-lint:allow (host integration test resolves the engine binary from env / build dir; not simulation code)
 #![cfg(any(feature = "sim", feature = "sim-link"))]
 

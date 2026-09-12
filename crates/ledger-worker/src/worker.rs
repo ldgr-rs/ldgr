@@ -330,9 +330,7 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
     if let Some(stored) = task.run_config_hash
         && stored != computed
     {
-        return Err(WorkerError::HashMismatch {
-            task_id: task.id.clone(),
-        });
+        return Err(WorkerError::HashMismatch { task_id: task.id });
     }
     // Identity gate runs before the simulation: a pinned identity that does
     // not match the worker's own assembly (or that cannot be compared because
@@ -340,14 +338,10 @@ pub fn execute_task(task: crate::queue::Task) -> Result<WorkerResult, WorkerErro
     let execution_identity = task_identity(&task, computed)?;
     if let Some(pin) = task.execution_identity {
         let Some(assembled) = execution_identity else {
-            return Err(WorkerError::IdentityIncomplete {
-                task_id: task.id.clone(),
-            });
+            return Err(WorkerError::IdentityIncomplete { task_id: task.id });
         };
         if assembled != pin {
-            return Err(WorkerError::IdentityMismatch {
-                task_id: task.id.clone(),
-            });
+            return Err(WorkerError::IdentityMismatch { task_id: task.id });
         }
     }
     let workload = workload_for(&task.workload)?;

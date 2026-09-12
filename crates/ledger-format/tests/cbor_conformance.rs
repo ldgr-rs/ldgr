@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 use std::collections::BTreeMap;
 
 use ledger_format::cbor::{self, CborError, CborValue};
@@ -576,7 +584,7 @@ fn manifest_round_trip_and_version_reject() {
     assert_eq!(decoded, manifest);
 
     // Prior versions fail.
-    let mut bad = bytes.clone();
+    let mut bad = bytes;
     bad[1] = 0x02;
     assert_eq!(
         RunManifest::from_canonical_bytes(&bad),

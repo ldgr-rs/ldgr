@@ -297,7 +297,7 @@ impl Executor {
             return Err(RuntimeError::Belt(belt_status));
         }
         // BestEffort continues and reports status via RunResult.protection.
-        let run_protection = belt_status.clone();
+        let run_protection = belt_status;
         self.journal_spawns()?;
         // Feed initial prefix (spawn entries) to monitor so it observes entry 0.
         let mut early_halt: Option<crate::RunOutcome> = None;
@@ -509,7 +509,7 @@ impl Executor {
             let wake_id = self.shared.journal_append(
                 ActorId(task_id as u32),
                 EntryKind::Wake,
-                send_id.into_iter().collect::<Vec<_>>(),
+                send_id,
                 EntryPayload::Wake(ledger_format::WakePayload::MessageReady {
                     message_id: MessageId::new(ActorId(task_id as u32), 0),
                 }),

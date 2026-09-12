@@ -1,3 +1,5 @@
+// Host build tooling: protoc/env failures fail closed via expect/unwrap.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 // ledger-lint:allow - build script may read env and fs by design
 include!("src/build_codegen.rs");
 

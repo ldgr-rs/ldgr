@@ -57,6 +57,14 @@ libc = "0.2"
 unsafe_op_in_unsafe_fn = "deny"
 missing_abi = "warn"
 
+[workspace.lints.clippy]
+# 08-engineering section 5.1 rule 5: fail the build on unchecked panics in
+# library code. Test code carries file-scoped or module-scoped allows.
+unwrap_used = "deny"
+expect_used = "deny"
+redundant_clone = "warn"
+needless_collect = "warn"
+
 # CI runners hit linker SIGBUS/OOM linking wasmtime-laden debug test
 # binaries; line tables keep backtraces useful at a fraction of the size.
 # Placed after all table sections so it is read as a profile, not keys.

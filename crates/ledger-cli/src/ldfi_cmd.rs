@@ -113,7 +113,7 @@ pub fn run_ldfi(
         steps: finding.run.steps,
         journal_root: finding.run.journal.root_hash(),
         witnesses: finding.verdict.witnesses.clone(),
-        origins: finding.run.origins.clone(),
+        origins: finding.run.origins,
         hypotheses: hypotheses
             .into_iter()
             .map(|hypothesis| LdfiHypothesis {

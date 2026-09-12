@@ -348,7 +348,7 @@ pub fn run_feedback_campaign_with_state<W: Workload, O: Oracle>(
         if violated {
             findings.push(Finding {
                 seed: finding.seed,
-                run: report.run.clone(),
+                run: report.run,
                 verdict,
             });
             break;

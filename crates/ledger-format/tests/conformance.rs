@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -879,7 +887,7 @@ fn manifest_version_migration() {
         Err(CborError::UnsupportedVersion(1))
     );
 
-    let mut version_0 = bytes.clone();
+    let mut version_0 = bytes;
     version_0[1] = 0x00;
     assert_eq!(
         RunManifest::from_canonical_bytes(&version_0),

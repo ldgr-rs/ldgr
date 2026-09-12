@@ -71,7 +71,7 @@ pub fn run_dpor(
         .max_steps(cfg.max_steps)
         .build();
 
-    let base = Simulation::new(base_config.clone(), programs.clone()).run()?;
+    let base = Simulation::new(base_config, programs.clone()).run()?;
     let base_root = base.journal.root_hash();
 
     let mut report = DporReport {
