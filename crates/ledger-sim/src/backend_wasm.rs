@@ -728,7 +728,7 @@ impl WasmBackend {
                 let path = String::from_utf8(path_bytes)
                     .map_err(|_| Error::msg("path_open path not utf8"))?;
                 let key = path.trim_start_matches('/').to_owned();
-                let key = if key.is_empty() { path.clone() } else { key };
+                let key = if key.is_empty() { path } else { key };
                 // Preview1 rights bits the u64-cell store can honor.
                 const RIGHT_FD_READ: u64 = 1 << 1;
                 const RIGHT_FD_SEEK: u64 = 1 << 3;

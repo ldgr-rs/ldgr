@@ -210,14 +210,9 @@ pub(crate) fn hash_to_hex(hash: &EntryHash) -> String {
 }
 
 fn hex_to_hash(s: &str) -> Result<EntryHash, String> {
-    if s.len() != 64 {
-        return Err(format!("hash hex must be 64 chars, got {}", s.len()));
-    }
-    let mut out = [0u8; 32];
-    for i in 0..32 {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())?;
-    }
-    Ok(EntryHash(out))
+    // Byte-slice decoding in ledger_format; never slices a `str` at char
+    // boundaries, so hostile multi-byte input is a typed error, not a panic.
+    ledger_format::hash_from_hex(s).map_err(|err| err.to_string())
 }
 
 fn check_string_bytes(s: &str, field: &str) -> Result<(), CertError> {
@@ -1043,18 +1038,23 @@ impl CampaignCertificate {
         }
         let paths = collect_fault_paths_iterative(journal, &data.witnesses, horizon)?;
         let cut: std::collections::BTreeSet<EntryHash> = data.cut.iter().copied().collect();
+        // One pass over all paths: a path with no cut member is a miss; a
+        // member is proven essential when some path hits it alone.
+        let mut essential: std::collections::BTreeSet<EntryHash> =
+            std::collections::BTreeSet::new();
         for path in &paths {
-            if path.iter().all(|id| !cut.contains(id)) {
+            let members: Vec<&EntryHash> = path.iter().filter(|id| cut.contains(*id)).collect();
+            if members.is_empty() {
                 return Err(CertError::Verification(
                     "recorded cut misses a witness derivation path".into(),
                 ));
             }
+            if let [only] = members.as_slice() {
+                essential.insert(**only);
+            }
         }
         for member in &data.cut {
-            let essential = paths.iter().any(|path| {
-                path.contains(member) && path.iter().filter(|id| cut.contains(*id)).count() == 1
-            });
-            if !essential {
+            if !essential.contains(member) {
                 return Err(CertError::Verification(format!(
                     "cut member {:02x?} is redundant: the recorded cut is not \
                      inclusion-minimal",
@@ -1648,6 +1648,23 @@ mod tests {
         let raw = " ".repeat(CERT_MAX_BYTES + 1);
         let error = CampaignCertificate::from_json(&raw).expect_err("oversize must fail");
         assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn from_json_rejects_multibyte_digest_without_panicking() {
+        // 64 bytes long, but a multi-byte char at an odd byte offset used to
+        // panic on the char-boundary slice in hex decoding.
+        let digest = "é".repeat(32);
+        let json = serde_json::json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "s", "digest": {"blake3": digest}}],
+            "predicateType": "https://slsa.dev/provenance/v1",
+            "predicate": {}
+        });
+        let raw = serde_json::to_string(&json).expect("JSON must serialize");
+        let error = CampaignCertificate::from_json(&raw)
+            .expect_err("multi-byte digest must be a schema error");
+        assert!(matches!(error, CertError::Schema(_)), "{error}");
     }
 
     #[test]

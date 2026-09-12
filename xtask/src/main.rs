@@ -1,3 +1,5 @@
+// Workspace dev tool: malformed workspace layout fails via expect/unwrap exit paths.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Workspace automation: `cargo xtask licenses`, `cargo xtask doctor`.
 //! `licenses` enforces the crate license split and the license-boundary
 //! architecture; `doctor` checks the onboarding environment.

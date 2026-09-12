@@ -46,10 +46,10 @@ impl Workload for MiniKvWorkload {
             .entries()
             .filter_map(|entry| match (&entry.data.kind, &entry.data.payload) {
                 (EntryKind::Send, EntryPayload::Send(frame)) if frame.to == ActorId(1) => {
+                    // Wire-decoded bytes are untrusted: a payload that does
+                    // not carry a full u64 is not a kv write, never a panic.
                     let value = u64::from_le_bytes(
-                        frame.original_content[..8]
-                            .try_into()
-                            .expect("8-byte payload"),
+                        <[u8; 8]>::try_from(frame.original_content.as_slice()).ok()?,
                     );
                     if entry.data.actor == ActorId(0) && value == 42 {
                         Some(HistoryOperation::Write {

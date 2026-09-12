@@ -516,9 +516,11 @@ impl Handle {
         // in-process net; sender ids are never scanned or bounded here.
         loop {
             let notified = {
+                // A poisoned guard is recovered, never converted into data:
+                // returning 0 here would look like a real empty payload.
                 let mut net = match self.shared_net.inner().lock() {
                     Ok(g) => g,
-                    Err(_) => return 0,
+                    Err(poisoned) => poisoned.into_inner(),
                 };
                 if let Some(payload) = net.recv_for(self.actor) {
                     return payload;
@@ -694,7 +696,7 @@ fn run_with_sim(config: RunConfig, main: Main) -> Result<RunResult, RuntimeError
     let seed = config.seed();
     let max_steps = config.max_steps();
     let shared_net = shared_network();
-    let net_for_sim = shared_net.clone();
+    let net_for_sim = shared_net;
     let sim_cfg = SimRunConfig::builder()
         .seed(seed)
         .max_steps(max_steps)

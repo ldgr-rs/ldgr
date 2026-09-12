@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Host-side throughput profiling binary for the 4-task sim workload.
 //!
 //! Run: `cargo run -p ledger-sim --example profile_throughput --release`,

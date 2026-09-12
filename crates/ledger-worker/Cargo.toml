@@ -30,8 +30,8 @@ reqwest = { version = "0.13", optional = true, default-features = false, feature
 	"json",
 ] }
 prost = { version = "0.14", optional = true }
-# `router` hosts add_service(); `transport` alone only ships channel and
-# server plumbing.
+# Client-only daemon: `transport` ships the channel. `router` exists for
+# `add_service`, used by the cross_boundary test's fake control plane only.
 tonic = { version = "0.14", optional = true, default-features = false, features = [
 	"transport",
 	"router",

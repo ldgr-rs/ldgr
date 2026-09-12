@@ -22,8 +22,24 @@ use std::collections::BTreeSet;
 
 use crate::ldfi::FaultableEvent;
 
+/// Maximum derivation paths the exact hitting-set engine accepts; excess
+/// fails closed instead of enumerating a super-polynomial candidate space.
+pub const MAX_HITTING_SET_PATHS: usize = 65536;
+
+/// Maximum candidate sets enumerated between pruning rounds; excess fails
+/// closed with [`SolverError::BudgetExhausted`].
+pub const MAX_HITTING_SET_CANDIDATES: usize = 65536;
+
 /// Minimal hitting sets. Deterministic: sorted inputs, pruned supersets.
-fn compute_minimal_hitting_sets(paths: &[Vec<FaultableEvent>]) -> Vec<BTreeSet<EntryHash>> {
+/// Fails closed when the path or candidate budget would be exceeded.
+fn compute_minimal_hitting_sets(
+    paths: &[Vec<FaultableEvent>],
+) -> Result<Vec<BTreeSet<EntryHash>>, SolverError> {
+    if paths.len() > MAX_HITTING_SET_PATHS {
+        return Err(SolverError::BudgetExhausted(
+            "derivation paths exceed the hitting-set budget",
+        ));
+    }
     let mut candidate_sets: Vec<BTreeSet<EntryHash>> = vec![BTreeSet::new()];
 
     for path in paths {
@@ -42,10 +58,15 @@ fn compute_minimal_hitting_sets(paths: &[Vec<FaultableEvent>]) -> Vec<BTreeSet<E
             }
         }
 
+        if next_candidates.len() > MAX_HITTING_SET_CANDIDATES {
+            return Err(SolverError::BudgetExhausted(
+                "hitting-set candidate sets exceed the budget",
+            ));
+        }
         candidate_sets = prune_supersets(next_candidates);
     }
 
-    candidate_sets
+    Ok(candidate_sets)
 }
 
 fn prune_supersets(mut sets: Vec<BTreeSet<EntryHash>>) -> Vec<BTreeSet<EntryHash>> {

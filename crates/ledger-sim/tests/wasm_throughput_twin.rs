@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Throughput workload native twin: Wasm and native backends journal identically.
 //!
 //! The guest `run_throughput` draws 2000 values from stream 9 with an inner

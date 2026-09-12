@@ -42,7 +42,7 @@ pub struct FaultDepScenario {
     /// Declared candidate fault vocabulary for the random control. Derived
     /// from the no-fault baseline of the base seed, never from a violating
     /// run.
-    pub fault_space: fn() -> Vec<SimFault>,
+    pub fault_space: fn() -> Result<Vec<SimFault>, String>,
     /// The pinned triggering schedule, derived from the baseline journal.
     pub trigger: fn(&Journal) -> Vec<SimFault>,
     /// Explicit support model, evaluated on the witness journal.
@@ -143,11 +143,11 @@ impl FaultDepScenario {
 // ---------------------------------------------------------------------------
 
 /// The no-fault baseline journal of one workload at one seed.
-fn probe_journal(seed: EntryHash, workload: &dyn Workload) -> Journal {
+fn probe_journal(seed: EntryHash, workload: &dyn Workload) -> Result<Journal, String> {
     Simulation::new(scenario_config(seed, Vec::new()), workload.programs())
         .run()
-        .expect("probe run must execute")
-        .journal
+        .map(|run| run.journal)
+        .map_err(|error| format!("probe run at seed {seed:?} failed: {error}"))
 }
 
 /// Last `FsWrite` of `actor`: the critical write the read-back observes.
@@ -175,9 +175,9 @@ fn push_decoys(program: &mut Vec<ledger_sim::Instruction>, count: usize, prefix:
 /// Declared vocabulary: one Corrupt and one CrashState candidate per
 /// `FsWrite` of the baseline. Parent edges never imply support; the encoding
 /// traverses the declared support.
-fn write_fault_space(seed: EntryHash, workload: &dyn Workload) -> Vec<SimFault> {
-    let journal = probe_journal(seed, workload);
-    journal
+fn write_fault_space(seed: EntryHash, workload: &dyn Workload) -> Result<Vec<SimFault>, String> {
+    let journal = probe_journal(seed, workload)?;
+    let faults: Vec<SimFault> = journal
         .entries()
         .filter(|entry| entry.data.kind == ledger_format::EntryKind::FsWrite)
         .flat_map(|entry| {
@@ -193,7 +193,8 @@ fn write_fault_space(seed: EntryHash, workload: &dyn Workload) -> Vec<SimFault> 
                 SimFault::CrashState { write, state: 2 },
             ]
         })
-        .collect()
+        .collect::<Vec<_>>();
+    Ok(faults)
 }
 
 /// Oracle: the last recorded outcome must equal `expected`.
@@ -218,9 +219,9 @@ fn first_send(baseline: &Journal, actor: ledger_format::ActorId) -> ledger_forma
 /// Declared vocabulary: one Drop, Delay, and Duplicate candidate per `Send`
 /// of the baseline. Parent edges never imply support; the encoding
 /// traverses the declared support.
-fn message_fault_space(seed: EntryHash, workload: &dyn Workload) -> Vec<SimFault> {
-    let journal = probe_journal(seed, workload);
-    journal
+fn message_fault_space(seed: EntryHash, workload: &dyn Workload) -> Result<Vec<SimFault>, String> {
+    let journal = probe_journal(seed, workload)?;
+    let faults: Vec<SimFault> = journal
         .entries()
         .filter(|entry| entry.data.kind == ledger_format::EntryKind::Send)
         .flat_map(|entry| {
@@ -231,7 +232,8 @@ fn message_fault_space(seed: EntryHash, workload: &dyn Workload) -> Vec<SimFault
                 SimFault::Duplicate { send },
             ]
         })
-        .collect()
+        .collect::<Vec<_>>();
+    Ok(faults)
 }
 
 /// Oracle: exactly one numeric outcome holding `expected`.
@@ -600,7 +602,7 @@ fn az_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn az_space() -> Vec<SimFault> {
+fn az_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([20; 32]), az_double_assign().as_ref())
 }
 
@@ -615,7 +617,7 @@ fn flap_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn flap_space() -> Vec<SimFault> {
+fn flap_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([21; 32]), instance_flap().as_ref())
 }
 
@@ -630,7 +632,7 @@ fn drift_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn drift_space() -> Vec<SimFault> {
+fn drift_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([22; 32]), config_drift().as_ref())
 }
 
@@ -645,7 +647,7 @@ fn quota_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn quota_space() -> Vec<SimFault> {
+fn quota_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([23; 32]), quota_retry_storm().as_ref())
 }
 
@@ -660,7 +662,7 @@ fn heartbeat_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn heartbeat_space() -> Vec<SimFault> {
+fn heartbeat_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([24; 32]), lease_heartbeat().as_ref())
 }
 
@@ -675,7 +677,7 @@ fn publish_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn publish_space() -> Vec<SimFault> {
+fn publish_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([25; 32]), config_publish().as_ref())
 }
 
@@ -690,7 +692,7 @@ fn dedup_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn dedup_space() -> Vec<SimFault> {
+fn dedup_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([26; 32]), quota_dedup_sector().as_ref())
 }
 
@@ -705,7 +707,7 @@ fn drain_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn drain_space() -> Vec<SimFault> {
+fn drain_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([27; 32]), drain_completion().as_ref())
 }
 
@@ -720,7 +722,7 @@ fn dual_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn dual_space() -> Vec<SimFault> {
+fn dual_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([28; 32]), dual_region_commit().as_ref())
 }
 
@@ -735,7 +737,7 @@ fn canary_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn canary_space() -> Vec<SimFault> {
+fn canary_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([29; 32]), canary_promote().as_ref())
 }
 
@@ -750,7 +752,7 @@ fn redelivery_support(journal: &Journal) -> SupportExpr {
     support_last_fs_write(journal, ledger_format::ActorId(0))
 }
 
-fn redelivery_space() -> Vec<SimFault> {
+fn redelivery_space() -> Result<Vec<SimFault>, String> {
     write_fault_space(EntryHash([30; 32]), duplicate_redelivery().as_ref())
 }
 
@@ -764,7 +766,7 @@ fn delivery_support(journal: &Journal) -> SupportExpr {
     support_observed_sends(journal)
 }
 
-fn delivery_space() -> Vec<SimFault> {
+fn delivery_space() -> Result<Vec<SimFault>, String> {
     message_fault_space(EntryHash([31; 32]), duplicate_delivery().as_ref())
 }
 

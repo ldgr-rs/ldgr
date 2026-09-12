@@ -1,3 +1,5 @@
+// Host build tooling: protoc/env failures fail closed via expect/unwrap.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 // ledger-lint:allow - build script may read env and fs by design
 include!("src/build_codegen.rs");
 
@@ -12,6 +14,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         regenerate(Path::new(env!("CARGO_MANIFEST_DIR")), |paths| {
             let includes: Vec<&PathBuf> = paths.includes.iter().collect();
             tonic_prost_build::configure()
+                // The daemon hosts no service; the generated server types
+                // exist for the cross_boundary test's fake control plane
+                // only, which is also why tonic carries the `router`
+                // feature in the grpc build.
                 .build_server(true)
                 .build_client(true)
                 .out_dir(&paths.out_dir)

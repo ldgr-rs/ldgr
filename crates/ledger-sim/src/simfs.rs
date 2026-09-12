@@ -38,6 +38,10 @@ pub enum SimFsError {
     /// A crash operator targeted a write entry that is not a prior write.
     #[error("crash operator targets unknown write entry")]
     UnknownWriteTarget,
+    /// A crash operator referenced a path that is not valid UTF-8, so the
+    /// file table cannot address it.
+    #[error("crash operator path is not addressable: {0}")]
+    UnaddressablePath(String),
     /// A crash operator carried an empty XOR payload.
     #[error("crash operator has an empty XOR payload")]
     EmptyXor,
@@ -685,8 +689,13 @@ impl SimFs {
                 let mut seen = BTreeSet::new();
                 let mut keys = Vec::new();
                 for path_ref in paths {
-                    let key =
-                        String::from_utf8(path_ref.canonical_path.clone()).unwrap_or_default();
+                    // A crash operator naming a path the table cannot
+                    // address must fail closed, not silently no-op.
+                    let key = String::from_utf8(path_ref.canonical_path.clone()).map_err(|_| {
+                        SimFsError::UnaddressablePath(
+                            String::from_utf8_lossy(&path_ref.canonical_path).into_owned(),
+                        )
+                    })?;
                     if !seen.insert(key.clone()) {
                         return Err(SimFsError::AlreadyExists(key));
                     }
@@ -1042,6 +1051,29 @@ mod tests {
         assert_eq!(observed, ObservedRead::Present { content: vec![1] });
         let observed = fs.read_bytes(&mut journal, ActorId(0), "b", 0, 1).unwrap();
         assert_eq!(observed, ObservedRead::Present { content: vec![2] });
+    }
+
+    #[test]
+    fn drop_paths_fails_closed_on_unaddressable_path() {
+        let mut journal = new_journal();
+        let mut fs = SimFs::new();
+        fs.write_bytes(&mut journal, ActorId(0), "a", 0, vec![1])
+            .unwrap();
+        // A non-UTF-8 canonical path cannot address any table entry; the
+        // operator must error instead of silently dropping nothing.
+        let mut raw = b"/a".to_vec();
+        raw.insert(2, 0xff);
+        let err = fs
+            .apply_crash_operation(&CrashOperation::DropPaths {
+                paths: vec![PathRef::new([0u8; 32], raw)],
+            })
+            .unwrap_err();
+        assert!(matches!(err, SimFsError::UnaddressablePath(_)), "{err}");
+        // The file survives: nothing was dropped.
+        fs.apply_crash_operation(&CrashOperation::DropPaths {
+            paths: vec![path_ref("a")],
+        })
+        .unwrap();
     }
 
     #[test]

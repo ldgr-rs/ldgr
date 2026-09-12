@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! MCS certificates on bug-corpus-v1: each planted bug reproduces,
 //! yields a MaxSAT MCS cut with a valid lower-bound certificate, and
 //! the cut maps to an executable fault schedule that replays.

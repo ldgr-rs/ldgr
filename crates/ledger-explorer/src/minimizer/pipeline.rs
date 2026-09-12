@@ -80,13 +80,13 @@ where
                 if oracle.check(&run_for_check(journal.clone())).violated {
                     (ids, journal)
                 } else {
-                    (all_ids.clone(), finding.run.journal.clone())
+                    (all_ids, finding.run.journal.clone())
                 }
             }
-            _ => (all_ids.clone(), finding.run.journal.clone()),
+            _ => (all_ids, finding.run.journal.clone()),
         }
     } else {
-        (all_ids.clone(), finding.run.journal.clone())
+        (all_ids, finding.run.journal.clone())
     };
     let slice_kept = slice.len();
 

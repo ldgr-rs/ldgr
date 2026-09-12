@@ -1,3 +1,5 @@
+// Host build tooling: protoc/env failures fail closed via expect/unwrap.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Build the process-belt interposition shim when the sentinel feature is on.
 //!
 //! The cc crate only produces static archives, but LD_PRELOAD needs a shared

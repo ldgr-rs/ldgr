@@ -27,3 +27,6 @@ path = "fuzz_targets/tolerant_reader.rs"
 test = false
 doc = false
 bench = false
+
+[lints]
+workspace = true

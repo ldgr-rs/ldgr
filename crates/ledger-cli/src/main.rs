@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::redundant_clone,
+        clippy::needless_collect
+    )
+)]
 //! Command-line interface for the Ledger DST platform.
 // ledger-lint:allow (host application; the CLI reads project files and spawns
 //   tool processes, unlike simulation code)

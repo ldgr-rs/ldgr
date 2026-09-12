@@ -24,7 +24,7 @@
 use std::cell::RefCell;
 use std::format;
 use std::fs::{self, File};
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Read};
 use std::path::{Path, PathBuf};
 use std::string::{String, ToString};
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use std::vec::Vec;
 use crate::clock::VectorClock;
 use crate::dag::{Entry, JournalError};
 use crate::retention::RetentionClass;
+use ledger_format::limits::{MAX_COMPRESSED_SEGMENT_BYTES, MAX_DECOMPRESSED_SEGMENT_BYTES};
 use ledger_format::{ActorId, CborValue, EntryData, EntryHash};
 
 mod indexing;
@@ -272,6 +273,35 @@ fn prefix_of(hash: &EntryHash) -> u32 {
     u32::from_le_bytes([hash.0[0], hash.0[1], hash.0[2], hash.0[3]])
 }
 
+/// Decompress one segment frame block under the declared byte caps.
+///
+/// The compressed input is bounded before decode; the streaming decoder is
+/// capped so a hostile bomb cannot allocate past
+/// [`MAX_DECOMPRESSED_SEGMENT_BYTES`].
+pub(crate) fn decode_segment_block(compressed: &[u8]) -> Result<Vec<u8>, JournalError> {
+    if compressed.len() > MAX_COMPRESSED_SEGMENT_BYTES {
+        return Err(JournalError::SegmentCorrupt(
+            "compressed segment block exceeds limit".to_string(),
+        ));
+    }
+    decode_segment_block_with_cap(compressed, MAX_DECOMPRESSED_SEGMENT_BYTES)
+}
+
+fn decode_segment_block_with_cap(compressed: &[u8], cap: usize) -> Result<Vec<u8>, JournalError> {
+    let decoder = zstd::stream::read::Decoder::new(compressed).map_err(segment_io)?;
+    let mut block = Vec::new();
+    decoder
+        .take((cap.saturating_add(1)) as u64)
+        .read_to_end(&mut block)
+        .map_err(segment_io)?;
+    if block.len() > cap {
+        return Err(JournalError::SegmentCorrupt(
+            "decompressed segment block exceeds limit".to_string(),
+        ));
+    }
+    Ok(block)
+}
+
 fn segment_io(err: io::Error) -> JournalError {
     JournalError::SegmentCorrupt(err.to_string())
 }
@@ -477,6 +507,17 @@ mod tests {
             std::env::temp_dir().join(format!("ldgr-segment-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn segment_block_decode_enforces_decompressed_cap() {
+        let raw = vec![0u8; 64 * 1024];
+        let compressed = zstd::encode_all(&raw[..], 3).unwrap();
+        let decoded = decode_segment_block_with_cap(&compressed, 64 * 1024).unwrap();
+        assert_eq!(decoded.len(), raw.len());
+        assert!(decode_segment_block_with_cap(&compressed, 1024).is_err());
+        let oversized = vec![0u8; MAX_COMPRESSED_SEGMENT_BYTES + 1];
+        assert!(decode_segment_block(&oversized).is_err());
     }
 
     #[test]

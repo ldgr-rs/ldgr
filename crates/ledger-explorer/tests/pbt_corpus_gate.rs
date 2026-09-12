@@ -1,9 +1,17 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! PBT-in-sim corpus gate: planted falsifying inputs found by the input
 //! axis.
 //!
 //! Six input-triggered planted workloads across the three documented
-//! property classes (exactly-once, quorum/consistency, linearizability)
-//! plus one joint (input, fault) plant. Each scenario:
+//! property classes (exactly-once, quorum/consistency, linearizability),
+//! one of them the joint (input, fault) plant. Each scenario:
 //!
 //! 1. holds under a non-triggering input vector (negative precondition);
 //! 2. is found by `search_input` within the declared budget at the pinned

@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Native/Wasm parity: same workload on both backends yields identical
 //! output, journal roots, and monitor-clean journals.
 #![cfg(feature = "backend-wasm")]

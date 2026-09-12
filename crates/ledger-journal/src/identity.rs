@@ -88,7 +88,10 @@ pub struct ExecutionIdentity {
 }
 
 impl ExecutionIdentity {
-    /// Whether every required build field is present.
+    /// Whether every engine build field is present, so a digest can be
+    /// derived. This is engine-side completeness only: root and digest
+    /// equality additionally require the SUT-side fields, which
+    /// [`Self::is_publish_ready`] checks.
     pub fn is_complete(&self) -> bool {
         self.engine_revision.is_some()
             && self.lockfile_digest.is_some()
@@ -96,6 +99,13 @@ impl ExecutionIdentity {
             && !self.toolchain.is_empty()
             && !self.target_triple.is_empty()
             && !self.build_profile.is_empty()
+    }
+
+    /// Whether the identity binds everything the launch playbook requires
+    /// for published evidence: engine completeness plus the SUT revision
+    /// and workload binding.
+    pub fn is_publish_ready(&self) -> bool {
+        self.is_complete() && self.sut_revision.is_some() && !self.workload_id.is_empty()
     }
 
     /// Canonical length-prefixed field encoding in declaration order.
@@ -710,7 +720,8 @@ mod tests {
                 "resource_limits",
                 ExecutionIdentity {
                     resource_limits: ResourceLimits { max_steps: 20_000 },
-                    ..base.clone()
+                    // Final arm: `base` moves here; no clone is needed.
+                    ..base
                 },
             ),
         ];
@@ -772,6 +783,18 @@ mod tests {
                 "{field} empty must yield no digest"
             );
         }
+    }
+
+    #[test]
+    fn publish_readiness_requires_sut_binding() {
+        let mut identity = sample();
+        assert!(identity.is_publish_ready());
+        identity.sut_revision = None;
+        assert!(
+            !identity.is_publish_ready(),
+            "published evidence must bind the SUT revision"
+        );
+        assert!(identity.is_complete(), "engine completeness is unaffected");
     }
 
     #[test]

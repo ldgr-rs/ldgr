@@ -5,7 +5,7 @@
 //! max_steps, attempts}`, response `{roots, findings, steps}` or `{error}`.
 //! Caller programs never cross this boundary.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,13 @@ pub const MAX_WORKLOAD_NAME_BYTES: usize = 128;
 
 /// Maximum remote attempts per call.
 pub const MAX_IPC_ATTEMPTS: usize = 1024;
+
+/// Maximum roots accepted in one run response; mirrors the attempt cap.
+pub const MAX_IPC_ROOTS: usize = MAX_IPC_ATTEMPTS;
+
+/// Maximum response-line bytes accepted from the engine (1 MiB); mirrors
+/// the server-side line cap.
+pub const MAX_IPC_LINE_BYTES: usize = 1 << 20;
 
 /// Maximum actor id accepted on the IPC control path.
 pub const MAX_IPC_ACTOR: u32 = 1 << 20;
@@ -321,7 +328,16 @@ impl EngineProcess {
         let _ = reader
             .get_mut()
             .set_read_timeout(Some(Duration::from_secs(5)));
-        let bytes = reader.read_line(&mut response_line)?;
+        // Bound the response line: a server streaming bytes without a
+        // newline must fail closed instead of growing the buffer.
+        let bytes = reader
+            .take((MAX_IPC_LINE_BYTES + 1) as u64)
+            .read_line(&mut response_line)?;
+        if bytes > MAX_IPC_LINE_BYTES {
+            return Err(IpcError::Protocol(
+                "server response line exceeds the byte cap",
+            ));
+        }
         if bytes == 0 {
             return Err(IpcError::Protocol(
                 "server closed connection without response",
@@ -485,6 +501,14 @@ fn validate_workload_request(
 fn parse_run_response(value: &serde_json::Value) -> Result<RunOutcome, IpcError> {
     let mut roots: Vec<EntryHash> = Vec::new();
     if let Some(array) = value.get("roots").and_then(|v| v.as_array()) {
+        // Fail closed on an oversized array instead of streaming unbounded
+        // 32-byte roots into memory.
+        if array.len() > MAX_IPC_ROOTS {
+            return Err(IpcError::CounterBounds {
+                name: "roots",
+                raw: array.len() as u64,
+            });
+        }
         for item in array {
             if let Some(hex) = item.as_str() {
                 roots.push(hex_decode32(hex)?);

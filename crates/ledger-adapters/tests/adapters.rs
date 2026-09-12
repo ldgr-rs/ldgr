@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 use ledger_adapters::envelope::{EntryMapping, EnvelopeHeader, Fidelity, InterchangeEnvelope};
 use ledger_adapters::otel::{
     OtelEvent, OtelSpan, ingest_otel_enveloped, ingest_otel_with_fidelity,

@@ -172,12 +172,8 @@ impl HittingSetSolver {
         {
             return Ok(cached.clone());
         }
-        self.cache.insert(key, clauses.clone());
-        let hitting_sets = compute_minimal_hitting_sets(&all_paths);
-        let hash_paths: Vec<Vec<EntryHash>> = all_paths
-            .iter()
-            .map(|path| path.iter().map(|event| event.event).collect())
-            .collect();
+        self.cache.insert(key, clauses);
+        let hitting_sets = compute_minimal_hitting_sets(&all_paths)?;
         // Support-gated wording uses the caller-supplied expression directly:
         // only `is_strong` backs a minimum claim.
         let strong = support.is_strong();
@@ -221,7 +217,6 @@ impl HittingSetSolver {
         hypotheses.sort_by_key(|hypothesis| (hypothesis.total_cost, hypothesis.events.len()));
         hypotheses = samc_prune(journal, hypotheses);
         self.hypothesis_cache.insert(key, hypotheses.clone());
-        let _ = hash_paths;
         Ok(hypotheses)
     }
 
@@ -231,7 +226,7 @@ impl HittingSetSolver {
         closure_hash: EntryHash,
         clauses: Vec<WeightedClause>,
         engine_tag: u8,
-    ) -> Vec<FaultHypothesis> {
+    ) -> Result<Vec<FaultHypothesis>, SolverError> {
         let key = self.incremental_key_with_tag(closure_hash, engine_tag);
         // Per-solver cache only; no process-global store exists.
         if let Some(cached) = self.hypothesis_cache.get(&key) {
@@ -242,7 +237,7 @@ impl HittingSetSolver {
             if let Some(cached_clauses) = self.cache.get(&key)
                 && cached_clauses == &clauses
             {
-                return cached.clone();
+                return Ok(cached.clone());
             }
         }
 
@@ -271,7 +266,7 @@ impl HittingSetSolver {
         let hitting_sets = if paths.is_empty() {
             Vec::new()
         } else {
-            compute_minimal_hitting_sets(&paths)
+            compute_minimal_hitting_sets(&paths)?
         };
 
         let mut hypotheses: Vec<FaultHypothesis> = hitting_sets
@@ -303,9 +298,9 @@ impl HittingSetSolver {
         hypotheses.sort_by_key(|h| (h.total_cost, h.events.len()));
 
         // Per-solver memo only; each campaign constructs its solver anew.
-        self.cache.insert(key, clauses.clone());
+        self.cache.insert(key, clauses);
         self.hypothesis_cache.insert(key, hypotheses.clone());
-        hypotheses
+        Ok(hypotheses)
     }
 }
 
@@ -430,9 +425,9 @@ impl FaultSolver for HittingSetSolver {
 
         // Insert clauses into the per-solver cache only. No global store
         // exists; each campaign constructs its solver anew.
-        self.cache.insert(key, clauses.clone());
+        self.cache.insert(key, clauses);
 
-        let hitting_sets = compute_minimal_hitting_sets(&all_paths);
+        let hitting_sets = compute_minimal_hitting_sets(&all_paths)?;
         let hash_paths: Vec<Vec<EntryHash>> = all_paths
             .iter()
             .map(|path| path.iter().map(|event| event.event).collect())
@@ -470,7 +465,7 @@ impl FaultSolver for HittingSetSolver {
         &mut self,
         closure_hash: EntryHash,
         clauses: Vec<WeightedClause>,
-    ) -> Vec<FaultHypothesis> {
+    ) -> Result<Vec<FaultHypothesis>, SolverError> {
         self.solve_incremental_with_tag(closure_hash, clauses, engine_tag::BUILTIN)
     }
 

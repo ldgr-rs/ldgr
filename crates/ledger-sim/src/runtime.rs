@@ -235,7 +235,7 @@ impl Simulation {
         programs: Vec<Vec<Instruction>>,
         replay: Vec<usize>,
     ) -> Self {
-        let executor = Executor::with_shared_and_replay_strict(config.clone(), replay, |shared| {
+        let executor = Executor::with_shared_and_replay_strict(config, replay, |shared| {
             install_programs(shared, programs);
         });
         Self { executor }
@@ -248,14 +248,10 @@ impl Simulation {
         replay: Vec<usize>,
         fallback: Policy,
     ) -> Self {
-        let executor = Executor::with_shared_and_replay_and_fallback(
-            config.clone(),
-            replay,
-            fallback,
-            |shared| {
+        let executor =
+            Executor::with_shared_and_replay_and_fallback(config, replay, fallback, |shared| {
                 install_programs(shared, programs);
-            },
-        );
+            });
         Self { executor }
     }
 
@@ -294,7 +290,7 @@ impl Simulation {
     /// reference-sim surface: protocol code in Rust, not instruction programs.
     pub fn with_tasks(config: RunConfig, builders: Vec<TaskBuilder>) -> Self {
         let executor = Executor::with_shared_and_replay_and_fallback(
-            config.clone(),
+            config,
             Vec::new(),
             Policy::Random,
             |shared| {

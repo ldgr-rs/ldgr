@@ -136,7 +136,8 @@ fn read_message(stream: &mut UnixStream) -> Result<(u64, Message), ShimError> {
 
 /// Encode and write one frame.
 fn write_message(stream: &mut UnixStream, seq: u64, message: &Message) -> Result<(), ShimError> {
-    let body = encode_message(message);
+    let body = encode_message(message)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     let frame = encode_frame(seq, &body)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     stream.write_all(&frame)?;

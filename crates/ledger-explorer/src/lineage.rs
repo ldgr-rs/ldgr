@@ -81,34 +81,66 @@ fn collect_bounded_hash(
     }
 }
 
+/// Node budget for the unbounded walk. A hostile deep or diamond-heavy
+/// journal exhausts the budget instead of the stack, and the walk degrades
+/// exactly like a horizon cut: `truncated` yields an `Opaque` support
+/// branch and the caller fails closed with `EmptyProvenance`.
+const LINEAGE_WALK_NODE_BUDGET: usize = 1_000_000;
+
 fn collect_hash(
     journal: &Journal,
-    current: EntryHash,
+    start: EntryHash,
     current_path: &mut Vec<EntryHash>,
     paths: &mut Vec<Vec<EntryHash>>,
     closure: &mut BTreeSet<EntryHash>,
+    truncated: &mut bool,
 ) {
-    let Some(entry) = journal.get(&current) else {
-        return;
-    };
-    closure.insert(current);
-    let pushed = if is_faultable(entry.data.kind) {
-        current_path.push(current);
-        true
-    } else {
-        false
-    };
-    if entry.data.parents.is_empty() {
-        if !current_path.is_empty() {
-            paths.push(current_path.clone());
-        }
-    } else {
-        for parent in &entry.data.parents {
-            collect_hash(journal, *parent, current_path, paths, closure);
-        }
+    enum Frame {
+        /// Visit an entry.
+        Enter(EntryHash),
+        /// Leave an entry, popping the faultable prefix pushed on entry.
+        Exit(bool),
     }
-    if pushed {
-        current_path.pop();
+    let mut budget = LINEAGE_WALK_NODE_BUDGET;
+    let mut stack = vec![Frame::Enter(start)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Exit(pushed) => {
+                if pushed {
+                    current_path.pop();
+                }
+            }
+            Frame::Enter(current) => {
+                if budget == 0 {
+                    *truncated = true;
+                    if !current_path.is_empty() {
+                        paths.push(current_path.clone());
+                    }
+                    continue;
+                }
+                budget -= 1;
+                let Some(entry) = journal.get(&current) else {
+                    continue;
+                };
+                closure.insert(current);
+                let pushed = if is_faultable(entry.data.kind) {
+                    current_path.push(current);
+                    true
+                } else {
+                    false
+                };
+                stack.push(Frame::Exit(pushed));
+                if entry.data.parents.is_empty() {
+                    if !current_path.is_empty() {
+                        paths.push(current_path.clone());
+                    }
+                } else {
+                    for parent in &entry.data.parents {
+                        stack.push(Frame::Enter(*parent));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -141,6 +173,7 @@ fn collect_lineage(
                 &mut current_path,
                 &mut raw_paths,
                 &mut closure,
+                &mut truncated,
             );
         }
     }

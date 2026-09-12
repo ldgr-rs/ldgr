@@ -159,12 +159,12 @@ pub fn task_from_dispatch(dispatch: TaskDispatch) -> Result<Task, SessionError> 
 /// Returns [`SessionError::IdentityEncoding`] when unhashable.
 pub fn worker_hello(worker_id: &str, version: &str) -> Result<WorkerHello, SessionError> {
     let profile = RuntimeProfile {
-        engine_sha: crate::RuntimeProfile::detect().engine_sha.clone(),
-        toolchain: crate::RuntimeProfile::detect().toolchain.clone(),
-        features: crate::RuntimeProfile::detect().features.clone(),
-        sut_hashes: crate::RuntimeProfile::detect().sut_hashes.clone(),
-        cpu_topology: crate::RuntimeProfile::detect().cpu_topology.clone(),
-        env_sanitation: crate::RuntimeProfile::detect().env_sanitation.clone(),
+        engine_sha: crate::RuntimeProfile::detect().engine_sha,
+        toolchain: crate::RuntimeProfile::detect().toolchain,
+        features: crate::RuntimeProfile::detect().features,
+        sut_hashes: crate::RuntimeProfile::detect().sut_hashes,
+        cpu_topology: crate::RuntimeProfile::detect().cpu_topology,
+        env_sanitation: crate::RuntimeProfile::detect().env_sanitation,
         fingerprint_hex: crate::RuntimeProfile::detect().fingerprint_hex8(),
     };
     Ok(WorkerHello {
@@ -278,7 +278,6 @@ pub async fn run_assigned_task(
             if tx.send(msg).await.is_err() {
                 return Err(SessionError::RequestChannelClosed);
             }
-            eprintln!("WORKER-SENT: upload {task_id}");
             TaskOutcome::Completed(ok)
         }
         Ok(Err(err)) => {

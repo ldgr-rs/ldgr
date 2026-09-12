@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Minimization gate: at least 90% of entries removed off a failing
 //! 10^6-entry run, violation preserved, judged by a VALUE-DEPENDENT causal
 //! oracle instead of a marker-assertion oracle.

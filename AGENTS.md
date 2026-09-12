@@ -21,7 +21,7 @@ Rust 1.97.1, pinned in `rust-toolchain.toml`.
 - `rust-toolchain.toml` is the toolchain and target source of truth.
 - `README.md` is the user-facing entry point.
 - `docs/` contains the design source of truth.
-- `crates/ledger-format/proto/ledger/control/v1/control.proto` is the source
+- `crates/ledger-format/proto/ledger/control/v2/control.proto` is the source
   of truth for the control-plane wire contract.
 - `corpora/` contains planted ambient-API leaks and deterministic bug fixtures.
 
@@ -115,7 +115,7 @@ Treat these as compatibility boundaries:
 - Do not change canonical CBOR, entry kinds, hash inputs, journal roots,
   manifests, or `.ldgr` framing without an approved format change and version
   review.
-- Do not change `ledger.control.v1` fields, field numbers, RPCs, or wire
+- Do not change `ledger.control.v2` fields, field numbers, RPCs, or wire
   semantics without updating the proto source, generated bindings,
   compatibility tests, and docs together. Keep changes additive within a
   version unless a version bump is approved.

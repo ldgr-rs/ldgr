@@ -33,7 +33,7 @@ jobs:
           targets: wasm32-wasip1
       - name: Install protoc
         # tonic_prost_build needs protoc to regenerate the checked-in
-        # src/gen/ledger.control.v1.rs under --all-features (ledger-worker
+        # src/gen/ledger.control.v2.rs under --all-features (ledger-worker
         # grpc), so clippy, check, and the test suite all need it. Mirrors
         # control-plane-ci.yml.
         uses: arduino/setup-protoc@v3
@@ -108,7 +108,7 @@ jobs:
           targets: wasm32-wasip1
       - name: Install protoc
         # The worker powerset below compiles grpc, whose build script
-        # regenerates src/gen/ledger.control.v1.rs via tonic_prost_build.
+        # regenerates src/gen/ledger.control.v2.rs via tonic_prost_build.
         uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ github.token }}

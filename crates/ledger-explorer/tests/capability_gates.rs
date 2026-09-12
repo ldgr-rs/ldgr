@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! A4 capability closure gates: direct evidence for the Stage 2 named
 //! capabilities.
 //!
@@ -510,7 +518,10 @@ fn run_scaling_chain(n: usize) -> (usize, usize, usize, usize, bool, bool, Durat
         v
     };
     let closure_hash = ClauseCache::closure_hash(&witness_ids);
-    let walked = solver.solve_incremental(closure_hash, clauses).len();
+    let walked = solver
+        .solve_incremental(closure_hash, clauses)
+        .expect("incremental solve must stay within budget")
+        .len();
     let solved = walked > 0;
 
     // Statement emission and journal-anchored validation.

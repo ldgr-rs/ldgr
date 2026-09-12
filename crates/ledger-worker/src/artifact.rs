@@ -39,6 +39,11 @@ pub enum ArtifactError {
         #[source]
         source: reqwest::Error,
     },
+    /// The HTTP client could not initialize (TLS backend failure); a
+    /// default client would lose the configured timeouts.
+    #[cfg(feature = "control-plane")]
+    #[error("artifact HTTP client failed to initialize")]
+    ClientBuild(#[source] reqwest::Error),
     /// The response was decodable but violated the wire contract.
     #[error("{0} response invalid: {1}")]
     Contract(Phase, &'static str),
@@ -113,20 +118,21 @@ impl HttpSink {
     /// Build a sink for `base_url`, optionally sending `Authorization:
     /// Bearer <token>`.
     ///
-    /// # Panics
-    /// Panics when the TLS backend cannot initialize (reqwest builder
-    /// contract); this is a startup-time failure, not per-task.
-    pub fn new(base_url: impl Into<String>, token: Option<String>) -> Self {
+    /// # Errors
+    /// Returns [`ArtifactError::ClientBuild`] when the TLS backend cannot
+    /// initialize. The caller must fail at startup: running with a default
+    /// client would silently drop the request timeouts.
+    pub fn new(base_url: impl Into<String>, token: Option<String>) -> Result<Self, ArtifactError> {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
-        Self {
+            .map_err(ArtifactError::ClientBuild)?;
+        Ok(Self {
             base_url: base_url.into(),
             token,
             client,
-        }
+        })
     }
 
     fn get(&self, path: &str) -> Result<reqwest::blocking::Response, ArtifactError> {

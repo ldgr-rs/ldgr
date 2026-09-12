@@ -2,7 +2,7 @@
 //! server replies `Welcome`/`Reject` then one response per request.
 //! All lengths checked before allocation.
 
-use super::codec::DecodeError;
+use super::codec::{CodecError, DecodeError};
 use super::{MAX_ACTOR, MAX_PATH_BYTES, MAX_PAYLOAD_BYTES, MAX_RANDOM_COUNT};
 use ledger_format::{ActorId, EntryHash};
 
@@ -176,8 +176,24 @@ const R_RANDOM: u8 = 3;
 const R_RECV: u8 = 4;
 const R_FS_READ: u8 = 5;
 
+/// Checked `u32` length prefix for one field.
+///
+/// Field caps (`MAX_PAYLOAD_BYTES`, `MAX_PATH_BYTES`, `MAX_RANDOM_COUNT`,
+/// the bounded-string reader) sit far below `u32::MAX`, so a lossy cast is
+/// unreachable for well-formed messages; oversized values fail with
+/// [`CodecError::BodyTooLarge`] instead of wrapping.
+fn write_len_u32(len: usize, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    let wide = u32::try_from(len).map_err(|_| CodecError::BodyTooLarge(len))?;
+    out.extend_from_slice(&wide.to_le_bytes());
+    Ok(())
+}
+
 /// Encode a message body.
-pub fn encode_message(message: &Message) -> Vec<u8> {
+///
+/// # Errors
+/// Returns [`CodecError::BodyTooLarge`] when a field length exceeds
+/// `u32::MAX`; well-formed messages stay under their decoder caps.
+pub fn encode_message(message: &Message) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
     match message {
         Message::Hello(hello) => {
@@ -192,16 +208,16 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
         Message::Reject(reject) => {
             out.push(T_REJECT);
             out.push(reject.reason as u8);
-            out.extend_from_slice(&(reject.detail.len() as u32).to_le_bytes());
+            write_len_u32(reject.detail.len(), &mut out)?;
             out.extend_from_slice(reject.detail.as_bytes());
         }
         Message::EffectRequest(request) => {
             out.push(T_EFFECT_REQUEST);
-            encode_effect(&request.effect, &mut out);
+            encode_effect(&request.effect, &mut out)?;
         }
         Message::EffectResponse(response) => {
             out.push(T_EFFECT_RESPONSE);
-            encode_result(&response.result, &mut out);
+            encode_result(&response.result, &mut out)?;
         }
         Message::Finish => out.push(T_FINISH),
         Message::Goodbye(goodbye) => {
@@ -210,10 +226,10 @@ pub fn encode_message(message: &Message) -> Vec<u8> {
             out.extend_from_slice(&goodbye.entries.to_le_bytes());
         }
     }
-    out
+    Ok(out)
 }
 
-fn encode_effect(effect: &Effect, out: &mut Vec<u8>) {
+fn encode_effect(effect: &Effect, out: &mut Vec<u8>) -> Result<(), CodecError> {
     match effect {
         Effect::Clock => out.push(E_CLOCK),
         Effect::Sleep { ticks } => {
@@ -228,7 +244,7 @@ fn encode_effect(effect: &Effect, out: &mut Vec<u8>) {
         Effect::Send { to, payload } => {
             out.push(E_SEND);
             out.extend_from_slice(&to.0.to_le_bytes());
-            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            write_len_u32(payload.len(), out)?;
             out.extend_from_slice(payload);
         }
         Effect::Recv => out.push(E_RECV),
@@ -238,25 +254,26 @@ fn encode_effect(effect: &Effect, out: &mut Vec<u8>) {
             bytes,
         } => {
             out.push(E_FS_WRITE);
-            encode_path(path, out);
+            encode_path(path, out)?;
             out.extend_from_slice(&offset.to_le_bytes());
-            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            write_len_u32(bytes.len(), out)?;
             out.extend_from_slice(bytes);
         }
         Effect::FsRead { path, offset, len } => {
             out.push(E_FS_READ);
-            encode_path(path, out);
+            encode_path(path, out)?;
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&len.to_le_bytes());
         }
         Effect::FsSync { path } => {
             out.push(E_FS_SYNC);
-            encode_path(path, out);
+            encode_path(path, out)?;
         }
     }
+    Ok(())
 }
 
-fn encode_result(result: &EffectResult, out: &mut Vec<u8>) {
+fn encode_result(result: &EffectResult, out: &mut Vec<u8>) -> Result<(), CodecError> {
     match result {
         EffectResult::Clock { ticks } => {
             out.push(R_CLOCK);
@@ -265,7 +282,7 @@ fn encode_result(result: &EffectResult, out: &mut Vec<u8>) {
         EffectResult::Ok => out.push(R_OK),
         EffectResult::Random { words } => {
             out.push(R_RANDOM);
-            out.extend_from_slice(&(words.len() as u32).to_le_bytes());
+            write_len_u32(words.len(), out)?;
             out.extend_from_slice(words);
         }
         EffectResult::Recv { payload } => {
@@ -273,7 +290,7 @@ fn encode_result(result: &EffectResult, out: &mut Vec<u8>) {
             match payload {
                 Some(bytes) => {
                     out.push(1);
-                    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    write_len_u32(bytes.len(), out)?;
                     out.extend_from_slice(bytes);
                 }
                 None => out.push(0),
@@ -281,15 +298,17 @@ fn encode_result(result: &EffectResult, out: &mut Vec<u8>) {
         }
         EffectResult::FsRead { observed } => {
             out.push(R_FS_READ);
-            out.extend_from_slice(&(observed.len() as u32).to_le_bytes());
+            write_len_u32(observed.len(), out)?;
             out.extend_from_slice(observed);
         }
     }
+    Ok(())
 }
 
-fn encode_path(path: &str, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+fn encode_path(path: &str, out: &mut Vec<u8>) -> Result<(), CodecError> {
+    write_len_u32(path.len(), out)?;
     out.extend_from_slice(path.as_bytes());
+    Ok(())
 }
 
 /// Append one framed hash (`FRAMED_HASH_PREFIX || digest`, 34 bytes).
@@ -519,7 +538,7 @@ mod tests {
     use super::*;
 
     fn roundtrip(msg: &Message) {
-        let body = encode_message(msg);
+        let body = encode_message(msg).expect("well-formed message encodes");
         let frame = encode_frame(7, &body).expect("frame fits");
         let (seq, got_body) = decode_frame(&frame).expect("frame decodes");
         assert_eq!(seq, 7);
@@ -599,7 +618,7 @@ mod tests {
                 bytes: vec![1],
             },
         });
-        let body = encode_message(&msg);
+        let body = encode_message(&msg).expect("well-formed message encodes");
         // Encode is unguarded for path (the cap is a decode-side trust bound
         // for the server); the decoder must reject it.
         assert_eq!(
@@ -628,7 +647,7 @@ mod tests {
             identity: EntryHash([0xAA; 32]),
             actor: ActorId(crate::proto::MAX_ACTOR + 1),
         });
-        let body = encode_message(&msg);
+        let body = encode_message(&msg).expect("well-formed message encodes");
         assert_eq!(
             decode_message(&body),
             Err(DecodeError::BadActor(crate::proto::MAX_ACTOR + 1)),
@@ -651,7 +670,7 @@ mod tests {
             identity: EntryHash([0xAA; 32]),
             actor: ActorId(3),
         });
-        let body = encode_message(&hello);
+        let body = encode_message(&hello).expect("well-formed message encodes");
         assert_eq!(body.len(), 1 + FRAMED_HASH_LEN + 4);
         assert_eq!(&body[1..3], &FRAMED_HASH_PREFIX);
         assert_eq!(&body[3..35], &[0xAA; 32]);
@@ -660,7 +679,7 @@ mod tests {
             root: EntryHash([0xBB; 32]),
             entries: 12,
         });
-        let body = encode_message(&goodbye);
+        let body = encode_message(&goodbye).expect("well-formed message encodes");
         assert_eq!(body.len(), 1 + FRAMED_HASH_LEN + 8);
         assert_eq!(&body[1..3], &FRAMED_HASH_PREFIX);
         assert_eq!(&body[3..35], &[0xBB; 32]);

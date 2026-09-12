@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::redundant_clone,
+        clippy::needless_collect
+    )
+)]
 #![deny(unsafe_code)]
 
 //! Campaign task execution daemon: pure client (no control-plane service).

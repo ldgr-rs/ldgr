@@ -27,7 +27,9 @@ use ledger_format::frame::MAGIC_SNAPSHOT_STORE;
 /// Name of the snapshot store file inside a journal directory.
 const SNAPSHOT_FILE: &str = "snapshots.ldgr";
 /// Snapshot store format version.
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+///
+/// v2 frames snapshot hashes as 34-byte multihashes, matching format v3.
+const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 /// Byte offset of the chain hash within the header.
 const CHAIN_OFFSET: usize = 8;
 /// Total header length: magic, version, chain hash.
@@ -122,11 +124,14 @@ impl SnapshotStore {
             let len = u64::from_le_bytes(bytes[offset..offset + 8].try_into().map_or([0; 8], |b| b))
                 as usize;
             offset += 8;
-            if offset + len > bytes.len() {
+            let end = offset
+                .checked_add(len)
+                .ok_or(JournalError::SnapshotHashMismatch)?;
+            if end > bytes.len() {
                 return Err(JournalError::SnapshotHashMismatch);
             }
-            let record = &bytes[offset..offset + len];
-            offset += len;
+            let record = &bytes[offset..end];
+            offset = end;
             let mut hasher = blake3::Hasher::new();
             hasher.update(&chain.0);
             hasher.update(record);

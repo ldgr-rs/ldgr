@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::redundant_clone,
+        clippy::needless_collect
+    )
+)]
 // ledger-lint:allow (host binary; rt-server parses process CLI arguments)
 //! `rt-server`: the AGPL engine effect server binary.
 //! Usage: `rt-server --socket PATH --seed HEX`.

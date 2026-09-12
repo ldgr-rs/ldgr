@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! Sim-overhead benchmark: CPU at 100k entries/s plus the journal share of
 //! cost, on the 4-task workload (5045 entries at 500 steps/task).
 // ledger-lint:allow (host-side benchmark measures the sim; it is not simulation code)

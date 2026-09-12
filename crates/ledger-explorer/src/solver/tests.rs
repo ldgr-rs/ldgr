@@ -374,10 +374,14 @@ fn incremental_solve_uses_cache() {
         WeightedClause::new(vec![hash_a], 2),
         WeightedClause::new(vec![hash_b], 2),
     ];
-    let first = solver.solve_incremental(closure, clauses.clone());
+    let first = solver
+        .solve_incremental(closure, clauses.clone())
+        .expect("incremental solve must stay within budget");
     assert_eq!(first.len(), 1);
     assert_eq!(solver.cache_len(), 1);
-    let second = solver.solve_incremental(closure, clauses.clone());
+    let second = solver
+        .solve_incremental(closure, clauses.clone())
+        .expect("incremental solve must stay within budget");
     assert_eq!(first, second);
     // cache hit does not grow
     assert_eq!(solver.cache_len(), 1);
@@ -641,8 +645,12 @@ fn solver_config_input_class_partitions_cache() {
             .with_horizon(64)
             .with_input_class(crate::pbt::gen_id("beta")),
     );
-    let key_a = solver_a.solve_incremental(closure, clauses.clone());
-    let key_b = solver_b.solve_incremental(closure, clauses.clone());
+    let key_a = solver_a
+        .solve_incremental(closure, clauses.clone())
+        .expect("incremental solve must stay within budget");
+    let key_b = solver_b
+        .solve_incremental(closure, clauses.clone())
+        .expect("incremental solve must stay within budget");
     // Different input classes must not share cache entry (keys differ).
     let ka = ClauseCache::compute_key(
         closure,
@@ -670,9 +678,13 @@ fn maxsat_incremental_logs_cache_hit() {
     let _hb = EntryHash([6; 32]);
     let closure = ClauseCache::closure_hash(&[ha]);
     let clauses = vec![WeightedClause::new(vec![ha], 2)];
-    let _ = solver.solve_incremental(closure, clauses.clone());
+    let _ = solver
+        .solve_incremental(closure, clauses.clone())
+        .expect("incremental solve must stay within budget");
     assert_eq!(solver.cache_hits(), 0);
-    let _ = solver.solve_incremental(closure, clauses.clone());
+    let _ = solver
+        .solve_incremental(closure, clauses.clone())
+        .expect("incremental solve must stay within budget");
     assert_eq!(solver.cache_hits(), 1);
 }
 
@@ -754,9 +766,13 @@ fn incremental_solve_engine_tags_do_not_share_cache_entries() {
     let hash = EntryHash([3u8; 32]);
     let closure = ClauseCache::closure_hash(&[hash]);
     let clauses = vec![WeightedClause::new(vec![hash], 2)];
-    let _ = solver.solve_incremental_with_tag(closure, clauses.clone(), engine_tag::BUILTIN);
+    let _ = solver
+        .solve_incremental_with_tag(closure, clauses.clone(), engine_tag::BUILTIN)
+        .expect("incremental solve must stay within budget");
     assert_eq!(solver.cache_len(), 1);
-    let _ = solver.solve_incremental_with_tag(closure, clauses.clone(), engine_tag::CADICAL);
+    let _ = solver
+        .solve_incremental_with_tag(closure, clauses.clone(), engine_tag::CADICAL)
+        .expect("incremental solve must stay within budget");
     // Distinct tags occupy distinct namespaces; neither entry satisfies the
     // other, so both persist in the per-solver cache.
     assert_eq!(solver.cache_len(), 2);
@@ -810,7 +826,7 @@ mod proptest_hitting_set {
                 .append(EntryKind::Outcome, ActorId(99), witness_parents.clone(), EntryPayload::Outcome(ledger_format::OutcomePayload { schema: EntryHash([0x00; 32]), value: CanonicalValue::Unsigned(0) }))
                 .expect("append must succeed");
             let path_hashes: Vec<Vec<EntryHash>> = all_paths.iter().map(|p| p.iter().map(|e| e.event).collect()).collect();
-            let hitting_sets = compute_minimal_hitting_sets(&all_paths);
+            let hitting_sets = compute_minimal_hitting_sets(&all_paths).expect("proptest paths must stay within budget");
             prop_assert!(!hitting_sets.is_empty(), "must produce at least one hitting set");
             for hs in &hitting_sets {
                 let v: Vec<EntryHash> = hs.iter().copied().collect();

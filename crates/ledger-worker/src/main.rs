@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::redundant_clone,
+        clippy::needless_collect
+    )
+)]
 // ledger-lint:allow - host daemon / non-sim passthrough, like TokioBackend
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,6 +90,7 @@ fn load_queue_file(path: &PathBuf, queue: &mut InMemoryQueue) -> Result<usize, Q
     })?;
     let reader = std::io::BufReader::new(file);
     let mut loaded = 0usize;
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (index, line) in reader.lines().enumerate() {
         let line = line.map_err(QueueLoadError::Read)?;
         let trimmed = line.trim();
@@ -102,6 +112,16 @@ fn load_queue_file(path: &PathBuf, queue: &mut InMemoryQueue) -> Result<usize, Q
             });
         match parsed {
             Ok(task) => {
+                // A duplicate task id would silently overwrite the first
+                // lease on pull and lose one task's accounting; reject it.
+                if !seen_ids.insert(task.id.clone()) {
+                    eprintln!(
+                        "ledger-worker: skipping duplicate task id {} at line {}",
+                        task.id,
+                        index + 1
+                    );
+                    continue;
+                }
                 queue.push(task);
                 loaded += 1;
             }
@@ -126,11 +146,16 @@ fn build_config(args: &LedgerWorker) -> WorkerConfig {
 /// Default is the no-op sink. `--artifact-base-url` selects the HTTP sink,
 /// but only when the `control-plane` feature is compiled in; without it the
 /// flag is ignored with a warning so offline builds keep running.
-fn build_sink(args: &LedgerWorker) -> Arc<dyn ledger_worker::ArtifactSink> {
+///
+/// # Errors
+/// Returns the sink-construction failure so `main` can exit before any
+/// task runs: a half-configured sink would publish without timeouts.
+fn build_sink(args: &LedgerWorker) -> Result<Arc<dyn ledger_worker::ArtifactSink>, String> {
     #[cfg(feature = "control-plane")]
     if let Some(base_url) = args.artifact_base_url.clone() {
         let token = std::env::var("LEDGER_ARTIFACT_TOKEN").ok();
-        return Arc::new(ledger_worker::HttpSink::new(base_url, token));
+        let sink = ledger_worker::HttpSink::new(base_url, token).map_err(|err| err.to_string())?;
+        return Ok(Arc::new(sink));
     }
     #[cfg(not(feature = "control-plane"))]
     if args.artifact_base_url.is_some() {
@@ -138,7 +163,7 @@ fn build_sink(args: &LedgerWorker) -> Arc<dyn ledger_worker::ArtifactSink> {
             "ledger-worker: --artifact-base-url ignored (built without --features control-plane)"
         );
     }
-    Arc::new(ledger_worker::NoopSink)
+    Ok(Arc::new(ledger_worker::NoopSink))
 }
 
 /// Run the standalone drain loop over a local in-memory queue.
@@ -277,8 +302,8 @@ async fn run_control_plane(
                         // upload the failure so the control plane retires or
                         // requeues it.
                         eprintln!("ledger-worker: {err}");
-                        if let ledger_worker::SessionError::InvalidDispatch { task_id, .. } = &err {
-                            let _ = ledger_worker::upload_failure(
+                        if let ledger_worker::SessionError::InvalidDispatch { task_id, .. } = &err
+                            && let Err(send_err) = ledger_worker::upload_failure(
                                 &tx,
                                 task_id,
                                 &ledger_worker::TaskFailure::Execution(
@@ -290,7 +315,14 @@ async fn run_control_plane(
                                     },
                                 ),
                             )
-                            .await;
+                            .await
+                        {
+                            // Deliberate but not silent: the lease timeout
+                            // recovers when the failure upload cannot be
+                            // sent.
+                            eprintln!(
+                                "ledger-worker: failure upload for {task_id} failed: {send_err}"
+                            );
                         }
                         continue;
                     }
@@ -298,7 +330,7 @@ async fn run_control_plane(
                 if !in_flight.insert(task.id.clone()) {
                     // Duplicate assignment: fail closed through the funnel.
                     eprintln!("ledger-worker: duplicate assignment of {}", task.id);
-                    let _ = ledger_worker::upload_failure(
+                    if let Err(send_err) = ledger_worker::upload_failure(
                         &tx,
                         &task.id,
                         &ledger_worker::TaskFailure::Execution(
@@ -310,7 +342,16 @@ async fn run_control_plane(
                             },
                         ),
                     )
-                    .await;
+                    .await
+                    {
+                        // The discard is deliberate but not silent: the
+                        // control-plane lease timeout is the recovery path
+                        // when the failure upload itself cannot be sent.
+                        eprintln!(
+                            "ledger-worker: failure upload for {} failed: {send_err}",
+                            task.id
+                        );
+                    }
                     continue;
                 }
                 let current_task_id = task.id.clone();
@@ -373,7 +414,13 @@ async fn run_control_plane(
 async fn main() {
     let args = LedgerWorker::parse();
     let config = build_config(&args);
-    let sink = build_sink(&args);
+    let sink = match build_sink(&args) {
+        Ok(sink) => sink,
+        Err(err) => {
+            eprintln!("ledger-worker: {err}");
+            std::process::exit(2);
+        }
+    };
 
     if args.drain_once {
         let queue = Box::new(InMemoryQueue::new(config.lease_timeout));

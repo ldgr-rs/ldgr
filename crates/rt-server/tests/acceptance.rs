@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! D1 acceptance: a real external canary through the IPC effect path, plus
 //! the three explorer services over the canary-shaped workload.
 //!
@@ -150,7 +158,8 @@ fn two_actors_are_deterministic_per_actor() {
     ) -> Vec<u8> {
         let hello = encode_frame(
             0,
-            &encode_message(&Message::Hello(Hello { identity, actor })),
+            &encode_message(&Message::Hello(Hello { identity, actor }))
+                .expect("test message encodes"),
         )
         .unwrap();
         let send = encode_frame(
@@ -160,10 +169,15 @@ fn two_actors_are_deterministic_per_actor() {
                     to: actor,
                     payload: b"hello".to_vec(),
                 },
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
-        let finish = encode_frame(2, &encode_message(&Message::Finish)).unwrap();
+        let finish = encode_frame(
+            2,
+            &encode_message(&Message::Finish).expect("test message encodes"),
+        )
+        .unwrap();
         [hello, send, finish].concat()
     }
 

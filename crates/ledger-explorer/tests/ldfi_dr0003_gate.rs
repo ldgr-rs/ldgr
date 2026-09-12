@@ -1,3 +1,11 @@
+// Test target per 08-engineering 5.1: unwrap/expect are allowed in test code;
+// clone/collect style lints are also relaxed under -D warnings.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::redundant_clone,
+    clippy::needless_collect
+)]
 //! DR-0003 non-vacuous paired-seed LDFI gate.
 //!
 //! Every counted case satisfies all six qualification conditions:
@@ -311,15 +319,22 @@ fn ldfi_qualifying_cost(case: &Case, seed: EntryHash, space: &[SimFault], budget
             }
             match case.replay(attempt_seed, &run, schedule.clone()) {
                 Ok(report) if !report.applied.is_empty() => {
-                    // Condition (5): the no-fault baseline must still pass.
-                    let rerun = case.execute(seed, Vec::new());
-                    if case.check(&rerun).violated {
-                        panic!(
-                            "{}: final no-fault rerun violates; unconditional plant",
-                            case.name
-                        );
+                    // Condition (4), same as the random control: the replayed
+                    // run must violate under strict replay, not merely apply
+                    // an eligible fault.
+                    let replay_verdict = case.check(&report.run);
+                    if replay_verdict.violated {
+                        // Condition (5): the no-fault rerun at the paired
+                        // seed must pass.
+                        let rerun = case.execute(attempt_seed, Vec::new());
+                        if case.check(&rerun).violated {
+                            panic!(
+                                "{}: final no-fault rerun violates; unconditional plant",
+                                case.name
+                            );
+                        }
+                        return attempt + 1;
                     }
-                    return attempt + 1;
                 }
                 Ok(_) => {}
                 Err(FaultReplayError::StrictReplay(_)) => {}
@@ -1175,6 +1190,32 @@ fn case_aggregate(case: &Case) -> (f64, f64, f64) {
 // Artifact schema (deterministic JSON)
 // ---------------------------------------------------------------------------
 
+/// Committed artifact directory; the artifacts are gate evidence, so the
+/// regeneration tests compare measured bytes against the committed file and
+/// fail closed when it is missing or drifted.
+fn committed_artifact_path(file: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../corpora/dr0003")
+        .join(file)
+}
+
+fn assert_artifact_matches_commit(file: &str, artifact: &str) {
+    let path = committed_artifact_path(file);
+    let committed = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "DR-0003 artifact {file} must be committed at {}: {error}; run the \
+             gate locally and commit the printed artifact",
+            path.display()
+        )
+    });
+    assert_eq!(
+        committed.trim_end(),
+        artifact,
+        "regenerated DR-0003 artifact {file} differs from the committed bytes; \
+         re-run the gate, review the diff, and re-commit the artifact"
+    );
+}
+
 fn artifact_json(rows: &[(String, usize, f64, f64, f64)], corpus_ratio: f64) -> String {
     let mut out = String::from("{\"pre_registered\":{\"B\":");
     out.push_str(&B.to_string());
@@ -1264,9 +1305,10 @@ fn ldfi_dr0003_gate() {
     );
 }
 
-/// The artifact regeneration test: the same pre-registered inputs produce
-/// byte-identical JSON. The full gate re-measures everything, so this test
-/// re-runs the aggregation on the same committed constants and compares.
+/// The artifact regeneration test: the same pre-registered inputs must
+/// regenerate the committed artifact byte-identically. The full gate
+/// re-measures everything, so this test re-runs the aggregation on the
+/// same committed constants and compares against the committed bytes.
 #[test]
 fn ldfi_dr0003_artifact_is_reproducible() {
     let cases = build_cases();
@@ -1292,12 +1334,8 @@ fn ldfi_dr0003_artifact_is_reproducible() {
         .iter()
         .fold(1.0f64, |acc, r| acc * r)
         .powf(1.0 / ratios.len() as f64);
-    let first = artifact_json(&rows, corpus_ratio);
-    let second = artifact_json(&rows, corpus_ratio);
-    assert_eq!(
-        first, second,
-        "artifact regeneration must be byte-identical"
-    );
+    let artifact = artifact_json(&rows, corpus_ratio);
+    assert_artifact_matches_commit("ldfi-dr0003.json", &artifact);
 }
 
 // ---------------------------------------------------------------------------
@@ -1438,7 +1476,8 @@ fn ldfi_corpus_ratio_gate() {
             name: scenario.name,
             workload: scenario.workload(),
             oracle: scenario.oracle(),
-            space: (scenario.fault_space)(),
+            space: (scenario.fault_space)()
+                .unwrap_or_else(|error| panic!("{}: fault space failed: {error}", scenario.name)),
             support: scenario
                 .support_provider(&baseline.journal)
                 .expression()
@@ -1513,7 +1552,8 @@ fn ldfi_corpus_ratio_artifact_is_reproducible() {
             name: scenario.name,
             workload: scenario.workload(),
             oracle: scenario.oracle(),
-            space: (scenario.fault_space)(),
+            space: (scenario.fault_space)()
+                .unwrap_or_else(|error| panic!("{}: fault space failed: {error}", scenario.name)),
             support: scenario
                 .support_provider(&baseline.journal)
                 .expression()
@@ -1538,10 +1578,8 @@ fn ldfi_corpus_ratio_artifact_is_reproducible() {
         .iter()
         .fold(1.0f64, |acc, r| acc * r)
         .powf(1.0 / ratios.len() as f64);
-    let first = artifact_json(&rows, corpus_ratio);
-    let second = artifact_json(&rows, corpus_ratio);
-    assert_eq!(
-        first, second,
-        "artifact regeneration must be byte-identical"
-    );
+    // The pre-registered inputs must regenerate the committed artifact
+    // byte-identically; the committed file is the evidence.
+    let artifact = artifact_json(&rows, corpus_ratio);
+    assert_artifact_matches_commit("corpus-ratio.json", &artifact);
 }

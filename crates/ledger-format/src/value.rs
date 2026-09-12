@@ -100,8 +100,8 @@ impl CanonicalValue {
             }
             Self::Map(entries) => {
                 budget.collection(entries.len())?;
-                // Sort by encoded key bytes; values encode after sorting
-                // so item accounting stays on the shared budget.
+                // Sort by encoded key bytes; duplicate detection then needs
+                // one adjacent comparison per pair of sorted neighbors.
                 let mut encoded_keys: Vec<(Vec<u8>, &CanonicalValue)> =
                     Vec::with_capacity(entries.len());
                 for (key, value) in entries {
@@ -109,14 +109,12 @@ impl CanonicalValue {
                     key.encode_into(&mut key_bytes, budget)?;
                     encoded_keys.push((key_bytes, value));
                 }
-                for i in 0..encoded_keys.len() {
-                    for j in (i + 1)..encoded_keys.len() {
-                        if encoded_keys[i].0 == encoded_keys[j].0 {
-                            return Err(ValueError::BoundsExceeded("duplicate map key"));
-                        }
+                encoded_keys.sort_by(|a, b| compare_canonical_keys(&a.0, &b.0));
+                for window in encoded_keys.windows(2) {
+                    if window[0].0 == window[1].0 {
+                        return Err(ValueError::BoundsExceeded("duplicate map key"));
                     }
                 }
-                encoded_keys.sort_by(|a, b| compare_canonical_keys(&a.0, &b.0));
                 cbor::map(out, encoded_keys.len());
                 for (key_bytes, value) in encoded_keys {
                     out.extend_from_slice(&key_bytes);
