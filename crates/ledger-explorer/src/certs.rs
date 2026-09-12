@@ -1038,18 +1038,23 @@ impl CampaignCertificate {
         }
         let paths = collect_fault_paths_iterative(journal, &data.witnesses, horizon)?;
         let cut: std::collections::BTreeSet<EntryHash> = data.cut.iter().copied().collect();
+        // One pass over all paths: a path with no cut member is a miss; a
+        // member is proven essential when some path hits it alone.
+        let mut essential: std::collections::BTreeSet<EntryHash> =
+            std::collections::BTreeSet::new();
         for path in &paths {
-            if path.iter().all(|id| !cut.contains(id)) {
+            let members: Vec<&EntryHash> = path.iter().filter(|id| cut.contains(*id)).collect();
+            if members.is_empty() {
                 return Err(CertError::Verification(
                     "recorded cut misses a witness derivation path".into(),
                 ));
             }
+            if let [only] = members.as_slice() {
+                essential.insert(**only);
+            }
         }
         for member in &data.cut {
-            let essential = paths.iter().any(|path| {
-                path.contains(member) && path.iter().filter(|id| cut.contains(*id)).count() == 1
-            });
-            if !essential {
+            if !essential.contains(member) {
                 return Err(CertError::Verification(format!(
                     "cut member {:02x?} is redundant: the recorded cut is not \
                      inclusion-minimal",
