@@ -143,6 +143,8 @@ pub fn send(peer: u32, payload: u64) -> bool {
 /// it to the matching `Send`.
 #[cfg(target_arch = "wasm32")]
 pub fn recv() -> Option<u64> {
+    // SAFETY: sentinel stream 0 requests any stream; the host copies the
+    // value out by return, no pointers cross the boundary.
     let value = unsafe { ledger_recv(0) };
     if value < 0 { None } else { Some(value as u64) }
 }
@@ -152,6 +154,9 @@ pub fn recv() -> Option<u64> {
 #[unsafe(no_mangle)]
 pub extern "C" fn run_boundary() {
     let mut line = String::new();
+    // SAFETY (rng/log/sleep below): stream ids and tick counts are
+    // constants; `line` and `tail` are valid buffers whose byte lengths
+    // fit `u32` (fixture strings are short constants).
     for index in 0..BOUNDARY_DRAW_COUNT {
         let value = unsafe { ledger_rng_u64(BOUNDARY_STREAM) };
         append_line(&mut line, format_args!("draw[{index}]={value}\n"));
@@ -177,6 +182,8 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 pub extern "C" fn run_virtualized() {
     let mut buf = [0u8; 16];
+    // SAFETY: `buf` is a valid local buffer; `buf.len()` bounds the host
+    // write exactly.
     let err = unsafe { random_get(buf.as_mut_ptr(), buf.len()) };
     assert_eq!(err, 0, "random_get must succeed");
     let mut line = String::new();
@@ -184,6 +191,8 @@ pub extern "C" fn run_virtualized() {
     emit(&line);
     line.clear();
     let mut now = 0u64;
+    // SAFETY: `now` is a valid 64-bit out-parameter; id 1 selects the
+    // monotonic clock per WASI preview 1.
     let err = unsafe { clock_time_get(1, 0, &mut now) }; // Monotonic
     assert_eq!(err, 0, "clock_time_get must succeed");
     append_line(&mut line, format_args!("monotonic={now}\n"));
@@ -195,6 +204,7 @@ pub extern "C" fn run_virtualized() {
 #[unsafe(no_mangle)]
 pub extern "C" fn run_forever() {
     loop {
+        // SAFETY: constant stream id, value returned by wire, no pointers.
         unsafe { ledger_rng_u64(0) };
         let buf = [0u8; 1];
         emit(&buf);
@@ -212,6 +222,7 @@ pub extern "C" fn run_empty() {}
 pub extern "C" fn run_throughput() {
     let mut accumulator: u64 = 0;
     for _index in 0..THROUGHPUT_DRAWS {
+        // SAFETY: constant stream id, value returned by wire, no pointers.
         let value = unsafe { ledger_rng_u64(THROUGHPUT_STREAM) };
         // Dependency-preserving loop the compiler cannot elide.
         let mut working = value;
@@ -220,6 +231,8 @@ pub extern "C" fn run_throughput() {
         }
         accumulator = accumulator.wrapping_add(working);
     }
+    // SAFETY: `accumulator` is a live local; the 8-byte little-endian
+    // encoding bounds the host read exactly.
     unsafe { ledger_log(accumulator.to_le_bytes().as_ptr(), 8) };
 }
 
@@ -235,6 +248,7 @@ const THROUGHPUT_STREAM: u32 = 9;
 #[unsafe(no_mangle)]
 pub extern "C" fn run_stale() {
     const STALE_STREAM: u32 = 11;
+    // SAFETY: constant stream id, values returned by wire, no pointers.
     let fresh = unsafe { ledger_rng_u64(STALE_STREAM) };
     let fresh_second = unsafe { ledger_rng_u64(STALE_STREAM) };
     let stale = fresh; // planted bug: second read serves the cached value
@@ -243,6 +257,8 @@ pub extern "C" fn run_stale() {
         &mut line,
         format_args!("fresh={fresh_second} stale={stale}\n"),
     );
+    // SAFETY: `line`/`marker` are live locals whose byte lengths fit `u32`
+    // (short fixture constants); the host only reads them for the call.
     unsafe { ledger_log(line.as_ptr(), line.len() as u32) };
     line.clear();
     if stale != fresh_second {
@@ -257,12 +273,16 @@ pub extern "C" fn run_stale() {
 pub extern "C" fn run_pingpong() {
     const PING_PAYLOAD: u64 = 0xCAFE_F00D;
     let sent = send(0, PING_PAYLOAD);
+    // SAFETY: the peer id is a valid actor constant; the payload is
+    // returned by wire, no pointers cross the boundary.
     let received = recv();
     let mut line = String::new();
     append_line(
         &mut line,
         format_args!("sent={sent} received={received:?}\n"),
     );
+    // SAFETY: `line`/`marker` are live locals whose byte lengths fit
+    // `u32` (short fixture constants).
     unsafe { ledger_log(line.as_ptr(), line.len() as u32) };
     line.clear();
     if sent && received == Some(PING_PAYLOAD) {
@@ -278,6 +298,9 @@ pub extern "C" fn run_pingpong() {
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run_fs() {
+    // SAFETY: `key` is a short constant byte string, its length bounds the
+    // host path read exactly, and values cross by return; the log line is a
+    // live local with a `u32`-bounded length.
     let key = b"k";
     let rc = unsafe { ledger_fs_write(key.as_ptr(), key.len(), 42) };
     assert_eq!(rc, 0, "ledger_fs_write must succeed");
@@ -294,6 +317,8 @@ pub extern "C" fn run_fs() {
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 pub extern "C" fn run_fs_crash() {
+    // SAFETY: same contract as `run_fs` (constant key, returned values);
+    // `ledger_fs_crash` takes no arguments at all.
     let key = b"k";
     let rc = unsafe { ledger_fs_write(key.as_ptr(), key.len(), 99) };
     assert_eq!(rc, 0, "ledger_fs_write must succeed");
@@ -315,8 +340,17 @@ pub extern "C" fn run_fs_crash() {
 // received in program order; sends to other peers journal `Send` entries
 // without being consumed. Every export emits a planted-bug marker line the
 // wasm corpus gate requires.
+//
+// SAFETY (inline `ledger_sleep` calls in this section): each takes a
+// constant tick count; no pointers cross the boundary. All pointer-taking
+// calls go through `scenario_line`/`recv_at`, whose contracts are stated
+// on those helpers.
 
 /// Log one fixed-format diagnostic line through the ledger boundary.
+///
+/// # SAFETY (single unsafe site of this helper)
+/// `line` is a live `&str`; its byte length is passed exactly and the host
+/// only reads it for the duration of the call.
 #[cfg(target_arch = "wasm32")]
 fn scenario_line(line: &str) {
     unsafe { ledger_log(line.as_ptr(), line.len() as u32) };
@@ -329,6 +363,10 @@ fn marker(text: &str) {
 }
 
 /// Receive one message addressed to `peer`, if immediately deliverable.
+///
+/// # SAFETY (single unsafe site of this helper)
+/// `peer` is a valid actor id constant; the payload is returned by wire,
+/// no pointers cross the boundary.
 #[cfg(target_arch = "wasm32")]
 fn recv_at(peer: u32) -> Option<u64> {
     let value = unsafe { ledger_recv(peer) };
