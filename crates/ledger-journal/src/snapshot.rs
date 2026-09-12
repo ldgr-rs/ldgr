@@ -63,14 +63,17 @@ impl Snapshot {
     }
 
     /// Encode the snapshot as deterministic canonical bytes.
+    ///
+    /// `EntryHash` fields use the 34-byte framed multihash wire form, like
+    /// every other v3 container; raw digests fail on decode.
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         cbor::array(&mut out, 6);
         cbor::unsigned(&mut out, u64::from(self.actor.0));
         cbor::unsigned(&mut out, self.sequence);
-        cbor::bytes(&mut out, &self.entry_id.0);
+        cbor::bytes(&mut out, &self.entry_id.to_framed_bytes());
         cbor::bytes(&mut out, &self.vector_clock.encode());
-        cbor::bytes(&mut out, &self.state_hash.0);
+        cbor::bytes(&mut out, &self.state_hash.to_framed_bytes());
         cbor::bytes(&mut out, &self.state_data);
         out
     }
@@ -111,7 +114,7 @@ impl Snapshot {
                 ));
             }
         };
-        let entry_id = decode_hash(&items[2], "entry id")?;
+        let entry_id = decode_framed_hash(&items[2], "entry id")?;
         let vector_clock = match &items[3] {
             CborValue::Bytes(bytes) => decode_vector_clock(bytes)?,
             _ => {
@@ -120,7 +123,7 @@ impl Snapshot {
                 ));
             }
         };
-        let state_hash = decode_hash(&items[4], "state hash")?;
+        let state_hash = decode_framed_hash(&items[4], "state hash")?;
         let state_data = match &items[5] {
             CborValue::Bytes(bytes) => bytes.clone(),
             _ => {
@@ -141,15 +144,15 @@ impl Snapshot {
 }
 
 #[cfg(any(feature = "std", test))]
-fn decode_hash(value: &CborValue, field: &str) -> Result<EntryHash, JournalError> {
+fn decode_framed_hash(value: &CborValue, field: &str) -> Result<EntryHash, JournalError> {
     match value {
-        CborValue::Bytes(bytes) if bytes.len() == 32 => {
-            let mut raw = [0u8; 32];
-            raw.copy_from_slice(bytes);
-            Ok(EntryHash(raw))
-        }
+        CborValue::Bytes(bytes) => EntryHash::from_framed_bytes(bytes).map_err(|_| {
+            JournalError::SnapshotStoreError(format!(
+                "snapshot {field} must be a 34-byte framed hash"
+            ))
+        }),
         _ => Err(JournalError::SnapshotStoreError(format!(
-            "snapshot {field} is not a 32-byte hash"
+            "snapshot {field} is not a 34-byte framed hash"
         ))),
     }
 }

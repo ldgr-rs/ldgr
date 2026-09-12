@@ -27,7 +27,9 @@ use ledger_format::frame::MAGIC_SNAPSHOT_STORE;
 /// Name of the snapshot store file inside a journal directory.
 const SNAPSHOT_FILE: &str = "snapshots.ldgr";
 /// Snapshot store format version.
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+///
+/// v2 frames snapshot hashes as 34-byte multihashes, matching format v3.
+const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 /// Byte offset of the chain hash within the header.
 const CHAIN_OFFSET: usize = 8;
 /// Total header length: magic, version, chain hash.
