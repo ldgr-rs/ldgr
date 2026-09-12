@@ -115,10 +115,9 @@ impl Session {
                     "sequence gap or repeat",
                 );
             }
-            next_seq = next_seq.checked_add(1).ok_or_else(|| {
-                let _ = std::io::Error::new(std::io::ErrorKind::InvalidData, "sequence overflow");
-                ServerError::Rejected(RejectReason::Protocol)
-            })?;
+            next_seq = next_seq
+                .checked_add(1)
+                .ok_or(ServerError::Rejected(RejectReason::Protocol))?;
             match frame {
                 Wire::EffectRequest(EffectRequest { effect }) => {
                     let result = self.apply(effect)?;
@@ -305,7 +304,11 @@ pub fn run(socket: &Path, seed: EntryHash) -> Result<std::process::ExitCode, Ser
         // defaults to actor zero.
         let mut session = Session::new(seed, expected_identity);
         let mut reader = stream.try_clone()?;
-        let _ = session.serve(&mut reader, &mut stream);
+        // Diagnosed, not fatal: identity rejects and protocol violations end
+        // this session only; the accept loop keeps serving new connections.
+        if let Err(err) = session.serve(&mut reader, &mut stream) {
+            eprintln!("ledger-rt-server: session ended: {err}");
+        }
     }
     Ok(std::process::ExitCode::SUCCESS)
 }
