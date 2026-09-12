@@ -19,8 +19,8 @@ use ledger_format::EntryHash;
 
 use super::{
     ArchivedSegment, INDEX_ENTRY_LEN, MANIFEST_FILE, MIN_FRAME_PAYLOAD, SealedSegment,
-    SegmentStore, TRAILER_LEN, WAL_FILE, decode_frame_payload, next_frame, prefix_of,
-    read_u32_be_at, read_u64_be_at, read_u64_le_at, segment_file_name, segment_io,
+    SegmentStore, TRAILER_LEN, WAL_FILE, decode_frame_payload, decode_segment_block, next_frame,
+    prefix_of, read_u32_be_at, read_u64_be_at, read_u64_le_at, segment_file_name, segment_io,
 };
 
 impl SegmentStore {
@@ -326,7 +326,7 @@ pub(crate) fn parse_segment_bytes(
     }
 
     let compressed = &bytes[data_offset as usize..index_start];
-    let block = zstd::decode_all(compressed).map_err(segment_io)?;
+    let block = decode_segment_block(compressed)?;
     if block.len() as u64 != uncompressed_len {
         return Err(JournalError::SegmentCorrupt(format!(
             "segment {id} uncompressed length mismatch: expected {uncompressed_len}, got {}",

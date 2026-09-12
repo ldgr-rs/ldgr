@@ -10,8 +10,8 @@ use crate::dag::{Entry, JournalError};
 use ledger_format::EntryHash;
 
 use super::{
-    SealedSegment, SegmentStore, decode_frame_payload, frame_payload_at, next_frame, prefix_of,
-    segment_file_name, segment_io,
+    SealedSegment, SegmentStore, decode_frame_payload, decode_segment_block, frame_payload_at,
+    next_frame, prefix_of, segment_file_name, segment_io,
 };
 
 impl SegmentStore {
@@ -64,7 +64,14 @@ impl SegmentStore {
         }
         let bytes = self.segment_bytes(segment.id)?;
         let start = segment.data_offset as usize;
-        let end = start + segment.compressed_len as usize;
+        let end = start
+            .checked_add(segment.compressed_len as usize)
+            .ok_or_else(|| {
+                JournalError::SegmentCorrupt(format!(
+                    "segment {} compressed block is truncated",
+                    segment.id
+                ))
+            })?;
         if end > bytes.len() {
             return Err(JournalError::SegmentCorrupt(format!(
                 "segment {} compressed block is truncated",
@@ -72,7 +79,7 @@ impl SegmentStore {
             )));
         }
         let compressed = &bytes[start..end];
-        let block = zstd::decode_all(compressed).map_err(segment_io)?;
+        let block = decode_segment_block(compressed)?;
         if block.len() != segment.uncompressed_len as usize {
             return Err(JournalError::SegmentCorrupt(format!(
                 "segment {} uncompressed length mismatch: expected {}, got {}",
