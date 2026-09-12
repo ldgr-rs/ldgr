@@ -30,38 +30,75 @@ pub struct MaxSatSolution {
 }
 /// Method tag carried by every MCS lower-bound certificate this module emits.
 pub const LOWER_BOUND_METHOD: &str = "mcs-lower-bound-v1";
+/// Total path-cell budget for the unbounded memo walk. Diamond-heavy
+/// journals multiply child path lists per parent; past the budget the walk
+/// degrades to a truncated (Opaque) support, which fails closed in
+/// [`encode_hazard`], instead of allocating exponentially.
+const HAZARD_WALK_CELL_BUDGET: usize = 4_000_000;
+
 fn collect_memo(
     journal: &Journal,
-    cur: EntryHash,
+    start: EntryHash,
     memo: &mut BTreeMap<EntryHash, Vec<Vec<EntryHash>>>,
+    truncated: &mut bool,
 ) -> Vec<Vec<EntryHash>> {
-    if let Some(cached) = memo.get(&cur) {
-        return cached.clone();
-    }
-    let Some(entry) = journal.get(&cur) else {
-        return Vec::new();
-    };
-    let faultable = is_faultable(entry.data.kind);
-    let mut paths: Vec<Vec<EntryHash>> = Vec::new();
-    if entry.data.parents.is_empty() {
-        if faultable {
-            paths.push(vec![cur]);
-        } else {
-            paths.push(Vec::new());
-        }
-    } else {
-        for p in &entry.data.parents {
-            for sub in collect_memo(journal, *p, memo) {
-                let mut path = sub;
-                if faultable {
-                    path.push(cur);
+    // Iterative post-order: children compute before their parent, so the
+    // parent memo entry reuses child lists exactly like the recursive form.
+    let mut stack: Vec<(EntryHash, u8)> = vec![(start, 0)];
+    let mut cells = 0usize;
+    while let Some((cur, phase)) = stack.pop() {
+        match phase {
+            0 => {
+                if memo.contains_key(&cur) {
+                    continue;
                 }
-                paths.push(path);
+                let Some(entry) = journal.get(&cur) else {
+                    memo.insert(cur, Vec::new());
+                    continue;
+                };
+                if entry.data.parents.is_empty() {
+                    let paths = if is_faultable(entry.data.kind) {
+                        vec![vec![cur]]
+                    } else {
+                        vec![Vec::new()]
+                    };
+                    memo.insert(cur, paths);
+                    continue;
+                }
+                stack.push((cur, 1));
+                for p in &entry.data.parents {
+                    stack.push((*p, 0));
+                }
             }
+            1 => {
+                let Some(entry) = journal.get(&cur) else {
+                    memo.entry(cur).or_default();
+                    continue;
+                };
+                let faultable = is_faultable(entry.data.kind);
+                let mut paths: Vec<Vec<EntryHash>> = Vec::new();
+                'append: for p in &entry.data.parents {
+                    let Some(sub) = memo.get(p) else {
+                        continue;
+                    };
+                    for mut path in sub.clone() {
+                        if cells > HAZARD_WALK_CELL_BUDGET {
+                            *truncated = true;
+                            break 'append;
+                        }
+                        if faultable {
+                            path.push(cur);
+                        }
+                        cells += path.len() + 1;
+                        paths.push(path);
+                    }
+                }
+                memo.insert(cur, paths);
+            }
+            _ => unreachable!("only phases 0 and 1 are pushed"),
         }
     }
-    memo.insert(cur, paths.clone());
-    paths
+    memo.get(&start).cloned().unwrap_or_default()
 }
 
 fn collect_bounded_memo(
@@ -127,16 +164,16 @@ pub fn encode_hazard(
                 }
             }
         } else {
-            for p in collect_memo(journal, *w, &mut memo) {
+            for p in collect_memo(journal, *w, &mut memo, &mut truncated) {
                 if !p.is_empty() {
                     all.push(p);
                 }
             }
         }
     }
-    // Support walk: paths join as `AllOf` under `AnyOf`; horizon cut joins `Opaque`.
-    let support =
-        crate::support::support_from_paths(&all, truncated && config.max_horizon.is_some());
+    // Support walk: paths join as `AllOf` under `AnyOf`; a horizon or
+    // budget cut joins `Opaque`.
+    let support = crate::support::support_from_paths(&all, truncated);
     let support_clauses = crate::support::hard_clauses_from_support(&support);
     if support_clauses.is_empty() && !verdict.witnesses.is_empty() {
         return Err(SolverError::EmptyProvenance);
