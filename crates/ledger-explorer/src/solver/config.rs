@@ -149,11 +149,12 @@ pub trait FaultSolver {
 
     /// Stateful incremental solve over a content-addressed clause key.
     /// Deterministic: same closure hash and clause set yield same hypotheses.
+    /// Fails closed when the derivation exceeds an engine budget.
     fn solve_incremental(
         &mut self,
         closure_hash: EntryHash,
         clauses: Vec<WeightedClause>,
-    ) -> Vec<FaultHypothesis>;
+    ) -> Result<Vec<FaultHypothesis>, SolverError>;
 
     /// Snapshot persisted state for cross-round resume.
     ///

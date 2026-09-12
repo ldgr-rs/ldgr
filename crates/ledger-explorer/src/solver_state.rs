@@ -1149,9 +1149,13 @@ mod tests {
         // A query under the OTHER closure key gets fresh hypotheses derived
         // from its own clauses, never closure A's cached hypothesis.
         let clauses_b = vec![WeightedClause::new(vec![hash_b], 3)];
-        let got_b = solver.solve_incremental(closure_b, clauses_b.clone());
+        let got_b = solver
+            .solve_incremental(closure_b, clauses_b.clone())
+            .expect("incremental solve must stay within budget");
         let mut fresh = HittingSetSolver::new();
-        let expected_b = fresh.solve_incremental(closure_b, clauses_b);
+        let expected_b = fresh
+            .solve_incremental(closure_b, clauses_b)
+            .expect("incremental solve must stay within budget");
         assert_eq!(
             got_b, expected_b,
             "the other key must recompute from its own clauses"
@@ -1165,9 +1169,13 @@ mod tests {
         // The one two-literal clause yields the minimal hitting sets {a} and
         // {b}, each costing the clause weight.
         let clauses_a2 = vec![WeightedClause::new(vec![hash_a, hash_b], 4)];
-        let got_a2 = solver.solve_incremental(closure_a, clauses_a2.clone());
+        let got_a2 = solver
+            .solve_incremental(closure_a, clauses_a2.clone())
+            .expect("incremental solve must stay within budget");
         let mut fresh2 = HittingSetSolver::new();
-        let expected_a2 = fresh2.solve_incremental(closure_a, clauses_a2);
+        let expected_a2 = fresh2
+            .solve_incremental(closure_a, clauses_a2)
+            .expect("incremental solve must stay within budget");
         assert_eq!(got_a2, expected_a2, "mismatched assumptions must recompute");
         let mut got_a2_sets: Vec<Vec<EntryHash>> = got_a2
             .iter()
@@ -1451,7 +1459,9 @@ mod tests {
         ];
 
         let mut solver_a = HittingSetSolver::new();
-        let first = solver_a.solve_incremental(closure, clauses.clone());
+        let first = solver_a
+            .solve_incremental(closure, clauses.clone())
+            .expect("incremental solve must stay within budget");
         assert!(!first.is_empty());
 
         // Snapshot and resume into fresh solver.
@@ -1475,7 +1485,9 @@ mod tests {
         solver_resumed
             .resume(&artifact, SolverEngine::Builtin)
             .expect("resume incremental");
-        let second = solver_resumed.solve_incremental(closure, clauses.clone());
+        let second = solver_resumed
+            .solve_incremental(closure, clauses.clone())
+            .expect("incremental solve must stay within budget");
         // Incremental cache hit path should produce identical sets and costs.
         let first_decisions: Vec<(Vec<EntryHash>, u64)> = first
             .iter()
@@ -1498,7 +1510,9 @@ mod tests {
         let clauses = vec![WeightedClause::new(vec![test_hash(7)], 4)];
 
         let mut solver_a = HittingSetSolver::new();
-        let first = solver_a.solve_incremental(closure, clauses.clone());
+        let first = solver_a
+            .solve_incremental(closure, clauses.clone())
+            .expect("incremental solve must stay within budget");
         assert_eq!(first[0].total_cost, 4);
 
         let mut tmp_journal = Journal::new();
@@ -1511,7 +1525,9 @@ mod tests {
         resumed
             .resume(&artifact, SolverEngine::Builtin)
             .expect("resume");
-        let second = resumed.solve_incremental(closure, clauses);
+        let second = resumed
+            .solve_incremental(closure, clauses)
+            .expect("incremental solve must stay within budget");
         assert_eq!(
             second[0].total_cost, 4,
             "resumed cost must be the exact clause-weight cost, not a flat 2"
@@ -1535,7 +1551,9 @@ mod tests {
         let hash = test_hash(3);
         let closure = ClauseCache::closure_hash(&[hash]);
         let clauses = vec![WeightedClause::new(vec![hash], 2)];
-        solver_a.solve_incremental(closure, clauses);
+        solver_a
+            .solve_incremental(closure, clauses)
+            .expect("incremental solve must stay within budget");
         let artifact = solver_a.snapshot_state().expect("snapshot under config A");
 
         let mut solver_b = HittingSetSolver::with_config(solver_config_b);
@@ -1590,9 +1608,13 @@ mod tests {
         let closure = ClauseCache::closure_hash(&[witness]);
         let real_clauses = vec![WeightedClause::new(vec![witness], 2)];
         let mut resumed = HittingSetSolver::new();
-        let got = resumed.solve_incremental(closure, real_clauses.clone());
+        let got = resumed
+            .solve_incremental(closure, real_clauses.clone())
+            .expect("incremental solve must stay within budget");
         let mut fresh_incremental = HittingSetSolver::new();
-        let expected = fresh_incremental.solve_incremental(closure, real_clauses);
+        let expected = fresh_incremental
+            .solve_incremental(closure, real_clauses)
+            .expect("incremental solve must stay within budget");
         assert_eq!(
             got, expected,
             "incremental solve must recompute like a fresh one"
@@ -1605,9 +1627,13 @@ mod tests {
 
         // An EMPTY clause query must recompute identically to a fresh solver.
         let empty_query = Vec::<WeightedClause>::new();
-        let got_empty = resumed.solve_incremental(closure, empty_query.clone());
+        let got_empty = resumed
+            .solve_incremental(closure, empty_query.clone())
+            .expect("incremental solve must stay within budget");
         let mut fresh_empty = HittingSetSolver::new();
-        let expected_empty = fresh_empty.solve_incremental(closure, empty_query);
+        let expected_empty = fresh_empty
+            .solve_incremental(closure, empty_query)
+            .expect("incremental solve must stay within budget");
         assert_eq!(
             got_empty, expected_empty,
             "the empty-clause query must behave like a fresh solver"

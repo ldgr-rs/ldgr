@@ -115,7 +115,7 @@ impl MaxSatSolver {
             })
             .collect();
         // Per-solver cache only; constructed per campaign.
-        self.inner.cache.insert(key, clauses.clone());
+        self.inner.cache.insert(key, clauses);
         let solution = if use_cadical {
             #[cfg(feature = "solver-cadical")]
             {
@@ -243,7 +243,7 @@ impl FaultSolver for MaxSatSolver {
         &mut self,
         closure_hash: EntryHash,
         clauses: Vec<WeightedClause>,
-    ) -> Vec<FaultHypothesis> {
+    ) -> Result<Vec<FaultHypothesis>, SolverError> {
         // No encoding here: Auto applies the crossover rule to the clause count.
         let (tag, _) = self.resolve_backend(clauses.len());
         let key = self.inner.incremental_key_with_tag(closure_hash, tag);

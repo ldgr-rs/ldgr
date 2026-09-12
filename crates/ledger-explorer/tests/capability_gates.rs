@@ -510,7 +510,10 @@ fn run_scaling_chain(n: usize) -> (usize, usize, usize, usize, bool, bool, Durat
         v
     };
     let closure_hash = ClauseCache::closure_hash(&witness_ids);
-    let walked = solver.solve_incremental(closure_hash, clauses).len();
+    let walked = solver
+        .solve_incremental(closure_hash, clauses)
+        .expect("incremental solve must stay within budget")
+        .len();
     let solved = walked > 0;
 
     // Statement emission and journal-anchored validation.
