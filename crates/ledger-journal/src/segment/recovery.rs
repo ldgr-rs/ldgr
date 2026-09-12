@@ -263,7 +263,8 @@ pub(crate) fn parse_segment_bytes(
             }
             Err(ledger_format::FrameError::UnsupportedVersion(v)) => {
                 return Err(JournalError::SegmentCorrupt(format!(
-                    "unsupported segment version {v}, expected 2"
+                    "unsupported segment version {v}, expected {}",
+                    ledger_format::FORMAT_VERSION
                 )));
             }
             Err(ledger_format::FrameError::HeaderTooLarge(_))

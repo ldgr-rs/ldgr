@@ -573,6 +573,13 @@ mod tests {
                 "in-memory journal must roll back on store error"
             );
             assert_eq!(journal.journal().head_for_actor(ActorId(1)), Some(id1));
+        } else {
+            // Named skip, not a silent pass: running with privileges that
+            // ignore the 0o400 mode (root, some CI sandboxes) keeps the
+            // append working, so the rollback path is not exercised here.
+            std::eprintln!(
+                "skipped rollback assertion: file permissions are ignored in this environment"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
