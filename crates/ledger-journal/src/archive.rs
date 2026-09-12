@@ -145,11 +145,14 @@ impl ArchiveStore {
                     .map_or([0; 8], |b| b),
             ) as usize;
             offset += RECORD_PREFIX_LEN;
-            if offset + len > bytes.len() {
+            let end = offset
+                .checked_add(len)
+                .ok_or(JournalError::ArchiveHashMismatch)?;
+            if end > bytes.len() {
                 return Err(JournalError::ArchiveHashMismatch);
             }
-            let record = &bytes[offset..offset + len];
-            offset += len;
+            let record = &bytes[offset..end];
+            offset = end;
             let mut hasher = blake3::Hasher::new();
             hasher.update(&chain.0);
             hasher.update(&ordinal.to_le_bytes());

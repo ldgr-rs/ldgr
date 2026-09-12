@@ -124,11 +124,14 @@ impl SnapshotStore {
             let len = u64::from_le_bytes(bytes[offset..offset + 8].try_into().map_or([0; 8], |b| b))
                 as usize;
             offset += 8;
-            if offset + len > bytes.len() {
+            let end = offset
+                .checked_add(len)
+                .ok_or(JournalError::SnapshotHashMismatch)?;
+            if end > bytes.len() {
                 return Err(JournalError::SnapshotHashMismatch);
             }
-            let record = &bytes[offset..offset + len];
-            offset += len;
+            let record = &bytes[offset..end];
+            offset = end;
             let mut hasher = blake3::Hasher::new();
             hasher.update(&chain.0);
             hasher.update(record);
