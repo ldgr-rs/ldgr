@@ -150,7 +150,8 @@ fn two_actors_are_deterministic_per_actor() {
     ) -> Vec<u8> {
         let hello = encode_frame(
             0,
-            &encode_message(&Message::Hello(Hello { identity, actor })),
+            &encode_message(&Message::Hello(Hello { identity, actor }))
+                .expect("test message encodes"),
         )
         .unwrap();
         let send = encode_frame(
@@ -160,10 +161,15 @@ fn two_actors_are_deterministic_per_actor() {
                     to: actor,
                     payload: b"hello".to_vec(),
                 },
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
-        let finish = encode_frame(2, &encode_message(&Message::Finish)).unwrap();
+        let finish = encode_frame(
+            2,
+            &encode_message(&Message::Finish).expect("test message encodes"),
+        )
+        .unwrap();
         [hello, send, finish].concat()
     }
 

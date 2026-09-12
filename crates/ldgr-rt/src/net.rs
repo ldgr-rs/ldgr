@@ -46,9 +46,11 @@ impl Conn {
 
     /// Send a payload (`false` when partitioned).
     pub fn send(&self, payload: u64) -> bool {
+        // Poisoned guards recover, matching `partition`: a silent `false`
+        // would masquerade as an active partition.
         let mut net = match self.shared.inner().lock() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(poisoned) => poisoned.into_inner(),
         };
         if net.partitions.contains(&(self.from, self.to)) {
             return false;
@@ -67,7 +69,7 @@ impl Conn {
     pub fn recv(&self) -> Option<u64> {
         let mut net = match self.shared.inner().lock() {
             Ok(g) => g,
-            Err(_) => return None,
+            Err(poisoned) => poisoned.into_inner(),
         };
         let pos = net
             .queue
@@ -79,7 +81,7 @@ impl Conn {
     pub fn has_ready(&self) -> bool {
         let net = match self.shared.inner().lock() {
             Ok(g) => g,
-            Err(_) => return false,
+            Err(poisoned) => poisoned.into_inner(),
         };
         net.queue
             .iter()

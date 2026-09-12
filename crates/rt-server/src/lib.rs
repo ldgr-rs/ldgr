@@ -257,7 +257,8 @@ fn read_message(reader: &mut impl Read) -> Result<(u64, Wire), ServerError> {
 
 /// Encode and write one frame.
 fn write_message(writer: &mut impl Write, seq: u64, message: &Wire) -> Result<(), ServerError> {
-    let body = encode_message(message);
+    let body = encode_message(message)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     let frame = encode_frame(seq, &body)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     writer.write_all(&frame)?;
@@ -372,39 +373,47 @@ mod tests {
     fn frames_for_actor(_seed: EntryHash, identity: EntryHash, actor: ActorId) -> Vec<u8> {
         let hello = encode_frame(
             0,
-            &encode_message(&Message::Hello(Hello { identity, actor })),
+            &encode_message(&Message::Hello(Hello { identity, actor }))
+                .expect("test message encodes"),
         )
         .unwrap();
         let clock = encode_frame(
             1,
             &encode_message(&Message::EffectRequest(EffectRequest {
                 effect: Effect::Clock,
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
         let write = encode_frame(
             2,
             &encode_message(&Message::EffectRequest(EffectRequest {
                 effect: Effect::FsWrite {
-                    path: "/kv/k".into(),
+                    path: "/kv/k".to_string(),
                     offset: 0,
                     bytes: 42u64.to_le_bytes().to_vec(),
                 },
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
         let read = encode_frame(
             3,
             &encode_message(&Message::EffectRequest(EffectRequest {
                 effect: Effect::FsRead {
-                    path: "/kv/k".into(),
+                    path: "/kv/k".to_string(),
                     offset: 0,
                     len: 8,
                 },
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
-        let finish = encode_frame(4, &encode_message(&Message::Finish)).unwrap();
+        let finish = encode_frame(
+            4,
+            &encode_message(&Message::Finish).expect("test message encodes"),
+        )
+        .unwrap();
         [hello, clock, write, read, finish].concat()
     }
 
@@ -449,14 +458,16 @@ mod tests {
             &encode_message(&Message::Hello(Hello {
                 identity,
                 actor: ActorId(0),
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
         let clock = encode_frame(
             5,
             &encode_message(&Message::EffectRequest(EffectRequest {
                 effect: Effect::Clock,
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
         let input = [hello, clock].concat();
@@ -477,41 +488,49 @@ mod tests {
             &encode_message(&Message::Hello(Hello {
                 identity,
                 actor: ActorId(0),
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
         let write = encode_frame(
             1,
             &encode_message(&Message::EffectRequest(EffectRequest {
                 effect: Effect::FsWrite {
-                    path: "/data/file.bin".into(),
+                    path: "/data/file.bin".to_string(),
                     offset: 16,
                     bytes: payload.clone(),
                 },
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
         let read = encode_frame(
             2,
             &encode_message(&Message::EffectRequest(EffectRequest {
                 effect: Effect::FsRead {
-                    path: "/data/file.bin".into(),
+                    path: "/data/file.bin".to_string(),
                     offset: 16,
                     len: payload.len() as u64,
                 },
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
         let sync = encode_frame(
             3,
             &encode_message(&Message::EffectRequest(EffectRequest {
                 effect: Effect::FsSync {
-                    path: "/data/file.bin".into(),
+                    path: "/data/file.bin".to_string(),
                 },
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
-        let finish = encode_frame(4, &encode_message(&Message::Finish)).unwrap();
+        let finish = encode_frame(
+            4,
+            &encode_message(&Message::Finish).expect("test message encodes"),
+        )
+        .unwrap();
         let input = [hello, write, read, sync, finish].concat();
 
         let goodbye = serve_session(seed, identity, &input).expect("session serves");
@@ -558,10 +577,15 @@ mod tests {
             &encode_message(&Message::Hello(Hello {
                 identity,
                 actor: ActorId(7),
-            })),
+            }))
+            .expect("test message encodes"),
         )
         .unwrap();
-        let finish = encode_frame(1, &encode_message(&Message::Finish)).unwrap();
+        let finish = encode_frame(
+            1,
+            &encode_message(&Message::Finish).expect("test message encodes"),
+        )
+        .unwrap();
         let mut reader = std::io::Cursor::new([hello, finish].concat());
         let mut writer = Vec::new();
         let goodbye = probe.serve(&mut reader, &mut writer).expect("probe serves");
