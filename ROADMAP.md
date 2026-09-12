@@ -2,7 +2,7 @@
 
 This file lists what ldgr can do today and where it is heading. It carries
 no dates: items move when they are ready, and the order below is intent,
-not a schedule. The [honest status](README.md#honest-status) rule applies
+not a schedule. The [status](README.md#status) rule applies
 here too - if this file drifts from reality, open an issue.
 
 ## Shipped
@@ -33,6 +33,9 @@ Works today, gated in CI.
 - Failure-spec scenarios: declarative fault programs (partitions, crash
   and restart, storage corruption, clock skew) compiled to deterministic
   fault schedules.
+- Duplicate-delivery faults for at-least-once systems, wired end to end
+  under the v3 format (inject, journal, replay, and minimize a duplicated
+  message).
 
 ## Next
 
@@ -43,8 +46,8 @@ The current focus, in rough order.
   coverage-guided exploration driven by journal-root diversity.
 - Time realism: a deadline oracle and seeded per-actor clock skew and
   drift, so timing bugs are both injectable and observable.
-- Resource realism: bounded queues, resource-exhaustion limits, and
-  slow-storage faults.
+- Resource realism: resource-exhaustion limits and slow-storage faults
+  (bounded queues and the SimFs resident-byte budget have shipped).
 - Source spans: minimized repros that point at the code locations that
   produced the conflicting values.
 - Fairness oracle: liveness properties beyond budget exhaustion - a
@@ -77,8 +80,6 @@ Directions we expect to pursue, design still open.
   injection and measure model coverage.
 - Structured mutation of failure-spec scenarios, including
   LLM-drafted scenarios validated by the compiler.
-- Duplicate-delivery faults for at-least-once systems (a deliberate,
-  format-versioned change).
 - Shared-memory schedule exploration: threads, atomics, and lock orders
   beside the message-passing model.
 - Byte-stream network fidelity for protocol stacks that need TCP/IP
