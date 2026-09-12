@@ -1476,7 +1476,8 @@ fn ldfi_corpus_ratio_gate() {
             name: scenario.name,
             workload: scenario.workload(),
             oracle: scenario.oracle(),
-            space: (scenario.fault_space)(),
+            space: (scenario.fault_space)()
+                .unwrap_or_else(|error| panic!("{}: fault space failed: {error}", scenario.name)),
             support: scenario
                 .support_provider(&baseline.journal)
                 .expression()
@@ -1551,7 +1552,8 @@ fn ldfi_corpus_ratio_artifact_is_reproducible() {
             name: scenario.name,
             workload: scenario.workload(),
             oracle: scenario.oracle(),
-            space: (scenario.fault_space)(),
+            space: (scenario.fault_space)()
+                .unwrap_or_else(|error| panic!("{}: fault space failed: {error}", scenario.name)),
             support: scenario
                 .support_provider(&baseline.journal)
                 .expression()
